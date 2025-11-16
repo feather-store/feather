@@ -1,9 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::fs::File;
 use feather_cli::DB;
 use ndarray::Array1;
-use ndarray_npy::read_npy;  // ← FREE FUNCTION
 
 #[derive(Parser)]
 #[command(name = "feather")]
@@ -27,17 +25,17 @@ fn main() -> anyhow::Result<()> {
             println!("Created: {:?}", path);
         }
         Commands::Add { db, id, npy } => {
-            let db = DB::open(&db, 0).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
-            let file = File::open(&npy)?;
-            let arr: Array1<f32> = read_npy(&file)?;  // ← FIXED: free function
+            let arr: Array1<f32> = ndarray_npy::read_npy(&npy)?;
+            let dim = arr.len();
+            let db = DB::open(&db, dim).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
             db.add(id, arr.as_slice().unwrap());
             db.save();
             println!("Added ID {}", id);
         }
         Commands::Search { db, npy, k } => {
-            let db = DB::open(&db, 0).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
-            let file = File::open(&npy)?;
-            let arr: Array1<f32> = read_npy(&file)?;  // ← FIXED: free function
+            let arr: Array1<f32> = ndarray_npy::read_npy(&npy)?;
+            let dim = arr.len();
+            let db = DB::open(&db, dim).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
             let (ids, dists) = db.search(arr.as_slice().unwrap(), k);
             for (id, dist) in ids.iter().zip(dists.iter()) {
                 println!("ID: {}  dist: {:.4}", id, dist);
