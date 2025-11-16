@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "pybind11>=2.6.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feather-db"
+version = "0.1.0"
+description = "Fast, lightweight vector database for similarity search"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Feather DB Contributors", email = "feather-db@example.com"}
+]
+keywords = [
+    "vector",
+    "database",
+    "similarity",
+    "search",
+    "embeddings",
+    "hnsw",
+    "ann",
+    "nearest-neighbor",
+    "machine-learning",
+    "ai"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "numpy>=1.19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "black>=21.0",
+    "flake8>=3.9",
+]
+examples = [
+    "sentence-transformers>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/feather-db"
+Documentation = "https://github.com/yourusername/feather-db/blob/main/USAGE_GUIDE.md"
+Repository = "https://github.com/yourusername/feather-db"
+Issues = "https://github.com/yourusername/feather-db/issues"
+Changelog = "https://github.com/yourusername/feather-db/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+packages = []
+
+[tool.setuptools.package-data]
+"*" = ["*.so", "*.pyd", "*.dll"]

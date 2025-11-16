@@ -1,145 +1,82 @@
-# Build artifacts and compiled files
+# Build artifacts
 *.o
+*.a
 *.so
 *.dylib
 *.dll
-*.a
-*.lib
 *.exe
+build/
+dist/
+*.egg-info/
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.egg-info/
-dist/
-build/
-.eggs/
-*.egg
 .pytest_cache/
 .coverage
-htmlcov/
-.tox/
-.venv/
-venv/
+.Python
 env/
+venv/
 ENV/
+*.egg
 
-# Rust (Cargo)
+# Rust
 target/
 Cargo.lock
+**/*.rs.bk
 *.pdb
 
-# C/C++
-*.obj
-*.elf
-*.ilk
-*.map
-*.exp
-*.gch
-*.pch
-*.tmp
-*.tmp_proj
-*_wpftmp.csproj
-*.log
-*.vspscc
-*.vssscc
-.builds
-*.pidb
-*.svclog
-*.scc
-
-# IDE and Editor files
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
-Thumbs.db
 
-# CMake
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-Makefile
-*.cmake
-!CMakeLists.txt
-
-# Generated files
-*.feather
-*.index
-*.bin
-*.dat
-
-# OS specific
+# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
+*.bak
+
+# Test files and databases
+*.feather
+test_*.npy
+demo.feather
+example.feather
+semantic_search.feather
+large_dataset.feather
+products.feather
+documents.feather
+search.feather
+large.feather
+mydb.feather
+vectors.feather
+benchmark.feather
+knowledge.feather
+images.feather
+docs.feather
+db.feather
+my_db.feather
+my_vectors.feather
+sentences.feather
+
+# Test data
+p-test/test-data/*.npy
+p-test/*.feather
+examples/*.feather
+*.npy
 
 # Temporary files
 *.tmp
-*.temp
-*.bak
-*.backup
-*~
-
-# Logs
 *.log
-logs/
-
-# Test outputs
-test_output/
-test_results/
+*.cache
 
 # Documentation build
 docs/_build/
-docs/build/
+site/
 
-# Environment variables
-.env
-.env.local
-.env.*.local
-
-# Package manager files
-node_modules/
-package-lock.json
-yarn.lock
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
-
-# Pipenv
-Pipfile.lock
-
-# PEP 582
-__pypackages__/
-
-# Celery
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+# Package files
+*.whl
+*.tar.gz

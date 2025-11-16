@@ -1,0 +1,29 @@
+# Include documentation
+include README.md
+include LICENSE
+include CHANGELOG.md
+include HOW_TO_USE.md
+include USAGE_GUIDE.md
+include CONTRIBUTING.md
+
+# Include C++ source and headers
+recursive-include include *.h
+recursive-include src *.cpp
+recursive-include bindings *.cpp
+
+# Include examples
+recursive-include examples *.py *.md
+
+# Exclude build artifacts
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.o
+global-exclude *.a
+global-exclude __pycache__
+global-exclude *.feather
+global-exclude *.npy
+
+# Exclude test files
+prune p-test
+prune feather-cli/target
+exclude feather-cli/Cargo.lock
