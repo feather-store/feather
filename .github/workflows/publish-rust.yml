@@ -1,0 +1,34 @@
+name: Publish Rust Crate
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: Build
+      run: |
+        cd feather-cli
+        cargo build --release
+    
+    - name: Test
+      run: |
+        cd feather-cli
+        cargo test
+    
+    - name: Publish to crates.io
+      run: |
+        cd feather-cli
+        cargo publish --token ${{ secrets.CARGO_TOKEN }}
+      continue-on-error: true  # Don't fail if already published
