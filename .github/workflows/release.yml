@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v0.1.0
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: |
+          ## What's New
+          
+          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
+          
+          ## Installation
+          
+          ```bash
+          pip install feather-db
+          ```
+          
+          ## Quick Start
+          
+          ```python
+          import feather_py
+          import numpy as np
+          
+          db = feather_py.DB.open("vectors.feather", dim=768)
+          vector = np.random.random(768).astype(np.float32)
+          db.add(1, vector)
+          
+          query = np.random.random(768).astype(np.float32)
+          ids, distances = db.search(query, k=5)
+          db.save()
+          ```
+        draft: false
+        prerelease: false
+  
+  build-rust-cli:
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: feather-cli
+            asset_name: feather-cli-linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: feather-cli
+            asset_name: feather-cli-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: feather-cli
+            asset_name: feather-cli-macos-aarch64
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: ${{ matrix.target }}
+        override: true
+    
+    - name: Build C++ core
+      run: |
+        g++ -O3 -std=c++17 -fPIC -c src/feather_core.cpp -o feather_core.o
+        ar rcs libfeather.a feather_core.o
+    
+    - name: Build Rust CLI
+      run: |
+        cd feather-cli
+        cargo build --release --target ${{ matrix.target }}
+    
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ./feather-cli/target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        asset_name: ${{ matrix.asset_name }}
+        asset_content_type: application/octet-stream
