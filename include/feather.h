@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <algorithm>
 #include <string>
 #include <tuple>
 #include <memory>
@@ -75,6 +76,7 @@ public:
             out.emplace_back(id, dist);
             res.pop();
         }
+        std::reverse(out.begin(), out.end());
         return out;
     }
 
