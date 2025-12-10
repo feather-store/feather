@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use feather_cli::DB;
+use feather_db_cli::DB;
 use ndarray::Array1;
 
 #[derive(Parser)]

@@ -1,7 +1,20 @@
 [package]
-name = "feather-cli"
+name = "feather-db-cli"
 version = "0.1.0"
 edition = "2021"
+authors = ["Feather DB Contributors <feather-db@example.com>"]
+description = "Command-line interface for Feather vector database"
+license = "MIT"
+repository = "https://github.com/yourusername/feather-db"
+homepage = "https://github.com/yourusername/feather-db"
+documentation = "https://github.com/yourusername/feather-db/blob/main/USAGE_GUIDE.md"
+readme = "../README.md"
+keywords = ["vector", "database", "similarity", "cli", "hnsw"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "feather"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
