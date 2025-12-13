@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 WORKDIR /data
 
 # Test installation
-RUN python -c "import feather_py; print('✓ Feather DB installed successfully')"
+RUN python -c "import feather_db; print('✓ Feather DB installed successfully')"
 
 # Default command
 CMD ["python"]

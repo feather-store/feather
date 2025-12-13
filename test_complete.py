@@ -57,20 +57,20 @@ print_header("🧪 Feather DB - Complete Local Testing Suite")
 print_test("1. Import Test")
 @run_test
 def test_import():
-    import feather_py
-    print_info(f"✓ feather_py module imported")
-    print_info(f"✓ Module: {feather_py.__name__}")
-    assert hasattr(feather_py, 'DB'), "DB class not found"
+    import feather_db
+    print_info(f"✓ feather_db module imported")
+    print_info(f"✓ Module: {feather_db.__name__}")
+    assert hasattr(feather_db, 'DB'), "DB class not found"
     print_info(f"✓ DB class available")
 
 # Test 2: Basic Functionality
 print_test("2. Basic Functionality")
 @run_test
 def test_basic():
-    import feather_py
+    import feather_db
     
     # Create database
-    db = feather_py.DB.open("test_basic.feather", dim=128)
+    db = feather_db.DB.open("test_basic.feather", dim=128)
     print_info("✓ Database created")
     
     # Check dimension
@@ -101,9 +101,9 @@ def test_basic():
 print_test("3. Edge Cases")
 @run_test
 def test_edge_cases():
-    import feather_py
+    import feather_db
     
-    db = feather_py.DB.open("test_edge.feather", dim=128)
+    db = feather_db.DB.open("test_edge.feather", dim=128)
     
     # Test dimension mismatch
     try:
@@ -136,10 +136,10 @@ def test_edge_cases():
 print_test("4. Persistence")
 @run_test
 def test_persistence():
-    import feather_py
+    import feather_db
     
     # Create and save
-    db = feather_py.DB.open("test_persist.feather", dim=64)
+    db = feather_db.DB.open("test_persist.feather", dim=64)
     test_vectors = []
     for i in range(10):
         vec = np.random.random(64).astype(np.float32)
@@ -150,7 +150,7 @@ def test_persistence():
     del db
     
     # Reopen
-    db2 = feather_py.DB.open("test_persist.feather", dim=64)
+    db2 = feather_db.DB.open("test_persist.feather", dim=64)
     print_info("✓ Database reopened")
     
     # Search for first vector
@@ -165,9 +165,9 @@ def test_persistence():
 print_test("5. Search Accuracy")
 @run_test
 def test_accuracy():
-    import feather_py
+    import feather_db
     
-    db = feather_py.DB.open("test_accuracy.feather", dim=128)
+    db = feather_db.DB.open("test_accuracy.feather", dim=128)
     
     # Create known vectors
     vec1 = np.zeros(128, dtype=np.float32)
@@ -207,10 +207,10 @@ def test_accuracy():
 print_test("6. Large Dataset (1000 vectors)")
 @run_test
 def test_large():
-    import feather_py
+    import feather_db
     import time
     
-    db = feather_py.DB.open("test_large.feather", dim=256)
+    db = feather_db.DB.open("test_large.feather", dim=256)
     
     # Add 1000 vectors
     start = time.time()
@@ -237,9 +237,9 @@ def test_large():
 print_test("7. File Format Validation")
 @run_test
 def test_file_format():
-    import feather_py
+    import feather_db
     
-    db = feather_py.DB.open("test_format.feather", dim=32)
+    db = feather_db.DB.open("test_format.feather", dim=32)
     vec = np.random.random(32).astype(np.float32)
     db.add(id=1, vec=vec)
     db.save()

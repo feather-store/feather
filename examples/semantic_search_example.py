@@ -6,7 +6,7 @@ Note: This uses random vectors as a placeholder. In production, use a real
 embedding model like sentence-transformers.
 """
 
-import feather
+import feather_db
 import numpy as np
 
 # Simulated embedding function (replace with real model in production)
@@ -43,7 +43,7 @@ def main():
     
     # Step 1: Create database
     print("\n1. Creating database...")
-    db = feather.DB.open("semantic_search.feather", dim=384)
+    db = feather_db.DB.open("semantic_search.feather", dim=384)
     print("   ✓ Database created")
     
     # Step 2: Add documents

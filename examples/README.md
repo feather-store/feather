@@ -111,11 +111,11 @@ python3 examples/batch_processing_example.py
 
 ### 1. Document Search
 ```python
-import feather_py
+import feather_db
 from sentence_transformers import SentenceTransformer
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
-db = feather_py.DB.open("docs.feather", dim=384)
+db = feather_db.DB.open("docs.feather", dim=384)
 
 # Add documents
 for i, doc in enumerate(documents):
@@ -129,7 +129,7 @@ ids, distances = db.search(query_emb, k=5)
 
 ### 2. Image Similarity
 ```python
-import feather_py
+import feather_db
 from torchvision import models, transforms
 from PIL import Image
 
@@ -137,7 +137,7 @@ from PIL import Image
 model = models.resnet50(pretrained=True)
 model.eval()
 
-db = feather_py.DB.open("images.feather", dim=2048)
+db = feather_db.DB.open("images.feather", dim=2048)
 
 # Add images
 for i, img_path in enumerate(image_paths):
@@ -152,10 +152,10 @@ ids, distances = db.search(query_emb, k=10)
 
 ### 3. Recommendation System
 ```python
-import feather_py
+import feather_db
 import numpy as np
 
-db = feather_py.DB.open("products.feather", dim=256)
+db = feather_db.DB.open("products.feather", dim=256)
 
 # Add product embeddings
 for product_id, features in products.items():

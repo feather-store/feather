@@ -87,13 +87,13 @@ fi
 echo ""
 
 # Test 4: Python import test
-run_test "Python Import Test" "python3 -c 'import feather; import numpy as np; print(\"Import successful\")'"
+run_test "Python Import Test" "python3 -c 'import feather_db; import numpy as np; print(\"Import successful\")'"
 
 # Test 5: Basic functionality
 run_test "Basic Functionality Test" "python3 << 'EOF'
-import feather
+import feather_db
 import numpy as np
-db = feather.DB.open(\"test_tmp.feather\", dim=128)
+db = feather_db.DB.open(\"test_tmp.feather\", dim=128)
 vec = np.random.random(128).astype(np.float32)
 db.add(id=1, vec=vec)
 query = np.random.random(128).astype(np.float32)

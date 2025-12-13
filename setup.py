@@ -3,7 +3,7 @@ import pybind11
 
 ext_modules = [
     Extension(
-        "feather.core",
+        "feather_db.core",
         ["bindings/feather.cpp"],
         include_dirs=[pybind11.get_include(), "include"],
         language="c++",
@@ -14,8 +14,8 @@ ext_modules = [
 
 setup(
     name="feather-db",
-    version="0.1.0",
-    packages=["feather"],
+    version="0.1.1",
+    packages=["feather_db"],
     ext_modules=ext_modules,
     python_requires=">=3.8",
 )

@@ -4,7 +4,7 @@ Feather DB - Basic Python Example
 This example shows how to create a database, add vectors, and search.
 """
 
-import feather
+import feather_db
 import numpy as np
 
 def main():
@@ -14,7 +14,7 @@ def main():
     
     # Step 1: Create or open a database
     print("\n1. Creating database...")
-    db = feather.DB.open("example.feather", dim=128)
+    db = feather_db.DB.open("example.feather", dim=128)
     print("   ✓ Database created with 128 dimensions")
     
     # Step 2: Add some vectors

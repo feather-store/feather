@@ -211,8 +211,8 @@ C++ Database (HNSW index, file I/O)
 
 **Python API:**
 ```python
-import feather_py
-db = feather_py.DB.open("db.feather", dim=768)
+import feather_db
+db = feather_db.DB.open("db.feather", dim=768)
 db.add(1, numpy_array)
 ids, dists = db.search(query, k=5)
 ```

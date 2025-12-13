@@ -16,11 +16,11 @@
 ### Python Usage
 
 ```python
-import feather
+import feather_db
 import numpy as np
 
 # Open or create a database
-db = feather.DB.open("my_vectors.feather", dim=768)
+db = feather_db.DB.open("my_vectors.feather", dim=768)
 
 # Add vectors
 vector = np.random.random(768).astype(np.float32)
@@ -144,7 +144,7 @@ Feather uses a custom binary format:
 
 ### Python API
 
-#### `feather.DB`
+#### `feather_db.DB`
 
 - **`DB.open(path: str, dim: int = 768)`**: Open or create database
 - **`add(id: int, vec: np.ndarray)`**: Add vector with ID
@@ -173,11 +173,11 @@ Feather uses a custom binary format:
 ### Semantic Search with Embeddings
 
 ```python
-import feather
+import feather_db
 import numpy as np
 
 # Create database for sentence embeddings
-db = feather.DB.open("sentences.feather", dim=384)
+db = feather_db.DB.open("sentences.feather", dim=384)
 
 # Add document embeddings
 documents = [
@@ -203,10 +203,10 @@ for id, dist in zip(ids, distances):
 ### Batch Processing
 
 ```python
-import feather
+import feather_db
 import numpy as np
 
-db = feather.DB.open("large_dataset.feather", dim=512)
+db = feather_db.DB.open("large_dataset.feather", dim=512)
 
 # Batch add vectors
 batch_size = 1000
