@@ -16,11 +16,11 @@
 ### Python Usage
 
 ```python
-import feather_py
+import feather
 import numpy as np
 
 # Open or create a database
-db = feather_py.DB.open("my_vectors.feather", dim=768)
+db = feather.DB.open("my_vectors.feather", dim=768)
 
 # Add vectors
 vector = np.random.random(768).astype(np.float32)
@@ -80,14 +80,22 @@ feather search my_db.feather --npy query.npy --k 10
 
 ## Installation
 
-### Prerequisites
+### Python Package (Recommended)
+
+```bash
+pip install feather-db
+```
+
+### Build from Source
+
+#### Prerequisites
 
 - **C++17** compatible compiler
 - **Python 3.8+** (for Python bindings)
 - **Rust 1.70+** (for CLI tool)
 - **pybind11** (for Python bindings)
 
-### Build from Source
+#### Steps
 
 1. **Clone the repository**
    ```bash
@@ -95,20 +103,12 @@ feather search my_db.feather --npy query.npy --k 10
    cd feather
    ```
 
-2. **Build C++ Core**
+2. **Install Python Package**
    ```bash
-   g++ -O3 -std=c++17 -fPIC -c src/feather_core.cpp -o feather_core.o
-   ar rcs libfeather.a feather_core.o
+   pip install .
    ```
 
-3. **Build Python Bindings**
-   ```bash
-   pip install pybind11 numpy
-   python setup.py build_ext --inplace
-   pip install -e .
-   ```
-
-4. **Build Rust CLI**
+3. **Build Rust CLI (Optional)**
    ```bash
    cd feather-cli
    cargo build --release
@@ -144,7 +144,7 @@ Feather uses a custom binary format:
 
 ### Python API
 
-#### `feather_py.DB`
+#### `feather.DB`
 
 - **`DB.open(path: str, dim: int = 768)`**: Open or create database
 - **`add(id: int, vec: np.ndarray)`**: Add vector with ID
@@ -173,11 +173,11 @@ Feather uses a custom binary format:
 ### Semantic Search with Embeddings
 
 ```python
-import feather_py
+import feather
 import numpy as np
 
 # Create database for sentence embeddings
-db = feather_py.DB.open("sentences.feather", dim=384)
+db = feather.DB.open("sentences.feather", dim=384)
 
 # Add document embeddings
 documents = [
@@ -203,10 +203,10 @@ for id, dist in zip(ids, distances):
 ### Batch Processing
 
 ```python
-import feather_py
+import feather
 import numpy as np
 
-db = feather_py.DB.open("large_dataset.feather", dim=512)
+db = feather.DB.open("large_dataset.feather", dim=512)
 
 # Batch add vectors
 batch_size = 1000

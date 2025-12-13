@@ -5,7 +5,7 @@
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(feather_py, m) {
+PYBIND11_MODULE(core, m) {
     m.doc() = "Feather: SQLite for Vectors";
 
     py::class_<feather::DB, std::unique_ptr<feather::DB, py::nodelete>>(m, "DB")

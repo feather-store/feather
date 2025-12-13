@@ -4,7 +4,7 @@ Feather DB - Batch Processing Example
 This example shows how to efficiently process large numbers of vectors.
 """
 
-import feather_py
+import feather
 import numpy as np
 import time
 
@@ -25,7 +25,7 @@ def main():
     
     # Create database
     print("\n1. Creating database...")
-    db = feather_py.DB.open("large_dataset.feather", dim=DIM)
+    db = feather.DB.open("batch_test.feather", dim=128)
     print("   ✓ Database created")
     
     # Add vectors in batches

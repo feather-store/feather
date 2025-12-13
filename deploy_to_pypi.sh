@@ -13,13 +13,21 @@ echo ""
 if [ ! -d "dist" ] || [ -z "$(ls -A dist)" ]; then
     echo "❌ No package found in dist/"
     echo "Building package..."
-    python -m build
+    if [ -f ".venv/bin/python" ]; then
+        .venv/bin/python -m build
+    else
+        python3 -m build
+    fi
     echo ""
 fi
 
 # Check package
 echo "📦 Checking package..."
-twine check dist/*
+if [ -f ".venv/bin/twine" ]; then
+    .venv/bin/twine check dist/*
+else
+    twine check dist/*
+fi
 echo ""
 
 # Ask user which PyPI to upload to
@@ -42,7 +50,11 @@ case $choice in
         echo "  Username: __token__"
         echo "  Password: (paste your token)"
         echo ""
-        twine upload --repository testpypi dist/*
+        if [ -f ".venv/bin/twine" ]; then
+            .venv/bin/twine upload --repository testpypi dist/*
+        else
+            twine upload --repository testpypi dist/*
+        fi
         
         echo ""
         echo "✅ Uploaded to TestPyPI!"
@@ -62,7 +74,11 @@ case $choice in
         echo "  Username: __token__"
         echo "  Password: (paste your token)"
         echo ""
-        twine upload dist/*
+        if [ -f ".venv/bin/twine" ]; then
+            .venv/bin/twine upload dist/*
+        else
+            twine upload dist/*
+        fi
         
         echo ""
         echo "✅ Uploaded to PyPI!"

@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+*.egg-info
+dist/
+build/
+
+# Rust
+feather-cli/target/
+*.rs.bk
+
+# Test files
+*.feather
+*.npy
+p-test/
+examples/
+
+# Documentation
+*.md
+!README.md
+!LICENSE
+
+# Build artifacts
+*.o
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# CI/CD
+.github/
+
+# Temporary
+*.tmp
+*.log
