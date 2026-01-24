@@ -4,7 +4,7 @@ import pybind11
 ext_modules = [
     Extension(
         "feather_db.core",
-        ["bindings/feather.cpp"],
+        ["bindings/feather.cpp", "src/metadata.cpp", "src/filter.cpp", "src/scoring.cpp"],
         include_dirs=[pybind11.get_include(), "include"],
         language="c++",
         extra_compile_args=["-O3", "-std=c++17"],

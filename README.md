@@ -5,11 +5,15 @@
 ## Features
 
 - 🚀 **High Performance**: Built with C++ and optimized HNSW algorithm
-- 🐍 **Python Integration**: Native Python bindings with NumPy support
-- 🦀 **Rust CLI**: Command-line interface for easy database operations
-- 💾 **Persistent Storage**: Custom binary format with automatic save/load
-- 🔍 **Fast Search**: Approximate nearest neighbor search with configurable parameters
-- 📦 **Multi-Language**: C++, Python, and Rust APIs
+- 🧠 **Context Engine**: Structured metadata storage (Facts, Preferences, Events, Conversations)
+- ⏳ **Temporal Retrieval**: Time-weighted scoring with exponential decay
+- 🔍 **Filtered Search**: Domain-logic filtering (by type, source, tags) during HNSW search
+- 🐍 **Python Integration**: Native Python bindings with `FilterBuilder` support
+- 🦀 **Rust CLI**: Enhanced CLI for metadata and filtered operations
+- 💾 **Persistent Storage**: Version 2 binary format with automatic metadata persistence
+
+[![PyPI](https://img.shields.io/pypi/v/feather-db)](https://pypi.org/project/feather-db/)
+[![Crates.io](https://img.shields.io/crates/v/feather-db-cli)](https://crates.io/crates/feather-db-cli)
 
 ## Quick Start
 
@@ -36,6 +40,25 @@ for i, (id, dist) in enumerate(zip(ids, distances)):
 
 # Save the database
 db.save()
+
+### Context Engine (Phase 2)
+
+```python
+from feather_db import DB, Metadata, ContextType, FilterBuilder
+
+# Add with metadata
+meta = Metadata()
+meta.content = "User prefers dark mode"
+meta.type = ContextType.PREFERENCE
+meta.importance = 0.9
+db.add(id=1, vec=embedding, meta=meta)
+
+# Search with filters and temporal decay
+fb = FilterBuilder()
+filter = fb.types(ContextType.PREFERENCE).min_importance(0.5).build()
+
+results = db.search(query, k=5, filter=filter, scoring=ScoringConfig(half_life=30))
+```
 ```
 
 ### C++ Usage
@@ -76,6 +99,18 @@ feather add my_db.feather 2 --npy vector2.npy
 
 # Search for similar vectors
 feather search my_db.feather --npy query.npy --k 10
+```
+
+### Rust CLI
+
+The CLI is available as a native binary for fast database management.
+
+```bash
+# Add with metadata
+feather add --npy vector.npy --content "Hello world" --source "cli" my_db 123
+
+# Search with filters
+feather search --npy query.npy --type-filter 0 --source-filter "cli" my_db
 ```
 
 ## Installation
