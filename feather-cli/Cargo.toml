@@ -1,13 +1,13 @@
 [package]
 name = "feather-db-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-authors = ["Feather DB Contributors <feather-db@example.com>"]
-description = "Command-line interface for Feather vector database"
+authors = ["Hawky.ai Team <hello@hawky.ai>"]
+description = "Command-line interface for Feather context-aware vector database - Part of Hawky.ai"
 license = "MIT"
-repository = "https://github.com/yourusername/feather-db"
-homepage = "https://github.com/yourusername/feather-db"
-documentation = "https://github.com/yourusername/feather-db/blob/main/USAGE_GUIDE.md"
+repository = "https://github.com/feather-store/feather"
+homepage = "https://www.getfeather.store/"
+documentation = "https://github.com/feather-store/feather/blob/main/README.md"
 readme = "../README.md"
 keywords = ["vector", "database", "similarity", "cli", "hnsw"]
 categories = ["command-line-utilities", "database"]

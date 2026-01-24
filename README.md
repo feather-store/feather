@@ -1,6 +1,15 @@
-# Feather DB
+# Feather DB 🪶
 
-**SQLite for Vectors** - A fast, lightweight vector database built with C++ and HNSW (Hierarchical Navigable Small World) algorithm for approximate nearest neighbor search.
+**Fast, lightweight context-aware vector database**
+
+*Part of [Hawky.ai](https://hawky.ai) - AI Native Digital Marketing OS*
+
+[![PyPI](https://img.shields.io/pypi/v/feather-db)](https://pypi.org/project/feather-db/)
+[![Crates.io](https://img.shields.io/crates/v/feather-db-cli)](https://crates.io/crates/feather-db-cli)
+[![Website](https://img.shields.io/badge/website-getfeather.store-blue)](https://www.getfeather.store/)
+[![GitHub](https://img.shields.io/github/stars/feather-store/feather?style=social)](https://github.com/feather-store/feather)
+
+A fast, lightweight vector database built with C++ and HNSW (Hierarchical Navigable Small World) algorithm for approximate nearest neighbor search.
 
 ## Features
 

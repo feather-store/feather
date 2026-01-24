@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feather-db"
-version = "0.1.1"
-description = "Fast, lightweight vector database for similarity search"
+version = "0.2.0"
+description = "Fast, lightweight context-aware vector database - Part of Hawky.ai Digital Marketing OS"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "Feather DB Contributors", email = "feather-db@example.com"}
+    {name = "Hawky.ai Team", email = "hello@hawky.ai"}
 ]
 keywords = [
     "vector",
@@ -56,11 +56,12 @@ examples = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/feather-db"
-Documentation = "https://github.com/yourusername/feather-db/blob/main/USAGE_GUIDE.md"
-Repository = "https://github.com/yourusername/feather-db"
-Issues = "https://github.com/yourusername/feather-db/issues"
-Changelog = "https://github.com/yourusername/feather-db/blob/main/CHANGELOG.md"
+Homepage = "https://www.getfeather.store/"
+Documentation = "https://github.com/feather-store/feather/blob/main/README.md"
+Repository = "https://github.com/feather-store/feather"
+Issues = "https://github.com/feather-store/feather/issues"
+Changelog = "https://github.com/feather-store/feather/blob/main/CHANGELOG.md"
+"Hawky.ai" = "https://hawky.ai"
 
 [tool.setuptools]
 packages = []
