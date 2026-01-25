@@ -19,6 +19,8 @@ A fast, lightweight vector database built with C++ and HNSW (Hierarchical Naviga
 - 🔍 **Filtered Search**: Domain-logic filtering (by type, source, tags) during HNSW search
 - 🐍 **Python Integration**: Native Python bindings with `FilterBuilder` support
 - 🦀 **Rust CLI**: Enhanced CLI for metadata and filtered operations
+
+**📖 [Phase 2 Features Guide](PHASE2_GUIDE.md)** - Complete documentation for context engine capabilities
 - 💾 **Persistent Storage**: Version 2 binary format with automatic metadata persistence
 
 [![PyPI](https://img.shields.io/pypi/v/feather-db)](https://pypi.org/project/feather-db/)

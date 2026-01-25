@@ -80,3 +80,12 @@ site/
 # Package files
 *.whl
 *.tar.gz
+
+# Archive folder for local test files
+.archive/
+
+# Deployment scripts (contain tokens)
+deploy_*.sh
+
+# Virtual environments
+repro_venv/

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feather-db"
-version = "0.2.0"
+version = "0.2.1"
 description = "Fast, lightweight context-aware vector database - Part of Hawky.ai Digital Marketing OS"
 readme = "README.md"
 requires-python = ">=3.8"
