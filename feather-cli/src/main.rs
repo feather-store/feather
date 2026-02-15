@@ -22,6 +22,12 @@ enum Commands {
         #[arg(long, default_value_t = 0)] context_type: u8,
         #[arg(long)] source: Option<String>,
         #[arg(long)] content: Option<String>,
+        #[arg(long, default_value = "text")] modality: String,
+    },
+    Link {
+        db: PathBuf,
+        from: u64,
+        to: u64,
     },
     Search { 
         db: PathBuf, 
@@ -29,6 +35,7 @@ enum Commands {
         #[arg(long, default_value_t = 5)] k: usize,
         #[arg(long)] type_filter: Option<u8>,
         #[arg(long)] source_filter: Option<String>,
+        #[arg(long, default_value = "text")] modality: String,
     },
 }
 
@@ -39,7 +46,7 @@ fn main() -> anyhow::Result<()> {
             DB::open(&path, dim).ok_or_else(|| anyhow::anyhow!("Failed to create DB"))?;
             println!("Created: {:?}", path);
         }
-        Commands::Add { db, id, npy, timestamp, importance, context_type, source, content } => {
+        Commands::Add { db, id, npy, timestamp, importance, context_type, source, content, modality } => {
             let arr: Array1<f32> = ndarray_npy::read_npy(&npy)?;
             let dim = arr.len();
             let db = DB::open(&db, dim).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
@@ -54,20 +61,26 @@ fn main() -> anyhow::Result<()> {
             db.add_with_meta(
                 id, arr.as_slice().unwrap(), 
                 ts, importance, context_type, 
-                source.as_deref(), content.as_deref()
+                source.as_deref(), content.as_deref(), Some(&modality)
             );
             db.save();
-            println!("Added ID {} with metadata", id);
+            println!("Added ID {} to modality '{}'", id, modality);
         }
-        Commands::Search { db, npy, k, type_filter, source_filter } => {
+        Commands::Link { db, from, to } => {
+            let db = DB::open(&db, 0).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
+            db.link(from, to);
+            db.save();
+            println!("Linked {} -> {}", from, to);
+        }
+        Commands::Search { db, npy, k, type_filter, source_filter, modality } => {
             let arr: Array1<f32> = ndarray_npy::read_npy(&npy)?;
             let dim = arr.len();
             let db = DB::open(&db, dim).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
             
             let (ids, dists) = if type_filter.is_some() || source_filter.is_some() {
-                db.search_with_filter(arr.as_slice().unwrap(), k, type_filter, source_filter.as_deref())
+                db.search_with_filter(arr.as_slice().unwrap(), k, type_filter, source_filter.as_deref(), Some(&modality))
             } else {
-                db.search(arr.as_slice().unwrap(), k)
+                db.search(arr.as_slice().unwrap(), k, Some(&modality))
             };
 
             for (id, dist) in ids.iter().zip(dists.iter()) {

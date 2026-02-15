@@ -14,7 +14,7 @@ ext_modules = [
 
 setup(
     name="feather-db",
-    version="0.2.1",
+    version="0.3.0",
     packages=["feather_db"],
     ext_modules=ext_modules,
     python_requires=">=3.8",

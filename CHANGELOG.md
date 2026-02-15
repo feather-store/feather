@@ -5,7 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-02-15
+
+### Added
+- **Multimodal Pockets**: Support for storing multiple named signals (text, visual, audio) under a single Entity ID.
+- **Contextual Graph**: Native variable-length edge lists (`links`) in Metadata for graph relationships.
+- **Living Context**: "Sticky Memory" implementation—adaptive decay based on `recall_count`.
+- **API**: New `db.link(from, to)` and `db.search(..., modality="visual")` methods.
+- **CLI**: Updates to `feather-cli` for multimodal ingestion and linking.
+
+## [0.2.1] - 2026-01-20
+
+### Added
+- **Context Engine**: Structured metadata attributes (type, source, creation_time).
+- **Time-Decay Scoring**: Implementation of `Scorer` class with half-life decay.
+- **Filtered Search**: `FilterBuilder` and pre-filtering logic in HNSW.
+- **Python Bindings**: `feather_db.Metadata` and `feather_db.ContextType` objects.
+
+## [0.1.0] - 2025-11-16
 
 ## [0.1.0] - 2025-11-16
 
