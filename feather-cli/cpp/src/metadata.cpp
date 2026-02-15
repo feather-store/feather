@@ -20,6 +20,15 @@ void Metadata::serialize(std::ostream& os) const {
     uint16_t tags_len = static_cast<uint16_t>(tags_json.size());
     os.write(reinterpret_cast<const char*>(&tags_len), 2);
     os.write(tags_json.data(), tags_len);
+
+    // Phase 3 serialization
+    uint16_t links_count = static_cast<uint16_t>(links.size());
+    os.write(reinterpret_cast<const char*>(&links_count), 2);
+    if (links_count > 0) {
+        os.write(reinterpret_cast<const char*>(links.data()), links_count * 8);
+    }
+    os.write(reinterpret_cast<const char*>(&recall_count), 4);
+    os.write(reinterpret_cast<const char*>(&last_recalled_at), 8);
 }
 
 Metadata Metadata::deserialize(std::istream& is) {
@@ -44,6 +53,17 @@ Metadata Metadata::deserialize(std::istream& is) {
     is.read(reinterpret_cast<char*>(&tags_len), 2);
     m.tags_json.resize(tags_len);
     is.read(&m.tags_json[0], tags_len);
+
+    // Phase 3 deserialization
+    uint16_t links_count = 0;
+    if (is.read(reinterpret_cast<char*>(&links_count), 2)) {
+        m.links.resize(links_count);
+        if (links_count > 0) {
+            is.read(reinterpret_cast<char*>(m.links.data()), links_count * 8);
+        }
+        is.read(reinterpret_cast<char*>(&m.recall_count), 4);
+        is.read(reinterpret_cast<char*>(&m.last_recalled_at), 8);
+    }
 
     return m;
 }

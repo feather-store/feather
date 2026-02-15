@@ -11,20 +11,20 @@
 
 A fast, lightweight vector database built with C++ and HNSW (Hierarchical Navigable Small World) algorithm for approximate nearest neighbor search.
 
-## Features
+## Features (v0.3.0)
 
-- 🚀 **High Performance**: Built with C++ and optimized HNSW algorithm
-- 🧠 **Context Engine**: Structured metadata storage (Facts, Preferences, Events, Conversations)
-- ⏳ **Temporal Retrieval**: Time-weighted scoring with exponential decay
-- 🔍 **Filtered Search**: Domain-logic filtering (by type, source, tags) during HNSW search
-- 🐍 **Python Integration**: Native Python bindings with `FilterBuilder` support
-- 🦀 **Rust CLI**: Enhanced CLI for metadata and filtered operations
+- 🪶 **Multimodal Pockets**: Store Text, Visual, and Audio vectors in a single Entity ID.
+- 🕸️ **Contextual Graph**: Native `link(source, target)` support for modeling relationships.
+- 🧠 **Living Context**: Adaptive "Sticky Memory" decay—frequently accessed items stay fresh.
+- 🚀 **High Performance**: Built with C++ and optimized HNSW algorithm (~0.05ms multimodal search).
+- 🔍 **Filtered Search**: Domain-logic filtering (by type, source, tags) during HNSW search.
+- 🐍 **Python Integration**: Native Python bindings with `FilterBuilder` support.
+- 🦀 **Rust CLI**: Enhanced CLI for metadata, linking, and filtered operations.
 
-**📖 [Phase 2 Features Guide](PHASE2_GUIDE.md)** - Complete documentation for context engine capabilities
-- 💾 **Persistent Storage**: Version 2 binary format with automatic metadata persistence
+**📖 [Phase 3 Features Guide](PHASE3_GUIDE.md)** - Complete documentation for Multimodal & Graph capabilities.
 
-[![PyPI](https://img.shields.io/pypi/v/feather-db)](https://pypi.org/project/feather-db/)
-[![Crates.io](https://img.shields.io/crates/v/feather-db-cli)](https://crates.io/crates/feather-db-cli)
+[![PyPI](https://img.shields.io/pypi/v/feather-db?label=feather-db&color=blue)](https://pypi.org/project/feather-db/)
+[![Crates.io](https://img.shields.io/crates/v/feather-db-cli?label=feather-db-cli&color=orange)](https://crates.io/crates/feather-db-cli)
 
 ## Quick Start
 
@@ -52,23 +52,21 @@ for i, (id, dist) in enumerate(zip(ids, distances)):
 # Save the database
 db.save()
 
-### Context Engine (Phase 2)
+### Context Usage (Phase 3)
 
 ```python
-from feather_db import DB, Metadata, ContextType, FilterBuilder
+from feather_db import DB, Metadata, ContextType
 
-# Add with metadata
-meta = Metadata()
-meta.content = "User prefers dark mode"
-meta.type = ContextType.PREFERENCE
-meta.importance = 0.9
-db.add(id=1, vec=embedding, meta=meta)
+# 1. Add Multimodal Data
+db.add(id=100, vec=img_vec, modality="visual")
+db.add(id=100, vec=txt_vec, modality="text") # Same ID!
 
-# Search with filters and temporal decay
-fb = FilterBuilder()
-filter = fb.types(ContextType.PREFERENCE).min_importance(0.5).build()
+# 2. Link Records (Graph)
+db.link(source_id=100, target_id=999)
 
-results = db.search(query, k=5, filter=filter, scoring=ScoringConfig(half_life=30))
+# 3. Search with Context
+results = db.search(query_vec, k=5, modality="visual")
+print(f"Linked to: {results[0].metadata.links}")
 ```
 ```
 

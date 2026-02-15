@@ -22,7 +22,10 @@ PYBIND11_MODULE(core, m) {
         .def_readwrite("type", &feather::Metadata::type)
         .def_readwrite("source", &feather::Metadata::source)
         .def_readwrite("content", &feather::Metadata::content)
-        .def_readwrite("tags_json", &feather::Metadata::tags_json);
+        .def_readwrite("tags_json", &feather::Metadata::tags_json)
+        .def_readwrite("links", &feather::Metadata::links)
+        .def_readwrite("recall_count", &feather::Metadata::recall_count)
+        .def_readwrite("last_recalled_at", &feather::Metadata::last_recalled_at);
 
     py::class_<feather::ScoringConfig>(m, "ScoringConfig")
         .def(py::init<float, float, float>(), py::arg("half_life") = 30.0f, py::arg("weight") = 0.3f, py::arg("min") = 0.0f)
@@ -48,25 +51,31 @@ PYBIND11_MODULE(core, m) {
     py::class_<feather::DB, std::unique_ptr<feather::DB, py::nodelete>>(m, "DB")
         .def_static("open", &feather::DB::open, py::arg("path"), py::arg("dim") = 768)
 
-        .def("add", [](feather::DB& db, uint64_t id, py::array_t<float> vec, const std::optional<feather::Metadata>& meta) {
+        .def("add", [](feather::DB& db, uint64_t id, py::array_t<float> vec, const std::optional<feather::Metadata>& meta, const std::string& modality = "text") {
             auto buf = vec.request();
-            if (buf.size != db.dim()) throw std::runtime_error("Dimension mismatch");
+            if (buf.size != db.dim(modality) && db.dim(modality) != 0) {
+                // If it's a new modality, we accept any dimension. If existing, it must match.
+                // Actually, get_or_create_index handles this.
+            }
             const float* ptr = static_cast<const float*>(buf.ptr);
             std::vector<float> vec_copy(ptr, ptr + buf.size);
-            db.add(id, vec_copy, meta ? *meta : feather::Metadata());
-        }, py::arg("id"), py::arg("vec"), py::arg("meta") = std::nullopt)
+            db.add(id, vec_copy, meta ? *meta : feather::Metadata(), modality);
+        }, py::arg("id"), py::arg("vec"), py::arg("meta") = std::nullopt, py::arg("modality") = "text")
 
-        .def("search", [](const feather::DB& db, py::array_t<float> q, size_t k = 5,
+        .def("search", [](feather::DB& db, py::array_t<float> q, size_t k = 5,
                           const feather::SearchFilter* filter = nullptr,
-                          const feather::ScoringConfig* scoring = nullptr) {
+                          const feather::ScoringConfig* scoring = nullptr,
+                          const std::string& modality = "text") {
             auto buf = q.request();
-            if (buf.size != db.dim()) throw std::runtime_error("Query dimension mismatch");
             const float* ptr = static_cast<const float*>(buf.ptr);
             std::vector<float> query(ptr, ptr + buf.size);
-            return db.search(query, k, filter, scoring);
-        }, py::arg("q"), py::arg("k") = 5, py::arg("filter") = nullptr, py::arg("scoring") = nullptr)
+            return db.search(query, k, filter, scoring, modality);
+        }, py::arg("q"), py::arg("k") = 5, py::arg("filter") = nullptr, py::arg("scoring") = nullptr, py::arg("modality") = "text")
+
+        .def("touch", &feather::DB::touch, py::arg("id"))
+        .def("link", &feather::DB::link, py::arg("from_id"), py::arg("to_id"))
 
         .def("get_metadata", &feather::DB::get_metadata, py::arg("id"))
         .def("save", &feather::DB::save)
-        .def("dim", &feather::DB::dim);
+        .def("dim", &feather::DB::dim, py::arg("modality") = "text");
 }

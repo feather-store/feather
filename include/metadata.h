@@ -19,8 +19,14 @@ struct Metadata {
     std::string source;
     std::string content;
     std::string tags_json; // JSON array of tags
+    
+    // Phase 3 Features: Graph & Salience
+    std::vector<uint64_t> links;      // Record IDs this record points to
+    uint32_t recall_count;            // How many times this was returned in search
+    uint64_t last_recalled_at;        // Timestamp of last recall
 
-    Metadata() : timestamp(0), importance(1.0f), type(ContextType::FACT) {}
+    Metadata() : timestamp(0), importance(1.0f), type(ContextType::FACT),
+                recall_count(0), last_recalled_at(0) {}
 
     void serialize(std::ostream& os) const;
     static Metadata deserialize(std::istream& is);
