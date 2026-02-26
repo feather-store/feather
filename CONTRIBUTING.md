@@ -51,9 +51,9 @@ For questions about usage:
 git clone https://github.com/yourusername/feather-db.git
 cd feather-db
 
-# 2. Build C++ core
-g++ -O3 -std=c++17 -fPIC -c src/feather_core.cpp -o feather_core.o
-ar rcs libfeather.a feather_core.o
+# 2. Build C++ core (Static Library)
+g++ -O3 -std=c++17 -fPIC -c src/feather_core.cpp src/metadata.cpp src/filter.cpp src/scoring.cpp -Iinclude
+ar rcs libfeather.a feather_core.o metadata.o filter.o scoring.o
 
 # 3. Install Python dependencies
 pip install pybind11 numpy
