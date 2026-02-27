@@ -42,7 +42,7 @@ private:
         if (!f) throw std::runtime_error("Cannot save file");
 
         uint32_t magic = 0x46454154; // "FEAT"
-        uint32_t version = 3;
+        uint32_t version = 4;
         f.write((char*)&magic, 4);
         f.write((char*)&version, 4);
 
@@ -88,7 +88,7 @@ private:
         if (magic != 0x46454154) return;
 
         if (version == 2) {
-            // Backward compatibility for v2 (single default "text" index)
+            // Backward compatibility for v2 (single default "text" index, no separate metadata section)
             uint32_t dim32;
             f.read((char*)&dim32, 4);
             auto& m_idx = get_or_create_index("text", dim32);
@@ -100,7 +100,8 @@ private:
                 m_idx.index->addPoint(vec.data(), id);
                 metadata_store_[id] = std::move(meta);
             }
-        } else if (version == 3) {
+        } else if (version == 3 || version == 4) {
+            // v3 and v4 share the same outer structure; new v4 fields are guarded in Metadata::deserialize
             uint32_t meta_count;
             f.read((char*)&meta_count, 4);
             for (uint32_t i = 0; i < meta_count; ++i) {
@@ -258,6 +259,17 @@ public:
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end()) return it->second;
         return std::nullopt;
+    }
+
+    void update_metadata(uint64_t id, const Metadata& meta) {
+        metadata_store_[id] = meta;
+    }
+
+    void update_importance(uint64_t id, float importance) {
+        auto it = metadata_store_.find(id);
+        if (it != metadata_store_.end()) {
+            it->second.importance = importance;
+        }
     }
 
     void save() { save_vectors(); }

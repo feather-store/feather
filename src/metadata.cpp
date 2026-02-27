@@ -29,6 +29,26 @@ void Metadata::serialize(std::ostream& os) const {
     }
     os.write(reinterpret_cast<const char*>(&recall_count), 4);
     os.write(reinterpret_cast<const char*>(&last_recalled_at), 8);
+
+    // Phase 4 serialization: namespace_id, entity_id, attributes
+    uint16_t ns_len = static_cast<uint16_t>(namespace_id.size());
+    os.write(reinterpret_cast<const char*>(&ns_len), 2);
+    os.write(namespace_id.data(), ns_len);
+
+    uint16_t eid_len = static_cast<uint16_t>(entity_id.size());
+    os.write(reinterpret_cast<const char*>(&eid_len), 2);
+    os.write(entity_id.data(), eid_len);
+
+    uint16_t attr_count = static_cast<uint16_t>(attributes.size());
+    os.write(reinterpret_cast<const char*>(&attr_count), 2);
+    for (const auto& [key, val] : attributes) {
+        uint16_t key_len = static_cast<uint16_t>(key.size());
+        os.write(reinterpret_cast<const char*>(&key_len), 2);
+        os.write(key.data(), key_len);
+        uint32_t val_len = static_cast<uint32_t>(val.size());
+        os.write(reinterpret_cast<const char*>(&val_len), 4);
+        os.write(val.data(), val_len);
+    }
 }
 
 Metadata Metadata::deserialize(std::istream& is) {
@@ -63,6 +83,34 @@ Metadata Metadata::deserialize(std::istream& is) {
         }
         is.read(reinterpret_cast<char*>(&m.recall_count), 4);
         is.read(reinterpret_cast<char*>(&m.last_recalled_at), 8);
+    }
+
+    // Phase 4 deserialization: namespace_id, entity_id, attributes (guard for v3 compat)
+    uint16_t ns_len = 0;
+    if (is.read(reinterpret_cast<char*>(&ns_len), 2)) {
+        m.namespace_id.resize(ns_len);
+        if (ns_len > 0) is.read(&m.namespace_id[0], ns_len);
+
+        uint16_t eid_len = 0;
+        is.read(reinterpret_cast<char*>(&eid_len), 2);
+        m.entity_id.resize(eid_len);
+        if (eid_len > 0) is.read(&m.entity_id[0], eid_len);
+
+        uint16_t attr_count = 0;
+        is.read(reinterpret_cast<char*>(&attr_count), 2);
+        for (uint16_t i = 0; i < attr_count; ++i) {
+            uint16_t key_len = 0;
+            is.read(reinterpret_cast<char*>(&key_len), 2);
+            std::string key(key_len, '\0');
+            if (key_len > 0) is.read(&key[0], key_len);
+
+            uint32_t val_len = 0;
+            is.read(reinterpret_cast<char*>(&val_len), 4);
+            std::string val(val_len, '\0');
+            if (val_len > 0) is.read(&val[0], val_len);
+
+            m.attributes[key] = val;
+        }
     }
 
     return m;
