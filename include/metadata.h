@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <cstdint>
 
 namespace feather {
@@ -19,11 +20,16 @@ struct Metadata {
     std::string source;
     std::string content;
     std::string tags_json; // JSON array of tags
-    
+
     // Phase 3 Features: Graph & Salience
     std::vector<uint64_t> links;      // Record IDs this record points to
     uint32_t recall_count;            // How many times this was returned in search
     uint64_t last_recalled_at;        // Timestamp of last recall
+
+    // Phase 4 Features: Namespace + Entity + Attributes
+    std::string namespace_id;         // Partition key (brand, org, tenant)
+    std::string entity_id;            // Subject key (user, customer, product)
+    std::unordered_map<std::string, std::string> attributes; // Domain-specific KV pairs
 
     Metadata() : timestamp(0), importance(1.0f), type(ContextType::FACT),
                 recall_count(0), last_recalled_at(0) {}

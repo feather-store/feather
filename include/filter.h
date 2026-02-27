@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <optional>
+#include <unordered_map>
 #include <algorithm>
 
 namespace feather {
@@ -16,14 +17,16 @@ struct SearchFilter {
     std::optional<float> importance_gte;
     std::optional<std::vector<std::string>> tags_contains;
 
+    // Phase 4 filters: namespace, entity, attributes
+    std::optional<std::string> namespace_id;
+    std::optional<std::string> entity_id;
+    std::optional<std::unordered_map<std::string, std::string>> attributes_match;
+
     bool matches(const Metadata& meta) const {
         if (types) {
             bool found = false;
             for (auto t : *types) {
-                if (meta.type == t) {
-                    found = true;
-                    break;
-                }
+                if (meta.type == t) { found = true; break; }
             }
             if (!found) return false;
         }
@@ -35,11 +38,18 @@ struct SearchFilter {
         if (importance_gte && meta.importance < *importance_gte) return false;
 
         if (tags_contains) {
-            // This is a simple check, assuming metadata contains the tags in some form.
-            // For now, let's just check if the tags_json contains the strings.
-            // In a real implementation, we might want to parse the JSON.
             for (const auto& tag : *tags_contains) {
                 if (meta.tags_json.find(tag) == std::string::npos) return false;
+            }
+        }
+
+        if (namespace_id && meta.namespace_id != *namespace_id) return false;
+        if (entity_id && meta.entity_id != *entity_id) return false;
+
+        if (attributes_match) {
+            for (const auto& [key, val] : *attributes_match) {
+                auto it = meta.attributes.find(key);
+                if (it == meta.attributes.end() || it->second != val) return false;
             }
         }
 

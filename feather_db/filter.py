@@ -37,5 +37,22 @@ class FilterBuilder:
         self._filter.tags_contains = tags
         return self
 
+    def namespace(self, ns: str) -> "FilterBuilder":
+        self._filter.namespace_id = ns
+        return self
+
+    def entity(self, eid: str) -> "FilterBuilder":
+        self._filter.entity_id = eid
+        return self
+
+    def attribute(self, key: str, value: str) -> "FilterBuilder":
+        current = self._filter.attributes_match
+        if current is None:
+            self._filter.attributes_match = {key: value}
+        else:
+            current[key] = value
+            self._filter.attributes_match = current
+        return self
+
     def build(self):
         return self._filter
