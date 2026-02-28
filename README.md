@@ -1,292 +1,372 @@
-# Feather DB 🪶
+# Feather DB
 
-**Fast, lightweight context-aware vector database**
+**Embedded vector database + living context engine**
 
-*Part of [Hawky.ai](https://hawky.ai) - AI Native Digital Marketing OS*
+*Part of [Hawky.ai](https://hawky.ai) — AI-Native Digital Marketing OS*
 
 [![PyPI](https://img.shields.io/pypi/v/feather-db)](https://pypi.org/project/feather-db/)
 [![Crates.io](https://img.shields.io/crates/v/feather-db-cli)](https://crates.io/crates/feather-db-cli)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Website](https://img.shields.io/badge/website-getfeather.store-blue)](https://www.getfeather.store/)
-[![GitHub](https://img.shields.io/github/stars/feather-store/feather?style=social)](https://github.com/feather-store/feather)
 
-A fast, lightweight vector database built with C++ and HNSW (Hierarchical Navigable Small World) algorithm for approximate nearest neighbor search.
+Feather DB is "SQLite for Vectors" — a fast, zero-server, file-based vector store with a built-in knowledge graph and adaptive memory decay. No separate database server required.
 
-## Features (v0.3.0)
+---
 
-- 🪶 **Multimodal Pockets**: Store Text, Visual, and Audio vectors in a single Entity ID.
-- 🕸️ **Contextual Graph**: Native `link(source, target)` support for modeling relationships.
-- 🧠 **Living Context**: Adaptive "Sticky Memory" decay—frequently accessed items stay fresh.
-- 🚀 **High Performance**: Built with C++ and optimized HNSW algorithm (~0.05ms multimodal search).
-- 🔍 **Filtered Search**: Domain-logic filtering (by type, source, tags) during HNSW search.
-- 🐍 **Python Integration**: Native Python bindings with `FilterBuilder` support.
-- 🦀 **Rust CLI**: Enhanced CLI for metadata, linking, and filtered operations.
+## What's Inside (v0.5.0)
 
-**📖 [Phase 3 Features Guide](PHASE3_GUIDE.md)** - Complete documentation for Multimodal & Graph capabilities.
+| Capability | Description |
+|------------|-------------|
+| **ANN Search** | Sub-millisecond approximate nearest-neighbor search via HNSW |
+| **Multimodal Pockets** | Text, image, audio vectors stored per entity under a single ID |
+| **Context Graph** | Typed + weighted edges, reverse index, auto-link by similarity |
+| **Living Context** | Recall-count-based sticky memory — frequently accessed items resist decay |
+| **Namespace / Entity / Attributes** | Generic partition + subject + KV metadata for any domain |
+| **Graph Visualizer** | Self-contained D3 force-graph HTML — fully offline, no CDN |
+| **Single-file persistence** | `.feather` binary format (v5); v3/v4 files load transparently |
 
-[![PyPI](https://img.shields.io/pypi/v/feather-db?label=feather-db&color=blue)](https://pypi.org/project/feather-db/)
-[![Crates.io](https://img.shields.io/crates/v/feather-db-cli?label=feather-db-cli&color=orange)](https://crates.io/crates/feather-db-cli)
+---
+
+## Installation
+
+```bash
+pip install feather-db
+```
+
+CLI (Rust):
+
+```bash
+cargo install feather-db-cli
+```
+
+Build from source:
+
+```bash
+git clone https://github.com/feather-store/feather
+cd feather
+python setup.py build_ext --inplace
+```
+
+---
 
 ## Quick Start
-
-### Python Usage
 
 ```python
 import feather_db
 import numpy as np
 
 # Open or create a database
-db = feather_db.DB.open("my_vectors.feather", dim=768)
+db = feather_db.DB.open("context.feather", dim=768)
 
-# Add vectors
-vector = np.random.random(768).astype(np.float32)
-db.add(id=1, vec=vector)
+# Add a vector with metadata
+meta = feather_db.Metadata()
+meta.content = "User prefers dark mode"
+meta.importance = 0.9
+db.add(id=1, vec=np.random.rand(768).astype(np.float32), meta=meta)
 
-# Search for similar vectors
-query = np.random.random(768).astype(np.float32)
-ids, distances = db.search(query, k=5)
+# Semantic search
+results = db.search(np.random.rand(768).astype(np.float32), k=5)
+for r in results:
+    print(r.id, r.score, r.metadata.content)
 
-print(f"Found {len(ids)} similar vectors")
-for i, (id, dist) in enumerate(zip(ids, distances)):
-    print(f"  {i+1}. ID: {id}, Distance: {dist:.4f}")
-
-# Save the database
 db.save()
+```
 
-### Context Usage (Phase 3)
+---
+
+## Core Features
+
+### Multimodal Pockets
+
+Each named modality gets its own independent HNSW index with its own dimensionality. A single entity ID can hold text, visual, and audio vectors simultaneously.
 
 ```python
-from feather_db import DB, Metadata, ContextType
+db.add(id=42, vec=text_vec,   modality="text")    # 768-dim
+db.add(id=42, vec=image_vec,  modality="visual")  # 512-dim
+db.add(id=42, vec=audio_vec,  modality="audio")   # 256-dim
 
-# 1. Add Multimodal Data
-db.add(id=100, vec=img_vec, modality="visual")
-db.add(id=100, vec=txt_vec, modality="text") # Same ID!
-
-# 2. Link Records (Graph)
-db.link(source_id=100, target_id=999)
-
-# 3. Search with Context
-results = db.search(query_vec, k=5, modality="visual")
-print(f"Linked to: {results[0].metadata.links}")
-```
+results = db.search(query_vec, k=10, modality="visual")
 ```
 
-### C++ Usage
+### Context Graph
 
-```cpp
-#include "include/feather.h"
-#include <vector>
+Typed, weighted edges between records. Nine built-in relationship types plus free-form strings.
 
-int main() {
-    // Open database
-    auto db = feather::DB::open("my_vectors.feather", 768);
-    
-    // Add a vector
-    std::vector<float> vec(768, 0.1f);
-    db->add(1, vec);
-    
-    // Search
-    std::vector<float> query(768, 0.1f);
-    auto results = db->search(query, 5);
-    
-    for (auto [id, distance] : results) {
-        std::cout << "ID: " << id << ", Distance: " << distance << std::endl;
-    }
-    
-    return 0;
-}
+```python
+from feather_db import RelType
+
+# Link records with typed relationships
+db.link(from_id=1, to_id=2, rel_type=RelType.CAUSED_BY, weight=0.9)
+db.link(from_id=1, to_id=3, rel_type=RelType.SUPPORTS,  weight=0.7)
+
+# Query graph structure
+edges    = db.get_edges(1)          # outgoing edges
+incoming = db.get_incoming(2)       # reverse index
+
+# Auto-create edges by vector similarity
+db.auto_link(modality="text", threshold=0.85, rel_type=RelType.RELATED_TO)
 ```
 
-### CLI Usage
+Built-in relationship types: `related_to`, `derived_from`, `caused_by`, `contradicts`, `supports`, `precedes`, `part_of`, `references`, `multimodal_of`.
+
+### Context Chain (Vector Search + Graph Expansion)
+
+One call that combines semantic vector search with n-hop BFS graph traversal:
+
+```python
+result = db.context_chain(
+    query=query_vec,
+    k=5,           # seed nodes from vector search
+    hops=2,        # BFS graph expansion depth
+    modality="text"
+)
+
+for node in result.nodes:
+    print(node.id, node.score, node.hop_distance)
+
+for edge in result.edges:
+    print(edge.source_id, "->", edge.target_id, edge.rel_type)
+```
+
+Score = `similarity × hop_decay × importance × stickiness`
+
+### Namespace / Entity / Attributes
+
+Generic partitioning for multi-tenant, multi-domain use:
+
+```python
+from feather_db import FilterBuilder, MarketingProfile
+
+# Build metadata with domain profile
+profile = feather_db.MarketingProfile()
+profile.set_brand("nike")
+profile.set_user("user_8821")
+profile.set_channel("instagram")
+profile.set_ctr(0.045)
+meta = profile.to_metadata()
+
+db.add(id=100, vec=vec, meta=meta)
+
+# Filter by namespace + entity + attribute
+f = FilterBuilder().namespace("nike").entity("user_8821").attribute("channel", "instagram").build()
+results = db.search(query_vec, k=10, filter=f)
+```
+
+Works for any domain — healthcare, e-commerce, finance — by subclassing `DomainProfile`.
+
+### Living Context / Adaptive Decay
+
+Records accessed more frequently resist temporal decay:
+
+```python
+from feather_db import ScoringConfig
+
+cfg = ScoringConfig(half_life=30.0, weight=0.3, min=0.0)
+results = db.search(query_vec, k=10, scoring=cfg)
+```
+
+Formula:
+```
+stickiness    = 1 + log(1 + recall_count)
+effective_age = age_in_days / stickiness
+recency       = 0.5 ^ (effective_age / half_life_days)
+final_score   = ((1 - time_weight) * similarity + time_weight * recency) * importance
+```
+
+`touch()` is called automatically on every search hit. Call `db.touch(id)` manually to boost salience.
+
+### Graph Visualization
+
+Exports a self-contained, offline D3 force-graph HTML — no CDN, no server:
+
+```python
+from feather_db.graph import visualize, export_graph
+
+# Interactive HTML force graph
+visualize(db, output_path="/tmp/graph.html")
+
+# JSON for D3 / Cytoscape (namespace-filtered)
+data = export_graph(db, namespace_filter="nike")
+```
+
+### Import / Export
+
+```python
+# D3 / Cytoscape-compatible JSON
+json_str = db.export_graph_json(namespace_filter="nike", entity_filter="user_8821")
+
+# Raw vector retrieval
+vec   = db.get_vector(id=42, modality="text")
+ids   = db.get_all_ids(modality="visual")
+
+# Metadata update without touching HNSW index
+db.update_metadata(id=42, meta=new_meta)
+db.update_importance(id=42, importance=0.95)
+```
+
+---
+
+## Filtered Search
+
+```python
+from feather_db import FilterBuilder
+
+results = db.search(
+    query_vec, k=10,
+    filter=FilterBuilder()
+        .namespace("nike")
+        .entity("user_8821")
+        .attribute("channel", "instagram")
+        .source("pipeline-v1")
+        .importance_gte(0.5)
+        .build()
+)
+```
+
+---
+
+## Metadata Fields
+
+```python
+meta = feather_db.Metadata()
+meta.timestamp      = int(time.time())    # Unix timestamp
+meta.importance     = 0.9                 # [0.0–1.0]
+meta.type           = feather_db.ContextType.FACT  # FACT | PREFERENCE | EVENT | CONVERSATION
+meta.source         = "pipeline-v1"
+meta.content        = "Human-readable content"
+meta.tags_json      = '["tag1","tag2"]'
+meta.namespace_id   = "nike"             # partition key
+meta.entity_id      = "user_8821"        # subject key
+meta.set_attribute("channel", "instagram")   # safe KV setter (use this, not meta.attributes['k']=v)
+val = meta.get_attribute("channel")
+```
+
+---
+
+## Rust CLI
 
 ```bash
-# Create a new database
-feather new my_db.feather --dim 768
+# Add a record
+feather add --db my.feather --id 1 --vec "0.1,0.2,0.3" --modality text
 
-# Add vectors from NumPy files
-feather add my_db.feather 1 --npy vector1.npy
-feather add my_db.feather 2 --npy vector2.npy
+# Search
+feather search --db my.feather --vec "0.1,0.2,0.3" --k 5
 
-# Search for similar vectors
-feather search my_db.feather --npy query.npy --k 10
+# Link two records
+feather link --db my.feather --from 1 --to 2
 ```
 
-### Rust CLI
+---
 
-The CLI is available as a native binary for fast database management.
+## Performance
 
-```bash
-# Add with metadata
-feather add --npy vector.npy --content "Hello world" --source "cli" my_db 123
+| Metric | Value |
+|--------|-------|
+| Add rate | 2,000–5,000 vectors/sec |
+| Search latency (k=10) | 0.5–1.5 ms |
+| Max vectors per modality | 1,000,000 (configurable) |
+| HNSW params | M=16, ef_construction=200 |
+| File format | Binary `.feather` v5 |
 
-# Search with filters
-feather search --npy query.npy --type-filter 0 --source-filter "cli" my_db
+SIMD (AVX2/AVX512) optimizations are available in `space_l2.h`. Enable with `-DUSE_AVX -march=native` in `setup.py`.
+
+---
+
+## File Format
+
+```
+[magic: 4B = "FEAT"] [version: 4B = 5]
+--- Metadata Section ---
+[meta_count: 4B]
+  for each record:
+    [id: 8B] [serialized Metadata including namespace/entity/attributes/edges]
+--- Modality Indices Section ---
+[modal_count: 4B]
+  for each modality:
+    [name_len: 2B] [name: N bytes]
+    [dim: 4B] [element_count: 4B]
+    for each element:
+      [id: 8B] [float32 vector: dim * 4 bytes]
 ```
 
-## Installation
+v3 and v4 files load transparently — missing fields default to empty.
 
-### Python Package (Recommended)
-
-```bash
-pip install feather-db
-```
-
-### Build from Source
-
-#### Prerequisites
-
-- **C++17** compatible compiler
-- **Python 3.8+** (for Python bindings)
-- **Rust 1.70+** (for CLI tool)
-- **pybind11** (for Python bindings)
-
-#### Steps
-
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd feather
-   ```
-
-2. **Install Python Package**
-   ```bash
-   pip install .
-   ```
-
-3. **Build Rust CLI (Optional)**
-   ```bash
-   cd feather-cli
-   cargo build --release
-   ```
-
-## Architecture
-
-### Core Components
-
-- **`feather::DB`**: Main C++ class providing vector database functionality
-- **HNSW Index**: Hierarchical Navigable Small World algorithm for fast ANN search
-- **Binary Format**: Custom storage format with magic number validation
-- **Multi-language Bindings**: Python (pybind11) and Rust (FFI) interfaces
-
-### File Format
-
-Feather uses a custom binary format:
-```
-[4 bytes] Magic number: 0x46454154 ("FEAT")
-[4 bytes] Version: 1
-[4 bytes] Dimension
-[Records] ID (8 bytes) + Vector data (dim * 4 bytes)
-```
-
-### Performance Characteristics
-
-- **Index Type**: HNSW with L2 distance
-- **Max Elements**: 1,000,000 (configurable)
-- **Construction Parameters**: M=16, ef_construction=200
-- **Memory Usage**: ~4 bytes per dimension per vector + index overhead
-
-## API Reference
-
-### Python API
-
-#### `feather_db.DB`
-
-- **`DB.open(path: str, dim: int = 768)`**: Open or create database
-- **`add(id: int, vec: np.ndarray)`**: Add vector with ID
-- **`search(query: np.ndarray, k: int = 5)`**: Search k nearest neighbors
-- **`save()`**: Persist database to disk
-- **`dim()`**: Get vector dimension
-
-### C++ API
-
-#### `feather::DB`
-
-- **`static std::unique_ptr<DB> open(path, dim)`**: Factory method
-- **`void add(uint64_t id, const std::vector<float>& vec)`**: Add vector
-- **`auto search(const std::vector<float>& query, size_t k)`**: Search vectors
-- **`void save()`**: Save to disk
-- **`size_t dim() const`**: Get dimension
-
-### CLI Commands
-
-- **`feather new <path> --dim <dimension>`**: Create new database
-- **`feather add <db> <id> --npy <file>`**: Add vector from .npy file
-- **`feather search <db> --npy <query> --k <count>`**: Search similar vectors
+---
 
 ## Examples
 
-### Semantic Search with Embeddings
+| File | Description |
+|------|-------------|
+| `examples/context_graph_demo.py` | Full context graph demo — auto-link, context_chain, D3 HTML export |
+| `examples/marketing_living_context.py` | Multi-brand namespace/entity/attribute filtering + importance feedback |
+| `examples/feather_inspector.py` | Local HTTP inspector — force graph, PCA scatter, edit, delete |
 
-```python
-import feather_db
-import numpy as np
+Run any example:
 
-# Create database for sentence embeddings
-db = feather_db.DB.open("sentences.feather", dim=384)
-
-# Add document embeddings
-documents = [
-    "The quick brown fox jumps over the lazy dog",
-    "Machine learning is a subset of artificial intelligence",
-    "Vector databases enable semantic search capabilities"
-]
-
-for i, doc in enumerate(documents):
-    # Assume get_embedding() returns a 384-dim vector
-    embedding = get_embedding(doc)
-    db.add(i, embedding)
-
-# Search for similar documents
-query_embedding = get_embedding("What is machine learning?")
-ids, distances = db.search(query_embedding, k=2)
-
-for id, dist in zip(ids, distances):
-    print(f"Document: {documents[id]}")
-    print(f"Similarity: {1 - dist:.3f}\n")
+```bash
+python setup.py build_ext --inplace
+python3 examples/context_graph_demo.py
 ```
 
-### Batch Processing
+---
 
-```python
-import feather_db
-import numpy as np
+## Architecture
 
-db = feather_db.DB.open("large_dataset.feather", dim=512)
+```
+[Generic Core — C++17]
+feather::DB
+  ├── modality_indices_  (unordered_map<string, ModalityIndex>)  — one HNSW per modality
+  ├── metadata_store_    (unordered_map<uint64_t, Metadata>)     — shared metadata by ID
+  └── Methods: add, search, link, context_chain, auto_link, export_graph_json ...
 
-# Batch add vectors
-batch_size = 1000
-for batch_start in range(0, 100000, batch_size):
-    for i in range(batch_size):
-        vector_id = batch_start + i
-        vector = np.random.random(512).astype(np.float32)
-        db.add(vector_id, vector)
-    
-    # Periodic save
-    if batch_start % 10000 == 0:
-        db.save()
-        print(f"Processed {batch_start + batch_size} vectors")
+[Python Layer]
+feather_db (pybind11)
+  ├── DB, Metadata, ContextType, ScoringConfig
+  ├── Edge, IncomingEdge, ContextNode, ContextEdge, ContextChainResult
+  ├── FilterBuilder       — fluent search filter helper
+  ├── DomainProfile       — generic namespace/entity/attributes base class
+  ├── MarketingProfile    — digital marketing typed adapter
+  ├── RelType             — standard relationship type constants
+  └── graph.visualize()   — D3 force-graph HTML exporter
+
+[Rust CLI]
+feather-db-cli (FFI via extern "C" from src/feather_core.cpp)
 ```
 
-## Performance Tips
+---
 
-1. **Batch Operations**: Add vectors in batches and save periodically
-2. **Memory Management**: Consider vector dimension vs. memory usage trade-offs
-3. **Search Parameters**: Adjust `k` parameter based on your precision/recall needs
-4. **File I/O**: Use SSD storage for better performance with large databases
+## Known Limitations
+
+| Issue | Detail |
+|-------|--------|
+| No concurrent writes | HNSW is not thread-safe for simultaneous adds |
+| No vector deletion | HNSW marks deletions; data stays until compaction |
+| Max 1M vectors/modality | Hardcoded in `get_or_create_index`; increase `max_elements` to raise |
+| `meta.attributes['k'] = v` silent no-op | pybind11 map copy; use `meta.set_attribute(k, v)` |
+| tags_json is raw string | Tag filtering uses substring search, not proper JSON parsing |
+
+---
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
+3. Make your changes with tests
+4. Submit a pull request
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+---
 
 ## License
 
-[Add your license information here]
+MIT — see [LICENSE](LICENSE)
+
+---
 
 ## Acknowledgments
 
-- Built on top of [hnswlib](https://github.com/nmslib/hnswlib)
-- Uses [pybind11](https://github.com/pybind/pybind11) for Python bindings
-- CLI built with [clap](https://github.com/clap-rs/clap) for Rust
+- HNSW algorithm: [hnswlib](https://github.com/nmslib/hnswlib)
+- Python bindings: [pybind11](https://github.com/pybind/pybind11)
+- Rust CLI: [clap](https://github.com/clap-rs/clap)
+- Graph visualization: [D3.js](https://d3js.org/)

@@ -1,9 +1,9 @@
 [package]
 name = "feather-db-cli"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Hawky.ai Team <hello@hawky.ai>"]
-description = "Command-line interface for Feather context-aware vector database - Part of Hawky.ai"
+description = "Command-line interface for Feather — embedded vector database + living context engine"
 license = "MIT"
 repository = "https://github.com/feather-store/feather"
 homepage = "https://www.getfeather.store/"

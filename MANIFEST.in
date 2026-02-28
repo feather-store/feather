@@ -2,9 +2,10 @@
 include README.md
 include LICENSE
 include CHANGELOG.md
-include HOW_TO_USE.md
-include USAGE_GUIDE.md
 include CONTRIBUTING.md
+
+# Include D3.js for offline visualization
+include feather_db/d3.min.js
 
 # Include C++ source and headers
 recursive-include include *.h
