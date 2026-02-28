@@ -6,7 +6,7 @@
 
 ## 1. Project Overview
 
-**Feather DB** is a lightweight, embedded vector database written in C++17 with Python and Rust bindings. It is designed as "SQLite for Vectors" — a fast, zero-server, file-based store for AI context and embeddings.
+**Feather DB** is a lightweight, embedded vector database and living context engine written in C++17 with Python and Rust bindings — zero-server, file-based, designed for AI context and embeddings.
 
 **Core Value Proposition:**
 - Sub-millisecond ANN (Approximate Nearest Neighbour) search via HNSW
