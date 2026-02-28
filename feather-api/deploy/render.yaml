@@ -1,0 +1,22 @@
+# render.yaml — Feather DB Cloud API on Render
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: feather-db-api
+    runtime: docker
+    dockerfilePath: feather-api/Dockerfile
+    dockerContext: .
+    envVars:
+      - key: FEATHER_DATA_DIR
+        value: /data
+      - key: FEATHER_DB_DIM
+        value: "768"
+      - key: FEATHER_API_KEY
+        sync: false          # set manually in Render dashboard
+    disk:
+      name: feather-data
+      mountPath: /data
+      sizeGB: 10
+    healthCheckPath: /health
+    autoDeploy: true

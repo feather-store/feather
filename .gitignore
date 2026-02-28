@@ -89,3 +89,9 @@ deploy_*.sh
 
 # Virtual environments
 repro_venv/
+
+# Real / proprietary datasets (never commit)
+real_data/
+
+# Claude Code session data
+.claude/

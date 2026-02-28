@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  feather-api:
+    build:
+      context: ..            # repo root (so Dockerfile can copy feather source)
+      dockerfile: feather-api/Dockerfile
+    image: feather-db-api:0.4.0
+    ports:
+      - "8000:8000"
+    volumes:
+      - feather-data:/data   # persistent vector store
+    environment:
+      FEATHER_DATA_DIR: /data
+      FEATHER_DB_DIM: "768"
+      FEATHER_API_KEY: "${FEATHER_API_KEY:-}"   # set in .env or shell
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  feather-data:
+    driver: local

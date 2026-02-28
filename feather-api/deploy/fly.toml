@@ -1,0 +1,41 @@
+# fly.toml — Feather DB Cloud API on Fly.io
+# Deploy: fly launch && fly deploy
+
+app = "feather-db-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "feather-api/Dockerfile"
+  build_target = "runtime"
+
+[env]
+  FEATHER_DATA_DIR = "/data"
+  FEATHER_DB_DIM   = "768"
+
+[mounts]
+  # Persistent volume for .feather files
+  source      = "feather_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https   = true
+  auto_stop_machines  = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period  = "10s"
+    interval      = "30s"
+    method        = "GET"
+    path          = "/health"
+    timeout       = "5s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus     = 1
+  memory   = "1gb"
+
+[secrets]
+  # Set via: fly secrets set FEATHER_API_KEY=your-key-here
+  # FEATHER_API_KEY = ""

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feather-db"
-version = "0.3.0"
-description = "Fast, lightweight context-aware vector database - Part of Hawky.ai Digital Marketing OS"
+version = "0.5.0"
+description = "Embedded vector database + living context engine — multimodal pockets, context graph, adaptive decay"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
@@ -13,16 +13,9 @@ authors = [
     {name = "Hawky.ai Team", email = "hello@hawky.ai"}
 ]
 keywords = [
-    "vector",
-    "database",
-    "similarity",
-    "search",
-    "embeddings",
-    "hnsw",
-    "ann",
-    "nearest-neighbor",
-    "machine-learning",
-    "ai"
+    "vector", "database", "similarity", "search", "embeddings",
+    "hnsw", "ann", "nearest-neighbor", "context-graph",
+    "knowledge-graph", "living-context", "multimodal", "ai"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -36,6 +29,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: C++",
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -64,7 +58,7 @@ Changelog = "https://github.com/feather-store/feather/blob/main/CHANGELOG.md"
 "Hawky.ai" = "https://hawky.ai"
 
 [tool.setuptools]
-packages = []
+packages = ["feather_db"]
 
 [tool.setuptools.package-data]
-"*" = ["*.so", "*.pyd", "*.dll"]
+"feather_db" = ["*.so", "*.pyd", "*.dll", "d3.min.js"]
