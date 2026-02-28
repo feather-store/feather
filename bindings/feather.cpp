@@ -6,7 +6,7 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(core, m) {
-    m.doc() = "Feather: SQLite for Vectors — Living Context Engine";
+    m.doc() = "Feather: Embedded Vector Database + Living Context Engine";
 
     // ── ContextType ──────────────────────────────────────────────────
     py::enum_<feather::ContextType>(m, "ContextType")

@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Website](https://img.shields.io/badge/website-getfeather.store-blue)](https://www.getfeather.store/)
 
-Feather DB is "SQLite for Vectors" — a fast, zero-server, file-based vector store with a built-in knowledge graph and adaptive memory decay. No separate database server required.
+Feather DB is an embedded vector database and living context engine — zero-server, file-based, with a built-in knowledge graph and adaptive memory decay. No separate database server required.
 
 ---
 
