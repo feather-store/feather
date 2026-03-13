@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feather-db"
-version = "0.5.0"
-description = "Embedded vector database + living context engine — multimodal pockets, context graph, adaptive decay"
+version = "0.6.0"
+description = "Embedded vector database + living context engine — multimodal pockets, context graph, adaptive decay, MCP server"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
@@ -48,6 +48,30 @@ dev = [
 examples = [
     "sentence-transformers>=2.0",
 ]
+langchain = [
+    "langchain>=0.1.0",
+    "langchain-core>=0.1.0",
+]
+llamaindex = [
+    "llama-index>=0.10.0",
+    "llama-index-core>=0.10.0",
+]
+mcp = [
+    "mcp>=0.9.0",
+]
+all = [
+    "langchain>=0.1.0",
+    "langchain-core>=0.1.0",
+    "llama-index>=0.10.0",
+    "llama-index-core>=0.10.0",
+    "mcp>=0.9.0",
+    "google-genai>=1.0.0",
+    "anthropic>=0.20.0",
+    "openai>=1.0.0",
+]
+
+[project.scripts]
+feather-serve = "feather_db.integrations.mcp_server:main"
 
 [project.urls]
 Homepage = "https://www.getfeather.store/"
@@ -58,7 +82,10 @@ Changelog = "https://github.com/feather-store/feather/blob/main/CHANGELOG.md"
 "Hawky.ai" = "https://hawky.ai"
 
 [tool.setuptools]
-packages = ["feather_db"]
+packages = [
+    "feather_db",
+    "feather_db.integrations",
+]
 
 [tool.setuptools.package-data]
 "feather_db" = ["*.so", "*.pyd", "*.dll", "d3.min.js"]

@@ -94,7 +94,7 @@ private:
         if (!f) throw std::runtime_error("Cannot save file");
 
         uint32_t magic   = 0x46454154; // "FEAT"
-        uint32_t version = 5;
+        uint32_t version = 6;
         f.write((char*)&magic,   4);
         f.write((char*)&version, 4);
 
@@ -587,6 +587,83 @@ public:
             [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
         if (results.size() > k) results.resize(k);
         return results;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Memory lifecycle: forget / purge / expire
+    // ─────────────────────────────────────────────────────────────────
+
+    // Soft-delete: mark-deleted in HNSW (exits search), blank content,
+    // set importance=0. The node shell remains so graph edges stay traversable.
+    void forget(uint64_t id) {
+        // Remove from every modality index
+        for (auto& [name, m_idx] : modality_indices_) {
+            try { m_idx.index->markDelete(id); } catch (...) {}
+        }
+        // Blank the metadata (keep the shell for graph traversal)
+        auto it = metadata_store_.find(id);
+        if (it != metadata_store_.end()) {
+            it->second.content    = "";
+            it->second.source     = "_forgotten";
+            it->second.importance = 0.0f;
+            it->second.ttl        = 0;   // stop further expiry processing
+        }
+    }
+
+    // Hard-delete: remove all nodes in namespace_id from indices +
+    // metadata store + reverse index. Returns count of removed nodes.
+    size_t purge(const std::string& ns_id) {
+        // Collect target IDs
+        std::unordered_set<uint64_t> to_purge;
+        for (const auto& [id, meta] : metadata_store_)
+            if (meta.namespace_id == ns_id) to_purge.insert(id);
+
+        // Mark-delete in every modality
+        for (auto& [name, m_idx] : modality_indices_) {
+            for (uint64_t id : to_purge) {
+                try { m_idx.index->markDelete(id); } catch (...) {}
+            }
+        }
+        // Erase metadata
+        for (uint64_t id : to_purge) metadata_store_.erase(id);
+
+        // Clean reverse index: remove entries sourced from purged nodes
+        for (auto& [target, incoming] : reverse_index_) {
+            incoming.erase(
+                std::remove_if(incoming.begin(), incoming.end(),
+                    [&to_purge](const IncomingEdge& ie) {
+                        return to_purge.count(ie.source_id) > 0;
+                    }),
+                incoming.end());
+        }
+        // Remove reverse index entries for purged target keys
+        for (uint64_t id : to_purge) reverse_index_.erase(id);
+
+        // Prune edges in surviving nodes that pointed to purged targets
+        for (auto& [id, meta] : metadata_store_) {
+            meta.edges.erase(
+                std::remove_if(meta.edges.begin(), meta.edges.end(),
+                    [&to_purge](const Edge& e) {
+                        return to_purge.count(e.target_id) > 0;
+                    }),
+                meta.edges.end());
+        }
+
+        return to_purge.size();
+    }
+
+    // Scan all nodes and soft-delete any with ttl>0 where now > timestamp+ttl.
+    // Returns count of nodes forgotten.
+    size_t forget_expired() {
+        int64_t now = static_cast<int64_t>(std::time(nullptr));
+        size_t  count = 0;
+        std::vector<uint64_t> expired;
+        for (const auto& [id, meta] : metadata_store_) {
+            if (meta.ttl > 0 && now > meta.timestamp + meta.ttl)
+                expired.push_back(id);
+        }
+        for (uint64_t id : expired) { forget(id); ++count; }
+        return count;
     }
 
     // ─────────────────────────────────────────────────────────────────

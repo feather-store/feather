@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] — 2026-03-13
+
+### Added — Complete Living Context Engine
+
+#### C++ Core (file format v6)
+- **`Metadata.ttl`** (int64_t) — time-to-live in seconds from `timestamp`. `0` = never expires. Enables working/session memory that auto-evicts.
+- **`Metadata.confidence`** (float, default 1.0) — epistemic certainty about the stored fact. Separate from `importance` (relevance weight).
+- **`DB.forget(id)`** — soft-delete: `markDelete` in HNSW (exits all searches), blanks `content`, sets `importance=0`. Graph shell preserved so incoming edges remain traversable.
+- **`DB.purge(namespace_id)`** — hard-delete all nodes in a namespace. Removes from HNSW, `metadata_store_`, reverse index, and outgoing edges of surviving nodes. Returns count.
+- **`DB.forget_expired()`** — scans all nodes, calls `forget()` on any where `ttl > 0 && now > timestamp + ttl`. Returns count of expired nodes.
+- File format bumped to **v6**. v5, v4, v3 files load transparently via end-of-stream guards.
+
+#### `feather_db.memory` — MemoryManager
+- **`why_retrieved(db, id, query_vec)`** — full score breakdown: similarity, stickiness, effective_age_days, recency, importance, confidence, final_score, and human-readable formula string.
+- **`health_report(db)`** — orphan nodes, hot/warm/cold tier counts, expired-TTL count, recall histogram, avg_importance, avg_confidence.
+- **`search_mmr(db, query_vec, k, diversity)`** — Maximal Marginal Relevance post-processing. Balances relevance vs diversity. `diversity=0` = pure similarity, `diversity=1` = maximum spread.
+- **`assign_tiers(db)`** — classifies nodes as hot/warm/cold by recall_count + recency percentile. Optionally writes `tier` attribute back to DB.
+- **`consolidate(db, namespace, since_hours, llm_fn)`** — greedy union-find clustering by cosine similarity, generates summary nodes, links originals with `consolidated_into` edge, lowers original importance to 0.3.
+
+#### `feather_db.triggers` — WatchManager + ContradictionDetector
+- **`WatchManager.watch(db, query_text, threshold, callback, embed_fn)`** — register a semantic watch that fires `callback(node_id, similarity)` when a new node matches.
+- **`WatchManager.check_triggers(db, new_node_id)`** — check all watches against a newly added node. Returns list of match records.
+- **`ContradictionDetector.check(db, new_node_id, threshold, auto_link)`** — detect high-similarity nodes from a different source; auto-create `contradicts` edges.
+- **`ContradictionDetector.scan_all(db)`** — full-DB contradiction scan (expensive; use sparingly).
+
+#### `feather_db.episodes` — EpisodeManager
+- **`begin_episode(db, episode_id, description)`** — create an episode header node; returns deterministic header ID.
+- **`add_to_episode(db, node_id, episode_id)`** — tag node with episode_id attribute + link from header via `episode_contains` edge.
+- **`get_episode(db, episode_id)`** — ordered member nodes by timestamp.
+- **`close_episode(db, episode_id)`** — seals episode, adds `episode_end` edge, writes `episode_status=closed`.
+- **`list_episodes(db)`** — all open and closed episodes.
+
+#### `feather_db.merge`
+- **`merge(target_db, source_path, conflict_policy)`** — merge two Feather DBs. Policies: `keep_target` (default), `keep_source`, `merge` (union attrs, higher importance/confidence wins). Returns `{merged, skipped, conflicts, edges_added}`.
+
+#### `feather_db.integrations.langchain_compat`
+- **`FeatherVectorStore`** — LangChain `VectorStore`: `add_texts()`, `similarity_search()`, `similarity_search_with_score()`, `from_texts()`, `from_documents()`.
+- **`FeatherMemory`** — LangChain `BaseMemory`: semantic history retrieval with adaptive decay scoring, `save_context()`, `clear()`.
+- **`FeatherRetriever`** — LangChain `BaseRetriever`: wraps `context_chain()` for graph-expanded retrieval.
+
+#### `feather_db.integrations.llamaindex_compat`
+- **`FeatherVectorStoreIndex`** — LlamaIndex `VectorStore`: `add()` (BaseNode), `query()` (VectorStoreQuery → VectorStoreQueryResult), `delete()`.
+- **`FeatherReader`** — LlamaIndex `BaseReader`: `load_data(db_path, dim)` → list of LlamaIndex Documents.
+
+#### 7 New Agent Tools (all providers — total 14 tools)
+- **`feather_forget`** — soft-delete a node by ID
+- **`feather_health`** — knowledge graph health report
+- **`feather_why`** — score breakdown explaining a retrieval
+- **`feather_mmr_search`** — diversity-aware semantic search
+- **`feather_consolidate`** — cluster + merge similar nodes
+- **`feather_episode_get`** — ordered nodes in a named episode
+- **`feather_expire`** — scan and expire all TTL-exceeded nodes
+
+#### `feather_db.integrations.mcp_server` — MCP Server
+- **`feather-serve`** CLI entry point — `feather-serve --db my.feather --dim 3072`
+- Full MCP server exposing all **14 Feather tools** as first-class MCP tool definitions
+- Works with Claude Desktop, Cursor, and any MCP-compatible agent — zero code required
+- Claude Desktop config: `{"mcpServers": {"feather": {"command": "feather-serve", "args": ["--db", "my.feather"]}}}`
+- `asyncio.run_in_executor` wrapping for non-blocking tool dispatch
+- Resource endpoint: `feather://db/info` returns DB stats
+
+### Changed
+- `feather_db.__version__` → `"0.6.0"`
+- `pyproject.toml`: optional dependency groups `langchain`, `llamaindex`, `mcp`, `all`; `feather-serve` console script entry point
+- `feather_db.integrations.__init__`: exports LangChain + LlamaIndex adapters (graceful fallback if deps absent)
+
+---
+
+### Added — LLM Agent Connectors (`feather_db.integrations`)
+
+- **`feather_db/integrations/`** package — production-ready connectors that expose Feather DB as tool-use / function-calling tools for any LLM provider.
+- **`ClaudeConnector`** — Feather DB tools in Anthropic `input_schema` format. Drop-in for `client.messages.create(tools=...)`. Includes `run_loop()` for fully autonomous multi-turn agent execution.
+- **`OpenAIConnector`** — OpenAI function-calling format. Works with OpenAI (`gpt-4o`), Azure OpenAI, Groq (`llama-3.3-70b-versatile`), Mistral, Together AI, Ollama. Pass `base_url=` for any OpenAI-compatible endpoint.
+- **`GeminiConnector`** — Gemini `FunctionDeclaration` + `types.Tool` format. Works with `client.chats.create(config=conn.chat_config())` and `google-genai` SDK.
+- **`GeminiEmbedder`** — Multimodal embedder wrapping `models/gemini-embedding-2-preview` (3072-dim). Supports `embed_text()`, `embed_image()`, `embed_video_transcript()`, `embed_any()`. Mock mode (offline) built in.
+- **`FeatherTools`** base class — 7 built-in tools available to all connectors:
+  - `feather_search` — semantic search with namespace/entity/product filtering
+  - `feather_context_chain` — vector search + BFS graph expansion (n hops)
+  - `feather_get_node` — full metadata + edge inspection by ID
+  - `feather_get_related` — graph neighbour traversal (in/out/both directions)
+  - `feather_add_intel` — agent-ingestible new intelligence nodes
+  - `feather_link_nodes` — typed weighted edge creation from agent output
+  - `feather_timeline` — chronological node list by product or entity type
+- All connectors share a single `TOOL_SPECS` definition (single source of truth) — adding a new tool propagates automatically to all three providers.
+- Mock embedder fallback — all connectors work fully offline without an API key (useful for testing, CI, local dev).
+- Top-level exports: `from feather_db import ClaudeConnector, OpenAIConnector, GeminiConnector, GeminiEmbedder`.
+- **Example**: `examples/agent_connectors_demo.py` — complete multi-connector demo with context chain, timeline, write tools, and agent loop for all four providers (Claude, OpenAI, Groq, Gemini). Runs fully offline in mock mode.
+
+---
+
 ## [0.5.0] — 2026-02-28
 
 ### Added — Context Graph & Living Context Engine
