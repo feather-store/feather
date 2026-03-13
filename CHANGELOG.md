@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.1] — 2026-03-14
+
+### Fixed
+- `setup.py`: `-undefined dynamic_lookup` linker flag now only applied on macOS — fixes build from source on Linux (HuggingFace Spaces, manylinux, Ubuntu)
+
 ## [0.6.0] — 2026-03-13
 
 ### Added — Complete Living Context Engine
