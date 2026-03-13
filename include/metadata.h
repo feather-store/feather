@@ -44,8 +44,13 @@ struct Metadata {
     // Phase 5: Typed, weighted context graph edges (replaces plain `links`)
     std::vector<Edge> edges;
 
+    // Phase 6: Working memory + epistemic confidence
+    int64_t ttl;          // seconds-to-live from timestamp; 0 = never expires
+    float   confidence;   // certainty about this fact [0.0–1.0]; default 1.0
+
     Metadata() : timestamp(0), importance(1.0f), type(ContextType::FACT),
-                 recall_count(0), last_recalled_at(0) {}
+                 recall_count(0), last_recalled_at(0),
+                 ttl(0), confidence(1.0f) {}
 
     void serialize(std::ostream& os) const;
     static Metadata deserialize(std::istream& is);

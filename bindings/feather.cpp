@@ -63,6 +63,9 @@ PYBIND11_MODULE(core, m) {
             for (const auto& e : m.edges) ids.push_back(e.target_id);
             return ids;
         })
+        // Phase 6 fields
+        .def_readwrite("ttl",        &feather::Metadata::ttl)
+        .def_readwrite("confidence", &feather::Metadata::confidence)
         // Helpers to avoid the pybind11 map/dict copy gotcha
         .def("set_attribute", [](feather::Metadata& m,
                                   const std::string& key,
@@ -198,6 +201,14 @@ PYBIND11_MODULE(core, m) {
             return py::array_t<float>(vec.size(), vec.data());
         }, py::arg("id"), py::arg("modality") = "text")
         .def("get_all_ids", &feather::DB::get_all_ids, py::arg("modality") = "text")
+
+        // -- Memory lifecycle --
+        .def("forget",         &feather::DB::forget,         py::arg("id"),
+             "Soft-delete: remove from search + blank content. Graph shell preserved.")
+        .def("purge",          &feather::DB::purge,          py::arg("namespace_id"),
+             "Hard-delete all nodes in namespace_id. Returns count of removed nodes.")
+        .def("forget_expired", &feather::DB::forget_expired,
+             "Soft-delete all nodes where ttl>0 and now > timestamp+ttl. Returns count.")
 
         // -- Persistence & info --
         .def("save", &feather::DB::save)

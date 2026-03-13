@@ -58,6 +58,10 @@ void Metadata::serialize(std::ostream& os) const {
         os.write(e.rel_type.data(), rt_len);
         os.write(reinterpret_cast<const char*>(&e.weight), 4);
     }
+
+    // Phase 6: ttl + confidence
+    os.write(reinterpret_cast<const char*>(&ttl),        8);
+    os.write(reinterpret_cast<const char*>(&confidence), 4);
 }
 
 Metadata Metadata::deserialize(std::istream& is) {
@@ -135,6 +139,14 @@ Metadata Metadata::deserialize(std::istream& is) {
         is.read(reinterpret_cast<char*>(&e.weight), 4);
         m.edges.push_back(std::move(e));
     }
+
+    // Phase 6: ttl + confidence (guarded — v5 files default to 0 / 1.0)
+    int64_t ttl_val = 0;
+    if (!is.read(reinterpret_cast<char*>(&ttl_val), 8)) return m;
+    m.ttl = ttl_val;
+    float conf_val = 1.0f;
+    if (!is.read(reinterpret_cast<char*>(&conf_val), 4)) return m;
+    m.confidence = conf_val;
 
     return m;
 }
