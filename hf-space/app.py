@@ -7,7 +7,7 @@ Demonstrates:
   - Context chain (vector search + graph BFS expansion)
   - Graph health report
   - feather_why — retrieval score breakdown
-  - D3 graph visualization
+  - Add new intel nodes live
 """
 
 import hashlib
@@ -17,14 +17,14 @@ import time
 import gradio as gr
 import numpy as np
 
-# ── Try to import feather_db (built from source or pip) ───────────────────────
 try:
     import feather_db
     _FEATHER_OK = True
 except ImportError:
     _FEATHER_OK = False
 
-# ── Deterministic offline embedder (no API key needed) ────────────────────────
+
+# ── Offline embedder (no API key needed) ──────────────────────────────────────
 def _embed(text: str, dim: int = 768) -> np.ndarray:
     vec = np.zeros(dim, dtype=np.float32)
     tokens = text.lower().replace(",", " ").replace(".", " ").split()
@@ -36,43 +36,98 @@ def _embed(text: str, dim: int = 768) -> np.ndarray:
     return (vec / norm) if norm > 0 else vec
 
 
-# ── Seed knowledge graph ──────────────────────────────────────────────────────
+# ── Seed knowledge graph — AI developer tools / product intelligence ──────────
+#
+# Domain: a team building an AI-powered developer tool (editor, CLI, SDK, cloud)
+# tracks feature performance, competitor moves, community signals, and strategy.
+# All data points are realistic and meaningful for this domain.
+#
 SEED_NODES = [
-    (1,  "FD video ad — senior couple hook. CTR 3.2%, ROAS 4.1x. Best format this quarter.",
-         "ad_performance", "FD",  0.92),
-    (2,  "Competitor bank launched 8.75% APY fixed deposit on Budget Day Feb 1. Directly undercuts our 8.5% rate.",
-         "competitor_intel", "FD", 0.95),
-    (3,  "Budget Day 2026: RBI held repo rate at 6.5%. FD search queries up 220%. High intent window.",
-         "market_signal",  "FD",  0.90),
-    (4,  "FD static banner creative showing fatigue — frequency 8.2, CTR dropped 12% WoW. Recommend creative rotation.",
-         "creative_insight","FD",  0.85),
-    (5,  "CC cashback reel — unlimited 5% cashback hook. CTR 3.8%. Best performing CC format this quarter.",
-         "ad_performance", "CC",  0.88),
-    (6,  "Strategy: lead with rate in first 2 seconds for FD video. 35-55 segment shows 3x ROAS vs general audience.",
-         "strategy_intel", "FD",  0.93),
-    (7,  "Mutual Fund SIP campaign — market volatility angle. CTR 2.1%, down from 2.8% last month.",
-         "ad_performance", "MF",  0.80),
-    (8,  "Instagram Reels outperforming Stories 2.4x for FD creatives. Recommend 70/30 budget split.",
-         "channel_insight", "FD", 0.87),
-    (9,  "Senior demographic (55+) shows highest FD conversion rate at 6.8%. Safety and guaranteed return messaging resonates.",
-         "audience_insight","FD",  0.89),
-    (10, "Bond fund competitor launched zero-commission offer. Targeting our MF audience on Google Search.",
-         "competitor_intel","MF",  0.91),
+    (
+        1,
+        "AI autocomplete in the editor: 68% daily active usage, avg 12 completions accepted per session. "
+        "Highest adoption of any feature shipped this quarter. Strongest signal in power-user cohort.",
+        "feature_performance", "Editor", 0.92,
+    ),
+    (
+        2,
+        "Competitor launched inline AI debugging with natural-language error explanations. "
+        "3,400 GitHub stars in 48 hours. Announcement dominated dev Twitter for two days. "
+        "Directly targets our core editor user base.",
+        "competitor_intel", "Editor", 0.95,
+    ),
+    (
+        3,
+        "StackOverflow Developer Survey 2026: 71% of developers now use AI coding assistants daily, "
+        "up from 44% last year. Willingness to pay for productivity tools at an all-time high. "
+        "Enterprise segment growing fastest.",
+        "market_signal", "SDK", 0.90,
+    ),
+    (
+        4,
+        "CLI onboarding funnel: 34% of new users drop off at step 3 (API key setup). "
+        "Median time-to-first-output is 4.2 minutes — well above our 90-second target. "
+        "Friction is authentication, not comprehension.",
+        "user_feedback", "CLI", 0.87,
+    ),
+    (
+        5,
+        "SDK v2 launched with streaming and tool-use support. Download velocity 2.1x faster than SDK v1 "
+        "in the first week. Community PRs opened within 6 hours of release. "
+        "Streaming is the most-requested missing feature now resolved.",
+        "feature_performance", "SDK", 0.89,
+    ),
+    (
+        6,
+        "Strategy brief: reduce time-to-first-value under 90 seconds for all entry points. "
+        "Frictionless auth (OAuth + token auto-detect) identified as the highest-leverage lever. "
+        "Target: onboarding completion rate from 66% to 85% in Q2.",
+        "strategy_brief", "CLI", 0.93,
+    ),
+    (
+        7,
+        "Community Discord: offline / air-gapped mode has 47 upvotes and is the top feature request. "
+        "Users cite enterprise security policy and data-residency requirements. "
+        "Three Fortune 500 pilots blocked specifically by this gap.",
+        "community_signal", "Cloud", 0.88,
+    ),
+    (
+        8,
+        "VS Code extension outperforms JetBrains plugin 3.1x in weekly active users and 4.8x in session length. "
+        "Recommend 70/30 investment split. JetBrains users skew toward Java/Kotlin — "
+        "worth a targeted language-server improvement sprint.",
+        "channel_insight", "Editor", 0.86,
+    ),
+    (
+        9,
+        "Retention analysis: power users (5+ sessions/week) show 8.4x 90-day retention vs casual users. "
+        "Habit formation — not feature breadth — is the primary retention driver. "
+        "Users who complete 3 sessions in week 1 have 72% chance of being active at day 90.",
+        "user_feedback", "SDK", 0.91,
+    ),
+    (
+        10,
+        "Open-source alternative launched under MIT license: 12k GitHub stars in first month. "
+        "No cloud sync, no team features, local-only. Actively targeting our free-tier users "
+        "with 'no vendor lock-in' messaging. Poses risk to top-of-funnel acquisition.",
+        "competitor_intel", "Cloud", 0.93,
+    ),
 ]
 
 SEED_EDGES = [
-    (2, 1, "contradicts",  0.9),
-    (3, 1, "supports",     0.85),
-    (4, 6, "references",   0.9),
-    (6, 1, "supports",     0.8),
-    (8, 1, "supports",     0.75),
-    (9, 6, "supports",     0.88),
-    (10, 7, "contradicts", 0.85),
+    (2,  1,  "contradicts",   0.90),   # competitor launch threatens editor feature lead
+    (3,  5,  "supports",      0.85),   # market survey supports SDK investment
+    (4,  6,  "references",    0.92),   # onboarding drop-off directly informs strategy brief
+    (6,  4,  "derived_from",  0.88),   # strategy brief derived from CLI feedback
+    (8,  1,  "supports",      0.78),   # VS Code dominance supports editor focus
+    (9,  6,  "supports",      0.87),   # retention data supports onboarding strategy
+    (10, 7,  "supports",      0.80),   # OSS competitor validates offline mode demand
+    (3,  1,  "supports",      0.75),   # rising AI adoption supports editor feature investment
 ]
 
-DIM = 768
+DIM      = 768
 _DB_PATH = "/tmp/feather_demo.feather"
-_db = None
+_db      = None
 
 
 def _get_db():
@@ -83,18 +138,18 @@ def _get_db():
         return None
 
     db = feather_db.DB.open(_DB_PATH, dim=DIM)
-    t0 = int(time.time()) - 86400
+    t0 = int(time.time()) - 7 * 86400  # seed nodes spread across last 7 days
 
     for nid, content, etype, product, imp in SEED_NODES:
-        vec = _embed(content, DIM)
+        vec  = _embed(content, DIM)
         meta = feather_db.Metadata()
-        meta.timestamp    = t0 + nid * 3600
+        meta.timestamp    = t0 + nid * 14400   # 4-hour intervals
         meta.importance   = imp
         meta.confidence   = 0.9
         meta.type         = feather_db.ContextType.FACT
         meta.source       = "demo_seed"
         meta.content      = content
-        meta.namespace_id = "demo"
+        meta.namespace_id = "devtools"
         meta.entity_id    = etype
         meta.set_attribute("entity_type", etype)
         meta.set_attribute("product",     product)
@@ -108,7 +163,8 @@ def _get_db():
     return db
 
 
-# ── Tool: semantic search ──────────────────────────────────────────────────────
+# ── Tool implementations ───────────────────────────────────────────────────────
+
 def do_search(query: str, k: int, product_filter: str) -> str:
     db = _get_db()
     if db is None:
@@ -126,13 +182,13 @@ def do_search(query: str, k: int, product_filter: str) -> str:
         if product_filter and product_filter != "All" and p != product_filter:
             continue
         rows.append({
-            "ID":          r.id,
-            "Score":       round(r.score, 4),
-            "Entity Type": m.get_attribute("entity_type"),
-            "Product":     p,
-            "Content":     m.content,
-            "Recall Count": m.recall_count,
-            "Importance":  round(m.importance, 3),
+            "id":           r.id,
+            "score":        round(r.score, 4),
+            "entity_type":  m.get_attribute("entity_type"),
+            "product":      p,
+            "content":      m.content,
+            "recall_count": m.recall_count,
+            "importance":   round(m.importance, 3),
         })
         if len(rows) >= k:
             break
@@ -142,7 +198,6 @@ def do_search(query: str, k: int, product_filter: str) -> str:
     return json.dumps(rows, indent=2)
 
 
-# ── Tool: context chain ────────────────────────────────────────────────────────
 def do_context_chain(query: str, k: int, hops: int) -> str:
     db = _get_db()
     if db is None:
@@ -150,35 +205,34 @@ def do_context_chain(query: str, k: int, hops: int) -> str:
     if not query.strip():
         return "Enter a query above."
 
-    vec    = _embed(query, DIM)
-    chain  = db.context_chain(vec, k=k, hops=hops, modality="text")
+    vec   = _embed(query, DIM)
+    chain = db.context_chain(vec, k=k, hops=hops, modality="text")
 
     nodes = []
     for node in sorted(chain.nodes, key=lambda n: (n.hop, -n.score)):
         m = node.metadata
         nodes.append({
-            "ID":          node.id,
-            "Hop":         node.hop,
-            "Score":       round(node.score, 4),
-            "Entity Type": m.get_attribute("entity_type"),
-            "Product":     m.get_attribute("product"),
-            "Content":     m.content[:120] + ("…" if len(m.content) > 120 else ""),
+            "id":          node.id,
+            "hop":         node.hop,
+            "score":       round(node.score, 4),
+            "entity_type": m.get_attribute("entity_type"),
+            "product":     m.get_attribute("product"),
+            "content":     m.content[:140] + ("…" if len(m.content) > 140 else ""),
         })
 
     edges = [
-        {"Source": e.source, "Target": e.target,
-         "Rel Type": e.rel_type, "Weight": round(e.weight, 3)}
+        {"source": e.source, "target": e.target,
+         "rel_type": e.rel_type, "weight": round(e.weight, 3)}
         for e in chain.edges
     ]
 
     return json.dumps({
-        "nodes": nodes,
-        "edges": edges,
         "summary": f"{len(nodes)} nodes reached across {hops} graph hop(s)",
+        "nodes":   nodes,
+        "edges":   edges,
     }, indent=2)
 
 
-# ── Tool: feather_why ─────────────────────────────────────────────────────────
 def do_why(node_id: int, query: str) -> str:
     db = _get_db()
     if db is None:
@@ -192,7 +246,6 @@ def do_why(node_id: int, query: str) -> str:
     return json.dumps(result, indent=2)
 
 
-# ── Tool: health report ────────────────────────────────────────────────────────
 def do_health() -> str:
     db = _get_db()
     if db is None:
@@ -203,7 +256,6 @@ def do_health() -> str:
     return json.dumps(report, indent=2)
 
 
-# ── Tool: add a node ──────────────────────────────────────────────────────────
 def do_add(content: str, entity_type: str, product: str, importance: float) -> str:
     db = _get_db()
     if db is None:
@@ -220,163 +272,192 @@ def do_add(content: str, entity_type: str, product: str, importance: float) -> s
     meta.type         = feather_db.ContextType.EVENT
     meta.source       = "gradio_user"
     meta.content      = content
-    meta.namespace_id = "demo"
+    meta.namespace_id = "devtools"
     meta.entity_id    = entity_type
     meta.set_attribute("entity_type", entity_type)
     meta.set_attribute("product",     product)
     db.add(id=nid, vec=vec, meta=meta)
     db.save()
-    return json.dumps({"status": "added", "id": nid, "entity_type": entity_type, "product": product})
+    return json.dumps({
+        "status":      "added",
+        "id":          nid,
+        "entity_type": entity_type,
+        "product":     product,
+        "tip":         "Node is now live — try searching for it in the Search tab.",
+    })
 
 
-# ── Preload DB on startup ─────────────────────────────────────────────────────
+# ── Preload on startup ────────────────────────────────────────────────────────
 _get_db()
-
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 with gr.Blocks(
-    title="Feather DB — Living Context Engine Demo",
+    title="Feather DB — Living Context Engine",
     theme=gr.themes.Soft(),
-    css="""
-    .tool-output { font-family: monospace; font-size: 0.85rem; }
-    .header-block { border-left: 4px solid #6366f1; padding-left: 1rem; }
-    """,
+    css=".tool-output { font-family: monospace; font-size: 0.84rem; }",
 ) as demo:
 
     gr.HTML("""
-    <div class="header-block">
-      <h1>🪶 Feather DB — Living Context Engine</h1>
-      <p>Embedded vector database with HNSW search, typed context graph, and adaptive decay.
-         <a href="https://pypi.org/project/feather-db/" target="_blank">PyPI</a> ·
-         <a href="https://github.com/feather-store/feather" target="_blank">GitHub</a> ·
-         <code>pip install feather-db</code>
+    <div style="border-left:4px solid #6366f1;padding-left:1rem;margin-bottom:1rem">
+      <h1 style="margin:0">🪶 Feather DB — Living Context Engine</h1>
+      <p style="margin:0.4rem 0 0 0">
+        Embedded vector DB · HNSW search · typed context graph · adaptive decay · MCP server<br/>
+        <a href="https://pypi.org/project/feather-db/" target="_blank">PyPI</a> ·
+        <a href="https://github.com/feather-store/feather" target="_blank">GitHub</a> ·
+        <code>pip install feather-db</code>
       </p>
     </div>
     """)
 
     gr.Markdown("""
-    **10 seed nodes** are pre-loaded: ad performance, competitor intel, market signals, strategy briefs — across FD, CC, and MF products.
-    Try the tabs below to explore the living context engine.
-    """)
+**Demo graph:** 10 nodes representing product intelligence for an AI developer tools team —
+feature performance, competitor moves, community signals, strategy briefs, and user research.
+8 typed causal edges connect them (`contradicts`, `supports`, `derived_from`, `references`).
+""")
 
     with gr.Tabs():
 
-        # ── Tab 1: Semantic Search ────────────────────────────────────────────
+        # ── Search ────────────────────────────────────────────────────────────
         with gr.TabItem("🔍 Semantic Search"):
-            gr.Markdown("Vector similarity search. Finds nodes by meaning, not keywords.")
+            gr.Markdown("Find nodes by **meaning**, not keywords. Filtered by product or entity type.")
             with gr.Row():
                 with gr.Column(scale=2):
-                    search_query   = gr.Textbox(label="Query", placeholder="Why is our FD CTR dropping?")
-                    search_k       = gr.Slider(1, 10, value=5, step=1, label="Top-k results")
-                    search_product = gr.Dropdown(["All","FD","CC","MF"], value="All", label="Product filter")
-                    search_btn     = gr.Button("Search", variant="primary")
+                    s_query   = gr.Textbox(label="Query",
+                                           placeholder="Why is user onboarding failing?")
+                    s_k       = gr.Slider(1, 10, value=5, step=1, label="Top-k")
+                    s_product = gr.Dropdown(["All","Editor","CLI","SDK","Cloud"],
+                                            value="All", label="Product filter")
+                    s_btn     = gr.Button("Search", variant="primary")
                 with gr.Column(scale=3):
-                    search_out = gr.Code(label="Results (JSON)", language="json", elem_classes=["tool-output"])
+                    s_out = gr.Code(label="Results", language="json",
+                                    elem_classes=["tool-output"])
 
             gr.Examples(
                 examples=[
-                    ["Why is our FD CTR dropping?",   5, "FD"],
-                    ["Competitor threats this month",  5, "All"],
-                    ["Best performing ad creative",    5, "All"],
-                    ["What audience converts best?",   5, "FD"],
+                    ["Why is user onboarding failing?",         5, "All"],
+                    ["What competitor moves should we watch?",  5, "All"],
+                    ["Which features drive retention?",         5, "SDK"],
+                    ["What does the community want most?",      5, "Cloud"],
+                    ["Where should we invest in the editor?",   5, "Editor"],
                 ],
-                inputs=[search_query, search_k, search_product],
+                inputs=[s_query, s_k, s_product],
             )
-            search_btn.click(do_search, [search_query, search_k, search_product], search_out)
+            s_btn.click(do_search, [s_query, s_k, s_product], s_out)
 
-        # ── Tab 2: Context Chain ──────────────────────────────────────────────
+        # ── Context Chain ─────────────────────────────────────────────────────
         with gr.TabItem("🕸️ Context Chain"):
             gr.Markdown(
-                "Two-phase retrieval: find seed nodes by vector similarity (hop=0), "
-                "then expand outward over typed graph edges (BFS). "
-                "Great for tracing **root causes** — e.g. start from a CTR drop and surface the competitor event that caused it."
+                "**Two-phase retrieval** — vector search finds seed nodes (hop 0), "
+                "then BFS expands outward over typed graph edges.\n\n"
+                "Use this to trace root causes: *start from a symptom, surface the events that explain it.*"
             )
             with gr.Row():
                 with gr.Column(scale=2):
-                    chain_query = gr.Textbox(label="Seed query", placeholder="FD CTR underperforming")
-                    chain_k     = gr.Slider(1, 5, value=3, step=1, label="Seed nodes (k)")
-                    chain_hops  = gr.Slider(1, 3, value=2, step=1, label="Graph hops")
-                    chain_btn   = gr.Button("Run Context Chain", variant="primary")
+                    c_query = gr.Textbox(label="Seed query",
+                                         placeholder="CLI adoption is slow")
+                    c_k     = gr.Slider(1, 5, value=3, step=1, label="Seed nodes (k)")
+                    c_hops  = gr.Slider(1, 3, value=2, step=1, label="Graph hops")
+                    c_btn   = gr.Button("Run Context Chain", variant="primary")
                 with gr.Column(scale=3):
-                    chain_out = gr.Code(label="Chain result (JSON)", language="json", elem_classes=["tool-output"])
+                    c_out = gr.Code(label="Chain result", language="json",
+                                    elem_classes=["tool-output"])
 
             gr.Examples(
                 examples=[
-                    ["FD CTR underperforming",     3, 2],
-                    ["Budget Day competitor moves", 3, 2],
-                    ["Which strategy drives ROAS?", 3, 1],
+                    ["CLI adoption is slow",                    3, 2],
+                    ["Why is the competitor threat serious?",   3, 2],
+                    ["What drives long-term user retention?",   3, 2],
+                    ["Why do enterprise deals stall?",          3, 1],
                 ],
-                inputs=[chain_query, chain_k, chain_hops],
+                inputs=[c_query, c_k, c_hops],
             )
-            chain_btn.click(do_context_chain, [chain_query, chain_k, chain_hops], chain_out)
+            c_btn.click(do_context_chain, [c_query, c_k, c_hops], c_out)
 
-        # ── Tab 3: Why Retrieved ──────────────────────────────────────────────
+        # ── Why Retrieved ─────────────────────────────────────────────────────
         with gr.TabItem("🔬 Why Retrieved?"):
             gr.Markdown(
-                "Score breakdown for a specific node — shows exactly why it would (or wouldn't) "
-                "surface for your query: **similarity**, **stickiness** (recall bonus), **recency**, **importance**, **confidence**, and the final formula."
+                "Score breakdown for any node — **similarity**, **stickiness** (recall bonus), "
+                "**recency** (adaptive decay), **importance**, **confidence**, and the full formula.\n\n"
+                "Use to understand and debug retrieval decisions."
             )
             with gr.Row():
                 with gr.Column(scale=2):
-                    why_id    = gr.Number(label="Node ID (1–10)", value=4, precision=0)
-                    why_query = gr.Textbox(label="Query", placeholder="FD creative performance")
-                    why_btn   = gr.Button("Explain", variant="primary")
+                    w_id    = gr.Number(label="Node ID (1–10)", value=4, precision=0)
+                    w_query = gr.Textbox(label="Query",
+                                         placeholder="onboarding drop-off")
+                    w_btn   = gr.Button("Explain", variant="primary")
                 with gr.Column(scale=3):
-                    why_out = gr.Code(label="Score breakdown (JSON)", language="json", elem_classes=["tool-output"])
+                    w_out = gr.Code(label="Score breakdown", language="json",
+                                    elem_classes=["tool-output"])
 
             gr.Examples(
                 examples=[
-                    [4,  "creative fatigue CTR drop"],
-                    [2,  "competitor FD rate"],
-                    [6,  "FD video strategy ROAS"],
-                    [9,  "best audience segment"],
+                    [4,  "onboarding drop-off time to value"],
+                    [2,  "competitor launch editor feature"],
+                    [9,  "retention power users habit"],
+                    [7,  "offline mode enterprise security"],
+                    [6,  "strategy brief Q2 auth friction"],
                 ],
-                inputs=[why_id, why_query],
+                inputs=[w_id, w_query],
             )
-            why_btn.click(do_why, [why_id, why_query], why_out)
+            w_btn.click(do_why, [w_id, w_query], w_out)
 
-        # ── Tab 4: Health Report ──────────────────────────────────────────────
+        # ── Health ────────────────────────────────────────────────────────────
         with gr.TabItem("🩺 Graph Health"):
             gr.Markdown(
-                "Snapshot of the knowledge graph: tier distribution (hot/warm/cold), "
-                "orphan nodes (no edges), expired TTL count, recall histogram, avg importance/confidence."
+                "Snapshot of the knowledge graph: **hot / warm / cold** tier distribution, "
+                "orphan nodes, expired TTL count, recall histogram, avg importance and confidence."
             )
-            health_btn = gr.Button("Run Health Check", variant="primary")
-            health_out = gr.Code(label="Health report (JSON)", language="json", elem_classes=["tool-output"])
-            health_btn.click(do_health, [], health_out)
+            h_btn = gr.Button("Run Health Check", variant="primary")
+            h_out = gr.Code(label="Health report", language="json",
+                            elem_classes=["tool-output"])
+            h_btn.click(do_health, [], h_out)
 
-        # ── Tab 5: Add Intel ──────────────────────────────────────────────────
+        # ── Add Intel ─────────────────────────────────────────────────────────
         with gr.TabItem("➕ Add Intel"):
-            gr.Markdown("Ingest a new intelligence node into the live graph. It becomes immediately searchable.")
+            gr.Markdown(
+                "Ingest a new intelligence node into the live graph. "
+                "It becomes **immediately searchable** — try adding something then switching to Search."
+            )
             with gr.Row():
                 with gr.Column():
-                    add_content     = gr.Textbox(label="Content", lines=3,
-                                                  placeholder="Competitor X launched a 9% FD rate targeting senior segment.")
-                    add_entity_type = gr.Dropdown(
-                        ["competitor_intel","ad_performance","market_signal",
-                         "strategy_intel","creative_insight","channel_insight","audience_insight"],
-                        value="competitor_intel", label="Entity Type")
-                    add_product     = gr.Dropdown(["FD","CC","MF","Bond"], value="FD", label="Product")
-                    add_importance  = gr.Slider(0.0, 1.0, value=0.85, step=0.05, label="Importance")
-                    add_btn         = gr.Button("Add to Graph", variant="primary")
+                    a_content = gr.Textbox(
+                        label="Content", lines=3,
+                        placeholder="Competitor Y just open-sourced their SDK. "
+                                    "10k stars overnight. Targets our developer acquisition funnel.",
+                    )
+                    a_etype = gr.Dropdown(
+                        ["competitor_intel", "feature_performance", "user_feedback",
+                         "strategy_brief", "market_signal", "community_signal", "channel_insight"],
+                        value="competitor_intel", label="Entity Type",
+                    )
+                    a_product    = gr.Dropdown(["Editor","CLI","SDK","Cloud"],
+                                               value="SDK", label="Product")
+                    a_importance = gr.Slider(0.0, 1.0, value=0.85, step=0.05,
+                                             label="Importance")
+                    a_btn = gr.Button("Add to Graph", variant="primary")
                 with gr.Column():
-                    add_out = gr.Code(label="Result (JSON)", language="json", elem_classes=["tool-output"])
+                    a_out = gr.Code(label="Result", language="json",
+                                    elem_classes=["tool-output"])
 
-            add_btn.click(do_add, [add_content, add_entity_type, add_product, add_importance], add_out)
+            a_btn.click(do_add, [a_content, a_etype, a_product, a_importance], a_out)
 
     gr.Markdown("""
-    ---
-    **Feather DB v0.6.0** — embedded vector database + living context engine · MIT License
+---
+**Connect Feather DB to any LLM in 5 lines:**
+```python
+pip install feather-db
 
-    ```python
-    pip install feather-db
+from feather_db.integrations import ClaudeConnector
+conn   = ClaudeConnector(db_path="my.feather", dim=3072, embedder=embed_fn)
+result = conn.run_loop(client,
+    messages=[{"role": "user", "content": "Why is onboarding drop-off so high?"}],
+    model="claude-opus-4-6")
+```
+Works with **Claude · OpenAI · Gemini · Groq · Mistral · Ollama · MCP (Claude Desktop, Cursor)**
 
-    from feather_db.integrations import ClaudeConnector
-    conn = ClaudeConnector(db_path="my.feather", dim=3072, embedder=embed_fn)
-    result = conn.run_loop(client, messages=[{"role":"user","content":"Why is CTR dropping?"}])
-    ```
-    """)
-
+[PyPI](https://pypi.org/project/feather-db/) · [GitHub](https://github.com/feather-store/feather) · [Integrations Guide](https://github.com/feather-store/feather/blob/main/docs/integrations.md) · [Hawky.ai](https://hawky.ai)
+""")
 
 if __name__ == "__main__":
     demo.launch()
