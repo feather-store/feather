@@ -302,6 +302,8 @@ with gr.Blocks(
       <h1 style="margin:0">🪶 Feather DB — Living Context Engine</h1>
       <p style="margin:0.4rem 0 0 0">
         Embedded vector DB · HNSW search · typed context graph · adaptive decay · MCP server<br/>
+        <a href="https://www.getfeather.store/" target="_blank">getfeather.store</a> ·
+        <a href="https://hawky.ai" target="_blank">Hawky.ai</a> ·
         <a href="https://pypi.org/project/feather-db/" target="_blank">PyPI</a> ·
         <a href="https://github.com/feather-store/feather" target="_blank">GitHub</a> ·
         <code>pip install feather-db</code>
@@ -456,7 +458,7 @@ result = conn.run_loop(client,
 ```
 Works with **Claude · OpenAI · Gemini · Groq · Mistral · Ollama · MCP (Claude Desktop, Cursor)**
 
-[PyPI](https://pypi.org/project/feather-db/) · [GitHub](https://github.com/feather-store/feather) · [Integrations Guide](https://github.com/feather-store/feather/blob/main/docs/integrations.md) · [Hawky.ai](https://hawky.ai)
+[getfeather.store](https://www.getfeather.store/) · [Hawky.ai](https://hawky.ai) · [PyPI](https://pypi.org/project/feather-db/) · [GitHub](https://github.com/feather-store/feather) · [Integrations Guide](https://github.com/feather-store/feather/blob/main/docs/integrations.md)
 """)
 
 if __name__ == "__main__":
