@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.0] — 2026-03-21
+
+### Added — Self-Aligned Context Engine (Phase 1)
+
+#### `feather_db.providers` — LLM Provider Abstraction
+- **`LLMProvider`** (ABC) — minimal `complete(messages, max_tokens, temperature) -> str` interface shared by all providers
+- **`ClaudeProvider`** — Anthropic Claude via `anthropic` SDK. Default: `claude-haiku-4-5-20251001`. Separates `system` from conversation messages per Anthropic API spec.
+- **`OpenAIProvider`** — OpenAI Chat Completions API and any compatible endpoint (Groq, Mistral, Together AI, vLLM, LM Studio). `json_mode=True` sets `response_format=json_object`.
+- **`OllamaProvider`** — Ollama local server. Subclass of `OpenAIProvider`; default `base_url="http://localhost:11434/v1"`. No API key required.
+- **`GeminiProvider`** — Google Gemini via `google-genai` SDK. Uses `response_mime_type="application/json"` for native JSON mode.
+- All providers default to `temperature=0.0` for deterministic JSON output.
+
+#### `feather_db.engine` — ContextEngine
+- **`ContextEngine`** — self-aligned ingestion pipeline that wraps `DB` with LLM-powered classification.
+- **`ingest(text, hint) -> int`** — 10-step pipeline: embed → sample context → LLM classify → apply hint → store → link → episode → watch triggers → contradiction check → auto-save.
+- **`ingest_batch(texts, hints) -> list[int]`** — batch ingestion helper.
+- LLM JSON schema: `{entity_type, importance, confidence, ttl, namespace, episode_id, suggested_links}`
+- **`_heuristic_classify(text)`** — built-in keyword-based fallback; activated when `provider=None` or LLM fails. Fully offline, zero latency.
+- 5-stage JSON extraction — direct parse → strip code fences → balanced brace scan → trailing comma repair → heuristic fallback. Robust on small/local models.
+- Node ID: SHA-256 of `text[:200] + timestamp + PID` mod 2^50.
+- Integrates with `WatchManager`, `EpisodeManager`, `ContradictionDetector` (all optional).
+
+#### New exports in `feather_db`
+- `LLMProvider`, `ClaudeProvider`, `OpenAIProvider`, `OllamaProvider`, `GeminiProvider`, `ContextEngine`
+
+#### New example
+- `examples/context_engine_demo.py` — auto-detects provider from env vars (Claude → OpenAI → Gemini → Ollama → heuristic), ingests 6 records, runs semantic search and context chain.
+
+### Changed
+- `feather_db.__version__` → `"0.7.0"`
+- `README.md` — updated to v0.7.0 architecture; added Self-Aligned Context Engine, LLM agent connectors, MCP server, LangChain/LlamaIndex sections.
+
+---
+
 ## [0.6.1] — 2026-03-14
 
 ### Fixed

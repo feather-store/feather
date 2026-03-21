@@ -19,6 +19,16 @@ from .integrations import (
     GeminiEmbedder,
 )
 
+# v0.7.0: Self-Aligned Context Engine
+from .providers import (
+    LLMProvider,
+    ClaudeProvider,
+    OpenAIProvider,
+    OllamaProvider,
+    GeminiProvider,
+)
+from .engine import ContextEngine
+
 __all__ = [
     "DB", "ContextType", "Metadata", "ScoringConfig",
     "Edge", "IncomingEdge",
@@ -32,5 +42,9 @@ __all__ = [
     # Integrations
     "ClaudeConnector", "OpenAIConnector",
     "GeminiConnector", "GeminiEmbedder",
+    # v0.7.0 Self-Aligned Context Engine
+    "LLMProvider", "ClaudeProvider", "OpenAIProvider",
+    "OllamaProvider", "GeminiProvider",
+    "ContextEngine",
 ]
-__version__ = "0.6.0"
+__version__ = "0.7.0"
