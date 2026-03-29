@@ -67,9 +67,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #controls button { background: #2d3748; border: 1px solid #4a5568; border-radius: 6px; color: #e2e8f0; padding: 4px 12px; font-size: 12px; cursor: pointer; }
   #controls button:hover { background: #4a5568; }
 
-  #main { display: flex; flex: 1; overflow: hidden; }
-  #canvas-wrap { flex: 1; position: relative; overflow: hidden; }
-  svg { width: 100%; height: 100%; }
+  #main { display: flex; overflow: hidden; }
+  #canvas-wrap { flex: 1; position: relative; overflow: hidden; background: #0f1117; height: 620px; min-height: 400px; }
+  svg { width: 100%; height: 100%; display: block; background: #0f1117; }
 
   #sidebar { width: 280px; background: #1a1d27; border-left: 1px solid #2d3748; display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0; }
   #sidebar-title { padding: 12px 14px; font-size: 12px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px; border-bottom: 1px solid #2d3748; }
