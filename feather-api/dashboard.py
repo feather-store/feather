@@ -20,7 +20,7 @@ import requests
 # ─────────────────────────────────────────────────────────────────────────────
 # Config — env vars or UI overrides
 # ─────────────────────────────────────────────────────────────────────────────
-DEFAULT_BASE = os.getenv("FEATHER_API_BASE", "http://feather-api:8000")
+DEFAULT_BASE = os.getenv("FEATHER_API_BASE", "http://localhost:8000")
 DEFAULT_KEY  = os.getenv("FEATHER_API_KEY",  "feather-9ad2c644da0d76a253b9326bd4d15d16")
 DEFAULT_NS   = os.getenv("FEATHER_NS",       "demo")
 DIM          = int(os.getenv("FEATHER_DIM",  "768"))
@@ -572,8 +572,11 @@ with gr.Blocks(title="Feather DB Dashboard") as app:
                           inputs=[cfg_base, cfg_key, raw_method, raw_path, raw_body],
                           outputs=raw_out)
 
-app.launch(
-    server_name="0.0.0.0",
-    server_port=int(os.getenv("DASHBOARD_PORT", "7863")),
-    share=False,
-)
+# When run directly: standalone mode
+# When imported: `app` is the gr.Blocks instance, mounted by FastAPI main.py
+if __name__ == "__main__":
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.getenv("DASHBOARD_PORT", "7863")),
+        share=False,
+    )
