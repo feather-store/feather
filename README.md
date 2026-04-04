@@ -435,6 +435,29 @@ SIMD (AVX2/AVX512) optimizations are available in `space_l2.h`. Enable with `-DU
 
 ---
 
+## Cloud Deployment (Azure / Docker)
+
+Feather DB ships with a production-ready FastAPI wrapper and Gradio management dashboard you can deploy on any Linux VM.
+
+```bash
+git clone https://github.com/feather-store/feather.git
+cd feather
+export FEATHER_API_KEY="your-secret-key"
+docker compose -f feather-api/docker-compose.yml up -d --build
+```
+
+| URL | Description |
+|-----|-------------|
+| `http://<VM_IP>:8000/health` | Health check |
+| `http://<VM_IP>:8000/docs` | Swagger / OpenAPI |
+| `http://<VM_IP>:8000/dashboard` | Management Dashboard UI |
+
+**Full Azure deployment guide → [`docs/deploy-azure.md`](docs/deploy-azure.md)**
+
+> Data is stored in a Docker named volume (`feather-data → /data`) and persists across restarts and rebuilds.
+
+---
+
 ## Examples
 
 | File | Description |
