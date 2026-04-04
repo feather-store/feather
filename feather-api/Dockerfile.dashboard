@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    gradio==5.9.1 \
+    plotly \
+    requests \
+    numpy
+
+COPY examples/feather_dashboard.py /app/feather_dashboard.py
+
+ENV FEATHER_API_BASE=http://feather-api:8000
+ENV DASHBOARD_PORT=7863
+
+EXPOSE 7863
+
+CMD ["python", "feather_dashboard.py"]
