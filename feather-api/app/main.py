@@ -270,6 +270,60 @@ def link_records(namespace: str, record_id: int, req: LinkRequest):
     return {"from_id": record_id, "to_id": req.to_id, "linked": True}
 
 
+@app.delete("/v1/{namespace}/records/{record_id}", tags=["records"],
+            dependencies=[Depends(verify_api_key)])
+def delete_record(namespace: str, record_id: int):
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    meta = db.get_metadata(record_id)
+    if meta is None:
+        raise HTTPException(404, f"Record {record_id} not found")
+
+    # HNSW doesn't support hard deletion — soft-delete: zero importance + mark flag
+    meta.importance = 0.0
+    meta.set_attribute("_deleted", "true")
+    with manager.lock(namespace):
+        db.update_metadata(record_id, meta)
+    return {"id": record_id, "deleted": True}
+
+
+@app.get("/v1/{namespace}/records", tags=["records"],
+         dependencies=[Depends(verify_api_key)])
+def list_records(namespace: str, k: int = 50, modality: str = "text"):
+    """Sample up to k records by searching with a spread of random vectors."""
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    import random, math
+    seen, results = set(), []
+    for seed in range(8):
+        rng = random.Random(seed * 997)
+        dim = db.dim()
+        vec = [rng.gauss(0, 1) for _ in range(dim)]
+        norm = math.sqrt(sum(x*x for x in vec)) or 1
+        vec = [x / norm for x in vec]
+        try:
+            raw = db.search(vec, k=k, modality=modality)
+            for r in raw:
+                if r.id not in seen:
+                    seen.add(r.id)
+                    m = r.metadata
+                    if m.get_attribute("_deleted") != "true":
+                        results.append(SearchResultItem(
+                            id=r.id, score=r.score,
+                            metadata=_meta_to_model(m)
+                        ))
+        except Exception:
+            break
+
+    return SearchResponse(results=results[:k], count=len(results[:k]))
+
+
 @app.post("/v1/{namespace}/save", tags=["admin"], dependencies=[Depends(verify_api_key)])
 def save_namespace(namespace: str):
     try:
