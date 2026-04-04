@@ -35,8 +35,12 @@ RUN pip install --no-cache-dir /tmp/wheels/*.whl numpy && rm -rf /tmp/wheels
 COPY feather-api/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy API source
+# Install dashboard dependencies
+RUN pip install --no-cache-dir gradio==5.9.1 plotly requests
+
+# Copy API source + dashboard
 COPY feather-api/app /app/app
+COPY feather-api/dashboard.py /app/dashboard.py
 
 # Data directory (override with -v /host/data:/data)
 RUN mkdir -p /data

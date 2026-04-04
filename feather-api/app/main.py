@@ -29,6 +29,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import JSONResponse
+import gradio as gr
 
 import feather_db
 from feather_db import Metadata, ContextType, ScoringConfig
@@ -68,6 +69,14 @@ app = FastAPI(
     version=feather_db.__version__,
     lifespan=lifespan,
 )
+
+# ─────────────────────────────────────────────
+# Mount Gradio dashboard at /dashboard
+# ─────────────────────────────────────────────
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+from dashboard import app as _dashboard_blocks
+app = gr.mount_gradio_app(app, _dashboard_blocks, path="/dashboard")
 
 # ─────────────────────────────────────────────
 # Auth middleware
