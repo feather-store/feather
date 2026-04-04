@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir \
     requests \
     numpy
 
-COPY examples/feather_dashboard.py /app/feather_dashboard.py
+COPY feather-api/dashboard.py /app/feather_dashboard.py
 
 ENV FEATHER_API_BASE=http://feather-api:8000
 ENV DASHBOARD_PORT=7863
