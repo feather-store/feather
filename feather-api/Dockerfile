@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . /build/feather_source
 
 WORKDIR /build/feather_source
-RUN pip install --upgrade pip setuptools wheel pybind11 && \
-    python setup.py bdist_wheel
+RUN pip install --upgrade pip setuptools wheel pybind11 build && \
+    pip wheel --no-build-isolation --no-deps -w dist .
 
 # ──────────────────────────────────────────────
 # Stage 2 — Runtime image
@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install feather_db from wheel built in stage 1
 COPY --from=builder /build/feather_source/dist/*.whl /tmp/wheels/
-RUN pip install --no-cache-dir /tmp/wheels/*.whl && rm -rf /tmp/wheels
+RUN pip install --no-cache-dir /tmp/wheels/*.whl numpy && rm -rf /tmp/wheels
 
 # Install API dependencies
 COPY feather-api/requirements.txt /app/requirements.txt
