@@ -76,9 +76,7 @@ app = FastAPI(
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 from dashboard import app as _dashboard_blocks
-from dashboard import CSS as _dashboard_css
-app = gr.mount_gradio_app(app, _dashboard_blocks, path="/dashboard",
-                          css=_dashboard_css)
+app = gr.mount_gradio_app(app, _dashboard_blocks, path="/dashboard")
 
 # ─────────────────────────────────────────────
 # Auth middleware
