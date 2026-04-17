@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.0] — 2026-04-04
+
+### Added — BM25 Hybrid Search (Phase 6)
+
+#### C++ Core (`include/feather.h`)
+- **BM25 inverted index** — in-memory posting list (`term → [{doc_id, term_freq}]`) with document length tracking and adaptive `avg_dl` computation.
+- **`tokenize(text)`** — static C++ tokenizer: lowercase, split on non-alphanumeric, stop-word filtered (40 common English words), minimum 2-char tokens.
+- **`keyword_search(query, k, filter)`** — Okapi BM25 scoring (`k1=1.2, b=0.75`). IDF formula: `log((N - n_t + 0.5) / (n_t + 0.5) + 1)`. Fully filter-aware. Returns ranked `SearchResult` list.
+- **`hybrid_search(vec, query, k, rrf_k, filter, scoring, modality)`** — merges dense vector search and BM25 via **Reciprocal Rank Fusion** (`score = Σ 1/(rrf_k + rank + 1)`, default `rrf_k=60`). Same RRF formula used by Qdrant, Weaviate, Elasticsearch.
+- BM25 index auto-built from `metadata_store_` on `load()` — fully **backward-compatible** with v3/v4/v5/v6 `.feather` files.
+- `add()` and `update_metadata()` both auto-update the inverted index on content changes.
+
+#### Python Bindings (`bindings/feather.cpp`)
+- `db.keyword_search(query, k, filter)` → `list[SearchResult]`
+- `db.hybrid_search(vec, query, k, rrf_k, filter, scoring, modality)` → `list[SearchResult]`
+
+#### REST API (`feather-api/`)
+- `POST /v1/{namespace}/keyword_search` — BM25 search with full filter support
+- `POST /v1/{namespace}/hybrid_search` — hybrid BM25+vector search with RRF
+
+---
+
 ## [0.7.0] — 2026-03-21
 
 ### Added — Self-Aligned Context Engine (Phase 1)
