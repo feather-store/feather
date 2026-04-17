@@ -1,6 +1,6 @@
 [package]
 name = "feather-db-cli"
-version = "0.6.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["Hawky.ai Team <hello@hawky.ai>"]
 description = "Command-line interface for Feather — embedded vector database + living context engine"

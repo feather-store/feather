@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feather-db"
-version = "0.7.0"
+version = "0.8.0"
 description = "Embedded vector database + living context engine — multimodal pockets, context graph, adaptive decay, MCP server"
 readme = "README.md"
 requires-python = ">=3.8"

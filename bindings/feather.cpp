@@ -202,6 +202,34 @@ PYBIND11_MODULE(core, m) {
         }, py::arg("id"), py::arg("modality") = "text")
         .def("get_all_ids", &feather::DB::get_all_ids, py::arg("modality") = "text")
 
+        // -- BM25 keyword search --
+        .def("keyword_search", [](feather::DB& db, const std::string& query, size_t k,
+                                   feather::SearchFilter* filter) {
+            return db.keyword_search(query, k, filter);
+        }, py::arg("query"), py::arg("k") = 10, py::arg("filter") = nullptr,
+           "BM25 keyword search over content field. Returns list of SearchResult.")
+
+        // -- Hybrid search: BM25 + vector via RRF --
+        .def("hybrid_search", [](feather::DB& db, py::array_t<float> q,
+                                   const std::string& query, size_t k,
+                                   size_t rrf_k,
+                                   feather::SearchFilter* filter,
+                                   feather::ScoringConfig* scoring,
+                                   const std::string& modality) {
+            py::buffer_info buf = q.request();
+            std::vector<float> query_vec(static_cast<float*>(buf.ptr),
+                                         static_cast<float*>(buf.ptr) + buf.size);
+            return db.hybrid_search(query_vec, query, k, rrf_k, filter, scoring, modality);
+        }, py::arg("vec"), py::arg("query"), py::arg("k") = 10,
+           py::arg("rrf_k") = 60, py::arg("filter") = nullptr,
+           py::arg("scoring") = nullptr, py::arg("modality") = "text",
+           "Hybrid search: BM25 + dense vector merged via Reciprocal Rank Fusion (RRF).")
+
+        // -- Compact (rebuild HNSW without soft-deleted records) --
+        .def("compact", &feather::DB::compact,
+             "Rebuild HNSW indices removing soft-deleted (_deleted=true, importance=0) records. "
+             "Returns count of records removed.")
+
         // -- Memory lifecycle --
         .def("forget",         &feather::DB::forget,         py::arg("id"),
              "Soft-delete: remove from search + blank content. Graph shell preserved.")

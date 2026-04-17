@@ -70,6 +70,43 @@ class SearchResponse(BaseModel):
     count: int
 
 
+class KeywordSearchRequest(BaseModel):
+    query: str
+    k: int = 10
+    # Filters (same as SearchRequest)
+    namespace_id: Optional[str] = None
+    entity_id: Optional[str] = None
+    attributes_match: Optional[Dict[str, str]] = None
+    source: Optional[str] = None
+    source_prefix: Optional[str] = None
+    importance_gte: Optional[float] = None
+    tags_contains: Optional[List[str]] = None
+    timestamp_after: Optional[int] = None
+    timestamp_before: Optional[int] = None
+
+
+class HybridSearchRequest(BaseModel):
+    vector: List[float]
+    query: str
+    k: int = 10
+    rrf_k: int = 60
+    modality: str = "text"
+    # Filters
+    namespace_id: Optional[str] = None
+    entity_id: Optional[str] = None
+    attributes_match: Optional[Dict[str, str]] = None
+    source: Optional[str] = None
+    source_prefix: Optional[str] = None
+    importance_gte: Optional[float] = None
+    tags_contains: Optional[List[str]] = None
+    timestamp_after: Optional[int] = None
+    timestamp_before: Optional[int] = None
+    # Scoring
+    scoring_half_life: Optional[float] = None
+    scoring_weight: Optional[float] = None
+    scoring_min: Optional[float] = None
+
+
 class LinkRequest(BaseModel):
     to_id: int
 

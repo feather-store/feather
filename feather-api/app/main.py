@@ -38,6 +38,7 @@ from feather_db.core import SearchFilter
 from .db_manager import DBManager
 from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
+    KeywordSearchRequest, HybridSearchRequest,
     LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest,
     MetadataOut, NamespaceStats, HealthResponse,
 )
@@ -301,36 +302,72 @@ def delete_record(namespace: str, record_id: int):
 
 @app.get("/v1/{namespace}/records", tags=["records"],
          dependencies=[Depends(verify_api_key)])
-def list_records(namespace: str, k: int = 50, modality: str = "text"):
-    """Sample up to k records by searching with a spread of random vectors."""
+def list_records(namespace: str, limit: int = 50, after: int = 0, modality: str = "text"):
+    """Cursor-based record listing. Returns up to `limit` records with id > `after`."""
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
-    import random, math
-    seen, results = set(), []
-    for seed in range(8):
-        rng = random.Random(seed * 997)
-        dim = db.dim()
-        vec = [rng.gauss(0, 1) for _ in range(dim)]
-        norm = math.sqrt(sum(x*x for x in vec)) or 1
-        vec = [x / norm for x in vec]
-        try:
-            raw = db.search(vec, k=k, modality=modality)
-            for r in raw:
-                if r.id not in seen:
-                    seen.add(r.id)
-                    m = r.metadata
-                    if m.get_attribute("_deleted") != "true":
-                        results.append(SearchResultItem(
-                            id=r.id, score=r.score,
-                            metadata=_meta_to_model(m)
-                        ))
-        except Exception:
-            break
+    all_ids = sorted(db.get_all_ids(modality=modality))
+    page_ids = [i for i in all_ids if i > after][:limit]
 
-    return SearchResponse(results=results[:k], count=len(results[:k]))
+    results = []
+    for record_id in page_ids:
+        meta = db.get_metadata(record_id)
+        if meta is None:
+            continue
+        if meta.get_attribute("_deleted") == "true":
+            continue
+        results.append(SearchResultItem(
+            id=record_id, score=float(meta.importance),
+            metadata=_meta_to_model(meta)
+        ))
+
+    next_cursor = page_ids[-1] if page_ids else after
+    return {
+        "results": results,
+        "count": len(results),
+        "next_cursor": next_cursor,
+        "has_more": len(page_ids) == limit,
+    }
+
+
+@app.post("/v1/{namespace}/keyword_search", response_model=SearchResponse, tags=["search"],
+          dependencies=[Depends(verify_api_key)])
+def keyword_search(namespace: str, req: KeywordSearchRequest):
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    sf = _build_filter(req)
+    raw = db.keyword_search(req.query, k=req.k, filter=sf)
+    items = [
+        SearchResultItem(id=r.id, score=r.score, metadata=_meta_to_model(r.metadata))
+        for r in raw
+    ]
+    return SearchResponse(results=items, count=len(items))
+
+
+@app.post("/v1/{namespace}/hybrid_search", response_model=SearchResponse, tags=["search"],
+          dependencies=[Depends(verify_api_key)])
+def hybrid_search(namespace: str, req: HybridSearchRequest):
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    sf = _build_filter(req)
+    sc = _build_scoring(req)
+    raw = db.hybrid_search(req.vector, req.query, k=req.k,
+                            rrf_k=req.rrf_k, filter=sf, scoring=sc,
+                            modality=req.modality)
+    items = [
+        SearchResultItem(id=r.id, score=r.score, metadata=_meta_to_model(r.metadata))
+        for r in raw
+    ]
+    return SearchResponse(results=items, count=len(items))
 
 
 @app.post("/v1/{namespace}/save", tags=["admin"], dependencies=[Depends(verify_api_key)])
