@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>featherdb_paper</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <link rel="stylesheet" href="/Users/apple/Documents/feather/docs/arxiv_style.css" />
+</head>
+<body>
+<h1 id="sec:intro">Introduction</h1>
+<p>The emergence of large language models (LLMs) as the foundation of
+production software has created a new class of infrastructure
+requirement: <em>AI application memory</em>. Unlike traditional
+databases optimised for structured data retrieval, AI applications
+require (i) semantic search by meaning rather than exact match,
+(ii) temporal relevance that weights recent or frequently confirmed
+knowledge higher, (iii) relational context to follow chains of related
+knowledge, and (iv) operational simplicity for edge, serverless, or
+single-file deployments.</p>
+<p>Existing approaches partition these concerns across multiple
+systems—a vector database <span class="citation"
+data-cites="pinecone2021 chroma2022 weaviate2021"></span> for semantic
+search, a key-value store for recency metadata, and a graph database for
+relational context—introducing synchronisation complexity, inter-process
+latency, and operational overhead.</p>
+<p>We argue these concerns are not separable: they are facets of a
+single unified problem—<em>how does an AI application recall the right
+context at the right time?</em>—and address it with a single embedded
+system.</p>
+<h4 id="contributions.">Contributions.</h4>
+<ol>
+<li><p><strong>Adaptive Temporal Decay (ATD)</strong>: A scoring formula
+coupling time-decay with access-frequency stickiness, preventing
+important memories from fading while dormant knowledge recedes
+naturally.</p></li>
+<li><p><strong>Embedded Hybrid Retrieval</strong>: BM25 inverted index
+and HNSW dense vector index fused via RRF inside a single process, with
+no external synchronisation, query planning, or schema
+definition.</p></li>
+<li><p><strong>Context Chain</strong>: A single-call operation combining
+vector ANN search with typed graph BFS expansion for multi-hop
+relational context retrieval.</p></li>
+<li><p><strong>Production Hardening for Embedded AI</strong>:
+Write-ahead log, atomic saves, per-instance mutex, and soft-delete with
+index compaction.</p></li>
+</ol>
+<h1 id="sec:related">Background and Related Work</h1>
+<h2 id="vector-databases">Vector Databases</h2>
+<p>FAISS <span class="citation" data-cites="johnson2019"></span>
+provides highly optimised ANNS indices as a library but offers no
+persistence, metadata, or query composability. Chroma <span
+class="citation" data-cites="chroma2022"></span>, Qdrant <span
+class="citation" data-cites="qdrant2021"></span>, and Weaviate <span
+class="citation" data-cites="weaviate2021"></span> build on similar
+indices with REST APIs and persistence but operate as server processes.
+None implement temporal scoring as a first-class primitive.</p>
+<h2 id="hnsw">HNSW</h2>
+<p>Hierarchical Navigable Small World graphs <span class="citation"
+data-cites="malkov2018"></span> provide
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mo stretchy="false" form="prefix">(</mo><mrow><mi mathvariant="normal">log</mi><mo>&#8289;</mo></mrow><mi>n</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">O(\log n)</annotation></semantics></math>
+query complexity with high recall by constructing a multi-layer
+proximity graph traversed from coarse to fine resolution. We use the
+hnswlib implementation <span class="citation"
+data-cites="hnswlib"></span> with
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>=</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">M=16</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>e</mi><mi>f</mi><mi>_</mi><mtext mathvariant="normal">construction</mtext><mo>=</mo><mn>200</mn></mrow><annotation encoding="application/x-tex">ef\_\text{construction}=200</annotation></semantics></math>.</p>
+<h2 id="bm25">BM25</h2>
+<p>Okapi BM25 <span class="citation" data-cites="robertson2009"></span>
+is a probabilistic term-frequency ranking function:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">BM25</mtext><mo stretchy="false" form="prefix">(</mo><mi>d</mi><mo>,</mo><mi>Q</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><munder><mo>∑</mo><mrow><msub><mi>q</mi><mi>i</mi></msub><mo>∈</mo><mi>Q</mi></mrow></munder><mtext mathvariant="normal">IDF</mtext><mo stretchy="false" form="prefix">(</mo><msub><mi>q</mi><mi>i</mi></msub><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><mfrac><mrow><mi>f</mi><mo stretchy="false" form="prefix">(</mo><msub><mi>q</mi><mi>i</mi></msub><mo>,</mo><mi>d</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="prefix">(</mo><msub><mi>k</mi><mn>1</mn></msub><mo>+</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo></mrow><mrow><mi>f</mi><mo stretchy="false" form="prefix">(</mo><msub><mi>q</mi><mi>i</mi></msub><mo>,</mo><mi>d</mi><mo stretchy="false" form="postfix">)</mo><mo>+</mo><msub><mi>k</mi><mn>1</mn></msub><mspace width="-0.167em"></mspace><mrow><mo stretchy="true" form="prefix">(</mo><mn>1</mn><mo>−</mo><mi>b</mi><mo>+</mo><mi>b</mi><mfrac><mrow><mo stretchy="false" form="prefix">|</mo><mi>d</mi><mo stretchy="false" form="prefix">|</mo></mrow><mover><mrow><mi>d</mi><mi>l</mi></mrow><mo accent="true">¯</mo></mover></mfrac><mo stretchy="true" form="postfix">)</mo></mrow></mrow></mfrac></mrow><annotation encoding="application/x-tex">\begin{equation}
+  \text{BM25}(d,Q) = \sum_{q_i \in Q} \text{IDF}(q_i) \cdot
+  \frac{f(q_i,d)(k_1+1)}{f(q_i,d)+k_1\!\left(1-b+b\frac{|d|}{\overline{dl}}\right)}
+  \label{eq:bm25}
+\end{equation}</annotation></semantics></math> where
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>k</mi><mn>1</mn></msub><mo>=</mo><mn>1.2</mn></mrow><annotation encoding="application/x-tex">k_1=1.2</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>b</mi><mo>=</mo><mn>0.75</mn></mrow><annotation encoding="application/x-tex">b=0.75</annotation></semantics></math>,
+and
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">IDF</mtext><mo stretchy="false" form="prefix">(</mo><msub><mi>q</mi><mi>i</mi></msub><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mrow><mi mathvariant="normal">log</mi><mo>&#8289;</mo></mrow><mspace width="-0.167em"></mspace><mrow><mo stretchy="true" form="prefix">(</mo><mfrac><mrow><mi>N</mi><mo>−</mo><msub><mi>n</mi><mi>t</mi></msub><mo>+</mo><mn>0.5</mn></mrow><mrow><msub><mi>n</mi><mi>t</mi></msub><mo>+</mo><mn>0.5</mn></mrow></mfrac><mo>+</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\text{IDF}(q_i)=\log\!\left(\frac{N-n_t+0.5}{n_t+0.5}+1\right)</annotation></semantics></math>.</p>
+<h2 id="reciprocal-rank-fusion">Reciprocal Rank Fusion</h2>
+<p>RRF <span class="citation" data-cites="cormack2009"></span> is a
+rank-fusion method robust to score-scale differences:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">RRF</mtext><mo stretchy="false" form="prefix">(</mo><mi>d</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><munder><mo>∑</mo><mi>r</mi></munder><mfrac><mn>1</mn><mrow><msub><mi>k</mi><mtext mathvariant="normal">rrf</mtext></msub><mo>+</mo><msub><mtext mathvariant="normal">rank</mtext><mi>r</mi></msub><mo stretchy="false" form="prefix">(</mo><mi>d</mi><mo stretchy="false" form="postfix">)</mo><mo>+</mo><mn>1</mn></mrow></mfrac></mrow><annotation encoding="application/x-tex">\begin{equation}
+  \text{RRF}(d) = \sum_r \frac{1}{k_{\text{rrf}} + \text{rank}_r(d) + 1}
+  \label{eq:rrf}
+\end{equation}</annotation></semantics></math> with
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>k</mi><mtext mathvariant="normal">rrf</mtext></msub><mo>=</mo><mn>60</mn></mrow><annotation encoding="application/x-tex">k_{\text{rrf}}=60</annotation></semantics></math>
+(default).</p>
+<h2 id="temporal-decay">Temporal Decay</h2>
+<p>Time-decay scoring typically models relevance as an exponential
+function of age <span class="citation" data-cites="li2003"></span>.
+MemGPT <span class="citation" data-cites="packer2023"></span> and
+Generative Agents <span class="citation" data-cites="park2023"></span>
+apply fixed exponential decay to agent memory. Our work extends this
+with a <em>stickiness</em> factor derived from access frequency,
+analogous to the spacing effect in human memory consolidation <span
+class="citation" data-cites="ebbinghaus1885"></span>.</p>
+<h2 id="graph-enhanced-retrieval">Graph-Enhanced Retrieval</h2>
+<p>GraphRAG <span class="citation" data-cites="edge2024"></span>
+augments LLM retrieval with graph traversal over entity relationship
+graphs using separate graph databases. Feather DB integrates graph
+traversal into the vector search index, eliminating the separate graph
+store.</p>
+<h1 id="sec:design">System Design</h1>
+<h2 id="data-model">Data Model</h2>
+<p>A Feather DB instance manages three in-memory structures:</p>
+<ul>
+<li><p><strong>Metadata Store</strong>:
+<code>unordered_map&lt;uint64_t, Metadata&gt;</code>—keyed by entity ID,
+carrying timestamp, importance, content, type, namespace, entity ID,
+typed edges, recall count, and a free-form attribute map.</p></li>
+<li><p><strong>Modality Indices</strong>:
+<code>unordered_map&lt;string, ModalityIndex&gt;</code>—named HNSW
+indices (e.g., “text”, “visual”), created on demand with independent
+dimensionality.</p></li>
+<li><p><strong>BM25 Index</strong>:
+<code>unordered_map&lt;string, vector&lt;PostingEntry&gt;&gt;</code>—inverted
+index over content tokens, rebuilt from the metadata store on every
+<code>open()</code>.</p></li>
+</ul>
+<h2 id="sec:atd">Adaptive Temporal Decay (ATD)</h2>
+<p>Let
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>r</mi><annotation encoding="application/x-tex">r</annotation></semantics></math>
+be a record with recall count
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>c</mi><annotation encoding="application/x-tex">c</annotation></semantics></math>,
+creation timestamp
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>t</mi><annotation encoding="application/x-tex">t</annotation></semantics></math>,
+and importance weight
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>α</mi><mo>∈</mo><mo stretchy="false" form="prefix">[</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="false" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">\alpha \in [0,1]</annotation></semantics></math>.
+For a query at time
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>τ</mi><annotation encoding="application/x-tex">\tau</annotation></semantics></math>
+with half-life
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>H</mi><annotation encoding="application/x-tex">H</annotation></semantics></math>
+and blend weight
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>w</mi><annotation encoding="application/x-tex">w</annotation></semantics></math>:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mtable><mtr><mtd columnalign="right" style="text-align: right; padding-right: 0"><mtext mathvariant="normal">stickiness</mtext><mo stretchy="false" form="prefix">(</mo><mi>c</mi><mo stretchy="false" form="postfix">)</mo></mtd><mtd columnalign="left" style="text-align: left; padding-left: 0"><mo>=</mo><mn>1</mn><mo>+</mo><mrow><mi mathvariant="normal">log</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>+</mo><mi>c</mi><mo stretchy="false" form="postfix">)</mo></mtd></mtr><mtr><mtd columnalign="right" style="text-align: right; padding-right: 0"><mtext mathvariant="normal">age_days</mtext></mtd><mtd columnalign="left" style="text-align: left; padding-left: 0"><mo>=</mo><mo stretchy="false" form="prefix">(</mo><mi>τ</mi><mo>−</mo><mi>t</mi><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mn>86400</mn></mtd></mtr><mtr><mtd columnalign="right" style="text-align: right; padding-right: 0"><mtext mathvariant="normal">eff_age</mtext></mtd><mtd columnalign="left" style="text-align: left; padding-left: 0"><mo>=</mo><mtext mathvariant="normal">age_days</mtext><mi>/</mi><mtext mathvariant="normal">stickiness</mtext><mo stretchy="false" form="prefix">(</mo><mi>c</mi><mo stretchy="false" form="postfix">)</mo></mtd></mtr><mtr><mtd columnalign="right" style="text-align: right; padding-right: 0"><mtext mathvariant="normal">recency</mtext><mo stretchy="false" form="prefix">(</mo><mi>r</mi><mo stretchy="false" form="postfix">)</mo></mtd><mtd columnalign="left" style="text-align: left; padding-left: 0"><mo>=</mo><msup><mn>0.5</mn><mrow><mspace width="0.167em"></mspace><mtext mathvariant="normal">eff_age</mtext><mi>/</mi><mi>H</mi></mrow></msup></mtd></mtr><mtr><mtd columnalign="right" style="text-align: right; padding-right: 0"><mtext mathvariant="normal">score</mtext><mo stretchy="false" form="prefix">(</mo><mi>r</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo></mtd><mtd columnalign="left" style="text-align: left; padding-left: 0"><mo>=</mo><mo minsize="120%" maxsize="120%" stretchy="true" form="prefix">[</mo><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>−</mo><mi>w</mi><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><mtext mathvariant="normal">sim</mtext><mo stretchy="false" form="prefix">(</mo><mi>r</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo><mo>+</mo><mi>w</mi><mo>⋅</mo><mtext mathvariant="normal">recency</mtext><mo stretchy="false" form="prefix">(</mo><mi>r</mi><mo stretchy="false" form="postfix">)</mo><mo minsize="120%" maxsize="120%" stretchy="true" form="postfix">]</mo><mo>⋅</mo><mi>α</mi></mtd></mtr></mtable><annotation encoding="application/x-tex">\begin{align}
+  \text{stickiness}(c) &amp;= 1 + \log(1 + c)
+  \label{eq:stickiness}\\
+  \text{age\_days}     &amp;= (\tau - t) / 86400\\
+  \text{eff\_age}      &amp;= \text{age\_days} / \text{stickiness}(c)\\
+  \text{recency}(r)    &amp;= 0.5^{\,\text{eff\_age} / H}
+  \label{eq:recency}\\
+  \text{score}(r,q)    &amp;= \bigl[(1-w)\cdot\text{sim}(r,q) + w\cdot\text{recency}(r)\bigr]\cdot\alpha
+  \label{eq:score}
+\end{align}</annotation></semantics></math></p>
+<div class="theorem">
+<p><strong>Theorem 1</strong> (Asymptotic Stickiness). <em>As
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi><mo>→</mo><mi>∞</mi></mrow><annotation encoding="application/x-tex">c \to \infty</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">stickiness</mtext><mo stretchy="false" form="prefix">(</mo><mi>c</mi><mo stretchy="false" form="postfix">)</mo><mo>→</mo><mi>∞</mi></mrow><annotation encoding="application/x-tex">\text{stickiness}(c) \to \infty</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">eff_age</mtext><mo>→</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">\text{eff\_age} \to 0</annotation></semantics></math>,
+and
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">recency</mtext><mo stretchy="false" form="prefix">(</mo><mi>r</mi><mo stretchy="false" form="postfix">)</mo><mo>→</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\text{recency}(r) \to 1</annotation></semantics></math>
+regardless of actual age. A memory accessed infinitely often never
+decays.</em></p>
+</div>
+<div class="theorem">
+<p><strong>Theorem 2</strong> (Neutral Baseline). <em>For
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">c=0</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">stickiness</mtext><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\text{stickiness}=1</annotation></semantics></math>
+and the formula reduces to standard exponential decay:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">recency</mtext><mo>=</mo><msup><mn>0.5</mn><mrow><mspace width="0.167em"></mspace><mtext mathvariant="normal">age</mtext><mi>/</mi><mi>H</mi></mrow></msup></mrow><annotation encoding="application/x-tex">\text{recency} = 0.5^{\,\text{age}/H}</annotation></semantics></math>.</em></p>
+</div>
+<p>The logarithmic form of stickiness is deliberately sub-linear,
+rewarding genuinely important long-term memories without allowing
+trivially-recalled records to dominate.</p>
+<h2 id="bm25-inverted-index">BM25 Inverted Index</h2>
+<h4 id="tokenisation.">Tokenisation.</h4>
+<p>Lowercase, split on non-alphanumeric characters, minimum token length
+2, 40 common English stop-words filtered.</p>
+<h4 id="incremental-maintenance.">Incremental maintenance.</h4>
+<p>Document lengths are tracked per-record. The corpus average document
+length
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mover><mrow><mi>d</mi><mi>l</mi></mrow><mo accent="true">¯</mo></mover><annotation encoding="application/x-tex">\overline{dl}</annotation></semantics></math>
+is updated incrementally:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mover><mrow><mi>d</mi><mi>l</mi></mrow><mo accent="true">¯</mo></mover><mrow><mo stretchy="false" form="prefix">(</mo><mi>N</mi><mo stretchy="false" form="postfix">)</mo></mrow></msup><mo>=</mo><mfrac><mrow><msup><mover><mrow><mi>d</mi><mi>l</mi></mrow><mo accent="true">¯</mo></mover><mrow><mo stretchy="false" form="prefix">(</mo><mi>N</mi><mo>−</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo></mrow></msup><mo stretchy="false" form="prefix">(</mo><mi>N</mi><mo>−</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo><mo>+</mo><mo stretchy="false" form="prefix">|</mo><mi>d</mi><mo stretchy="false" form="prefix">|</mo></mrow><mi>N</mi></mfrac></mrow><annotation encoding="application/x-tex">\begin{equation}
+  \overline{dl}^{(N)} = \frac{\overline{dl}^{(N-1)}(N-1) + |d|}{N}
+\end{equation}</annotation></semantics></math> avoiding a full corpus
+rescan on each insertion.</p>
+<h2 id="hybrid-search-pipeline">Hybrid Search Pipeline</h2>
+<div class="sourceCode" id="cb1" data-language="Python"
+data-caption="Hybrid search pseudocode"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>Input: query_vec q, query_string s, k</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> HNSW search(q, <span class="dv">4</span><span class="er">k</span>)  <span class="op">-&gt;</span> vec_results</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> BM25 search(s, <span class="dv">4</span><span class="er">k</span>)  <span class="op">-&gt;</span> kw_results</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> RRF(vec_results, kw_results, rrf_k<span class="op">=</span><span class="dv">60</span>)</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> touch_nolock(<span class="bu">id</span>) <span class="cf">for</span> top<span class="op">-</span>k</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fl">5.</span> Return top<span class="op">-</span>k by RRF score</span></code></pre></div>
+<p>Steps 1–5 execute under a single <code>std::lock_guard</code> to
+prevent deadlock. The
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4</mn><mi>k</mi></mrow><annotation encoding="application/x-tex">4k</annotation></semantics></math>
+over-fetch ensures sufficient candidates for RRF to produce meaningful
+top-<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+results even when both arms have sparse overlap.</p>
+<h2 id="context-chain-traversal">Context Chain Traversal</h2>
+<div class="sourceCode" id="cb2" data-language="Python"
+data-caption="Context chain pseudocode"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>Input: query_vec q, k seeds, hops h</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> HNSW search(q, k)  <span class="op">-&gt;</span> seed_nodes (hop<span class="op">=</span><span class="dv">0</span>)</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> BFS expansion:</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>   <span class="cf">for</span> hop <span class="kw">in</span> <span class="fl">1.</span>.h:</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>     <span class="cf">for</span> node at hop<span class="op">-</span><span class="dv">1</span>:</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>       <span class="cf">for</span> edge e of node:</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>         <span class="cf">if</span> target unseen:</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>           score <span class="op">=</span> cosine(target_vec, q)</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>           add to results at hop distance</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> Return ContextChainResult{nodes, edges}</span></code></pre></div>
+<p>Similarity scores for graph-expanded nodes
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">hop</mtext><mo>&gt;</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">\text{hop} &gt; 0</annotation></semantics></math>)
+are computed as cosine similarity to the query vector, maintaining
+retrieval-grounded scores even for nodes reached via graph
+traversal.</p>
+<h2 id="write-ahead-log-and-atomic-saves">Write-Ahead Log and Atomic
+Saves</h2>
+<p>Every write operation appends to <code>{path}.wal</code>:</p>
+<div class="center">
+<p><code>[op_code: 1B] [payload_len: 4B] [payload: N B]</code></p>
+</div>
+<p>On <code>open()</code>, after loading the main <code>.feather</code>
+file, the WAL is replayed if present. On <code>save()</code>, the main
+file is written atomically via POSIX <code>rename()</code> and the WAL
+is cleared.</p>
+<div class="proposition">
+<p><strong>Proposition 1</strong> (Crash Safety). <em>Any write
+confirmed to the application (<code>add()</code> returned) is
+recoverable after a crash, subject to OS filesystem sync
+guarantees.</em></p>
+</div>
+<h2 id="concurrency">Concurrency</h2>
+<p>Feather DB uses a single <code>std::mutex</code> per DB instance with
+<code>std::lock_guard</code> on all public methods. A private
+<code>touch_nolock()</code> method allows <code>search()</code>,
+<code>keyword_search()</code>, and <code>context_chain()</code> to
+update recall counts without re-acquiring the lock.
+<code>hybrid_search()</code> inlines both retrieval arms under one lock
+to prevent recursive deadlock.</p>
+<h1 id="sec:eval">Evaluation</h1>
+<h2 id="experimental-setup">Experimental Setup</h2>
+<p><strong>Hardware</strong>: Apple M-series (ARM64), 16 GB RAM.<br />
+<strong>Dataset</strong>: 3,050 synthetic records, 256-dimensional
+unit-normalised vectors.<br />
+<strong>Topics</strong>: 10 semantic clusters (billing, API usage,
+security, performance, etc.).<br />
+<strong>Namespaces</strong>: 3 (acme_corp, techwave, startup_ai).<br />
+<strong>Embeddings</strong>: Clustered synthetic vectors (centroid +
+Gaussian noise
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi><mo>=</mo><mn>0.08</mn></mrow><annotation encoding="application/x-tex">\sigma=0.08</annotation></semantics></math>,
+unit-normalised). Synthetic embeddings with known cluster membership
+enable precise precision measurement without dependence on a specific
+embedding model.</p>
+<h2 id="ingestion-performance">Ingestion Performance</h2>
+<div id="tab:ingestion">
+<table>
+<caption>Ingestion and persistence benchmarks.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Operation</th>
+<th style="text-align: right;">Value</th>
+<th style="text-align: right;">Unit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Records ingested</td>
+<td style="text-align: right;">3,000</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td style="text-align: left;">Total ingestion time</td>
+<td style="text-align: right;">1,151</td>
+<td style="text-align: right;">ms</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Throughput</strong></td>
+<td style="text-align: right;"><strong>2,606</strong></td>
+<td style="text-align: right;"><strong>rec/s</strong></td>
+</tr>
+<tr>
+<td style="text-align: left;">Hot save (flush)</td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">ms</td>
+</tr>
+<tr>
+<td style="text-align: left;">Cold open (3,050 records)</td>
+<td style="text-align: right;">1,023</td>
+<td style="text-align: right;">ms</td>
+</tr>
+<tr>
+<td style="text-align: left;">File size</td>
+<td style="text-align: right;">3.91</td>
+<td style="text-align: right;">MB</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="search-latency">Search Latency</h2>
+<div id="tab:latency">
+<table>
+<caption>Median single-query search latency.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Mode</th>
+<th
+style="text-align: right;"><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math></th>
+<th style="text-align: right;">Latency (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Vector (HNSW)</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;"><strong>0.10</strong></td>
+</tr>
+<tr>
+<td style="text-align: left;">Keyword (BM25)</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;"><strong>0.06</strong></td>
+</tr>
+<tr>
+<td style="text-align: left;">Hybrid (RRF)</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;"><strong>0.24</strong></td>
+</tr>
+<tr>
+<td style="text-align: left;">Context chain
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>h</mi><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">h=2</annotation></semantics></math>)</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;"><strong>0.10</strong></td>
+</tr>
+<tr>
+<td style="text-align: left;">Namespace-filtered</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">0.12</td>
+</tr>
+<tr>
+<td style="text-align: left;">Combined filter</td>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">0.13</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Hybrid search is
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2.4</mn><mo>×</mo></mrow><annotation encoding="application/x-tex">2.4\times</annotation></semantics></math>
+slower than pure vector search due to dual-arm retrieval, but remains
+well within sub-millisecond targets.</p>
+<h2 id="retrieval-quality">Retrieval Quality</h2>
+<p>We report <em>topic precision@5</em> (P@5): the fraction of top-5
+results belonging to the ground-truth topic cluster of the query.</p>
+<div id="tab:quality">
+<table>
+<caption>Topic precision@5 across retrieval modes.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Query</th>
+<th style="text-align: center;">Vector</th>
+<th style="text-align: center;">BM25</th>
+<th style="text-align: center;">Hybrid</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">invoice billing payment</td>
+<td style="text-align: center;">1.00</td>
+<td style="text-align: center;">0.00</td>
+<td style="text-align: center;">0.40</td>
+</tr>
+<tr>
+<td style="text-align: left;">AES-256 encryption TLS</td>
+<td style="text-align: center;">1.00</td>
+<td style="text-align: center;">1.00</td>
+<td style="text-align: center;">1.00</td>
+</tr>
+<tr>
+<td style="text-align: left;">HNSW benchmark millisecond</td>
+<td style="text-align: center;">1.00</td>
+<td style="text-align: center;">0.20</td>
+<td style="text-align: center;">0.40</td>
+</tr>
+<tr>
+<td style="text-align: left;">dark mode notification</td>
+<td style="text-align: center;">1.00</td>
+<td style="text-align: center;">1.00</td>
+<td style="text-align: center;">1.00</td>
+</tr>
+<tr>
+<td style="text-align: left;">SSO SAML OAuth login</td>
+<td style="text-align: center;">1.00</td>
+<td style="text-align: center;">0.00</td>
+<td style="text-align: center;">0.60</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Mean</strong></td>
+<td style="text-align: center;"><strong>1.00</strong></td>
+<td style="text-align: center;"><strong>0.44</strong></td>
+<td style="text-align: center;"><strong>0.68</strong></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Vector search achieves perfect precision on well-separated semantic
+clusters but requires an embedding model. BM25 excels on precise
+terminology but fails on semantic paraphrases. Hybrid provides a robust
+middle ground, with a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>55</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">55\%</annotation></semantics></math>
+relative improvement in precision over keyword-only.</p>
+<h2 id="adaptive-decay-validation">Adaptive Decay Validation</h2>
+<p>A record was touched
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi><mo>=</mo><mn>20</mn></mrow><annotation encoding="application/x-tex">c=20</annotation></semantics></math>
+times prior to search. With
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>H</mi><mo>=</mo><mn>30</mn></mrow><annotation encoding="application/x-tex">H=30</annotation></semantics></math>
+days,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>w</mi><mo>=</mo><mn>0.3</mn></mrow><annotation encoding="application/x-tex">w=0.3</annotation></semantics></math>:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">stickiness</mtext><mo stretchy="false" form="prefix">(</mo><mn>20</mn><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>1</mn><mo>+</mo><mrow><mi mathvariant="normal">log</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>21</mn><mo stretchy="false" form="postfix">)</mo><mo>≈</mo><mn>4.04</mn></mrow><annotation encoding="application/x-tex">\text{stickiness}(20) = 1 + \log(21) \approx 4.04</annotation></semantics></math></p>
+<p>For a 7-day-old record, the effective age drops from
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>7.0</mn><annotation encoding="application/x-tex">7.0</annotation></semantics></math>
+to
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>1.73</mn><annotation encoding="application/x-tex">1.73</annotation></semantics></math>
+days. The recency factor improves from
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>0.857</mn><annotation encoding="application/x-tex">0.857</annotation></semantics></math>
+to
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>0.961</mn><annotation encoding="application/x-tex">0.961</annotation></semantics></math>—a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>12</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">12\%</annotation></semantics></math>
+improvement that competes with similarity for rank promotion. This
+demonstrates measurable impact at realistic access frequencies.</p>
+<h2 id="concurrency-and-reliability">Concurrency and Reliability</h2>
+<div id="tab:reliability">
+<table>
+<caption>Concurrency and reliability results.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Test</th>
+<th style="text-align: right;">Value</th>
+<th style="text-align: right;">Unit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Concurrent threads</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td style="text-align: left;">Queries per thread</td>
+<td style="text-align: right;">50</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td style="text-align: left;">Total time</td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">ms</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Throughput</strong></td>
+<td style="text-align: right;"><strong>15,119</strong></td>
+<td style="text-align: right;"><strong>q/s</strong></td>
+</tr>
+<tr>
+<td style="text-align: left;">Thread errors</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td style="text-align: left;">WAL recovery (50 records, no save)</td>
+<td style="text-align: right;">100</td>
+<td style="text-align: right;">%</td>
+</tr>
+<tr>
+<td style="text-align: left;">Compact (100 soft-deleted records)</td>
+<td style="text-align: right;">100</td>
+<td style="text-align: right;">removed</td>
+</tr>
+<tr>
+<td style="text-align: left;">Filter correctness</td>
+<td style="text-align: right;">100</td>
+<td style="text-align: right;">%</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h1 id="sec:limitations">Limitations and Future Work</h1>
+<p><strong>Cold open latency.</strong> For
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>&gt;</mo><mn>100</mn></mrow><annotation encoding="application/x-tex">&gt; 100</annotation></semantics></math>k
+records, HNSW reconstruction and BM25 rebuild during <code>open()</code>
+will be slow. Planned fix: persist the BM25 posting list in the
+<code>.feather</code> file.</p>
+<p><strong>Single-writer concurrency.</strong> The coarse mutex prevents
+concurrent writes. Future work will explore reader-writer locks for
+read-heavy workloads.</p>
+<p><strong>Synthetic benchmarks.</strong> Evaluation uses clustered
+synthetic embeddings. Future work will benchmark with
+sentence-transformers (MiniLM, BGE) and OpenAI embeddings on standard IR
+benchmarks (BEIR <span class="citation" data-cites="thakur2021"></span>,
+MS-MARCO).</p>
+<p><strong>No query language.</strong> Future work: a minimal
+declarative DSL over the filter and graph primitives.</p>
+<h1 id="sec:conclusion">Conclusion</h1>
+<p>We presented Feather DB, an embedded vector database and living
+context engine that addresses AI application memory through three
+integrated mechanisms: adaptive temporal decay, embedded hybrid
+retrieval, and context chain traversal. Our evaluation demonstrates
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>0.10</mn><annotation encoding="application/x-tex">0.10</annotation></semantics></math> ms
+search latency, production-grade concurrency
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>15</mn><mo>,</mo><mn>119</mn></mrow><annotation encoding="application/x-tex">15{,}119</annotation></semantics></math> q/s),
+100% crash recovery, and a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>55</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">55\%</annotation></semantics></math>
+relative precision improvement of hybrid retrieval over
+keyword-only—within a zero-configuration embedded deployment model with
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>&lt;</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">&lt;4</annotation></semantics></math> MB
+file footprint for 3,000 records.</p>
+<p>Feather DB makes the case that AI application memory is not a storage
+problem but a <em>retrieval relevance</em> problem. By treating temporal
+adaptation, graph relations, and semantic similarity as first-class
+primitives rather than application-layer concerns, Feather DB provides a
+foundation on which AI applications can build persistent, intelligent,
+and adaptive memory at any scale.</p>
+<div class="thebibliography">
+<p><span>99</span></p>
+<p>Chroma (2022). . <a href="https://trychroma.com"
+class="uri">https://trychroma.com</a>.</p>
+<p>Cormack, G. V., Clarke, C. L., and Buettcher, S. (2009). Reciprocal
+rank fusion outperforms condorcet and individual rank learning methods.
+In <em>SIGIR 2009</em>.</p>
+<p>Ebbinghaus, H. (1885). <em><span>Ü</span>ber das
+Ged<span>ä</span>chtnis: Untersuchungen zur experimentellen
+Psychologie</em>.</p>
+<p>Edge, D., Trinh, H., Cheng, N., Bradley, J., Chao, A., Mody, A.,
+Truitt, S., and Larson, J. (2024). From local to global: A graph
+<span>RAG</span> approach to query-focused summarization.
+<em>arXiv:2404.16130</em>.</p>
+<p>Johnson, J., Douze, M., and J<span>é</span>gou, H. (2019).
+Billion-scale similarity search with <span>GPU</span>s. <em>IEEE
+Transactions on Big Data</em>.</p>
+<p>Li, X. and Croft, W. B. (2003). Time-based language models. In
+<em>CIKM 2003</em>.</p>
+<p>Malkov, Y. A. and Yashunin, D. A. (2018). Efficient and robust
+approximate nearest neighbor search using hierarchical navigable small
+world graphs. <em>IEEE Transactions on Pattern Analysis and Machine
+Intelligence</em>.</p>
+<p>Malkov, Y. (2018). hnswlib: fast approximate nearest neighbor search
+library. <a href="https://github.com/nmslib/hnswlib"
+class="uri">https://github.com/nmslib/hnswlib</a>.</p>
+<p>Packer, C., Fang, V., Patil, S. G., Oh, K., Agrawal, A., and
+Gonzalez, J. E. (2023). : Towards <span>LLM</span>s as operating
+systems. <em>arXiv:2310.08560</em>.</p>
+<p>Park, J. S., O’Brien, J., Cai, C. J., Morris, M. R., Liang, P., and
+Bernstein, M. S. (2023). Generative agents: Interactive simulacra of
+human behavior. In <em>UIST 2023</em>.</p>
+<p>Pinecone Systems Inc. (2021). . <a href="https://pinecone.io"
+class="uri">https://pinecone.io</a>.</p>
+<p>Qdrant (2021). . <a href="https://qdrant.tech"
+class="uri">https://qdrant.tech</a>.</p>
+<p>Robertson, S. and Zaragoza, H. (2009). The probabilistic relevance
+framework: <span>BM25</span> and beyond. <em>Foundations and Trends in
+Information Retrieval</em>, 3(4):333–389.</p>
+<p>Thakur, N., Reimers, N., R<span>ü</span>ckl<span>é</span>, A.,
+Srivastava, A., and Gurevych, I. (2021). : A heterogeneous benchmark for
+zero-shot evaluation of information retrieval models. In <em>NeurIPS
+2021 Datasets and Benchmarks Track</em>.</p>
+<p>Weaviate B.V. (2021). . <a href="https://weaviate.io"
+class="uri">https://weaviate.io</a>.</p>
+</div>
+</body>
+</html>

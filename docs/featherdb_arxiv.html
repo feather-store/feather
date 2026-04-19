@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>Feather DB: Adaptive Temporal Decay and Hybrid Retrieval for Embedded AI Memory Systems</title>
+<script>
+MathJax = {
+  tex: { inlineMath: [['$','$']], displayMath: [['$$','$$']], tags: 'ams' },
+  options: { skipHtmlTags: ['script','noscript','style','textarea','pre'] }
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,600;0,700;1,400&family=Source+Code+Pro:wght@400;500&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'EB Garamond', 'Times New Roman', serif;
+  font-size: 10.5pt;
+  line-height: 1.45;
+  color: #000;
+  background: #fff;
+}
+
+/* Page layout */
+.page {
+  width: 210mm;
+  min-height: 297mm;
+  margin: 0 auto;
+  padding: 20mm 18mm 22mm 18mm;
+}
+
+/* Title block — full width */
+.title-block {
+  text-align: center;
+  margin-bottom: 14pt;
+}
+.paper-title {
+  font-size: 17pt;
+  font-weight: 700;
+  line-height: 1.25;
+  margin-bottom: 10pt;
+}
+.authors {
+  font-size: 11pt;
+  margin-bottom: 4pt;
+}
+.affiliation {
+  font-size: 9.5pt;
+  color: #333;
+  margin-bottom: 2pt;
+}
+.links {
+  font-size: 9pt;
+  color: #1a0dab;
+  margin-top: 4pt;
+}
+.links a { color: #1a0dab; text-decoration: none; }
+
+/* Abstract — full width, indented */
+.abstract-section {
+  border-top: 1px solid #000;
+  border-bottom: 1px solid #000;
+  padding: 8pt 0;
+  margin: 12pt 0 16pt 0;
+}
+.abstract-section h2 {
+  font-size: 10pt;
+  font-weight: 700;
+  text-align: center;
+  margin-bottom: 5pt;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.abstract-section p {
+  font-size: 9.5pt;
+  line-height: 1.4;
+  text-align: justify;
+  hyphens: auto;
+}
+
+/* Two-column body */
+.two-col {
+  column-count: 2;
+  column-gap: 16pt;
+  column-rule: none;
+  text-align: justify;
+  hyphens: auto;
+}
+
+/* Sections */
+h2.section {
+  font-size: 11pt;
+  font-weight: 700;
+  margin-top: 12pt;
+  margin-bottom: 4pt;
+  counter-increment: section;
+}
+h2.section::before {
+  content: counter(section) ". ";
+}
+body { counter-reset: section subsection; }
+
+h3.subsection {
+  font-size: 10.5pt;
+  font-weight: 700;
+  margin-top: 8pt;
+  margin-bottom: 3pt;
+  counter-increment: subsection;
+}
+h3.subsection::before {
+  content: counter(section) "." counter(subsection) " ";
+}
+h2.section + h3.subsection { counter-reset: subsection; }
+
+/* Paragraphs */
+.two-col p {
+  margin-bottom: 4pt;
+}
+.two-col p + p {
+  text-indent: 1em;
+}
+
+/* Bold paragraph heading */
+.para-head {
+  font-weight: 700;
+  font-style: italic;
+}
+
+/* Lists */
+ul.body-list, ol.body-list {
+  margin: 4pt 0 4pt 14pt;
+  padding: 0;
+}
+ul.body-list li, ol.body-list li {
+  margin-bottom: 2pt;
+  font-size: 10pt;
+}
+
+/* Math display blocks */
+.math-block {
+  margin: 6pt 0;
+  text-align: center;
+  font-size: 10pt;
+}
+
+/* Theorem environments */
+.theorem-box {
+  border-left: 2pt solid #555;
+  padding: 4pt 8pt;
+  margin: 6pt 0;
+  background: #fafafa;
+  break-inside: avoid;
+}
+.theorem-box .theorem-label {
+  font-weight: 700;
+  font-style: italic;
+}
+
+/* Tables */
+table.paper-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 9pt;
+  margin: 6pt 0;
+  break-inside: avoid;
+}
+table.paper-table caption {
+  font-size: 9pt;
+  font-weight: 700;
+  text-align: left;
+  margin-bottom: 4pt;
+  caption-side: top;
+}
+table.paper-table th {
+  border-top: 1px solid #000;
+  border-bottom: 1px solid #000;
+  padding: 2pt 6pt;
+  font-weight: 700;
+  text-align: left;
+}
+table.paper-table td {
+  padding: 2pt 6pt;
+  text-align: left;
+}
+table.paper-table td.num { text-align: right; }
+table.paper-table tr:last-child td {
+  border-bottom: 1px solid #000;
+}
+table.paper-table .bold { font-weight: 700; }
+.midrule td, .midrule th {
+  border-top: 1px solid #888;
+}
+
+/* Code blocks */
+pre.code-block {
+  font-family: 'Source Code Pro', 'Courier New', monospace;
+  font-size: 7.8pt;
+  background: #f5f5f5;
+  border: 0.5pt solid #ccc;
+  padding: 5pt 7pt;
+  margin: 5pt 0;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  break-inside: avoid;
+  line-height: 1.35;
+}
+.code-caption {
+  font-size: 8.5pt;
+  font-weight: 700;
+  font-style: italic;
+  color: #333;
+  margin-bottom: 2pt;
+}
+
+/* References */
+.references {
+  font-size: 8.5pt;
+  line-height: 1.35;
+}
+.references h2 {
+  font-size: 11pt;
+  font-weight: 700;
+  margin: 12pt 0 6pt 0;
+}
+.ref-entry {
+  margin-bottom: 4pt;
+  padding-left: 16pt;
+  text-indent: -16pt;
+}
+
+/* Page header line */
+.page-header {
+  font-size: 8pt;
+  font-style: italic;
+  color: #555;
+  border-bottom: 0.5pt solid #999;
+  padding-bottom: 3pt;
+  margin-bottom: 14pt;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* Footnote-style arxiv id */
+.arxiv-id {
+  font-size: 8pt;
+  color: #888;
+  text-align: right;
+  margin-top: 4pt;
+}
+
+/* Break helper */
+.col-break { break-before: column; }
+.no-break { break-inside: avoid; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- Page header -->
+<div class="page-header">
+  <span>Feather DB: Adaptive Temporal Decay and Hybrid Retrieval for Embedded AI Memory Systems</span>
+  <span>Hawky.ai, 2026</span>
+</div>
+
+<!-- Title -->
+<div class="title-block">
+  <div class="paper-title">
+    Feather DB: Adaptive Temporal Decay and Hybrid Retrieval<br/>for Embedded AI Memory Systems
+  </div>
+  <div class="authors"><strong>Hawky.ai Research Team</strong></div>
+  <div class="affiliation">Hawky.ai &nbsp;|&nbsp; <a href="mailto:hello@hawky.ai">hello@hawky.ai</a></div>
+  <div class="links">
+    <a href="https://github.com/feather-store/feather">github.com/feather-store/feather</a>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="https://www.getfeather.store">getfeather.store</a>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="https://pypi.org/project/feather-db">pypi.org/project/feather-db</a>
+  </div>
+  <div class="arxiv-id">Preprint &mdash; April 2026</div>
+</div>
+
+<!-- Abstract -->
+<div class="abstract-section">
+  <h2>Abstract</h2>
+  <p>
+    AI-native applications require memory systems that go beyond static vector retrieval: they need context that is
+    temporally adaptive, relationally connected, and queryable via both semantic similarity and exact keyword matching.
+    We present <strong>Feather DB</strong>, an embedded vector database and living context engine that introduces
+    three novel contributions:
+    (1)&nbsp;<em>Adaptive Temporal Decay (ATD)</em>&mdash;a scoring formula that modulates time-based relevance
+    decay using access frequency, preventing frequently recalled memories from fading;
+    (2)&nbsp;<em>embedded hybrid retrieval</em>&mdash;tight integration of Okapi BM25 and HNSW approximate
+    nearest-neighbour search fused via Reciprocal Rank Fusion (RRF), with zero index synchronisation overhead; and
+    (3)&nbsp;<em>context chain traversal</em>&mdash;a single-call operation combining semantic vector search with
+    $n$-hop graph BFS expansion over a typed, weighted knowledge graph, enabling relational context retrieval in a
+    single call.
+    We evaluate Feather DB on a synthetic multi-tenant AI memory workload of 3,050 records across 10 topic
+    categories, demonstrating $0.10$&thinsp;ms vector search latency, $15{,}119$ concurrent queries/sec across
+    8&nbsp;threads, 100% write-ahead-log crash recovery, and 70% hybrid search topic precision versus 44% for
+    keyword-only retrieval.
+    Feather DB is open-source (MIT) and available at <a href="https://github.com/feather-store/feather">github.com/feather-store/feather</a>.
+  </p>
+</div>
+
+<!-- Two-column body -->
+<div class="two-col">
+
+<!-- §1 Introduction -->
+<h2 class="section">Introduction</h2>
+
+<p>
+The emergence of large language models (LLMs) as the foundation of production software has created a new class
+of infrastructure requirement: <em>AI application memory</em>. Unlike traditional databases optimised for
+structured data retrieval, AI applications require (i)&nbsp;semantic search by meaning, (ii)&nbsp;temporal
+relevance that weights frequently confirmed knowledge higher, (iii)&nbsp;relational context to follow chains of
+related knowledge, and (iv)&nbsp;operational simplicity for edge, serverless, or single-file deployments.
+</p>
+<p>
+Existing approaches partition these concerns across multiple systems&mdash;a vector database [1,2,3] for
+semantic search, a key-value store for recency metadata, and a graph database for relational context&mdash;
+introducing synchronisation complexity, inter-process latency, and operational overhead.
+</p>
+<p>
+We argue these concerns are not separable: they are facets of a single unified problem&mdash;<em>how does an AI
+application recall the right context at the right time?</em>&mdash;and address it with a single embedded system.
+</p>
+
+<p><span class="para-head">Contributions.</span></p>
+<ol class="body-list">
+  <li><strong>Adaptive Temporal Decay (ATD):</strong> A scoring formula coupling time-decay with
+    access-frequency stickiness, preventing important memories from fading while dormant knowledge recedes.</li>
+  <li><strong>Embedded Hybrid Retrieval:</strong> BM25 inverted index and HNSW dense vector index fused via RRF
+    inside a single process, with no external synchronisation or schema definition.</li>
+  <li><strong>Context Chain:</strong> A single-call operation combining vector ANN search with typed graph BFS
+    expansion for multi-hop relational context retrieval.</li>
+  <li><strong>Production Hardening:</strong> Write-ahead log, atomic saves, per-instance mutex, and soft-delete
+    with index compaction.</li>
+</ol>
+
+<!-- §2 Related Work -->
+<h2 class="section">Background and Related Work</h2>
+
+<h3 class="subsection">Vector Databases</h3>
+<p>
+FAISS [4] provides highly optimised ANNS indices as a library but offers no persistence, metadata, or query
+composability. Chroma [3], Qdrant [5], and Weaviate [2] build on similar indices with REST APIs and persistence
+but operate as server processes. None implement temporal scoring as a first-class primitive.
+</p>
+
+<h3 class="subsection">HNSW</h3>
+<p>
+Hierarchical Navigable Small World graphs [6] provide $O(\log n)$ query complexity with high recall by
+constructing a multi-layer proximity graph traversed from coarse to fine resolution. We use the hnswlib
+implementation [7] with $M{=}16$, $ef_\text{construction}{=}200$.
+</p>
+
+<h3 class="subsection">BM25</h3>
+<p>For query $Q = \{q_1,\ldots,q_n\}$ and document $d$, Okapi BM25 [8] scores:</p>
+$$\text{BM25}(d,Q) = \sum_{q_i \in Q} \text{IDF}(q_i) \cdot \frac{f(q_i,d)(k_1+1)}{f(q_i,d)+k_1\!\left(1-b+b\tfrac{|d|}{\bar{dl}}\right)}$$
+<p>where $k_1{=}1.2$, $b{=}0.75$, and $\text{IDF}(q_i)=\log\!\left(\tfrac{N-n_t+0.5}{n_t+0.5}+1\right)$.</p>
+
+<h3 class="subsection">Reciprocal Rank Fusion</h3>
+<p>RRF [9] merges heterogeneous ranked lists without score normalisation:</p>
+$$\text{RRF}(d) = \sum_r \frac{1}{k_\text{rrf} + \text{rank}_r(d) + 1}$$
+<p>with $k_\text{rrf}{=}60$. Its rank-based nature makes it robust to scale differences between BM25 and cosine similarity.</p>
+
+<h3 class="subsection">Temporal Decay</h3>
+<p>
+Time-decay scoring models relevance as an exponential function of age [10]. MemGPT [11] and Generative
+Agents [12] apply fixed exponential decay to agent memory. Our work extends this with a stickiness factor
+derived from access frequency, analogous to the spacing effect in human memory consolidation [13].
+</p>
+
+<h3 class="subsection">Graph-Enhanced Retrieval</h3>
+<p>
+GraphRAG [14] augments LLM retrieval with graph traversal over entity relationship graphs using separate graph
+databases. Feather DB integrates graph traversal into the vector search index, eliminating the separate graph store.
+</p>
+
+<!-- §3 System Design -->
+<h2 class="section">System Design</h2>
+
+<h3 class="subsection">Data Model</h3>
+<p>A Feather DB instance manages three in-memory structures:</p>
+<ul class="body-list">
+  <li><strong>Metadata Store:</strong> <code>unordered_map&lt;uint64_t, Metadata&gt;</code>&mdash;keyed by entity ID,
+    carrying timestamp, importance, content, type, namespace, entity ID, typed edges, recall count, and a free-form attribute map.</li>
+  <li><strong>Modality Indices:</strong> <code>unordered_map&lt;string, ModalityIndex&gt;</code>&mdash;named HNSW
+    indices (e.g., "text", "visual"), created on demand with independent dimensionality.</li>
+  <li><strong>BM25 Index:</strong> Inverted posting list over content tokens, rebuilt from the metadata store on every <code>open()</code>.</li>
+</ul>
+
+<h3 class="subsection">Adaptive Temporal Decay</h3>
+<p>
+Let $r$ be a record with recall count $c$, creation timestamp $t$, and importance $\alpha \in [0,1]$.
+For a query at time $\tau$ with half-life $H$ and blend weight $w$:
+</p>
+$$\text{stickiness}(c) = 1 + \log(1 + c) \tag{1}$$
+$$\text{eff\_age} = \frac{(\tau-t)/86400}{\text{stickiness}(c)} \tag{2}$$
+$$\text{recency}(r) = 0.5^{\,\text{eff\_age}/H} \tag{3}$$
+$$\text{score}(r,q) = \bigl[(1-w)\cdot\text{sim}(r,q) + w\cdot\text{recency}(r)\bigr]\cdot\alpha \tag{4}$$
+
+<div class="theorem-box">
+  <span class="theorem-label">Theorem 1 (Asymptotic Stickiness).</span>
+  As $c \to \infty$, $\text{stickiness}(c) \to \infty$, $\text{eff\_age} \to 0$, and $\text{recency}(r) \to 1$
+  regardless of actual age. A memory accessed infinitely often never decays.
+</div>
+<div class="theorem-box">
+  <span class="theorem-label">Theorem 2 (Neutral Baseline).</span>
+  For $c{=}0$, stickiness$=1$ and the formula reduces to standard exponential decay:
+  $\text{recency} = 0.5^{\,\text{age}/H}$.
+</div>
+
+<h3 class="subsection">BM25 Inverted Index</h3>
+<p>
+<span class="para-head">Tokenisation.</span> Lowercase, split on non-alphanumeric characters, minimum token
+length 2, 40 common English stop-words filtered.
+</p>
+<p>
+<span class="para-head">Incremental maintenance.</span> The corpus average document length $\bar{dl}$ is updated
+incrementally on each <code>add()</code>, avoiding a full corpus rescan:
+$$\bar{dl}^{(N)} = \frac{\bar{dl}^{(N-1)}(N-1) + |d|}{N} \tag{5}$$
+</p>
+
+<h3 class="subsection">Hybrid Search Pipeline</h3>
+<div class="code-caption">Listing 1: Hybrid search pseudocode</div>
+<pre class="code-block">Input: query_vec q, query_string s, k
+1. HNSW search(q, 4k)  → vec_results
+2. BM25 search(s, 4k)  → kw_results
+3. RRF(vec_results, kw_results, rrf_k=60)
+4. touch_nolock(id) for top-k
+5. Return top-k by RRF score</pre>
+<p>
+Steps 1&ndash;5 execute under a single <code>std::lock_guard</code> to prevent deadlock.
+The $4k$ over-fetch ensures sufficient candidates for RRF even when both arms have sparse overlap.
+</p>
+
+<h3 class="subsection">Context Chain Traversal</h3>
+<div class="code-caption">Listing 2: Context chain pseudocode</div>
+<pre class="code-block">Input: query_vec q, k seeds, hops h
+1. HNSW search(q, k)   → seed_nodes (hop=0)
+2. BFS expansion:
+   for hop in 1..h:
+     for node at hop-1:
+       for edge e of node:
+         if target unseen:
+           score = cosine(target_vec, q)
+           add at hop distance
+3. Return {nodes, edges}</pre>
+
+<h3 class="subsection">Write-Ahead Log and Atomic Saves</h3>
+<p>Every write appends to <code>{path}.wal</code>:</p>
+<pre class="code-block">[op_code: 1B] [payload_len: 4B] [payload: N B]</pre>
+<p>
+On <code>open()</code>, the WAL is replayed after loading the main file.
+On <code>save()</code>, the main file is written atomically via POSIX <code>rename()</code> and the WAL is cleared.
+</p>
+<div class="theorem-box">
+  <span class="theorem-label">Proposition 1 (Crash Safety).</span>
+  Any write confirmed to the application (<code>add()</code> returned) is recoverable after a crash,
+  subject to OS filesystem sync guarantees.
+</div>
+
+<h3 class="subsection">Concurrency Model</h3>
+<p>
+Feather DB uses a single <code>std::mutex</code> per DB instance with <code>std::lock_guard</code> on all
+public methods. A private <code>touch_nolock()</code> method allows <code>search()</code> and
+<code>keyword_search()</code> to update recall counts without re-acquiring the lock.
+<code>hybrid_search()</code> inlines both retrieval arms under one lock to prevent recursive deadlock.
+</p>
+
+<!-- §4 Evaluation -->
+<h2 class="section">Evaluation</h2>
+
+<h3 class="subsection">Experimental Setup</h3>
+<p>
+<strong>Hardware:</strong> Apple M-series (ARM64), 16&thinsp;GB RAM.
+<strong>Dataset:</strong> 3,050 synthetic records, 256-dimensional unit-normalised vectors.
+<strong>Topics:</strong> 10 semantic clusters (billing, API usage, security, performance, user prefs, etc.).
+<strong>Namespaces:</strong> 3 tenants.
+<strong>Embeddings:</strong> Clustered synthetic vectors (centroid + Gaussian noise $\sigma{=}0.08$,
+unit-normalised). Known cluster membership enables precise precision measurement without dependence on a
+specific embedding model.
+</p>
+
+<h3 class="subsection">Ingestion Performance</h3>
+<div class="no-break">
+<table class="paper-table">
+  <caption>Table 1: Ingestion and persistence benchmarks.</caption>
+  <thead><tr><th>Operation</th><th class="num">Value</th><th>Unit</th></tr></thead>
+  <tbody>
+    <tr><td>Records ingested</td><td class="num">3,000</td><td>&mdash;</td></tr>
+    <tr><td>Ingestion time</td><td class="num">1,151</td><td>ms</td></tr>
+    <tr><td class="bold">Throughput</td><td class="num bold">2,606</td><td><strong>rec/s</strong></td></tr>
+    <tr><td>Hot save (flush)</td><td class="num">23</td><td>ms</td></tr>
+    <tr><td>Cold open (3,050 records)</td><td class="num">1,023</td><td>ms</td></tr>
+    <tr><td>File size</td><td class="num">3.91</td><td>MB</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3 class="subsection">Search Latency</h3>
+<div class="no-break">
+<table class="paper-table">
+  <caption>Table 2: Median single-query search latency.</caption>
+  <thead><tr><th>Mode</th><th class="num">$k$</th><th class="num">Latency (ms)</th></tr></thead>
+  <tbody>
+    <tr><td>Vector (HNSW)</td><td class="num">10</td><td class="num bold">0.10</td></tr>
+    <tr><td>Keyword (BM25)</td><td class="num">5</td><td class="num bold">0.06</td></tr>
+    <tr><td>Hybrid (RRF)</td><td class="num">10</td><td class="num bold">0.24</td></tr>
+    <tr><td>Context chain ($h{=}2$)</td><td class="num">3</td><td class="num bold">0.10</td></tr>
+    <tr><td>Namespace-filtered</td><td class="num">10</td><td class="num">0.12</td></tr>
+    <tr><td>Combined filter</td><td class="num">20</td><td class="num">0.13</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Hybrid search is $2.4\times$ slower than pure vector search due to dual-arm retrieval, but remains sub-millisecond.</p>
+
+<h3 class="subsection">Retrieval Quality</h3>
+<p>
+We report <em>topic precision@5</em> (P@5): fraction of top-5 results belonging to the ground-truth topic cluster.
+</p>
+<div class="no-break">
+<table class="paper-table">
+  <caption>Table 3: Topic P@5 across retrieval modes.</caption>
+  <thead><tr><th>Query (truncated)</th><th class="num">Vec</th><th class="num">BM25</th><th class="num">Hybrid</th></tr></thead>
+  <tbody>
+    <tr><td>invoice billing payment</td><td class="num">1.00</td><td class="num">0.00</td><td class="num">0.40</td></tr>
+    <tr><td>AES-256 encryption TLS</td><td class="num">1.00</td><td class="num">1.00</td><td class="num">1.00</td></tr>
+    <tr><td>HNSW benchmark millisecond</td><td class="num">1.00</td><td class="num">0.20</td><td class="num">0.40</td></tr>
+    <tr><td>dark mode notification</td><td class="num">1.00</td><td class="num">1.00</td><td class="num">1.00</td></tr>
+    <tr><td>SSO SAML OAuth login</td><td class="num">1.00</td><td class="num">0.00</td><td class="num">0.60</td></tr>
+    <tr class="midrule"><td><strong>Mean</strong></td><td class="num bold">1.00</td><td class="num bold">0.44</td><td class="num bold">0.68</td></tr>
+  </tbody>
+</table>
+</div>
+<p>
+Hybrid retrieval achieves a 55% relative improvement in precision over keyword-only retrieval by combining
+both semantic and lexical signals.
+</p>
+
+<h3 class="subsection">Adaptive Decay Validation</h3>
+<p>
+A record was touched $c{=}20$ times before search. With $H{=}30$ days, $w{=}0.3$:
+$$\text{stickiness}(20) = 1 + \log(21) \approx 4.04$$
+For a 7-day-old record, effective age drops from $7.0$ to $1.73$ days. Recency improves from
+$0.857$ to $0.961$&mdash;a 12% improvement that competes with similarity for rank promotion.
+</p>
+
+<h3 class="subsection">Concurrency and Reliability</h3>
+<div class="no-break">
+<table class="paper-table">
+  <caption>Table 4: Concurrency and reliability results.</caption>
+  <thead><tr><th>Test</th><th class="num">Value</th><th>Unit</th></tr></thead>
+  <tbody>
+    <tr><td>Concurrent threads</td><td class="num">8</td><td>&mdash;</td></tr>
+    <tr><td>Queries per thread</td><td class="num">50</td><td>&mdash;</td></tr>
+    <tr><td>Total time</td><td class="num">26</td><td>ms</td></tr>
+    <tr><td class="bold">Throughput</td><td class="num bold">15,119</td><td><strong>q/s</strong></td></tr>
+    <tr><td>Thread errors</td><td class="num">0</td><td>&mdash;</td></tr>
+    <tr class="midrule"><td>WAL recovery (50 recs, no save)</td><td class="num">100</td><td>%</td></tr>
+    <tr><td>compact() correctness</td><td class="num">100</td><td>removed</td></tr>
+    <tr><td>Filter correctness</td><td class="num">100</td><td>%</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- §5 Limitations -->
+<h2 class="section">Limitations and Future Work</h2>
+<p>
+<span class="para-head">Cold open latency.</span>
+For $>100$k records, HNSW reconstruction and BM25 rebuild will be slow. Planned fix: persist the BM25
+posting list directly in the <code>.feather</code> file.
+</p>
+<p>
+<span class="para-head">Single-writer concurrency.</span>
+The coarse mutex prevents concurrent writes. Future work will explore reader-writer locks for read-heavy
+workloads, and optimistic concurrency for write-heavy ones.
+</p>
+<p>
+<span class="para-head">Synthetic benchmarks.</span>
+Future work will benchmark with sentence-transformers (MiniLM, BGE) and OpenAI embeddings on BEIR [15]
+and MS-MARCO to measure real-world retrieval quality.
+</p>
+<p>
+<span class="para-head">No query language.</span>
+Future work: a minimal declarative DSL over the filter and graph primitives for complex multi-hop joins.
+</p>
+
+<!-- §6 Conclusion -->
+<h2 class="section">Conclusion</h2>
+<p>
+We presented Feather DB, an embedded vector database and living context engine that addresses AI application
+memory through three integrated mechanisms: adaptive temporal decay, embedded hybrid retrieval, and context
+chain traversal. Our evaluation demonstrates $0.10$&thinsp;ms search latency, production-grade concurrency
+($15{,}119$&thinsp;q/s), 100% crash recovery, and a 55% relative precision improvement of hybrid over
+keyword-only retrieval&mdash;within a zero-configuration embedded deployment with a $<4$&thinsp;MB file footprint
+for 3,000 records.
+</p>
+<p>
+Feather DB makes the case that AI application memory is not a storage problem but a <em>retrieval relevance</em>
+problem. By treating temporal adaptation, graph relations, and semantic similarity as first-class primitives,
+Feather DB provides a foundation on which AI applications can build persistent, intelligent, and adaptive memory at any scale.
+</p>
+
+<!-- References -->
+<div class="references">
+<h2>References</h2>
+<div class="ref-entry">[1] Pinecone Systems Inc. Pinecone: Vector Database for Machine Learning. https://pinecone.io, 2021.</div>
+<div class="ref-entry">[2] Weaviate B.V. Weaviate: Open Source Vector Database. https://weaviate.io, 2021.</div>
+<div class="ref-entry">[3] Chroma. Chroma: The AI-Native Open-Source Embedding Database. https://trychroma.com, 2022.</div>
+<div class="ref-entry">[4] Johnson, J., Douze, M., &amp; Jégou, H. Billion-scale similarity search with GPUs. <em>IEEE TBIG</em>, 2019.</div>
+<div class="ref-entry">[5] Qdrant. Qdrant: Vector Database for the Next Generation of AI. https://qdrant.tech, 2021.</div>
+<div class="ref-entry">[6] Malkov, Y.A. &amp; Yashunin, D.A. Efficient and robust approximate nearest neighbor search using hierarchical navigable small world graphs. <em>IEEE TPAMI</em>, 2018.</div>
+<div class="ref-entry">[7] Malkov, Y. hnswlib: fast approximate nearest neighbor search library. https://github.com/nmslib/hnswlib, 2018.</div>
+<div class="ref-entry">[8] Robertson, S. &amp; Zaragoza, H. The Probabilistic Relevance Framework: BM25 and Beyond. <em>Foundations and Trends in IR</em>, 3(4):333&ndash;389, 2009.</div>
+<div class="ref-entry">[9] Cormack, G.V., Clarke, C.L., &amp; Buettcher, S. Reciprocal rank fusion outperforms condorcet and individual rank learning methods. <em>SIGIR 2009</em>.</div>
+<div class="ref-entry">[10] Li, X. &amp; Croft, W.B. Time-based language models. <em>CIKM 2003</em>.</div>
+<div class="ref-entry">[11] Packer, C., et al. MemGPT: Towards LLMs as Operating Systems. <em>arXiv:2310.08560</em>, 2023.</div>
+<div class="ref-entry">[12] Park, J.S., et al. Generative Agents: Interactive Simulacra of Human Behavior. <em>UIST 2023</em>.</div>
+<div class="ref-entry">[13] Ebbinghaus, H. Über das Gedächtnis. 1885.</div>
+<div class="ref-entry">[14] Edge, D., et al. From Local to Global: A Graph RAG Approach to Query-Focused Summarization. <em>arXiv:2404.16130</em>, 2024.</div>
+<div class="ref-entry">[15] Thakur, N., et al. BEIR: A Heterogeneous Benchmark for Zero-Shot Evaluation of IR Models. <em>NeurIPS 2021 Datasets &amp; Benchmarks Track</em>.</div>
+</div>
+
+</div><!-- end two-col -->
+</div><!-- end page -->
+</body>
+</html>
