@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>Feather DB — Business Overview</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #f8f9fc;
+    font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+    padding: 40px;
+    display: flex;
+    justify-content: center;
+  }
+
+  .canvas {
+    width: 1200px;
+    background: #ffffff;
+    border-radius: 20px;
+    padding: 48px;
+    box-shadow: 0 4px 40px rgba(0,0,0,0.08);
+  }
+
+  /* ── Header ─────────────────────────────────────────────── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 40px;
+    padding-bottom: 28px;
+    border-bottom: 2px solid #f1f3f9;
+  }
+  .header-left { display: flex; align-items: center; gap: 16px; }
+  .logo-box {
+    width: 52px; height: 52px; border-radius: 14px;
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+  }
+  .brand-name {
+    font-size: 26px; font-weight: 800; color: #0f172a;
+    letter-spacing: -0.5px;
+  }
+  .brand-tag {
+    font-size: 13px; font-weight: 500; color: #64748b;
+    margin-top: 2px;
+  }
+  .header-badges { display: flex; gap: 10px; }
+  .badge {
+    padding: 6px 14px; border-radius: 20px;
+    font-size: 12px; font-weight: 600;
+  }
+  .badge-green  { background: #f0fdf4; color: #16a34a; border: 1.5px solid #bbf7d0; }
+  .badge-blue   { background: #eff6ff; color: #2563eb; border: 1.5px solid #bfdbfe; }
+  .badge-purple { background: #faf5ff; color: #7c3aed; border: 1.5px solid #e9d5ff; }
+
+  /* ── Problem → Solution strip ───────────────────────────── */
+  .problem-solution {
+    display: grid; grid-template-columns: 1fr 60px 1fr;
+    gap: 0; margin-bottom: 36px; align-items: center;
+  }
+  .problem-box {
+    background: #fff8f8; border: 2px solid #fecaca;
+    border-radius: 14px; padding: 20px 24px;
+  }
+  .solution-box {
+    background: linear-gradient(135deg, #f0f9ff, #eff6ff);
+    border: 2px solid #bfdbfe;
+    border-radius: 14px; padding: 20px 24px;
+  }
+  .box-label {
+    font-size: 10px; font-weight: 700; letter-spacing: 1.5px;
+    text-transform: uppercase; margin-bottom: 8px;
+  }
+  .problem-box .box-label { color: #ef4444; }
+  .solution-box .box-label { color: #2563eb; }
+  .box-title { font-size: 15px; font-weight: 700; color: #0f172a; margin-bottom: 6px; }
+  .box-desc { font-size: 12.5px; color: #64748b; line-height: 1.5; }
+  .arrow-center {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 28px; color: #4f46e5;
+  }
+
+  /* ── Section title ──────────────────────────────────────── */
+  .section-title {
+    font-size: 11px; font-weight: 700; color: #94a3b8;
+    letter-spacing: 1.5px; text-transform: uppercase;
+    margin-bottom: 16px; margin-top: 32px;
+  }
+
+  /* ── Main flow diagram ──────────────────────────────────── */
+  .flow {
+    display: grid;
+    grid-template-columns: 200px 40px 1fr 40px 200px;
+    gap: 0; align-items: stretch; margin-bottom: 36px;
+  }
+
+  .flow-col {
+    display: flex; flex-direction: column; gap: 10px;
+  }
+
+  .flow-arrow {
+    display: flex; align-items: center; justify-content: center;
+    color: #94a3b8; font-size: 22px;
+  }
+
+  /* Input cards */
+  .input-card {
+    background: #f8faff; border: 1.5px solid #dbeafe;
+    border-radius: 12px; padding: 12px 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .input-icon { font-size: 20px; }
+  .input-label { font-size: 12px; font-weight: 600; color: #1e40af; }
+  .input-sub { font-size: 10px; color: #93c5fd; margin-top: 1px; }
+
+  /* Core engine */
+  .core-engine {
+    background: #fafbff;
+    border: 2px solid #e0e7ff;
+    border-radius: 16px;
+    padding: 20px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto auto auto;
+    gap: 12px;
+  }
+
+  .engine-module {
+    border-radius: 11px;
+    padding: 14px 16px;
+    border: 1.5px solid transparent;
+  }
+  .em-hnsw  { background: #faf5ff; border-color: #e9d5ff; }
+  .em-bm25  { background: #ecfeff; border-color: #a5f3fc; }
+  .em-graph { background: #fffbeb; border-color: #fde68a; }
+  .em-decay { background: #fff1f2; border-color: #fecdd3; }
+  .em-filter {
+    grid-column: 1 / -1;
+    background: #f0fdf4; border-color: #bbf7d0;
+  }
+  .em-hybrid {
+    grid-column: 1 / -1;
+    background: linear-gradient(135deg, #faf5ff, #ecfeff);
+    border-color: #c4b5fd;
+    display: flex; align-items: center; gap: 14px;
+  }
+
+  .em-icon { font-size: 18px; margin-bottom: 6px; }
+  .em-title { font-size: 11.5px; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
+  .em-desc  { font-size: 10px; color: #64748b; line-height: 1.45; }
+  .em-badge {
+    display: inline-block; margin-top: 6px;
+    padding: 2px 8px; border-radius: 20px;
+    font-size: 9.5px; font-weight: 700;
+  }
+  .badge-purple-sm { background: #ede9fe; color: #7c3aed; }
+  .badge-cyan-sm   { background: #cffafe; color: #0e7490; }
+  .badge-amber-sm  { background: #fef3c7; color: #92400e; }
+  .badge-pink-sm   { background: #fce7f3; color: #9d174d; }
+  .badge-green-sm  { background: #dcfce7; color: #15803d; }
+  .badge-indigo-sm { background: #e0e7ff; color: #3730a3; }
+
+  /* Output cards */
+  .output-card {
+    background: #f0fdf4; border: 1.5px solid #86efac;
+    border-radius: 12px; padding: 12px 14px;
+  }
+  .output-label { font-size: 11.5px; font-weight: 700; color: #15803d; margin-bottom: 3px; }
+  .output-val   { font-size: 10px; color: #4ade80; font-weight: 600; }
+  .output-desc  { font-size: 10px; color: #64748b; margin-top: 2px; }
+
+  /* ── Use Cases grid ─────────────────────────────────────── */
+  .usecases {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 36px;
+  }
+
+  .uc-card {
+    border-radius: 14px;
+    padding: 20px;
+    border: 1.5px solid transparent;
+  }
+  .uc-icon { font-size: 28px; margin-bottom: 10px; }
+  .uc-title { font-size: 13px; font-weight: 700; color: #0f172a; margin-bottom: 6px; }
+  .uc-desc  { font-size: 11px; color: #64748b; line-height: 1.5; margin-bottom: 10px; }
+  .uc-tags  { display: flex; flex-wrap: wrap; gap: 4px; }
+  .uc-tag   {
+    padding: 2px 8px; border-radius: 10px;
+    font-size: 9px; font-weight: 600;
+  }
+
+  .uc-chatbot  { background: #f5f3ff; border-color: #ddd6fe; }
+  .uc-kb       { background: #eff6ff; border-color: #bfdbfe; }
+  .uc-agent    { background: #fff7ed; border-color: #fed7aa; }
+  .uc-saas     { background: #f0fdf4; border-color: #bbf7d0; }
+
+  /* ── Differentiators ────────────────────────────────────── */
+  .diff-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    margin-bottom: 36px;
+  }
+  .diff-card {
+    background: #fafafa;
+    border: 1.5px solid #e2e8f0;
+    border-radius: 14px;
+    padding: 20px;
+  }
+  .diff-icon { font-size: 22px; margin-bottom: 8px; }
+  .diff-title { font-size: 13px; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
+  .diff-desc  { font-size: 11px; color: #64748b; line-height: 1.5; }
+  .diff-stat  {
+    margin-top: 10px; font-size: 18px; font-weight: 800;
+    color: #4f46e5; letter-spacing: -0.5px;
+  }
+  .diff-stat-label { font-size: 10px; color: #94a3b8; font-weight: 500; }
+
+  /* ── Benchmark strip ────────────────────────────────────── */
+  .bench {
+    background: linear-gradient(135deg, #f8f9ff, #f0f4ff);
+    border: 1.5px solid #e0e7ff;
+    border-radius: 14px;
+    padding: 20px 28px;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 0;
+    margin-bottom: 36px;
+  }
+  .bench-item {
+    text-align: center;
+    padding: 4px 8px;
+    border-right: 1px solid #e0e7ff;
+  }
+  .bench-item:last-child { border-right: none; }
+  .bench-val   { font-size: 22px; font-weight: 800; color: #4f46e5; letter-spacing: -1px; }
+  .bench-unit  { font-size: 10px; color: #94a3b8; font-weight: 500; }
+  .bench-label { font-size: 10px; color: #64748b; margin-top: 4px; font-weight: 500; }
+
+  /* ── Comparison table ───────────────────────────────────── */
+  .compare {
+    margin-bottom: 36px;
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1.5px solid #e2e8f0;
+  }
+  .compare table { width: 100%; border-collapse: collapse; }
+  .compare th {
+    background: #f8faff;
+    font-size: 11px; font-weight: 700; color: #64748b;
+    padding: 12px 16px; text-align: left;
+    border-bottom: 1.5px solid #e2e8f0;
+  }
+  .compare th.highlight { background: #eff6ff; color: #2563eb; }
+  .compare td {
+    font-size: 11.5px; color: #374151;
+    padding: 10px 16px;
+    border-bottom: 1px solid #f1f5f9;
+  }
+  .compare tr:last-child td { border-bottom: none; }
+  .compare td.highlight { background: #fafcff; font-weight: 600; color: #1e40af; }
+  .compare td.row-label { font-weight: 600; color: #374151; }
+  .chk  { color: #16a34a; font-weight: 700; }
+  .xmk  { color: #dc2626; }
+  .meh  { color: #f59e0b; }
+
+  /* ── Stack diagram ──────────────────────────────────────── */
+  .stack {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 36px;
+  }
+  .stack-col-title {
+    font-size: 12px; font-weight: 700; color: #0f172a;
+    margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+  }
+  .stack-layer {
+    border-radius: 10px;
+    padding: 10px 16px;
+    margin-bottom: 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* ── Footer ─────────────────────────────────────────────── */
+  .footer {
+    border-top: 2px solid #f1f3f9;
+    padding-top: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .footer-links { display: flex; gap: 24px; }
+  .footer-link  { font-size: 11px; color: #94a3b8; text-decoration: none; }
+  .footer-copy  { font-size: 11px; color: #cbd5e1; }
+
+  /* Divider line */
+  .divider {
+    height: 2px; background: #f1f3f9;
+    margin: 32px 0; border-radius: 2px;
+  }
+</style>
+</head>
+<body>
+<div class="canvas">
+
+  <!-- ── HEADER ───────────────────────────────────────────── -->
+  <div class="header">
+    <div class="header-left">
+      <div class="logo-box">🪶</div>
+      <div>
+        <div class="brand-name">Feather DB</div>
+        <div class="brand-tag">Living Context Engine for AI-Native Applications</div>
+      </div>
+    </div>
+    <div class="header-badges">
+      <span class="badge badge-green">MIT Open Source</span>
+      <span class="badge badge-blue">v0.8.0</span>
+      <span class="badge badge-purple">Zero Server · Embedded</span>
+    </div>
+  </div>
+
+  <!-- ── PROBLEM → SOLUTION ───────────────────────────────── -->
+  <div class="problem-solution">
+    <div class="problem-box">
+      <div class="box-label">The Problem</div>
+      <div class="box-title">AI Applications Have No Memory</div>
+      <div class="box-desc">
+        Every LLM call starts from zero. Developers bolt on external vector databases that need dedicated servers,
+        network round-trips, and complex DevOps — adding cost, latency, and privacy risks.
+        Memory that is <em>static, siloed, and server-dependent</em> cannot serve modern AI products.
+      </div>
+    </div>
+    <div class="arrow-center">→</div>
+    <div class="solution-box">
+      <div class="box-label">The Solution</div>
+      <div class="box-title">A Living Context Engine — Embedded in Your App</div>
+      <div class="box-desc">
+        Feather DB runs <strong>inside your process</strong>, stores everything in a single file, and delivers
+        sub-millisecond search. Memory that is <em>semantically searchable, temporally adaptive,
+        and relationally connected</em> — with zero servers and zero operational cost.
+      </div>
+    </div>
+  </div>
+
+  <!-- ── HOW IT WORKS ─────────────────────────────────────── -->
+  <div class="section-title">How It Works — Data Flow</div>
+
+  <div class="flow">
+
+    <!-- Inputs -->
+    <div class="flow-col">
+      <div class="input-card">
+        <div class="input-icon">📝</div>
+        <div>
+          <div class="input-label">Text & Documents</div>
+          <div class="input-sub">conversations · docs · tickets</div>
+        </div>
+      </div>
+      <div class="input-card">
+        <div class="input-icon">🖼</div>
+        <div>
+          <div class="input-label">Images & Visual</div>
+          <div class="input-sub">visual embeddings</div>
+        </div>
+      </div>
+      <div class="input-card">
+        <div class="input-icon">🏷</div>
+        <div>
+          <div class="input-label">Structured Metadata</div>
+          <div class="input-sub">namespace · entity · attributes</div>
+        </div>
+      </div>
+      <div class="input-card">
+        <div class="input-icon">🔗</div>
+        <div>
+          <div class="input-label">Relationships</div>
+          <div class="input-sub">typed weighted graph edges</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flow-arrow">→</div>
+
+    <!-- Core Engine -->
+    <div class="core-engine">
+
+      <div class="engine-module em-hnsw">
+        <div class="em-icon">🧭</div>
+        <div class="em-title">Vector Search (HNSW)</div>
+        <div class="em-desc">Sub-ms approximate nearest neighbour search across text, image & audio modalities independently.</div>
+        <span class="em-badge badge-purple-sm">0.10ms · O(log n)</span>
+      </div>
+
+      <div class="engine-module em-bm25">
+        <div class="em-icon">🔤</div>
+        <div class="em-title">Keyword Search (BM25)</div>
+        <div class="em-desc">Full-text inverted index with Okapi BM25 scoring, stop-word filtering, and incremental updates.</div>
+        <span class="em-badge badge-cyan-sm">0.06ms · exact terms</span>
+      </div>
+
+      <div class="engine-module em-graph">
+        <div class="em-icon">🕸</div>
+        <div class="em-title">Context Graph</div>
+        <div class="em-desc">Typed weighted edges between records. Auto-link by similarity. BFS traversal with context_chain().</div>
+        <span class="em-badge badge-amber-sm">n-hop graph expansion</span>
+      </div>
+
+      <div class="engine-module em-decay">
+        <div class="em-icon">⏳</div>
+        <div class="em-title">Adaptive Decay</div>
+        <div class="em-desc">Frequently recalled memories resist decay. score = sim + recency × importance × stickiness.</div>
+        <span class="em-badge badge-pink-sm">living context scoring</span>
+      </div>
+
+      <div class="engine-module em-filter">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span style="font-size:16px">🎯</span>
+          <span class="em-title" style="margin-bottom:0">Smart Filters</span>
+          <span class="em-badge badge-green-sm">namespace</span>
+          <span class="em-badge badge-green-sm">entity</span>
+          <span class="em-badge badge-green-sm">attributes</span>
+          <span class="em-badge badge-green-sm">importance ≥ n</span>
+          <span class="em-badge badge-green-sm">timestamp range</span>
+          <span class="em-badge badge-green-sm">context type</span>
+          <span class="em-desc" style="width:100%;margin-top:4px">All fields optional · fully composable · zero overhead</span>
+        </div>
+      </div>
+
+      <div class="engine-module em-hybrid">
+        <span style="font-size:22px">⊕</span>
+        <div>
+          <div class="em-title">Hybrid Search — RRF Fusion</div>
+          <div class="em-desc">Vector rankings + BM25 rankings merged via Reciprocal Rank Fusion. Best of both worlds — semantic understanding + exact keyword match.</div>
+        </div>
+        <span class="em-badge badge-indigo-sm" style="white-space:nowrap">0.24ms · 70% precision</span>
+      </div>
+
+    </div>
+
+    <div class="flow-arrow">→</div>
+
+    <!-- Outputs -->
+    <div class="flow-col">
+      <div class="output-card">
+        <div class="output-label">Ranked Results</div>
+        <div class="output-val">id · score · metadata</div>
+        <div class="output-desc">ATD-weighted, relevance-ranked list of matching records</div>
+      </div>
+      <div class="output-card">
+        <div class="output-label">Context Chain</div>
+        <div class="output-val">nodes · edges · hop distance</div>
+        <div class="output-desc">Expanded knowledge subgraph from seed vectors</div>
+      </div>
+      <div class="output-card">
+        <div class="output-label">Graph Visualizer</div>
+        <div class="output-val">D3 force-graph HTML</div>
+        <div class="output-desc">Self-contained offline visualization</div>
+      </div>
+      <div class="output-card">
+        <div class="output-label">Persistence</div>
+        <div class="output-val">single .feather file</div>
+        <div class="output-desc">WAL + atomic saves · 100% crash recovery</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── BENCHMARKS ────────────────────────────────────────── -->
+  <div class="section-title">Performance Benchmarks — 3,050 records · 256-dim · Apple M-series</div>
+
+  <div class="bench">
+    <div class="bench-item">
+      <div class="bench-val">0.10</div>
+      <div class="bench-unit">ms</div>
+      <div class="bench-label">Vector Search (k=10)</div>
+    </div>
+    <div class="bench-item">
+      <div class="bench-val">0.06</div>
+      <div class="bench-unit">ms</div>
+      <div class="bench-label">Keyword Search (BM25)</div>
+    </div>
+    <div class="bench-item">
+      <div class="bench-val">0.24</div>
+      <div class="bench-unit">ms</div>
+      <div class="bench-label">Hybrid RRF Search</div>
+    </div>
+    <div class="bench-item">
+      <div class="bench-val">15K</div>
+      <div class="bench-unit">q/s</div>
+      <div class="bench-label">Concurrent Queries (8 threads)</div>
+    </div>
+    <div class="bench-item">
+      <div class="bench-val">100%</div>
+      <div class="bench-unit"></div>
+      <div class="bench-label">WAL Crash Recovery</div>
+    </div>
+    <div class="bench-item">
+      <div class="bench-val">&lt;4</div>
+      <div class="bench-unit">MB</div>
+      <div class="bench-label">File size / 3,000 records</div>
+    </div>
+  </div>
+
+  <!-- ── BUSINESS USE CASES ────────────────────────────────── -->
+  <div class="section-title">Business Use Cases</div>
+
+  <div class="usecases">
+
+    <div class="uc-card uc-chatbot">
+      <div class="uc-icon">🤖</div>
+      <div class="uc-title">AI Chatbot Long-Term Memory</div>
+      <div class="uc-desc">
+        Store every conversation turn as a vector. Retrieve relevant past context on each new message.
+        Adaptive decay ensures recent, frequently cited memories surface first.
+        Users feel remembered — not reset.
+      </div>
+      <div class="uc-tags">
+        <span class="uc-tag" style="background:#ede9fe;color:#7c3aed">hybrid search</span>
+        <span class="uc-tag" style="background:#ede9fe;color:#7c3aed">decay scoring</span>
+        <span class="uc-tag" style="background:#ede9fe;color:#7c3aed">per-user namespace</span>
+      </div>
+    </div>
+
+    <div class="uc-card uc-kb">
+      <div class="uc-icon">📚</div>
+      <div class="uc-title">Enterprise Knowledge Base</div>
+      <div class="uc-desc">
+        Index docs, FAQs, runbooks, and Slack threads. Use namespace isolation per department.
+        Link related articles via the graph. context_chain() retrieves full dependency trees, not just the nearest article.
+      </div>
+      <div class="uc-tags">
+        <span class="uc-tag" style="background:#dbeafe;color:#1d4ed8">BM25 search</span>
+        <span class="uc-tag" style="background:#dbeafe;color:#1d4ed8">context chain</span>
+        <span class="uc-tag" style="background:#dbeafe;color:#1d4ed8">dept namespaces</span>
+      </div>
+    </div>
+
+    <div class="uc-card uc-agent">
+      <div class="uc-icon">🧠</div>
+      <div class="uc-title">AI Agent Memory</div>
+      <div class="uc-desc">
+        Agents executing long-horizon tasks recall prior decisions, tool outputs, and intermediate results.
+        Graph edges link cause-to-effect chains. Multi-hop traversal enables complex planning
+        and reasoning over accumulated experience.
+      </div>
+      <div class="uc-tags">
+        <span class="uc-tag" style="background:#fff7ed;color:#c2410c">context_chain</span>
+        <span class="uc-tag" style="background:#fff7ed;color:#c2410c">graph edges</span>
+        <span class="uc-tag" style="background:#fff7ed;color:#c2410c">FACT / EVENT</span>
+      </div>
+    </div>
+
+    <div class="uc-card uc-saas">
+      <div class="uc-icon">🏢</div>
+      <div class="uc-title">Multi-Tenant SaaS Platform</div>
+      <div class="uc-desc">
+        Namespace/entity/attributes maps directly to SaaS tenancy. Each customer gets an isolated namespace.
+        Queries never cross namespace boundaries. FastAPI wrapper provides a ready-to-deploy REST layer
+        with per-namespace routing.
+      </div>
+      <div class="uc-tags">
+        <span class="uc-tag" style="background:#dcfce7;color:#15803d">namespace isolation</span>
+        <span class="uc-tag" style="background:#dcfce7;color:#15803d">REST API</span>
+        <span class="uc-tag" style="background:#dcfce7;color:#15803d">Docker ready</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── DIFFERENTIATORS ───────────────────────────────────── -->
+  <div class="section-title">Why Feather DB</div>
+
+  <div class="diff-grid">
+
+    <div class="diff-card">
+      <div class="diff-icon">⚡</div>
+      <div class="diff-title">Zero-Latency, In-Process</div>
+      <div class="diff-desc">Runs embedded in your application process. No network, no serialisation overhead. Query the index directly in memory — the same way SQLite works for SQL.</div>
+      <div class="diff-stat">0.10ms</div>
+      <div class="diff-stat-label">vs ~300ms for cloud APIs</div>
+    </div>
+
+    <div class="diff-card">
+      <div class="diff-icon">🔒</div>
+      <div class="diff-title">Data Never Leaves Your Infrastructure</div>
+      <div class="diff-desc">No data sent to third-party servers. Critical for healthcare (HIPAA), finance (SOC 2), legal, and any enterprise with data sovereignty requirements.</div>
+      <div class="diff-stat">100%</div>
+      <div class="diff-stat-label">on-premise, air-gap capable</div>
+    </div>
+
+    <div class="diff-card">
+      <div class="diff-icon">💰</div>
+      <div class="diff-title">Zero Operational Cost at Scale</div>
+      <div class="diff-desc">No per-query billing, no per-token fees, no infrastructure to manage. Ship Feather DB inside your product and scale to millions of users with zero memory-layer cost.</div>
+      <div class="diff-stat">$0</div>
+      <div class="diff-stat-label">per query, forever</div>
+    </div>
+
+    <div class="diff-card">
+      <div class="diff-icon">🧬</div>
+      <div class="diff-title">Memory That Stays Truthful Over Time</div>
+      <div class="diff-desc">Adaptive Temporal Decay means frequently accessed memories persist while stale knowledge fades. Records touched 20× age 4× slower — like human long-term memory consolidation.</div>
+      <div class="diff-stat">Living</div>
+      <div class="diff-stat-label">not just stored — adaptive</div>
+    </div>
+
+    <div class="diff-card">
+      <div class="diff-icon">🌐</div>
+      <div class="diff-title">Works Offline & at the Edge</div>
+      <div class="diff-desc">Single <code style="background:#f1f5f9;padding:1px 4px;border-radius:4px;font-size:10px">.feather</code> file. Works in mobile apps, desktop tools, IoT devices, air-gapped environments, and serverless functions with no cold-start memory.</div>
+      <div class="diff-stat">1 file</div>
+      <div class="diff-stat-label">all data, graph, and index</div>
+    </div>
+
+    <div class="diff-card">
+      <div class="diff-icon">🔓</div>
+      <div class="diff-title">Fully Open Source — No Vendor Lock-In</div>
+      <div class="diff-desc">MIT license. Full C++17 source code. Audit it, fork it, extend it. The <code style="background:#f1f5f9;padding:1px 4px;border-radius:4px;font-size:10px">.feather</code> file format is documented and versioned. Your data is yours forever.</div>
+      <div class="diff-stat">MIT</div>
+      <div class="diff-stat-label">fork, extend, own</div>
+    </div>
+
+  </div>
+
+  <!-- ── COMPARISON TABLE ──────────────────────────────────── -->
+  <div class="section-title">Competitive Landscape</div>
+
+  <div class="compare">
+    <table>
+      <thead>
+        <tr>
+          <th>Capability</th>
+          <th class="highlight">Feather DB</th>
+          <th>Pinecone</th>
+          <th>Chroma</th>
+          <th>Supermemory</th>
+          <th>FAISS</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="row-label">Deployment</td>
+          <td class="highlight chk">Embedded (in-process)</td>
+          <td>Cloud only</td>
+          <td>Embedded</td>
+          <td>Cloud API</td>
+          <td>Library only</td>
+        </tr>
+        <tr>
+          <td class="row-label">Search latency</td>
+          <td class="highlight chk">0.10ms</td>
+          <td class="xmk">~100ms (network)</td>
+          <td class="meh">~2–5ms</td>
+          <td class="xmk">~300ms</td>
+          <td class="chk">~0.3ms</td>
+        </tr>
+        <tr>
+          <td class="row-label">Hybrid search (BM25 + Vector)</td>
+          <td class="highlight chk">✓ Built-in RRF</td>
+          <td class="meh">✓ Managed</td>
+          <td class="xmk">✗</td>
+          <td class="chk">✓ Managed</td>
+          <td class="xmk">✗</td>
+        </tr>
+        <tr>
+          <td class="row-label">Knowledge graph</td>
+          <td class="highlight chk">✓ Typed edges + BFS</td>
+          <td class="xmk">✗</td>
+          <td class="xmk">✗</td>
+          <td class="chk">✓ Ontology-aware</td>
+          <td class="xmk">✗</td>
+        </tr>
+        <tr>
+          <td class="row-label">Temporal decay / living memory</td>
+          <td class="highlight chk">✓ Adaptive (ATD)</td>
+          <td class="xmk">✗</td>
+          <td class="xmk">✗</td>
+          <td class="chk">✓ Selective forgetting</td>
+          <td class="xmk">✗</td>
+        </tr>
+        <tr>
+          <td class="row-label">Data privacy (on-device)</td>
+          <td class="highlight chk">✓ Always</td>
+          <td class="xmk">✗ Cloud</td>
+          <td class="chk">✓</td>
+          <td class="xmk">✗ Cloud</td>
+          <td class="chk">✓</td>
+        </tr>
+        <tr>
+          <td class="row-label">Cost at scale</td>
+          <td class="highlight chk">$0 / query</td>
+          <td class="xmk">$$$ / query</td>
+          <td class="chk">$0</td>
+          <td class="xmk">$$ / token</td>
+          <td class="chk">$0</td>
+        </tr>
+        <tr>
+          <td class="row-label">Crash recovery (WAL)</td>
+          <td class="highlight chk">✓ 100%</td>
+          <td class="chk">✓ Managed</td>
+          <td class="xmk">✗</td>
+          <td class="chk">✓ Managed</td>
+          <td class="xmk">✗</td>
+        </tr>
+        <tr>
+          <td class="row-label">Open source (MIT)</td>
+          <td class="highlight chk">✓ Full source</td>
+          <td class="xmk">✗ Proprietary</td>
+          <td class="chk">✓ Apache 2</td>
+          <td class="meh">Non-commercial</td>
+          <td class="chk">✓ MIT</td>
+        </tr>
+        <tr>
+          <td class="row-label">Works offline / edge</td>
+          <td class="highlight chk">✓ Single file</td>
+          <td class="xmk">✗</td>
+          <td class="chk">✓</td>
+          <td class="xmk">✗</td>
+          <td class="chk">✓</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── INTEGRATION STACK ──────────────────────────────────── -->
+  <div class="section-title">Integration & Deployment Stack</div>
+
+  <div class="stack">
+    <div>
+      <div class="stack-col-title">🐍 Python API</div>
+      <div class="stack-layer" style="background:#eff6ff;color:#1d4ed8">pip install feather-db</div>
+      <div class="stack-layer" style="background:#f8faff;color:#3730a3;font-weight:500;font-size:11px">DB · Metadata · FilterBuilder · ScoringConfig</div>
+      <div class="stack-layer" style="background:#f8faff;color:#3730a3;font-weight:500;font-size:11px">keyword_search · hybrid_search · context_chain</div>
+      <div class="stack-layer" style="background:#f8faff;color:#3730a3;font-weight:500;font-size:11px">visualize() → D3 force-graph HTML</div>
+
+      <div class="stack-col-title" style="margin-top:16px">🦀 Rust CLI</div>
+      <div class="stack-layer" style="background:#fff7ed;color:#c2410c">cargo install feather-db-cli</div>
+      <div class="stack-layer" style="background:#fffbf7;color:#9a3412;font-weight:500;font-size:11px">feather add · search · link · save</div>
+    </div>
+
+    <div>
+      <div class="stack-col-title">🌐 REST API (FastAPI + Docker)</div>
+      <div class="stack-layer" style="background:#f0fdf4;color:#15803d">docker-compose up (feather-api/)</div>
+      <div class="stack-layer" style="background:#f8fffe;color:#0e7490;font-weight:500;font-size:11px">POST /v1/{namespace}/vectors</div>
+      <div class="stack-layer" style="background:#f8fffe;color:#0e7490;font-weight:500;font-size:11px">POST /v1/{namespace}/search</div>
+      <div class="stack-layer" style="background:#f8fffe;color:#0e7490;font-weight:500;font-size:11px">POST /v1/{namespace}/hybrid_search</div>
+      <div class="stack-layer" style="background:#f8fffe;color:#0e7490;font-weight:500;font-size:11px">GET  /v1/{namespace}/records?after=ID (cursor pagination)</div>
+    </div>
+  </div>
+
+  <!-- ── FOOTER ─────────────────────────────────────────────── -->
+  <div class="footer">
+    <div class="footer-links">
+      <a class="footer-link" href="https://github.com/feather-store/feather">github.com/feather-store/feather</a>
+      <a class="footer-link" href="https://pypi.org/project/feather-db">pypi: feather-db</a>
+      <a class="footer-link" href="https://crates.io/crates/feather-db-cli">crates.io: feather-db-cli</a>
+      <a class="footer-link" href="https://www.getfeather.store">getfeather.store</a>
+      <a class="footer-link" href="https://huggingface.co/spaces/Sri-Vigneshwar-DJ/feather-db">HF Demo</a>
+    </div>
+    <div class="footer-copy">Feather DB v0.8.0 · MIT License · Hawky.ai © 2026</div>
+  </div>
+
+</div>
+</body>
+</html>
