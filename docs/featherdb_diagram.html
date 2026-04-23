@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>Feather DB — Architecture Diagram</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0f1117;
+    font-family: 'SF Pro Display', -apple-system, 'Segoe UI', sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px;
+    min-height: 100vh;
+  }
+  h1 {
+    color: #fff;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    margin-bottom: 6px;
+  }
+  .subtitle {
+    color: #888;
+    font-size: 13px;
+    margin-bottom: 36px;
+    letter-spacing: 0.3px;
+  }
+  svg text { font-family: 'SF Pro Display', -apple-system, 'Segoe UI', sans-serif; }
+</style>
+</head>
+<body>
+<h1>Feather DB — Living Context Engine</h1>
+<p class="subtitle">Architecture Overview · v0.8.0</p>
+
+<svg width="1100" height="860" viewBox="0 0 1100 860" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Gradients -->
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a1d27"/>
+      <stop offset="100%" stop-color="#141720"/>
+    </linearGradient>
+    <linearGradient id="inputGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <linearGradient id="hnswGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="bm25Grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#0e7490"/>
+    </linearGradient>
+    <linearGradient id="metaGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+    <linearGradient id="graphGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#b45309"/>
+    </linearGradient>
+    <linearGradient id="decayGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#db2777"/>
+      <stop offset="100%" stop-color="#be185d"/>
+    </linearGradient>
+    <linearGradient id="searchGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#4f46e5"/>
+      <stop offset="100%" stop-color="#4338ca"/>
+    </linearGradient>
+    <linearGradient id="outputGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#16a34a"/>
+      <stop offset="100%" stop-color="#15803d"/>
+    </linearGradient>
+    <linearGradient id="persistGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#374151"/>
+      <stop offset="100%" stop-color="#1f2937"/>
+    </linearGradient>
+    <linearGradient id="apiGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+
+    <!-- Arrow markers -->
+    <marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#8b5cf6"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#22c55e"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#f59e0b"/>
+    </marker>
+    <marker id="arrow-pink" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ec4899"/>
+    </marker>
+    <marker id="arrow-white" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#94a3b8"/>
+    </marker>
+
+    <!-- Drop shadow -->
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000" flood-opacity="0.4"/>
+    </filter>
+    <filter id="glow-blue">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+
+    <!-- Clip paths -->
+    <clipPath id="roundClip">
+      <rect width="1100" height="860" rx="16"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1100" height="860" rx="16" fill="url(#bgGrad)" filter="url(#shadow)"/>
+
+  <!-- Subtle grid -->
+  <g opacity="0.04">
+    <line x1="0" y1="100" x2="1100" y2="100" stroke="#fff" stroke-width="0.5"/>
+    <line x1="0" y1="200" x2="1100" y2="200" stroke="#fff" stroke-width="0.5"/>
+    <line x1="0" y1="300" x2="1100" y2="300" stroke="#fff" stroke-width="0.5"/>
+    <line x1="0" y1="400" x2="1100" y2="400" stroke="#fff" stroke-width="0.5"/>
+    <line x1="0" y1="500" x2="1100" y2="500" stroke="#fff" stroke-width="0.5"/>
+    <line x1="0" y1="600" x2="1100" y2="600" stroke="#fff" stroke-width="0.5"/>
+    <line x1="0" y1="700" x2="1100" y2="700" stroke="#fff" stroke-width="0.5"/>
+    <line x1="100" y1="0" x2="100" y2="860" stroke="#fff" stroke-width="0.5"/>
+    <line x1="220" y1="0" x2="220" y2="860" stroke="#fff" stroke-width="0.5"/>
+    <line x1="340" y1="0" x2="340" y2="860" stroke="#fff" stroke-width="0.5"/>
+    <line x1="460" y1="0" x2="460" y2="860" stroke="#fff" stroke-width="0.5"/>
+    <line x1="580" y1="0" x2="580" y2="860" stroke="#fff" stroke-width="0.5"/>
+    <line x1="700" y1="0" x2="700" y2="860" stroke="#fff" stroke-width="0.5"/>
+    <line x1="820" y1="0" x2="820" y2="860" stroke="#fff" stroke-width="0.5"/>
+    <line x1="940" y1="0" x2="940" y2="860" stroke="#fff" stroke-width="0.5"/>
+    <line x1="1060" y1="0" x2="1060" y2="860" stroke="#fff" stroke-width="0.5"/>
+  </g>
+
+  <!-- ══════════════════════════════════════════════════════════ -->
+  <!-- ROW 1: INPUT LAYER -->
+  <!-- ══════════════════════════════════════════════════════════ -->
+
+  <!-- Layer label -->
+  <text x="30" y="72" fill="#475569" font-size="10" font-weight="600" letter-spacing="1.5" text-anchor="middle" transform="rotate(-90, 30, 72)">INPUT</text>
+
+  <!-- Text input -->
+  <rect x="60" y="28" width="130" height="52" rx="10" fill="url(#inputGrad)" opacity="0.9"/>
+  <text x="125" y="50" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">📝 Text</text>
+  <text x="125" y="66" fill="#bfdbfe" font-size="9" text-anchor="middle">conversations, docs</text>
+
+  <!-- Image input -->
+  <rect x="210" y="28" width="130" height="52" rx="10" fill="url(#inputGrad)" opacity="0.9"/>
+  <text x="275" y="50" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">🖼 Image</text>
+  <text x="275" y="66" fill="#bfdbfe" font-size="9" text-anchor="middle">visual embeddings</text>
+
+  <!-- Audio input -->
+  <rect x="360" y="28" width="130" height="52" rx="10" fill="url(#inputGrad)" opacity="0.9"/>
+  <text x="425" y="50" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">🎵 Audio</text>
+  <text x="425" y="66" fill="#bfdbfe" font-size="9" text-anchor="middle">audio embeddings</text>
+
+  <!-- Metadata input -->
+  <rect x="510" y="28" width="160" height="52" rx="10" fill="url(#inputGrad)" opacity="0.85"/>
+  <text x="590" y="48" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">🏷 Metadata</text>
+  <text x="590" y="63" fill="#bfdbfe" font-size="9" text-anchor="middle">namespace · entity · attrs</text>
+
+  <!-- API clients label -->
+  <rect x="700" y="28" width="360" height="52" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="880" y="47" fill="#94a3b8" font-size="11" font-weight="700" text-anchor="middle">CLIENT APIs</text>
+  <text x="760" y="67" fill="#4f9cf9" font-size="10" font-weight="600" text-anchor="middle">Python</text>
+  <text x="880" y="67" fill="#f97316" font-size="10" font-weight="600" text-anchor="middle">Rust CLI</text>
+  <text x="1000" y="67" fill="#22c55e" font-size="10" font-weight="600" text-anchor="middle">REST API</text>
+  <line x1="816" y1="38" x2="816" y2="72" stroke="#334155" stroke-width="1"/>
+  <line x1="936" y1="38" x2="936" y2="72" stroke="#334155" stroke-width="1"/>
+
+  <!-- ══════════════════════════════════════════════════════════ -->
+  <!-- ARROWS: Input → Core -->
+  <!-- ══════════════════════════════════════════════════════════ -->
+  <line x1="125" y1="80" x2="125" y2="148" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-blue)" opacity="0.7"/>
+  <line x1="275" y1="80" x2="275" y2="148" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-blue)" opacity="0.7"/>
+  <line x1="425" y1="80" x2="425" y2="148" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-blue)" opacity="0.7"/>
+  <line x1="590" y1="80" x2="590" y2="148" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-blue)" opacity="0.7"/>
+  <line x1="880" y1="80" x2="880" y2="130" stroke="#475569" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-white)" opacity="0.5"/>
+
+  <!-- add() label -->
+  <rect x="225" y="92" width="100" height="20" rx="4" fill="#1e293b"/>
+  <text x="275" y="106" fill="#60a5fa" font-size="9" font-weight="600" text-anchor="middle">db.add(id, vec, meta)</text>
+
+  <!-- ══════════════════════════════════════════════════════════ -->
+  <!-- ROW 2: CORE ENGINE (main box) -->
+  <!-- ══════════════════════════════════════════════════════════ -->
+
+  <!-- Core engine outer box -->
+  <rect x="40" y="148" width="790" height="400" rx="14" fill="#0d1117" stroke="#1e2d45" stroke-width="1.5"/>
+  <rect x="40" y="148" width="790" height="32" rx="14" fill="#162032"/>
+  <rect x="40" y="168" width="790" height="12" rx="0" fill="#162032"/>
+  <text x="435" y="170" fill="#7dd3fc" font-size="11" font-weight="700" text-anchor="middle" letter-spacing="1">⚙  FEATHER DB CORE ENGINE</text>
+
+  <!-- ── HNSW Section ─────────────────────────────────────── -->
+  <rect x="56" y="194" width="238" height="168" rx="10" fill="#1a0a3a" stroke="#7c3aed" stroke-width="1.2"/>
+  <rect x="56" y="194" width="238" height="28" rx="10" fill="url(#hnswGrad)" opacity="0.9"/>
+  <rect x="56" y="210" width="238" height="12" rx="0" fill="url(#hnswGrad)" opacity="0.9"/>
+  <text x="175" y="213" fill="#fff" font-size="10" font-weight="800" text-anchor="middle" letter-spacing="0.5">HNSW MULTIMODAL INDICES</text>
+
+  <!-- Modality pockets -->
+  <rect x="68" y="230" width="65" height="48" rx="7" fill="#2d1060" stroke="#7c3aed" stroke-width="1"/>
+  <text x="100" y="248" fill="#c4b5fd" font-size="9" font-weight="700" text-anchor="middle">text</text>
+  <text x="100" y="262" fill="#a78bfa" font-size="8" text-anchor="middle">768-dim</text>
+  <text x="100" y="273" fill="#7c3aed" font-size="7" text-anchor="middle">HNSW M=16</text>
+
+  <rect x="143" y="230" width="65" height="48" rx="7" fill="#2d1060" stroke="#7c3aed" stroke-width="1"/>
+  <text x="175" y="248" fill="#c4b5fd" font-size="9" font-weight="700" text-anchor="middle">visual</text>
+  <text x="175" y="262" fill="#a78bfa" font-size="8" text-anchor="middle">512-dim</text>
+  <text x="175" y="273" fill="#7c3aed" font-size="7" text-anchor="middle">HNSW M=16</text>
+
+  <rect x="218" y="230" width="65" height="48" rx="7" fill="#2d1060" stroke="#7c3aed" stroke-width="1"/>
+  <text x="250" y="248" fill="#c4b5fd" font-size="9" font-weight="700" text-anchor="middle">audio</text>
+  <text x="250" y="262" fill="#a78bfa" font-size="8" text-anchor="middle">256-dim</text>
+  <text x="250" y="273" fill="#7c3aed" font-size="7" text-anchor="middle">HNSW M=16</text>
+
+  <text x="175" y="298" fill="#6d28d9" font-size="8" text-anchor="middle">ef_construction=200 · max 1M/modality</text>
+
+  <!-- Cosine sim badge -->
+  <rect x="80" y="307" width="190" height="18" rx="5" fill="#1e0a50"/>
+  <text x="175" y="319" fill="#8b5cf6" font-size="8" font-weight="600" text-anchor="middle">cosine similarity · O(log n) query</text>
+
+  <!-- Sub-ms badge -->
+  <rect x="80" y="332" width="190" height="20" rx="5" fill="#3b0764"/>
+  <text x="175" y="346" fill="#e9d5ff" font-size="9" font-weight="700" text-anchor="middle">⚡ sub-millisecond ANN search</text>
+
+  <!-- ── BM25 Section ─────────────────────────────────────── -->
+  <rect x="306" y="194" width="202" height="168" rx="10" fill="#0a2030" stroke="#0891b2" stroke-width="1.2"/>
+  <rect x="306" y="194" width="202" height="28" rx="10" fill="url(#bm25Grad)" opacity="0.9"/>
+  <rect x="306" y="210" width="202" height="12" rx="0" fill="url(#bm25Grad)" opacity="0.9"/>
+  <text x="407" y="213" fill="#fff" font-size="10" font-weight="800" text-anchor="middle" letter-spacing="0.5">BM25 INVERTED INDEX</text>
+
+  <!-- Posting list visual -->
+  <rect x="318" y="230" width="178" height="72" rx="6" fill="#041c2c" stroke="#164e63" stroke-width="1"/>
+  <text x="340" y="246" fill="#7dd3fc" font-size="8" font-weight="600">"invoice"</text>
+  <text x="420" y="246" fill="#475569" font-size="8">→ [{id:1, tf:2}, {id:47…}]</text>
+  <text x="340" y="262" fill="#7dd3fc" font-size="8" font-weight="600">"billing"</text>
+  <text x="420" y="262" fill="#475569" font-size="8">→ [{id:1, tf:3}, {id:12…}]</text>
+  <text x="340" y="278" fill="#7dd3fc" font-size="8" font-weight="600">"api"</text>
+  <text x="420" y="278" fill="#475569" font-size="8">→ [{id:9, tf:1}, {id:33…}]</text>
+  <text x="407" y="296" fill="#0e7490" font-size="7" text-anchor="middle">posting lists · avg_dl tracking</text>
+
+  <rect x="318" y="310" width="178" height="18" rx="5" fill="#0c4a6e"/>
+  <text x="407" y="322" fill="#bae6fd" font-size="8" font-weight="600" text-anchor="middle">k₁=1.2 · b=0.75 · stop-words filtered</text>
+
+  <rect x="318" y="334" width="178" height="20" rx="5" fill="#083344"/>
+  <text x="407" y="348" fill="#e0f2fe" font-size="9" font-weight="700" text-anchor="middle">🔤 exact keyword · 0.06ms avg</text>
+
+  <!-- ── Metadata Store ───────────────────────────────────── -->
+  <rect x="520" y="194" width="298" height="168" rx="10" fill="#0a1e14" stroke="#059669" stroke-width="1.2"/>
+  <rect x="520" y="194" width="298" height="28" rx="10" fill="url(#metaGrad)" opacity="0.9"/>
+  <rect x="520" y="210" width="298" height="12" rx="0" fill="url(#metaGrad)" opacity="0.9"/>
+  <text x="669" y="213" fill="#fff" font-size="10" font-weight="800" text-anchor="middle" letter-spacing="0.5">METADATA STORE</text>
+
+  <!-- Metadata fields -->
+  <rect x="532" y="230" width="134" height="120" rx="6" fill="#041a0e" stroke="#064e3b" stroke-width="1"/>
+  <text x="540" y="246" fill="#6ee7b7" font-size="8" font-weight="700">Record Fields</text>
+  <text x="540" y="260" fill="#a7f3d0" font-size="7.5">• content (text)</text>
+  <text x="540" y="273" fill="#a7f3d0" font-size="7.5">• type (FACT|PREF|EVENT|CONV)</text>
+  <text x="540" y="286" fill="#a7f3d0" font-size="7.5">• namespace_id</text>
+  <text x="540" y="299" fill="#a7f3d0" font-size="7.5">• entity_id</text>
+  <text x="540" y="312" fill="#a7f3d0" font-size="7.5">• importance [0–1]</text>
+  <text x="540" y="325" fill="#a7f3d0" font-size="7.5">• attributes (KV map)</text>
+  <text x="540" y="338" fill="#a7f3d0" font-size="7.5">• timestamp</text>
+  <text x="540" y="346" fill="#064e3b" font-size="6">───────────────</text>
+
+  <rect x="674" y="230" width="132" height="120" rx="6" fill="#041a0e" stroke="#064e3b" stroke-width="1"/>
+  <text x="682" y="246" fill="#6ee7b7" font-size="8" font-weight="700">Living Context</text>
+  <text x="682" y="260" fill="#a7f3d0" font-size="7.5">• recall_count</text>
+  <text x="682" y="273" fill="#a7f3d0" font-size="7.5">• last_recalled_at</text>
+  <text x="682" y="286" fill="#34d399" font-size="7.5" font-weight="600">• edges [ ]</text>
+  <text x="692" y="299" fill="#6ee7b7" font-size="7">  target_id</text>
+  <text x="692" y="312" fill="#6ee7b7" font-size="7">  rel_type</text>
+  <text x="692" y="325" fill="#6ee7b7" font-size="7">  weight [0–1]</text>
+  <text x="682" y="340" fill="#a7f3d0" font-size="7.5">• incoming_index</text>
+
+  <!-- ── Context Graph ─────────────────────────────────────── -->
+  <rect x="56" y="378" width="238" height="158" rx="10" fill="#1c1206" stroke="#d97706" stroke-width="1.2"/>
+  <rect x="56" y="378" width="238" height="28" rx="10" fill="url(#graphGrad)" opacity="0.9"/>
+  <rect x="56" y="394" width="238" height="12" rx="0" fill="url(#graphGrad)" opacity="0.9"/>
+  <text x="175" y="397" fill="#fff" font-size="10" font-weight="800" text-anchor="middle" letter-spacing="0.5">CONTEXT GRAPH</text>
+
+  <!-- Graph node visual -->
+  <circle cx="100" cy="440" r="16" fill="#422006" stroke="#d97706" stroke-width="1.5"/>
+  <text x="100" y="444" fill="#fcd34d" font-size="8" font-weight="700" text-anchor="middle">billing</text>
+
+  <circle cx="175" cy="425" r="16" fill="#422006" stroke="#d97706" stroke-width="1.5"/>
+  <text x="175" y="429" fill="#fcd34d" font-size="8" font-weight="700" text-anchor="middle">onboard</text>
+
+  <circle cx="255" cy="445" r="16" fill="#422006" stroke="#d97706" stroke-width="1.5"/>
+  <text x="255" y="449" fill="#fcd34d" font-size="8" font-weight="700" text-anchor="middle">api</text>
+
+  <!-- Edges between nodes -->
+  <line x1="116" y1="440" x2="159" y2="430" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+  <line x1="191" y1="432" x2="239" y2="441" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+  <text x="135" y="428" fill="#fbbf24" font-size="7" text-anchor="middle">references</text>
+  <text x="218" y="429" fill="#fbbf24" font-size="7" text-anchor="middle">leads_to</text>
+
+  <!-- Auto-link badge -->
+  <rect x="68" y="468" width="214" height="18" rx="5" fill="#292000"/>
+  <text x="175" y="481" fill="#fcd34d" font-size="8" font-weight="600" text-anchor="middle">auto_link(threshold=0.97)</text>
+
+  <!-- Context chain badge -->
+  <rect x="68" y="492" width="214" height="18" rx="5" fill="#292000"/>
+  <text x="175" y="505" fill="#fcd34d" font-size="8" font-weight="600" text-anchor="middle">context_chain(query, k, hops=n)</text>
+
+  <rect x="68" y="516" width="214" height="14" rx="5" fill="#451a00"/>
+  <text x="175" y="527" fill="#fdba74" font-size="7.5" font-weight="700" text-anchor="middle">🕸 vector search + BFS graph expansion</text>
+
+  <!-- ── Adaptive Decay ─────────────────────────────────────── -->
+  <rect x="306" y="378" width="202" height="158" rx="10" fill="#1a0720" stroke="#db2777" stroke-width="1.2"/>
+  <rect x="306" y="378" width="202" height="28" rx="10" fill="url(#decayGrad)" opacity="0.9"/>
+  <rect x="306" y="394" width="202" height="12" rx="0" fill="url(#decayGrad)" opacity="0.9"/>
+  <text x="407" y="397" fill="#fff" font-size="10" font-weight="800" text-anchor="middle" letter-spacing="0.5">ADAPTIVE TEMPORAL DECAY</text>
+
+  <!-- Formula -->
+  <rect x="318" y="414" width="178" height="90" rx="6" fill="#0d0212" stroke="#831843" stroke-width="1"/>
+  <text x="407" y="432" fill="#f9a8d4" font-size="8.5" font-weight="600" text-anchor="middle" font-style="italic">stickiness = 1 + log(1 + recall_count)</text>
+  <line x1="330" y1="438" x2="484" y2="438" stroke="#831843" stroke-width="0.5"/>
+  <text x="407" y="452" fill="#f9a8d4" font-size="8" text-anchor="middle" font-style="italic">eff_age = age_days / stickiness</text>
+  <line x1="330" y1="458" x2="484" y2="458" stroke="#831843" stroke-width="0.5"/>
+  <text x="407" y="472" fill="#f9a8d4" font-size="8" text-anchor="middle" font-style="italic">recency = 0.5^(eff_age / H)</text>
+  <line x1="330" y1="478" x2="484" y2="478" stroke="#831843" stroke-width="0.5"/>
+  <text x="407" y="493" fill="#fda4af" font-size="8.5" font-weight="700" text-anchor="middle" font-style="italic">score = [(1-w)·sim + w·recency] × α</text>
+
+  <rect x="318" y="510" width="178" height="18" rx="5" fill="#3b0764"/>
+  <text x="407" y="523" fill="#f0abfc" font-size="8" font-weight="600" text-anchor="middle">H=30d · w=0.3 · touch() on search hit</text>
+
+  <!-- ── Filters ─────────────────────────────────────────────── -->
+  <rect x="520" y="378" width="298" height="158" rx="10" fill="#0c1220" stroke="#4f46e5" stroke-width="1.2"/>
+  <rect x="520" y="378" width="298" height="28" rx="10" fill="url(#searchGrad)" opacity="0.9"/>
+  <rect x="520" y="394" width="298" height="12" rx="0" fill="url(#searchGrad)" opacity="0.9"/>
+  <text x="669" y="397" fill="#fff" font-size="10" font-weight="800" text-anchor="middle" letter-spacing="0.5">SEARCH FILTER LAYER</text>
+
+  <!-- Filter pills -->
+  <rect x="532" y="414" width="88" height="22" rx="5" fill="#1e1b4b" stroke="#4f46e5" stroke-width="1"/>
+  <text x="576" y="429" fill="#a5b4fc" font-size="8.5" font-weight="600" text-anchor="middle">namespace_id</text>
+
+  <rect x="628" y="414" width="72" height="22" rx="5" fill="#1e1b4b" stroke="#4f46e5" stroke-width="1"/>
+  <text x="664" y="429" fill="#a5b4fc" font-size="8.5" font-weight="600" text-anchor="middle">entity_id</text>
+
+  <rect x="708" y="414" width="98" height="22" rx="5" fill="#1e1b4b" stroke="#4f46e5" stroke-width="1"/>
+  <text x="757" y="429" fill="#a5b4fc" font-size="8.5" font-weight="600" text-anchor="middle">attributes_match</text>
+
+  <rect x="532" y="444" width="80" height="22" rx="5" fill="#1e1b4b" stroke="#4f46e5" stroke-width="1"/>
+  <text x="572" y="459" fill="#a5b4fc" font-size="8.5" font-weight="600" text-anchor="middle">importance ≥</text>
+
+  <rect x="620" y="444" width="80" height="22" rx="5" fill="#1e1b4b" stroke="#4f46e5" stroke-width="1"/>
+  <text x="660" y="459" fill="#a5b4fc" font-size="8.5" font-weight="600" text-anchor="middle">timestamp ±</text>
+
+  <rect x="708" y="444" width="98" height="22" rx="5" fill="#1e1b4b" stroke="#4f46e5" stroke-width="1"/>
+  <text x="757" y="459" fill="#a5b4fc" font-size="8.5" font-weight="600" text-anchor="middle">source_prefix</text>
+
+  <rect x="532" y="474" width="274" height="22" rx="5" fill="#1e1b4b" stroke="#4f46e5" stroke-width="1"/>
+  <text x="669" y="489" fill="#a5b4fc" font-size="8.5" font-weight="600" text-anchor="middle">ContextType: FACT · PREFERENCE · EVENT · CONVERSATION</text>
+
+  <rect x="532" y="504" width="274" height="24" rx="5" fill="#312e81"/>
+  <text x="669" y="520" fill="#e0e7ff" font-size="9" font-weight="700" text-anchor="middle">all fields optional · composable · zero-overhead</text>
+
+  <!-- ══════════════════════════════════════════════════════════ -->
+  <!-- ROW 3: HYBRID SEARCH -->
+  <!-- ══════════════════════════════════════════════════════════ -->
+
+  <!-- Arrow down from core to search -->
+  <line x1="175" y1="548" x2="175" y2="582" stroke="#8b5cf6" stroke-width="1.5" marker-end="url(#arrow-purple)" opacity="0.8"/>
+  <line x1="407" y1="548" x2="407" y2="582" stroke="#06b6d4" stroke-width="1.5" marker-end="url(#arrow-cyan)" opacity="0.8"/>
+  <line x1="669" y1="536" x2="669" y2="582" stroke="#6366f1" stroke-width="1.5" marker-end="url(#arrow-purple)" opacity="0.8"/>
+
+  <!-- Hybrid search box -->
+  <rect x="40" y="582" width="790" height="90" rx="12" fill="#0f0a2a" stroke="#4f46e5" stroke-width="1.5"/>
+  <rect x="40" y="582" width="790" height="30" rx="12" fill="#1a1060"/>
+  <rect x="40" y="600" width="790" height="12" rx="0" fill="#1a1060"/>
+  <text x="435" y="601" fill="#a5b4fc" font-size="11" font-weight="800" text-anchor="middle" letter-spacing="1">HYBRID SEARCH ENGINE</text>
+
+  <!-- Vector arm -->
+  <rect x="60" y="622" width="210" height="42" rx="8" fill="#1e1260" stroke="#7c3aed" stroke-width="1"/>
+  <text x="165" y="638" fill="#c4b5fd" font-size="9.5" font-weight="700" text-anchor="middle">① Vector Search (HNSW)</text>
+  <text x="165" y="654" fill="#8b5cf6" font-size="8.5" text-anchor="middle">cosine similarity · top-4k candidates</text>
+
+  <!-- RRF box -->
+  <rect x="290" y="618" width="290" height="50" rx="8" fill="#312e81" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="435" y="636" fill="#e0e7ff" font-size="10" font-weight="800" text-anchor="middle">⊕  RRF FUSION</text>
+  <text x="435" y="651" fill="#a5b4fc" font-size="8.5" text-anchor="middle" font-style="italic">score(d) = Σ 1/(60 + rank + 1)</text>
+  <text x="435" y="663" fill="#6366f1" font-size="7.5" text-anchor="middle">rank-based · scale-agnostic · deadlock-safe mutex</text>
+
+  <!-- BM25 arm -->
+  <rect x="600" y="622" width="210" height="42" rx="8" fill="#0c2a35" stroke="#0891b2" stroke-width="1"/>
+  <text x="705" y="638" fill="#7dd3fc" font-size="9.5" font-weight="700" text-anchor="middle">② Keyword Search (BM25)</text>
+  <text x="705" y="654" fill="#0891b2" font-size="8.5" text-anchor="middle">term frequency · IDF · top-4k candidates</text>
+
+  <!-- Fusion arrows -->
+  <line x1="270" y1="643" x2="290" y2="643" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrow-purple)" opacity="0.8"/>
+  <line x1="600" y1="643" x2="580" y2="643" stroke="#06b6d4" stroke-width="1.5" marker-end="url(#arrow-cyan)" opacity="0.8"/>
+
+  <!-- ══════════════════════════════════════════════════════════ -->
+  <!-- ROW 4: OUTPUT -->
+  <!-- ══════════════════════════════════════════════════════════ -->
+
+  <!-- Arrow down to output -->
+  <line x1="435" y1="672" x2="435" y2="700" stroke="#22c55e" stroke-width="2" marker-end="url(#arrow-green)"/>
+
+  <!-- Output box -->
+  <rect x="40" y="700" width="790" height="72" rx="12" fill="#071a0e" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="435" y="720" fill="#86efac" font-size="11" font-weight="800" text-anchor="middle" letter-spacing="0.5">OUTPUT — SearchResult[]</text>
+
+  <!-- Result fields -->
+  <rect x="60" y="728" width="120" height="36" rx="7" fill="#052e16" stroke="#15803d" stroke-width="1"/>
+  <text x="120" y="743" fill="#4ade80" font-size="9" font-weight="700" text-anchor="middle">r.id</text>
+  <text x="120" y="757" fill="#86efac" font-size="7.5" text-anchor="middle">uint64 entity ID</text>
+
+  <rect x="192" y="728" width="130" height="36" rx="7" fill="#052e16" stroke="#15803d" stroke-width="1"/>
+  <text x="257" y="743" fill="#4ade80" font-size="9" font-weight="700" text-anchor="middle">r.score</text>
+  <text x="257" y="757" fill="#86efac" font-size="7.5" text-anchor="middle">ATD-weighted float</text>
+
+  <rect x="334" y="728" width="152" height="36" rx="7" fill="#052e16" stroke="#15803d" stroke-width="1"/>
+  <text x="410" y="743" fill="#4ade80" font-size="9" font-weight="700" text-anchor="middle">r.metadata</text>
+  <text x="410" y="757" fill="#86efac" font-size="7.5" text-anchor="middle">full Metadata struct</text>
+
+  <rect x="498" y="728" width="145" height="36" rx="7" fill="#052e16" stroke="#15803d" stroke-width="1"/>
+  <text x="570" y="743" fill="#4ade80" font-size="9" font-weight="700" text-anchor="middle">r.hop (chain)</text>
+  <text x="570" y="757" fill="#86efac" font-size="7.5" text-anchor="middle">graph hop distance</text>
+
+  <rect x="655" y="728" width="160" height="36" rx="7" fill="#0d3321" stroke="#15803d" stroke-width="1"/>
+  <text x="735" y="743" fill="#22c55e" font-size="9" font-weight="800" text-anchor="middle">touch() auto-called</text>
+  <text x="735" y="757" fill="#86efac" font-size="7.5" text-anchor="middle">recall_count++ on hit</text>
+
+  <!-- ══════════════════════════════════════════════════════════ -->
+  <!-- PERSISTENCE COLUMN (right side) -->
+  <!-- ══════════════════════════════════════════════════════════ -->
+
+  <!-- Persistence box -->
+  <rect x="852" y="148" width="220" height="400" rx="12" fill="#111827" stroke="#374151" stroke-width="1.2"/>
+  <rect x="852" y="148" width="220" height="30" rx="12" fill="#1f2937"/>
+  <rect x="852" y="166" width="220" height="12" rx="0" fill="#1f2937"/>
+  <text x="962" y="169" fill="#9ca3af" font-size="10" font-weight="800" text-anchor="middle" letter-spacing="1">PERSISTENCE</text>
+
+  <!-- .feather file -->
+  <rect x="868" y="192" width="188" height="120" rx="9" fill="#0d1117" stroke="#4b5563" stroke-width="1"/>
+  <text x="962" y="210" fill="#d1d5db" font-size="9.5" font-weight="700" text-anchor="middle">📄 .feather binary (v5)</text>
+  <line x1="876" y1="215" x2="1048" y2="215" stroke="#374151" stroke-width="0.5"/>
+  <text x="876" y="228" fill="#6b7280" font-size="7.5">[magic: FEAT][version: 5]</text>
+  <text x="876" y="241" fill="#6b7280" font-size="7.5">── Metadata section</text>
+  <text x="886" y="254" fill="#4b5563" font-size="7">  [id][ts][importance][type]</text>
+  <text x="886" y="267" fill="#4b5563" font-size="7">  [content][tags][edges]</text>
+  <text x="886" y="280" fill="#4b5563" font-size="7">  [recall_count][ns][entity]</text>
+  <text x="876" y="295" fill="#6b7280" font-size="7.5">── Modality indices section</text>
+  <text x="886" y="308" fill="#4b5563" font-size="7">  [name][dim][id+vector…]</text>
+
+  <!-- v3/v4 compat badge -->
+  <rect x="868" y="318" width="188" height="18" rx="5" fill="#1c2a1c" stroke="#166534" stroke-width="1"/>
+  <text x="962" y="330" fill="#4ade80" font-size="7.5" font-weight="600" text-anchor="middle">v3/v4 transparent backward compat</text>
+
+  <!-- WAL -->
+  <rect x="868" y="348" width="188" height="80" rx="9" fill="#0d1117" stroke="#4b5563" stroke-width="1"/>
+  <text x="962" y="366" fill="#d1d5db" font-size="9.5" font-weight="700" text-anchor="middle">📋 Write-Ahead Log (.wal)</text>
+  <line x1="876" y1="371" x2="1048" y2="371" stroke="#374151" stroke-width="0.5"/>
+  <text x="876" y="384" fill="#6b7280" font-size="7.5">[op_code][len][payload]</text>
+  <text x="876" y="397" fill="#6b7280" font-size="7.5">ADD · UPDATE · LINK · FORGET</text>
+  <text x="876" y="412" fill="#22c55e" font-size="7.5" font-weight="600">replay on open → 100% recovery</text>
+  <text x="876" y="424" fill="#16a34a" font-size="7.5">atomic rename() on save</text>
+
+  <!-- Thread safety -->
+  <rect x="868" y="440" width="188" height="50" rx="9" fill="#0d1117" stroke="#4b5563" stroke-width="1"/>
+  <text x="962" y="457" fill="#d1d5db" font-size="9.5" font-weight="700" text-anchor="middle">🔒 Thread Safety</text>
+  <text x="876" y="472" fill="#6b7280" font-size="7.5">std::mutex per DB instance</text>
+  <text x="876" y="484" fill="#6b7280" font-size="7.5">15,119 q/s · 0 errors (8 threads)</text>
+
+  <!-- compact -->
+  <rect x="868" y="502" width="188" height="36" rx="9" fill="#0d1117" stroke="#4b5563" stroke-width="1"/>
+  <text x="962" y="520" fill="#d1d5db" font-size="9.5" font-weight="700" text-anchor="middle">🗜 compact()</text>
+  <text x="876" y="533" fill="#6b7280" font-size="7.5">soft-delete + HNSW rebuild</text>
+
+  <!-- Arrow from core to persistence -->
+  <line x1="830" y1="310" x2="852" y2="310" stroke="#4b5563" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-white)" opacity="0.6"/>
+  <text x="841" y="305" fill="#4b5563" font-size="7" text-anchor="middle">save()</text>
+
+  <!-- ══════════════════════════════════════════════════════════ -->
+  <!-- BOTTOM: BENCHMARK STRIP -->
+  <!-- ══════════════════════════════════════════════════════════ -->
+
+  <rect x="40" y="788" width="1032" height="52" rx="10" fill="#0d1117" stroke="#1e293b" stroke-width="1"/>
+  <text x="556" y="806" fill="#475569" font-size="9" font-weight="700" text-anchor="middle" letter-spacing="1">BENCHMARK RESULTS (3,050 records · 256-dim · Apple M-series)</text>
+
+  <!-- Metric chips -->
+  <rect x="55" y="814" width="130" height="20" rx="5" fill="#1a1060"/>
+  <text x="120" y="828" fill="#a5b4fc" font-size="9" font-weight="700" text-anchor="middle">⚡ 0.10ms vector search</text>
+
+  <rect x="195" y="814" width="130" height="20" rx="5" fill="#0a2030"/>
+  <text x="260" y="828" fill="#7dd3fc" font-size="9" font-weight="700" text-anchor="middle">🔤 0.06ms BM25 search</text>
+
+  <rect x="335" y="814" width="130" height="20" rx="5" fill="#0f0a2a"/>
+  <text x="400" y="828" fill="#c4b5fd" font-size="9" font-weight="700" text-anchor="middle">⊕ 0.24ms hybrid RRF</text>
+
+  <rect x="475" y="814" width="148" height="20" rx="5" fill="#071a0e"/>
+  <text x="549" y="828" fill="#4ade80" font-size="9" font-weight="700" text-anchor="middle">✓ 100% WAL recovery</text>
+
+  <rect x="633" y="814" width="148" height="20" rx="5" fill="#1a0a10"/>
+  <text x="707" y="828" fill="#f9a8d4" font-size="9" font-weight="700" text-anchor="middle">📈 2,606 rec/sec ingest</text>
+
+  <rect x="791" y="814" width="148" height="20" rx="5" fill="#071a0e"/>
+  <text x="865" y="828" fill="#34d399" font-size="9" font-weight="700" text-anchor="middle">🧵 15,119 q/s concurrent</text>
+
+  <rect x="949" y="814" width="108" height="20" rx="5" fill="#1c1206"/>
+  <text x="1003" y="828" fill="#fcd34d" font-size="9" font-weight="700" text-anchor="middle">🗜 3.91 MB / 3k recs</text>
+
+  <!-- ══════════════════════════════════════════════════════════ -->
+  <!-- LEGEND -->
+  <!-- ══════════════════════════════════════════════════════════ -->
+
+  <!-- Persistence arrows legend (bottom right area already used) -->
+
+  <!-- Version watermark -->
+  <text x="1072" y="850" fill="#1e293b" font-size="9" text-anchor="middle">Feather DB v0.8.0 · MIT · github.com/feather-store/feather</text>
+
+</svg>
+
+</body>
+</html>
