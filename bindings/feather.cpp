@@ -241,5 +241,15 @@ PYBIND11_MODULE(core, m) {
         // -- Persistence & info --
         .def("save", &feather::DB::save)
         .def("size", &feather::DB::size)
-        .def("dim",  &feather::DB::dim, py::arg("modality") = "text");
+        .def("dim",  &feather::DB::dim, py::arg("modality") = "text")
+
+        // -- HNSW tuning --
+        .def("set_ef", &feather::DB::set_ef,
+             py::arg("ef"), py::arg("modality") = "",
+             "Set HNSW search beam width. Higher ef -> better recall, "
+             "slower search. Default is 50. Pass modality=\"\" to apply "
+             "to all modalities.")
+        .def("get_ef", &feather::DB::get_ef,
+             py::arg("modality") = "text",
+             "Current HNSW search beam width for the given modality.");
 }

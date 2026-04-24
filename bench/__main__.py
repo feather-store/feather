@@ -64,7 +64,8 @@ def main(argv=None):
     p_run.add_argument("--n", type=int, default=10_000)
     p_run.add_argument("--dim", type=int, default=128)
     p_run.add_argument("--k", type=int, default=10)
-    p_run.add_argument("--ef", type=int, default=50)
+    p_run.add_argument("--ef", type=int, default=None,
+                       help="HNSW search beam width. Default = DB default (50).")
     p_run.add_argument("--queries", type=int, default=200)
     p_run.set_defaults(func=cmd_run)
 

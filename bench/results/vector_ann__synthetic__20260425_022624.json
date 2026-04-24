@@ -1,0 +1,34 @@
+{
+  "scenario": "vector_ann",
+  "dataset": "synthetic",
+  "n": 5000,
+  "dim": 128,
+  "feather_version": "0.8.0",
+  "python_version": "3.12.2",
+  "platform": "Darwin arm64",
+  "commit": "01e49ac",
+  "started_at": 1777064184.2444868,
+  "wall_seconds": 2.4317800998687744,
+  "metrics": {
+    "count": 100,
+    "mean_ms": 0.13287830166518688,
+    "p50_ms": 0.12933305697515607,
+    "p95_ms": 0.15550001990050077,
+    "p99_ms": 0.1722089946269989,
+    "min_ms": 0.10825000936165452,
+    "max_ms": 0.23362500360235572,
+    "build_seconds": 2.29332404199522,
+    "build_ingest_qps": 2180.2413912906695,
+    "search_qps": 7321.604731030278,
+    "recall@10": 0.995,
+    "file_size_mb": 2.81707763671875,
+    "bytes_per_vec": 590.784,
+    "peak_rss_mb": 188.59375
+  },
+  "params": {
+    "k": 10,
+    "ef": 50,
+    "queries": 100
+  },
+  "notes": ""
+}

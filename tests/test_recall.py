@@ -4,13 +4,12 @@ These tests pin the recall floor we promise at the default ef. If the
 floor regresses (e.g. a binding change silently changes the default ef,
 or the distance function breaks), CI fails.
 
-Baselines measured on 2026-04-25 against v0.8.0 (ef default = 10):
-    n=1k,  dim=128  -> recall@10 ≈ 0.96
-    n=5k,  dim=128  -> recall@10 ≈ 0.90
-    n=10k, dim=128  -> recall@10 ≈ 0.83
+Baselines measured on 2026-04-25 against v0.8.0 (ef default = 50):
+    n=1k,  dim=128  -> recall@10 ≈ 0.99
+    n=5k,  dim=128  -> recall@10 ≈ 0.995
+    n=10k, dim=128  -> recall@10 ≈ 0.99
 
-We assert a conservative floor to avoid flakiness from the small
-synthetic seed. Tune thresholds up once `set_ef` is exposed.
+Floors are set below measured values to avoid seed flakiness.
 """
 from __future__ import annotations
 import numpy as np
@@ -56,8 +55,8 @@ def _recall_at_k(db: feather_db.DB, base: np.ndarray,
 
 
 @pytest.mark.parametrize("n,dim,floor", [
-    (1_000,  128, 0.80),
-    (5_000,  128, 0.70),
+    (1_000,  128, 0.95),
+    (5_000,  128, 0.95),
 ])
 def test_recall_floor(tmp_path_feather, n, dim, floor):
     base, centroids = _clustered(n, dim)

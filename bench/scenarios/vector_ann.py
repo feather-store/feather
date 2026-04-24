@@ -19,12 +19,7 @@ def _brute_force_topk(base: np.ndarray, queries: np.ndarray, k: int) -> np.ndarr
 
 
 def run(base: np.ndarray, queries: np.ndarray, k: int = 10, ef: int | None = None):
-    """Execute the scenario. Returns a metrics dict the runner persists.
-
-    Note: HNSW `ef` (search beam width) is currently fixed at the C++ default
-    (10). The `ef` argument is accepted for forward-compat once DB exposes
-    `set_ef()`.
-    """
+    """Execute the scenario. Returns a metrics dict the runner persists."""
     n, dim = base.shape
     path = tempfile.mktemp(suffix=".feather")
     try:
@@ -37,6 +32,11 @@ def run(base: np.ndarray, queries: np.ndarray, k: int = 10, ef: int | None = Non
             m.content = f"doc_{i}"
             db.add(id=i + 1, vec=base[i], meta=m)
         build_s = time.perf_counter() - t0
+
+        # Apply tuning
+        if ef is not None:
+            db.set_ef(ef)
+        ef_actual = db.get_ef()
 
         # Save so we can measure on-disk footprint
         db.save()
@@ -65,6 +65,7 @@ def run(base: np.ndarray, queries: np.ndarray, k: int = 10, ef: int | None = Non
             f"recall@{k}": recall,
             "file_size_mb": file_mb,
             "bytes_per_vec": (file_mb * 1024 * 1024 / n) if n else 0,
+            "ef": ef_actual,
         })
         return stats
     finally:
