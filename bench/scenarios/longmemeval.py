@@ -44,6 +44,11 @@ def _build_context(retrieved) -> str:
     return "\n---\n".join(parts)
 
 
+def _judge_can_answer(judge) -> bool:
+    """True if the judge object also exposes an `answer(question, ctx)` method."""
+    return callable(getattr(judge, "answer", None))
+
+
 def run(questions: list[dict], embedder: Embedder, judge: Judge,
         top_k: int = 10, ef: Optional[int] = None,
         modality: str = "text") -> dict:
@@ -58,6 +63,8 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
     per_q_type = []
     embeddings_emitted = 0
     history_turns_total = 0
+    use_llm_answer = _judge_can_answer(judge)
+    has_batch = callable(getattr(embedder, "embed_batch", None))
 
     for q_idx, q in enumerate(questions):
         qid = q.get("question_id") or f"q{q_idx}"
@@ -73,22 +80,34 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
             if ef is not None:
                 db.set_ef(ef)
 
-            # ---------- Ingest haystack ----------
-            uid = 0
+            # ---------- Collect haystack into a flat list ----------
+            import datetime
+            turns = []
             for sid, date_str, role, content, has_ans in iter_history_turns(q):
                 if not content.strip():
                     continue
-                uid += 1
-                history_turns_total += 1
-
-                # Best-effort timestamp parse — LongMemEval uses ISO-ish strings
                 ts = 0
                 try:
-                    import datetime
-                    ts = int(datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00")).timestamp())
+                    ts = int(datetime.datetime.fromisoformat(
+                        date_str.replace("Z", "+00:00")).timestamp())
                 except Exception:
                     pass
+                turns.append((sid, ts, role, content, has_ans))
+            history_turns_total += len(turns)
 
+            # ---------- Embed all turns + question (batch if possible) ----------
+            if has_batch:
+                texts = [t[3] for t in turns] + [question_text]
+                vecs = embedder.embed_batch(texts)
+                turn_vecs, qvec = vecs[:-1], vecs[-1]
+            else:
+                turn_vecs = [embedder.embed(t[3]) for t in turns]
+                qvec = embedder.embed(question_text)
+            embeddings_emitted += len(turns) + 1
+
+            # ---------- Ingest ----------
+            for uid, ((sid, ts, role, content, has_ans), v) in enumerate(
+                    zip(turns, turn_vecs), start=1):
                 meta = feather_db.Metadata()
                 meta.content = content
                 meta.timestamp = ts
@@ -96,15 +115,9 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
                 meta.entity_id = sid
                 meta.source = role
                 meta.set_attribute("has_answer", has_ans)
-
-                vec = embedder.embed(content)
-                embeddings_emitted += 1
-                db.add(id=uid, vec=vec, meta=meta, modality=modality)
+                db.add(id=uid, vec=v, meta=meta, modality=modality)
 
             # ---------- Retrieve ----------
-            qvec = embedder.embed(question_text)
-            embeddings_emitted += 1
-
             try:
                 results = db.hybrid_search(
                     qvec, question_text, k=top_k, modality=modality,
@@ -114,8 +127,12 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
 
             context = _build_context(results)
 
+            # ---------- Answer ----------
+            predicted = (judge.answer(question_text, context)
+                         if use_llm_answer else context)
+
             # ---------- Score ----------
-            jr = judge.score(predicted=context, gold=gold, question=question_text)
+            jr = judge.score(predicted=predicted, gold=gold, question=question_text)
             per_q_score.append(jr.score)
             per_q_axis.append(axis)
             per_q_type.append(qtype)

@@ -65,8 +65,25 @@ def cmd_run(args):
             variant=args.dataset,
             limit=(args.limit if args.limit > 0 else None),
         )
-        embedder = get_embedder(args.embedder, dim=args.dim)
-        judge = get_judge(args.judge)
+
+        # Build embedder
+        if args.embedder == "openai":
+            from .embedders_openai import OpenAIEmbedder
+            embedder = OpenAIEmbedder(model=args.embedder_model,
+                                      dim=(args.dim or None))
+        else:
+            embedder = get_embedder(args.embedder, dim=args.dim)
+
+        # Build judge
+        if args.judge == "llm":
+            from .judges_llm import LLMJudge
+            judge = LLMJudge(provider=args.judge_provider,
+                             model=args.judge_model,
+                             answerer_provider=args.answerer_provider,
+                             answerer_model=args.answerer_model)
+        else:
+            judge = get_judge(args.judge)
+
         result = runner.run(
             lambda _r: lme_scenario.run(
                 questions, embedder=embedder, judge=judge,
@@ -137,6 +154,18 @@ def main(argv=None):
     p_run.add_argument("--judge", default="substring",
                        choices=["substring", "llm"],
                        help="LongMemEval scorer. Phase 1 = substring (free).")
+    p_run.add_argument("--embedder-model", default="text-embedding-3-small",
+                       help="OpenAI embedder model name.")
+    p_run.add_argument("--judge-provider", default="gemini",
+                       choices=["gemini", "claude", "openai", "ollama"])
+    p_run.add_argument("--judge-model", default=None,
+                       help="Override judge model (default = provider's default).")
+    p_run.add_argument("--answerer-provider", default=None,
+                       choices=[None, "gemini", "claude", "openai", "ollama"],
+                       help="Provider for the answer-generation step. "
+                            "Defaults to same as --judge-provider.")
+    p_run.add_argument("--answerer-model", default=None,
+                       help="Override answerer model.")
 
     p_run.set_defaults(func=cmd_run)
 
