@@ -1,0 +1,52 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "oracle",
+  "n": 5,
+  "dim": 1536,
+  "feather_version": "0.8.0",
+  "python_version": "3.12.2",
+  "platform": "Darwin arm64",
+  "commit": "d07d1ac",
+  "started_at": 1777127491.484274,
+  "wall_seconds": 18.142791271209717,
+  "metrics": {
+    "overall": 1.0,
+    "by_axis": {
+      "information-extraction": 1.0,
+      "multi-session-reasoning": 1.0,
+      "temporal-reasoning": 1.0
+    },
+    "by_question_type": {
+      "single-session-user": 1.0,
+      "single-session-assistant": 1.0,
+      "multi-session": 1.0,
+      "single-session-preference": 1.0,
+      "temporal-reasoning": 1.0
+    },
+    "per_q_seconds_p50": 3.598623999976553,
+    "per_q_seconds_mean": 3.62745757518569,
+    "n_questions": 5,
+    "n_scored": 5,
+    "n_failures": 0,
+    "failures_sample": [],
+    "history_turns_total": 78,
+    "embeddings_emitted": 83,
+    "embedder": "azure_text-embedding-3-small-featherdb-test_d1536",
+    "judge": "llm_judge=gemini/gemini-2.0-flash_ans=gemini/gemini-2.5-flash",
+    "top_k": 10,
+    "decay_engaged": true,
+    "decay_half_life_days": 14.0,
+    "decay_time_weight": 0.4,
+    "peak_rss_mb": 575.484375
+  },
+  "params": {
+    "k": 10,
+    "ef": null,
+    "embedder": "azure_text-embedding-3-small-featherdb-test_d1536",
+    "judge": "llm_judge=gemini/gemini-2.0-flash_ans=gemini/gemini-2.5-flash",
+    "variant": "oracle",
+    "decay_half_life": 14.0,
+    "decay_time_weight": 0.4
+  },
+  "notes": ""
+}

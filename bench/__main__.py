@@ -88,10 +88,14 @@ def cmd_run(args):
             lambda _r: lme_scenario.run(
                 questions, embedder=embedder, judge=judge,
                 top_k=args.k, ef=args.ef,
+                scoring_half_life=args.decay_half_life,
+                scoring_time_weight=args.decay_time_weight,
             ),
             n=len(questions), dim=embedder.dim, k=args.k,
             ef=args.ef, embedder=embedder.name, judge=judge.name,
             variant=args.dataset,
+            decay_half_life=args.decay_half_life,
+            decay_time_weight=args.decay_time_weight,
         )
 
     else:
@@ -166,6 +170,11 @@ def main(argv=None):
                             "Defaults to same as --judge-provider.")
     p_run.add_argument("--answerer-model", default=None,
                        help="Override answerer model.")
+    p_run.add_argument("--decay-half-life", type=float, default=None,
+                       help="Engage adaptive decay: half-life in days.")
+    p_run.add_argument("--decay-time-weight", type=float, default=None,
+                       help="Adaptive decay time-weight in [0,1]. Engages "
+                            "ScoringConfig in retrieval. 0.3-0.5 typical.")
 
     p_run.set_defaults(func=cmd_run)
 

@@ -51,8 +51,17 @@ def _judge_can_answer(judge) -> bool:
 
 def run(questions: list[dict], embedder: Embedder, judge: Judge,
         top_k: int = 10, ef: Optional[int] = None,
-        modality: str = "text") -> dict:
-    """Execute the scenario and return aggregate metrics."""
+        modality: str = "text",
+        scoring_half_life: Optional[float] = None,
+        scoring_time_weight: Optional[float] = None) -> dict:
+    """Execute the scenario and return aggregate metrics.
+
+    Adaptive decay is engaged when scoring_time_weight is provided.
+    Because Feather scores against real wall-clock time, we shift each
+    question's timestamps so that the question_date maps to "now" —
+    preserving the *relative* ages of turns vs. the question.
+    """
+    use_decay = scoring_time_weight is not None and scoring_time_weight > 0
     n_q = len(questions)
     if n_q == 0:
         return {"overall": 0.0, "by_axis": {}, "by_question_type": {}, "n_q": 0}
@@ -86,6 +95,17 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
 
             # ---------- Collect haystack into a flat list ----------
             import datetime
+            # Compute timestamp shift so question_date maps to real-now.
+            real_now = int(time.time())
+            q_date_ts = 0
+            try:
+                q_date_ts = int(datetime.datetime.fromisoformat(
+                    (q.get("question_date") or "").replace("Z", "+00:00")
+                ).timestamp())
+            except Exception:
+                pass
+            ts_shift = (real_now - q_date_ts) if q_date_ts > 0 else 0
+
             turns = []
             for sid, date_str, role, content, has_ans in iter_history_turns(q):
                 if not content.strip():
@@ -96,6 +116,8 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
                         date_str.replace("Z", "+00:00")).timestamp())
                 except Exception:
                     pass
+                if ts > 0 and ts_shift:
+                    ts += ts_shift   # anchor question_date -> real-now
                 turns.append((sid, ts, role, content, has_ans))
             history_turns_total += len(turns)
 
@@ -122,12 +144,32 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
                 db.add(id=uid, vec=v, meta=meta, modality=modality)
 
             # ---------- Retrieve ----------
-            try:
-                results = db.hybrid_search(
-                    qvec, question_text, k=top_k, modality=modality,
+            scoring = None
+            if use_decay:
+                scoring = feather_db.ScoringConfig(
+                    half_life=scoring_half_life or 30.0,
+                    weight=scoring_time_weight,
+                    min=0.0,
                 )
+            try:
+                if scoring is not None:
+                    results = db.hybrid_search(
+                        qvec, question_text, k=top_k, modality=modality,
+                        scoring=scoring,
+                    )
+                else:
+                    results = db.hybrid_search(
+                        qvec, question_text, k=top_k, modality=modality,
+                    )
             except Exception:
-                results = db.search(qvec, k=top_k, modality=modality)
+                if scoring is not None:
+                    try:
+                        results = db.search(qvec, k=top_k, modality=modality,
+                                            scoring=scoring)
+                    except Exception:
+                        results = db.search(qvec, k=top_k, modality=modality)
+                else:
+                    results = db.search(qvec, k=top_k, modality=modality)
 
             context = _build_context(results)
 
@@ -195,4 +237,7 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
         "embedder": embedder.name,
         "judge": judge.name,
         "top_k": top_k,
+        "decay_engaged": use_decay,
+        "decay_half_life_days": scoring_half_life if use_decay else None,
+        "decay_time_weight": scoring_time_weight if use_decay else None,
     }
