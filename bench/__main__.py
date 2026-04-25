@@ -7,15 +7,21 @@ from .runner import BenchRunner
 from .report import write_report
 from .datasets.synthetic import load_synthetic
 from .datasets.sift import load_sift
+from .datasets.longmemeval import load_longmemeval
 from .scenarios import vector_ann, vector_ann_real
+from .scenarios import longmemeval as lme_scenario
+from .embedders import get_embedder
+from .judges import get_judge
 
 
 SCENARIOS = {
     "vector_ann":      "synthetic only — brute-force GT computed locally",
     "vector_ann_real": "datasets that ship pre-computed ground truth (sift1m, siftsmall)",
+    "longmemeval":     "long-term memory QA benchmark (Xu et al., 2024)",
 }
 
 REAL_DATASETS = {"sift1m", "siftsmall"}
+LME_VARIANTS = {"oracle", "s", "m"}
 
 
 def cmd_run(args):
@@ -48,6 +54,27 @@ def cmd_run(args):
         result = runner.run(
             lambda _r: vector_ann_real.run(base, queries, gt, k=args.k, ef=ef_arg),
             n=n, dim=dim, k=args.k, ef=str(ef_arg), queries=len(queries),
+        )
+
+    elif args.scenario == "longmemeval":
+        if args.dataset not in LME_VARIANTS:
+            print(f"longmemeval needs --dataset one of {sorted(LME_VARIANTS)}",
+                  file=sys.stderr)
+            return 2
+        questions = load_longmemeval(
+            variant=args.dataset,
+            limit=(args.limit if args.limit > 0 else None),
+        )
+        embedder = get_embedder(args.embedder, dim=args.dim)
+        judge = get_judge(args.judge)
+        result = runner.run(
+            lambda _r: lme_scenario.run(
+                questions, embedder=embedder, judge=judge,
+                top_k=args.k, ef=args.ef,
+            ),
+            n=len(questions), dim=embedder.dim, k=args.k,
+            ef=args.ef, embedder=embedder.name, judge=judge.name,
+            variant=args.dataset,
         )
 
     else:
@@ -100,6 +127,17 @@ def main(argv=None):
                        help="Comma-separated ef values to sweep, e.g. 10,50,100,200")
     p_run.add_argument("--queries", type=int, default=200,
                        help="Subset queries. Use 0 for all.")
+
+    # LongMemEval-specific knobs
+    p_run.add_argument("--limit", type=int, default=5,
+                       help="LongMemEval: max # questions to evaluate (0 = all).")
+    p_run.add_argument("--embedder", default="deterministic",
+                       choices=["deterministic", "openai"],
+                       help="LongMemEval embedder. Phase 1 = deterministic.")
+    p_run.add_argument("--judge", default="substring",
+                       choices=["substring", "llm"],
+                       help="LongMemEval scorer. Phase 1 = substring (free).")
+
     p_run.set_defaults(func=cmd_run)
 
     p_rep = sub.add_parser("report", help="Regenerate Markdown report")

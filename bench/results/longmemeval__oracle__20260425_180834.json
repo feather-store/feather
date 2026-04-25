@@ -1,0 +1,46 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "oracle",
+  "n": 30,
+  "dim": 768,
+  "feather_version": "0.8.0",
+  "python_version": "3.12.2",
+  "platform": "Darwin arm64",
+  "commit": "b1a3493",
+  "started_at": 1777120714.553123,
+  "wall_seconds": 0.42757511138916016,
+  "metrics": {
+    "overall": 0.5,
+    "by_axis": {
+      "information-extraction": 0.4666666666666667,
+      "multi-session-reasoning": 0.6,
+      "temporal-reasoning": 0.2,
+      "knowledge-updates": 0.8
+    },
+    "by_question_type": {
+      "single-session-user": 1.0,
+      "single-session-assistant": 0.4,
+      "multi-session": 0.6,
+      "single-session-preference": 0.0,
+      "temporal-reasoning": 0.2,
+      "knowledge-update": 0.8
+    },
+    "per_q_seconds_p50": 0.012435979006113485,
+    "per_q_seconds_mean": 0.014117313838020588,
+    "n_questions": 30,
+    "history_turns_total": 546,
+    "embeddings_emitted": 576,
+    "embedder": "deterministic_d768",
+    "judge": "substring",
+    "top_k": 10,
+    "peak_rss_mb": 1010.484375
+  },
+  "params": {
+    "k": 10,
+    "ef": null,
+    "embedder": "deterministic_d768",
+    "judge": "substring",
+    "variant": "oracle"
+  },
+  "notes": ""
+}
