@@ -18,16 +18,21 @@ from .judges import Judge, JudgeResult
 # ---------------- Prompts ----------------
 
 ANSWER_SYSTEM = (
-    "You are a helpful assistant. Use ONLY the provided memory context to "
-    "answer the user's question. If the context does not contain the answer, "
-    "reply exactly: I don't know. Keep answers concise (1–2 sentences)."
+    "You are a helpful assistant answering questions about a user's past "
+    "conversations. Use the memory context to answer the question. The "
+    "answer may require combining facts across multiple snippets, doing "
+    "arithmetic, or making reasonable inferences from what was said. "
+    "Think step by step before answering when the question requires "
+    "synthesis. Only reply 'I don't know' if the relevant facts are "
+    "genuinely absent from the context. Keep the final answer concise "
+    "(1–2 sentences) and put it on the last line."
 )
 
 ANSWER_USER_TMPL = (
     "Memory context (snippets retrieved from past conversations, separated "
     "by '---'):\n\n{context}\n\n"
     "Question: {question}\n\n"
-    "Answer:"
+    "Reason briefly, then give the final answer on the last line:"
 )
 
 # Modeled after the LongMemEval rubric (Xu et al., 2024). Binary judgment.
@@ -81,11 +86,18 @@ class LLMJudge(Judge):
                  answerer_provider: Optional[str] = None,
                  model: Optional[str] = None,
                  answerer_model: Optional[str] = None,
-                 max_context_chars: int = 12_000):
+                 max_context_chars: int = 12_000,
+                 answer_max_tokens: int = 1024,
+                 judge_max_tokens: int = 256):
         self._judge_llm = _provider_from_name(provider, model)
         self._answer_llm = (_provider_from_name(answerer_provider, answerer_model)
                             if answerer_provider else self._judge_llm)
         self._max_context_chars = max_context_chars
+        # 2.5-tier reasoning models (thinking mode) burn many tokens before
+        # producing the final answer; 200 is not enough. 1024 covers
+        # chain-of-thought + a concise final answer comfortably.
+        self._answer_max_tokens = answer_max_tokens
+        self._judge_max_tokens = judge_max_tokens
         self.name = (f"llm_judge={provider}/{model or 'default'}"
                      f"_ans={answerer_provider or provider}"
                      f"/{answerer_model or model or 'default'}")
@@ -101,7 +113,9 @@ class LLMJudge(Judge):
                 context=ctx, question=question)},
         ]
         try:
-            return self._answer_llm.complete(messages, max_tokens=200, temperature=0.0).strip()
+            return self._answer_llm.complete(
+                messages, max_tokens=self._answer_max_tokens, temperature=0.0
+            ).strip()
         except Exception as e:
             return f"[answerer error: {e}]"
 
@@ -119,7 +133,9 @@ class LLMJudge(Judge):
                 question=question, gold=g, predicted=p)},
         ]
         try:
-            raw = self._judge_llm.complete(messages, max_tokens=120, temperature=0.0)
+            raw = self._judge_llm.complete(
+                messages, max_tokens=self._judge_max_tokens, temperature=0.0
+            )
         except Exception as e:
             return JudgeResult(0.0, f"judge call failed: {e}")
 
