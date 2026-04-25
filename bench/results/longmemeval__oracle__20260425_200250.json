@@ -1,0 +1,54 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "oracle",
+  "n": 500,
+  "dim": 1536,
+  "feather_version": "0.8.0",
+  "python_version": "3.12.2",
+  "platform": "Darwin arm64",
+  "commit": "c4e83d9",
+  "started_at": 1777127570.514828,
+  "wall_seconds": 2361.505879163742,
+  "metrics": {
+    "overall": 0.67,
+    "by_axis": {
+      "temporal-reasoning": 0.40601503759398494,
+      "multi-session-reasoning": 0.6240601503759399,
+      "knowledge-updates": 0.7435897435897436,
+      "information-extraction": 0.8974358974358975
+    },
+    "by_question_type": {
+      "temporal-reasoning": 0.40601503759398494,
+      "multi-session": 0.6240601503759399,
+      "knowledge-update": 0.7435897435897436,
+      "single-session-preference": 0.7,
+      "single-session-assistant": 0.9464285714285714,
+      "single-session-user": 0.9428571428571428
+    },
+    "per_q_seconds_p50": 4.285988957999507,
+    "per_q_seconds_mean": 4.722451661059866,
+    "n_questions": 500,
+    "n_scored": 500,
+    "n_failures": 0,
+    "failures_sample": [],
+    "history_turns_total": 10960,
+    "embeddings_emitted": 11460,
+    "embedder": "azure_text-embedding-3-small-featherdb-test_d1536",
+    "judge": "llm_judge=gemini/gemini-2.0-flash_ans=gemini/gemini-2.5-flash",
+    "top_k": 10,
+    "decay_engaged": true,
+    "decay_half_life_days": 14.0,
+    "decay_time_weight": 0.4,
+    "peak_rss_mb": 1034.4375
+  },
+  "params": {
+    "k": 10,
+    "ef": null,
+    "embedder": "azure_text-embedding-3-small-featherdb-test_d1536",
+    "judge": "llm_judge=gemini/gemini-2.0-flash_ans=gemini/gemini-2.5-flash",
+    "variant": "oracle",
+    "decay_half_life": 14.0,
+    "decay_time_weight": 0.4
+  },
+  "notes": ""
+}

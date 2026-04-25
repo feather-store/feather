@@ -7,13 +7,15 @@
 
 ---
 
-## TL;DR (placeholder until runs complete)
+## TL;DR
 
-- **Oracle, no decay**: 65.6% overall (500q, gemini-2.5-flash answerer).
-- **Oracle, decay engaged**: TBD. Early signal at q25/500 = 84% running score (+12pp over baseline at the same checkpoint).
-- **LongMemEval_S**: TBD — direct apples-to-apples vs Mem0/Zep/Supermemory.
+- **Oracle, no decay**: **0.656 overall** (500q, gemini-2.5-flash answerer, 0/500 failures).
+- **Oracle, decay engaged**: **0.670 overall** — modest +1.4pp lift; decay's real test is on _S_ (next).
+- **LongMemEval_S, decay engaged**: _running, ~85 min, will fill in_.
 - **Cost**: ~$0.15 per 500-question oracle run, ~$1.65 projected for S.
 - **Wall time**: ~38 min oracle, ~85 min projected for S.
+
+**Honest read of the decay number**: oracle ships only evidence sessions, so there's almost no noise for decay to filter out. The same configuration on _S_ (which adds ~40 distractor sessions per question) is where decay should have meaningful headroom. Many temporal-reasoning questions also require *old* memories, which a recency-biased decay can hurt as much as help — a future "decay-aware retrieval" that surfaces both old and new in parallel is a follow-up idea.
 
 ---
 
@@ -100,10 +102,10 @@ Per-run JSON results land in `bench/results/`; rolled-up table in `bench/reports
 | Variant | Decay | overall | info-extr | multi-sess | temporal | knowledge-upd | per-q time | n_failures |
 |---|---|---|---|---|---|---|---|---|
 | oracle | off | 0.656 | 0.891 | 0.617 | 0.383 | 0.718 | 4.5s mean | 0/500 |
-| oracle | on  | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| s | on | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| oracle | on  | **0.670** | 0.897 | 0.624 | **0.406** | **0.744** | 4.7s mean | 0/500 |
+| s | on | _running_ | _running_ | _running_ | _running_ | _running_ | _running_ | _running_ |
 
-(Cells marked _TBD_ fill in when the in-flight runs complete.)
+Decay-on configuration: `half_life=14d`, `time_weight=0.4`. Lift on oracle is modest because the oracle variant has no distractor sessions — see honest-read note in TL;DR.
 
 ---
 
@@ -116,8 +118,8 @@ Per-run JSON results land in `bench/results/`; rolled-up table in `bench/reports
 | System | Variant | Answerer LLM | Overall | SS-User | SS-Asst | SS-Pref | KU | TR | MS | Source |
 |---|---|---|---|---|---|---|---|---|---|---|
 | **Feather DB v0.8.0 (oracle, no decay)** | oracle | gemini-2.5-flash | 0.656 | 0.943 | 0.946 | 0.667 | 0.718 | 0.383 | 0.617 | (this work) |
-| **Feather DB v0.8.0 (oracle, decay)** | oracle | gemini-2.5-flash | _TBD_ | — | — | — | — | — | — | (this work) |
-| **Feather DB v0.8.0 (S, decay)** | S | gemini-2.5-flash | _TBD_ | — | — | — | — | — | — | (this work) |
+| **Feather DB v0.8.0 (oracle, decay)** | oracle | gemini-2.5-flash | 0.670 | 0.943 | 0.946 | 0.700 | 0.744 | 0.406 | 0.624 | (this work) |
+| **Feather DB v0.8.0 (S, decay)** | S | gemini-2.5-flash | _running_ | _running_ | _running_ | _running_ | _running_ | _running_ | _running_ | (this work) |
 | Full-context GPT-4o (paper ceiling, full history) | S | GPT-4o + CoN+JSON | 0.640 | 0.814 | 0.946 | 0.200 | 0.782 | 0.451 | 0.443 | [paper](https://arxiv.org/html/2410.10813v1) |
 | Oracle GPT-4o (paper ceiling, evidence-only) | oracle | GPT-4o + CoN+JSON | 0.924 | — | — | — | — | — | — | [paper](https://arxiv.org/html/2410.10813v1) |
 | Oracle GPT-4o (no CoN) | oracle | GPT-4o | 0.870 | — | — | — | — | — | — | [paper](https://arxiv.org/html/2410.10813v1) |
