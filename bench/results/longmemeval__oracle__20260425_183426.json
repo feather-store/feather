@@ -1,0 +1,46 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "oracle",
+  "n": 20,
+  "dim": 1536,
+  "feather_version": "0.8.0",
+  "python_version": "3.12.2",
+  "platform": "Darwin arm64",
+  "commit": "2c8a2ec",
+  "started_at": 1777122266.080652,
+  "wall_seconds": 53.90854597091675,
+  "metrics": {
+    "overall": 0.65,
+    "by_axis": {
+      "information-extraction": 0.9090909090909091,
+      "multi-session-reasoning": 0.0,
+      "temporal-reasoning": 0.3333333333333333,
+      "knowledge-updates": 0.6666666666666666
+    },
+    "by_question_type": {
+      "single-session-user": 1.0,
+      "single-session-assistant": 1.0,
+      "multi-session": 0.0,
+      "single-session-preference": 0.6666666666666666,
+      "temporal-reasoning": 0.3333333333333333,
+      "knowledge-update": 0.6666666666666666
+    },
+    "per_q_seconds_p50": 2.647024000500096,
+    "per_q_seconds_mean": 2.6951861706533236,
+    "n_questions": 20,
+    "history_turns_total": 338,
+    "embeddings_emitted": 358,
+    "embedder": "azure_text-embedding-3-small-featherdb-test_d1536",
+    "judge": "llm_judge=gemini/default_ans=gemini/default",
+    "top_k": 10,
+    "peak_rss_mb": 423.140625
+  },
+  "params": {
+    "k": 10,
+    "ef": null,
+    "embedder": "azure_text-embedding-3-small-featherdb-test_d1536",
+    "judge": "llm_judge=gemini/default_ans=gemini/default",
+    "variant": "oracle"
+  },
+  "notes": ""
+}
