@@ -6,42 +6,69 @@ import sys
 from .runner import BenchRunner
 from .report import write_report
 from .datasets.synthetic import load_synthetic
-from .scenarios import vector_ann
+from .datasets.sift import load_sift
+from .scenarios import vector_ann, vector_ann_real
 
 
 SCENARIOS = {
-    "vector_ann": vector_ann.run,
+    "vector_ann":      "synthetic only — brute-force GT computed locally",
+    "vector_ann_real": "datasets that ship pre-computed ground truth (sift1m, siftsmall)",
 }
 
-DATASETS = {
-    "synthetic": load_synthetic,
-}
+REAL_DATASETS = {"sift1m", "siftsmall"}
 
 
 def cmd_run(args):
-    scenario_fn = SCENARIOS.get(args.scenario)
-    if not scenario_fn:
+    runner = BenchRunner(scenario=args.scenario, dataset=args.dataset)
+
+    if args.scenario == "vector_ann":
+        if args.dataset != "synthetic":
+            print("vector_ann scenario only supports --dataset synthetic", file=sys.stderr)
+            return 2
+        base, queries = load_synthetic(n=args.n, dim=args.dim,
+                                       n_queries=args.queries)
+        n, dim = base.shape
+        result = runner.run(
+            lambda _r: vector_ann.run(base, queries, k=args.k, ef=args.ef),
+            n=n, dim=dim, k=args.k, ef=args.ef, queries=len(queries),
+        )
+
+    elif args.scenario == "vector_ann_real":
+        if args.dataset not in REAL_DATASETS:
+            print(f"vector_ann_real needs --dataset one of {sorted(REAL_DATASETS)}",
+                  file=sys.stderr)
+            return 2
+        base, queries, gt = load_sift(
+            variant=args.dataset,
+            n_base=args.n if args.n > 0 else None,
+            n_queries=args.queries if args.queries > 0 else None,
+        )
+        n, dim = base.shape
+        ef_arg = args.ef_sweep if args.ef_sweep else args.ef
+        result = runner.run(
+            lambda _r: vector_ann_real.run(base, queries, gt, k=args.k, ef=ef_arg),
+            n=n, dim=dim, k=args.k, ef=str(ef_arg), queries=len(queries),
+        )
+
+    else:
         print(f"unknown scenario: {args.scenario}", file=sys.stderr)
         return 2
 
-    dataset_fn = DATASETS.get(args.dataset)
-    if not dataset_fn:
-        print(f"unknown dataset: {args.dataset}", file=sys.stderr)
-        return 2
-
-    base, queries = dataset_fn(n=args.n, dim=args.dim, n_queries=args.queries)
-    runner = BenchRunner(scenario=args.scenario, dataset=args.dataset)
-
-    result = runner.run(
-        lambda _r: scenario_fn(base, queries, k=args.k, ef=args.ef),
-        n=args.n, dim=args.dim, k=args.k, ef=args.ef, queries=args.queries,
-    )
-
-    # Pretty-print headline metrics
+    # Pretty-print headline metrics (skip nested sweep dict)
     print()
-    print(f"=== {args.scenario} / {args.dataset} / n={args.n} dim={args.dim} ===")
+    print(f"=== {args.scenario} / {args.dataset} / n={result.n} dim={result.dim} ===")
     for k, v in result.metrics.items():
-        if isinstance(v, float):
+        if isinstance(v, dict):
+            print(f"  {k:>20} :")
+            for sk, sv in v.items():
+                if isinstance(sv, dict):
+                    summary = (f"recall@{args.k}={sv.get(f'recall@{args.k}', 0):.3f} "
+                               f"p50={sv.get('p50_ms', 0):.2f}ms "
+                               f"p95={sv.get('p95_ms', 0):.2f}ms")
+                    print(f"    {sk:>14} : {summary}")
+                else:
+                    print(f"    {sk:>14} : {sv}")
+        elif isinstance(v, float):
             print(f"  {k:>20} : {v:.3f}")
         else:
             print(f"  {k:>20} : {v}")
@@ -60,13 +87,19 @@ def main(argv=None):
 
     p_run = sub.add_parser("run", help="Run a scenario against a dataset")
     p_run.add_argument("scenario", choices=SCENARIOS.keys())
-    p_run.add_argument("--dataset", default="synthetic", choices=DATASETS.keys())
-    p_run.add_argument("--n", type=int, default=10_000)
-    p_run.add_argument("--dim", type=int, default=128)
+    p_run.add_argument("--dataset", default="synthetic")
+    p_run.add_argument("--n", type=int, default=10_000,
+                       help="Subset base set to first N. Use 0 for full dataset.")
+    p_run.add_argument("--dim", type=int, default=128,
+                       help="Synthetic only.")
     p_run.add_argument("--k", type=int, default=10)
     p_run.add_argument("--ef", type=int, default=None,
                        help="HNSW search beam width. Default = DB default (50).")
-    p_run.add_argument("--queries", type=int, default=200)
+    p_run.add_argument("--ef-sweep", type=lambda s: [int(x) for x in s.split(",")],
+                       default=None,
+                       help="Comma-separated ef values to sweep, e.g. 10,50,100,200")
+    p_run.add_argument("--queries", type=int, default=200,
+                       help="Subset queries. Use 0 for all.")
     p_run.set_defaults(func=cmd_run)
 
     p_rep = sub.add_parser("report", help="Regenerate Markdown report")
