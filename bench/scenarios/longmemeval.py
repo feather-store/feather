@@ -63,8 +63,11 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
     per_q_type = []
     embeddings_emitted = 0
     history_turns_total = 0
+    failures: list[dict] = []
     use_llm_answer = _judge_can_answer(judge)
     has_batch = callable(getattr(embedder, "embed_batch", None))
+    progress_every = max(1, n_q // 20)  # ~5% increments
+    run_t0 = time.perf_counter()
 
     for q_idx, q in enumerate(questions):
         qid = q.get("question_id") or f"q{q_idx}"
@@ -75,6 +78,7 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
 
         path = tempfile.mktemp(suffix=f"_{qid}.feather")
         t0 = time.perf_counter()
+        scored = False
         try:
             db = feather_db.DB.open(path, dim=embedder.dim)
             if ef is not None:
@@ -136,12 +140,37 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
             per_q_score.append(jr.score)
             per_q_axis.append(axis)
             per_q_type.append(qtype)
+            scored = True
+
+        except Exception as e:
+            failures.append({
+                "question_id": qid,
+                "question_type": qtype,
+                "error": f"{type(e).__name__}: {e}",
+                "q_index": q_idx,
+            })
+            print(f"[lme] q{q_idx+1}/{n_q} ({qid}) FAILED: "
+                  f"{type(e).__name__}: {str(e)[:120]}",
+                  flush=True)
 
         finally:
             elapsed = time.perf_counter() - t0
-            per_q_seconds.append(elapsed)
+            if scored:
+                per_q_seconds.append(elapsed)
             if os.path.exists(path):
                 os.remove(path)
+
+            # Progress print
+            if (q_idx + 1) % progress_every == 0 or q_idx + 1 == n_q:
+                done = q_idx + 1
+                ok = len(per_q_score)
+                running = (statistics.fmean(per_q_score) if per_q_score else 0.0)
+                wall = time.perf_counter() - run_t0
+                eta = (wall / done) * (n_q - done) if done else 0
+                print(f"[lme] {done}/{n_q}  ok={ok}  fail={len(failures)}  "
+                      f"running_score={running:.3f}  elapsed={wall:.0f}s  "
+                      f"eta={eta:.0f}s",
+                      flush=True)
 
     # ---------- Aggregate ----------
     by_axis: dict[str, list[float]] = defaultdict(list)
@@ -158,6 +187,9 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
         "per_q_seconds_p50": statistics.median(per_q_seconds) if per_q_seconds else 0.0,
         "per_q_seconds_mean": statistics.fmean(per_q_seconds) if per_q_seconds else 0.0,
         "n_questions": n_q,
+        "n_scored": len(per_q_score),
+        "n_failures": len(failures),
+        "failures_sample": failures[:10],
         "history_turns_total": history_turns_total,
         "embeddings_emitted": embeddings_emitted,
         "embedder": embedder.name,

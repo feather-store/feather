@@ -10,9 +10,23 @@ Claude / OpenAI / Gemini / Ollama just by swapping the provider object.
 from __future__ import annotations
 import os
 import re
-from typing import Optional
+import time
+from typing import Optional, Callable
 
 from .judges import Judge, JudgeResult
+
+
+def _retry(fn: Callable, *, attempts: int = 3, base_delay: float = 1.5,
+           label: str = "llm"):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i + 1 < attempts:
+                time.sleep(base_delay ** (i + 1))
+    raise RuntimeError(f"{label} failed after {attempts} attempts: {last}")
 
 
 # ---------------- Prompts ----------------
@@ -113,9 +127,12 @@ class LLMJudge(Judge):
                 context=ctx, question=question)},
         ]
         try:
-            return self._answer_llm.complete(
-                messages, max_tokens=self._answer_max_tokens, temperature=0.0
-            ).strip()
+            return _retry(
+                lambda: self._answer_llm.complete(
+                    messages, max_tokens=self._answer_max_tokens, temperature=0.0
+                ).strip(),
+                label="answerer",
+            )
         except Exception as e:
             return f"[answerer error: {e}]"
 
@@ -133,8 +150,11 @@ class LLMJudge(Judge):
                 question=question, gold=g, predicted=p)},
         ]
         try:
-            raw = self._judge_llm.complete(
-                messages, max_tokens=self._judge_max_tokens, temperature=0.0
+            raw = _retry(
+                lambda: self._judge_llm.complete(
+                    messages, max_tokens=self._judge_max_tokens, temperature=0.0
+                ),
+                label="judge",
             )
         except Exception as e:
             return JudgeResult(0.0, f"judge call failed: {e}")
