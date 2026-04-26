@@ -81,6 +81,9 @@ def _provider_from_name(name: str, model: Optional[str] = None):
     if name == "ollama":
         from feather_db.providers import OllamaProvider
         return OllamaProvider(model=model or "llama3.1:8b")
+    if name in ("azure", "azure-openai"):
+        from .providers_azure import AzureChatProvider
+        return AzureChatProvider(model=model)
     raise ValueError(f"unknown LLM provider: {name}")
 
 

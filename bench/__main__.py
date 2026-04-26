@@ -161,11 +161,13 @@ def main(argv=None):
     p_run.add_argument("--embedder-model", default="text-embedding-3-small",
                        help="OpenAI embedder model name.")
     p_run.add_argument("--judge-provider", default="gemini",
-                       choices=["gemini", "claude", "openai", "ollama"])
+                       choices=["gemini", "claude", "openai", "ollama",
+                                "azure", "azure-openai"])
     p_run.add_argument("--judge-model", default=None,
                        help="Override judge model (default = provider's default).")
     p_run.add_argument("--answerer-provider", default=None,
-                       choices=[None, "gemini", "claude", "openai", "ollama"],
+                       choices=[None, "gemini", "claude", "openai", "ollama",
+                                "azure", "azure-openai"],
                        help="Provider for the answer-generation step. "
                             "Defaults to same as --judge-provider.")
     p_run.add_argument("--answerer-model", default=None,
