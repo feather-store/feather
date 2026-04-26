@@ -1,3 +1,31 @@
+---
+id: longmemeval-2026-04
+title: "You don't need GPT-4o full-context for AI memory — Feather DB beats it for $2.40"
+slug: longmemeval-results-april-2026
+date: 2026-04-26
+author: Hawky.ai
+status: ready
+channels:
+  - website
+  - substack
+  - dev_to
+  - medium
+tags:
+  - benchmark
+  - longmemeval
+  - memory
+  - vector-db
+  - agents
+  - rag
+headline_metric: "0.693 on LongMemEval_S with GPT-4o · 0.657 with Gemini-Flash"
+do_not_mention:
+  - "Supermemory head-to-head numbers"
+  - "Mem0 head-to-head numbers"
+  - "Zep head-to-head numbers in launch creative"
+cta_primary: "Cloud waitlist (getfeather.store/cloud)"
+cta_secondary: "GitHub star"
+---
+
 # You don't need GPT-4o full-context for AI memory — Feather DB beats it for $2.40
 
 *Published: April 2026 · Hawky.ai · [github.com/feather-store/feather](https://github.com/feather-store/feather)*

@@ -1,0 +1,134 @@
+{
+  "$schema_version": "1.0",
+  "description": "Manifest of publishable Feather DB content. The Feather website's Claude-code agent fetches this manifest first, then pulls individual markdown files. Update this file whenever a new article/asset becomes publish-ready.",
+  "repo": {
+    "owner": "feather-store",
+    "name": "feather",
+    "branch": "master",
+    "raw_base_url": "https://raw.githubusercontent.com/feather-store/feather/master"
+  },
+  "last_updated": "2026-04-26",
+  "blog_posts": [
+    {
+      "id": "longmemeval-2026-04",
+      "title": "You don't need GPT-4o full-context for AI memory — Feather DB beats it for $2.40",
+      "slug": "longmemeval-results-april-2026",
+      "summary": "Feather DB v0.8.0 + GPT-4o scores 0.693 on LongMemEval_S, beating the LongMemEval paper's full-context GPT-4o ceiling (0.640). Cheap-tier with Gemini-Flash hits 0.657 for $2.40 per benchmark run.",
+      "path": "docs/blog/longmemeval-publish.md",
+      "raw_url": "https://raw.githubusercontent.com/feather-store/feather/master/docs/blog/longmemeval-publish.md",
+      "status": "ready",
+      "publish_date": "2026-04-26",
+      "channels": ["website", "substack", "dev_to", "medium"],
+      "tags": ["benchmark", "longmemeval", "memory", "vector-db", "agents", "rag"],
+      "headline_metric": "0.693 on LongMemEval_S with GPT-4o · 0.657 with Gemini-Flash",
+      "cover_image_spec": "Bar chart: Feather (both tiers) vs full-context GPT-4o ceiling vs naive RAG. White bg, blue/orange. Inter font. No competitor names.",
+      "cta": {
+        "primary": "Cloud waitlist (getfeather.store/cloud)",
+        "secondary": "GitHub star (github.com/feather-store/feather)"
+      },
+      "do_not_mention": ["Supermemory head-to-head", "Mem0 head-to-head", "Zep head-to-head numbers in launch creative"]
+    }
+  ],
+  "marketing_assets": [
+    {
+      "id": "gtm-plan-v0.8.0",
+      "title": "Feather DB GTM Plan — v0.8.0 LongMemEval Launch",
+      "path": "docs/marketing/gtm-plan.md",
+      "raw_url": "https://raw.githubusercontent.com/feather-store/feather/master/docs/marketing/gtm-plan.md",
+      "status": "internal",
+      "audience": "claude_cowork_marketing",
+      "summary": "Positioning, ICP, channel plan, KPIs, asset checklist, founder talking points. Treat as source-of-truth for the launch."
+    },
+    {
+      "id": "twitter-thread-launch",
+      "title": "7-tweet launch thread",
+      "path": "docs/marketing/twitter-thread.md",
+      "raw_url": "https://raw.githubusercontent.com/feather-store/feather/master/docs/marketing/twitter-thread.md",
+      "status": "ready",
+      "channels": ["twitter"],
+      "audience": "claude_cowork_marketing"
+    },
+    {
+      "id": "hn-submission-launch",
+      "title": "Hacker News submission + reply templates",
+      "path": "docs/marketing/hn-submission.md",
+      "raw_url": "https://raw.githubusercontent.com/feather-store/feather/master/docs/marketing/hn-submission.md",
+      "status": "ready",
+      "channels": ["hackernews"],
+      "audience": "claude_cowork_marketing"
+    }
+  ],
+  "technical_reports": [
+    {
+      "id": "longmemeval-report",
+      "title": "Feather DB on LongMemEval — Full Report",
+      "path": "docs/benchmarks/longmemeval.md",
+      "raw_url": "https://raw.githubusercontent.com/feather-store/feather/master/docs/benchmarks/longmemeval.md",
+      "status": "ready",
+      "audience": "technical",
+      "summary": "Full benchmark report with all caveats, competitor comparison (including Supermemory), reproducibility commands, per-axis breakdowns. The internal/honest version — distinct from the public blog post which omits competitor head-to-heads."
+    }
+  ],
+  "papers": [
+    {
+      "id": "feather-db-arxiv",
+      "title": "Feather DB: An Embedded Vector Database with Adaptive Temporal Decay and Hybrid BM25/Dense Retrieval",
+      "tex_path": "docs/featherdb_paper.tex",
+      "pdf_path": "docs/featherdb_paper.pdf",
+      "raw_pdf_url": "https://raw.githubusercontent.com/feather-store/feather/master/docs/featherdb_paper.pdf",
+      "submission_guide": "docs/arxiv-submission/SUBMISSION_GUIDE.md",
+      "status": "submitted_v1_draft_v2",
+      "version": "2",
+      "version_changes": "Added §4.7 LongMemEval empirical results (0.693 with GPT-4o, 0.657 with Gemini-Flash)."
+    }
+  ],
+  "raw_data": [
+    {
+      "id": "benchmark-results-jsons",
+      "title": "Per-run benchmark result JSONs",
+      "github_dir": "bench/results/",
+      "github_url": "https://github.com/feather-store/feather/tree/master/bench/results",
+      "huggingface_dataset": "Hawky-ai/feather-db-benchmarks",
+      "huggingface_url": "https://huggingface.co/datasets/Hawky-ai/feather-db-benchmarks",
+      "purpose": "Audit trail. Every benchmark number cited anywhere in our content links back to a JSON in this directory."
+    }
+  ],
+  "headline_metrics": {
+    "longmemeval_s_gpt4o":          { "value": "0.693", "answerer": "gpt-4o",          "cost_per_run_usd": "~8" },
+    "longmemeval_s_gemini_flash":   { "value": "0.657", "answerer": "gemini-2.5-flash", "cost_per_run_usd": "~2.40" },
+    "longmemeval_oracle_with_decay":{ "value": "0.670", "answerer": "gemini-2.5-flash", "cost_per_run_usd": "~0.15" },
+    "sift1m_p50_latency":           { "value": "0.19ms", "config": "ef=50, 500K × 128-dim, real SIFT" },
+    "sift1m_recall_at_10":          { "value": "0.972",  "config": "ef=50" },
+    "sift1m_p99_at_ef_10":          { "value": "0.13ms", "config": "ef=10, 500K × 128-dim" }
+  },
+  "always_include_links": {
+    "github":           "https://github.com/feather-store/feather",
+    "pypi":             "https://pypi.org/project/feather-db/",
+    "crates":           "https://crates.io/crates/feather-db-cli",
+    "hf_space":         "https://huggingface.co/spaces/Hawky-ai/feather-db",
+    "hf_dataset":       "https://huggingface.co/datasets/Hawky-ai/feather-db-benchmarks",
+    "website":          "https://www.getfeather.store/",
+    "cloud_waitlist":   "https://www.getfeather.store/cloud",
+    "hawky_ai":         "https://hawky.ai"
+  },
+  "rules_for_consumers": [
+    "Always preserve front-matter at the top of markdown files when re-rendering.",
+    "Never edit the raw markdown — fetch fresh, render fresh.",
+    "If a content item's status is not 'ready', do not auto-publish it.",
+    "If a content item lists 'do_not_mention' entries, those phrases must NOT appear in the rendered output.",
+    "When publishing, use the canonical 'always_include_links' for any cross-references; do not invent URLs.",
+    "Cite headline_metrics by the values in this manifest, not from the markdown body (the manifest is the single source of truth).",
+    "On any content update detected (commit SHA changed for the file), re-publish to all listed channels."
+  ],
+  "watcher_recipe": {
+    "description": "Suggested approach for the consumer agent (e.g. Feather website's Claude code) to detect changes and re-publish",
+    "steps": [
+      "1. Periodically fetch CONTENT_INDEX.json (every 5–15 minutes).",
+      "2. Compare last-seen file SHAs (use https://api.github.com/repos/feather-store/feather/contents/<path>) to detect changes.",
+      "3. For changed files with status='ready', fetch the markdown via raw_url.",
+      "4. Render to each channel listed.",
+      "5. Log a successful publish event back to a state file."
+    ],
+    "github_api_for_sha": "https://api.github.com/repos/feather-store/feather/contents/{path}?ref=master"
+  }
+}
