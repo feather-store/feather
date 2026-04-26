@@ -8,7 +8,13 @@
 [![Crates.io](https://img.shields.io/crates/v/feather-db-cli)](https://crates.io/crates/feather-db-cli)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Website](https://img.shields.io/badge/website-getfeather.store-blue)](https://www.getfeather.store/)
-[![HuggingFace Space](https://img.shields.io/badge/demo-HuggingFace-yellow)](https://huggingface.co/spaces/Sri-Vigneshwar-DJ/feather-db)
+[![HuggingFace Space](https://img.shields.io/badge/demo-HuggingFace-yellow)](https://huggingface.co/spaces/Hawky-ai/feather-db)
+[![Benchmark Results](https://img.shields.io/badge/dataset-benchmarks-orange)](https://huggingface.co/datasets/Hawky-ai/feather-db-benchmarks)
+
+[![LongMemEval_S](https://img.shields.io/badge/LongMemEval__S-0.693%20%7C%20gpt--4o-success)](docs/benchmarks/longmemeval.md)
+[![LongMemEval_S Cheap](https://img.shields.io/badge/LongMemEval__S-0.657%20%7C%20gemini--flash-success)](docs/benchmarks/longmemeval.md)
+[![ANN p50](https://img.shields.io/badge/SIFT1M%20p50-0.19ms-blue)](docs/benchmarks/longmemeval.md)
+[![ANN Recall](https://img.shields.io/badge/recall%4010-0.972-blue)](docs/benchmarks/longmemeval.md)
 
 Feather DB is an embedded vector database and living context engine — zero-server, file-based, with a built-in knowledge graph, adaptive memory decay, LLM agent connectors, and a self-aligned ingestion engine that organises data automatically.
 
