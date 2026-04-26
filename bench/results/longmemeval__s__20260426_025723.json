@@ -1,0 +1,85 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "s",
+  "n": 500,
+  "dim": 1536,
+  "feather_version": "0.8.0",
+  "python_version": "3.12.2",
+  "platform": "Darwin arm64",
+  "commit": "7b6814b",
+  "started_at": 1777152443.162761,
+  "wall_seconds": 16134.159065008163,
+  "metrics": {
+    "overall": 0.6565656565656566,
+    "by_axis": {
+      "information-extraction": 0.8961038961038961,
+      "multi-session-reasoning": 0.5833333333333334,
+      "temporal-reasoning": 0.4166666666666667,
+      "knowledge-updates": 0.7142857142857143
+    },
+    "by_question_type": {
+      "single-session-user": 0.9411764705882353,
+      "multi-session": 0.5833333333333334,
+      "single-session-preference": 0.6666666666666666,
+      "temporal-reasoning": 0.4166666666666667,
+      "knowledge-update": 0.7142857142857143,
+      "single-session-assistant": 0.9642857142857143
+    },
+    "per_q_seconds_p50": 34.34540712501621,
+    "per_q_seconds_mean": 32.013714820447944,
+    "n_questions": 500,
+    "n_scored": 495,
+    "n_failures": 5,
+    "failures_sample": [
+      {
+        "question_id": "b86304ba",
+        "question_type": "single-session-user",
+        "error": "RuntimeError: embeddings failed after retries: Error code: 400 - {'error': {'message': \"This model's maximum context length is 8192 tokens, however you requested 9134 tokens (9134 in your prompt; 0 for the completion). Please reduce your prompt; or completion length.\", 'type': 'invalid_request_error', 'param': None, 'code': None}}",
+        "q_index": 30
+      },
+      {
+        "question_id": "311778f1",
+        "question_type": "single-session-user",
+        "error": "RuntimeError: embeddings failed after retries: Error code: 400 - {'error': {'message': \"This model's maximum context length is 8192 tokens, however you requested 8565 tokens (8565 in your prompt; 0 for the completion). Please reduce your prompt; or completion length.\", 'type': 'invalid_request_error', 'param': None, 'code': None}}",
+        "q_index": 53
+      },
+      {
+        "question_id": "2e6d26dc",
+        "question_type": "multi-session",
+        "error": "RuntimeError: embeddings failed after retries: Error code: 400 - {'error': {'message': \"This model's maximum context length is 8192 tokens, however you requested 8565 tokens (8565 in your prompt; 0 for the completion). Please reduce your prompt; or completion length.\", 'type': 'invalid_request_error', 'param': None, 'code': None}}",
+        "q_index": 87
+      },
+      {
+        "question_id": "gpt4_1e4a8aeb",
+        "question_type": "temporal-reasoning",
+        "error": "RuntimeError: embeddings failed after retries: Error code: 400 - {'error': {'message': \"This model's maximum context length is 8192 tokens, however you requested 8560 tokens (8560 in your prompt; 0 for the completion). Please reduce your prompt; or completion length.\", 'type': 'invalid_request_error', 'param': None, 'code': None}}",
+        "q_index": 256
+      },
+      {
+        "question_id": "852ce960",
+        "question_type": "knowledge-update",
+        "error": "RuntimeError: embeddings failed after retries: Error code: 400 - {'error': {'message': \"This model's maximum context length is 8192 tokens, however you requested 16973 tokens (16973 in your prompt; 0 for the completion). Please reduce your prompt; or completion length.\", 'type': 'invalid_request_error', 'param': None, 'code': None}}",
+        "q_index": 369
+      }
+    ],
+    "history_turns_total": 246738,
+    "embeddings_emitted": 244908,
+    "embedder": "azure_text-embedding-3-small-2_d1536",
+    "judge": "llm_judge=gemini/gemini-2.0-flash_ans=gemini/gemini-2.5-flash",
+    "top_k": 10,
+    "decay_engaged": true,
+    "decay_half_life_days": 14.0,
+    "decay_time_weight": 0.4,
+    "peak_rss_mb": 2251.34375
+  },
+  "params": {
+    "k": 10,
+    "ef": null,
+    "embedder": "azure_text-embedding-3-small-2_d1536",
+    "judge": "llm_judge=gemini/gemini-2.0-flash_ans=gemini/gemini-2.5-flash",
+    "variant": "s",
+    "decay_half_life": 14.0,
+    "decay_time_weight": 0.4
+  },
+  "notes": ""
+}

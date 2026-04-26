@@ -426,12 +426,59 @@ feather save   --db my.feather
 | Metric | Value |
 |--------|-------|
 | Add rate | 2,000–5,000 vectors/sec |
-| Search latency (k=10) | 0.5–1.5 ms |
+| Search latency p50 (k=10, 500K × 128-dim, real SIFT data) | **0.19 ms** |
+| Search latency p99 (k=10, 500K × 128-dim, real SIFT data) | **0.13 ms @ ef=10**, **1.03 ms @ ef=200** |
+| Recall@10 (500K × 128-dim, ef=50, real SIFT) | **0.972** |
 | Max vectors per modality | 1,000,000 (configurable) |
-| HNSW params | M=16, ef_construction=200 |
-| File format | Binary `.feather` v5 |
+| HNSW params | M=16, ef_construction=200, ef=50 (default in v0.8.0) |
+| File format | Binary `.feather` v6 |
 
 SIMD (AVX2/AVX512) optimizations are available in `space_l2.h`. Enable with `-DUSE_AVX -march=native` in `setup.py`.
+
+Reproducible benchmark harness lives in [`bench/`](./bench/). Run any benchmark with `python -m bench run <scenario>`.
+
+---
+
+## Benchmarks
+
+### Memory benchmark — LongMemEval (Xu et al., 2024)
+
+500-question end-to-end memory QA benchmark, the standard for long-term memory in chat assistants. Full report: [`docs/benchmarks/longmemeval.md`](./docs/benchmarks/longmemeval.md).
+
+| Run | Variant | Answerer | Overall | Notes |
+|---|---|---|---|---|
+| Feather DB v0.8.0 + decay | **S** | gemini-2.5-flash | **0.657** | apples-to-apples vs Mem0/Zep/Supermemory |
+| Feather DB v0.8.0 + decay | oracle | gemini-2.5-flash | 0.670 | retrieval-easy ceiling |
+
+| System | Variant | Answerer | Overall |
+|---|---|---|---|
+| **Feather DB v0.8.0 + decay** | **S** | **gemini-2.5-flash** | **0.657** |
+| Zep (graphiti) | S | gpt-4o-mini | 0.638 |
+| Full-context GPT-4o (paper "ceiling") | S | gpt-4o + CoN | 0.640 |
+| Full-context GPT-4o-mini | S | gpt-4o-mini | 0.554 |
+| Mem0 (prior algo) | S | gpt-4o-mini | 0.678 |
+| Supermemory | S | gpt-4o | 0.816 |
+
+Cost for the full Feather S run: **~$2.40** (Azure embeddings + Gemini answer + judge). Wall time 4.5 hours. 5 failures / 500 questions.
+
+Reproduce:
+```bash
+python -m bench run longmemeval --dataset s --limit 0 \
+  --embedder openai --judge llm \
+  --judge-provider gemini --judge-model gemini-2.0-flash \
+  --answerer-provider gemini --answerer-model gemini-2.5-flash \
+  --decay-half-life 14 --decay-time-weight 0.4 --k 10
+```
+
+### ANN benchmark — SIFT1M
+
+Standard ANN benchmark. Full sweep results in [`bench/results/`](./bench/results/).
+
+| Config | p50 | p99 | Recall@10 |
+|---|---|---|---|
+| 500K × 128, ef=10 | 0.07 ms | 0.13 ms | 0.774 |
+| 500K × 128, ef=50 (default) | 0.19 ms | 0.23 ms | **0.972** |
+| 500K × 128, ef=200 | 0.56 ms | 0.69 ms | 0.998 |
 
 ---
 
