@@ -477,9 +477,16 @@ question's posed-date maps to wall-clock now, preserving relative ages
 between memories.
 
 \textbf{Results.} Feather DB scored \textbf{0.657 overall} on
-\texttt{LongMemEval\_S}. The full per-axis breakdown and competitor comparison
-are in Table~\ref{tab:longmemeval}. Run completed in 268 minutes wall-clock
-with 5/500 failures (1\%) and total API cost $\sim$\$2.40.
+\texttt{LongMemEval\_S} with \texttt{gemini-2.5-flash} as the answerer
+(268 min wall, 5/500 failures, $\sim$\$2.40 cost). A second run substituting
+\texttt{gpt-4o} for the answerer (272 min wall, $\sim$\$7--9 cost) lifted
+overall to \textbf{0.693}, with gains concentrated on temporal-reasoning
+($+6.0$pp), single-session-preference ($+10.0$pp), and single-session-user
+(reaching $1.000$, beating Supermemory's $0.971$). Knowledge-update was
+unchanged across answerer model classes ($0.714$ in both runs), suggesting
+that axis is bounded by retrieval/structural factors rather than answerer
+capability. The full per-axis breakdown and competitor comparison are in
+Table~\ref{tab:longmemeval}.
 
 \begin{table}[h]
 \centering
@@ -492,7 +499,8 @@ tokens). All competitor numbers are vendor-published.}
 \toprule
 System & Var. & Answerer LLM & Score \\
 \midrule
-\textbf{Feather DB v0.8.0} (this work) & S & gemini-2.5-flash & \textbf{0.657} \\
+\textbf{Feather DB v0.8.0} (this work, gpt-4o) & S & gpt-4o & \textbf{0.693} \\
+\textbf{Feather DB v0.8.0} (this work, flash) & S & gemini-2.5-flash & \textbf{0.657} \\
 Zep (graphiti)~\cite{rasmussen2025zep} & S & gpt-4o-mini & 0.638 \\
 Full-context~\cite{xu2024longmemeval} & S & gpt-4o + CoN+JSON & 0.640 \\
 Full-context~\cite{xu2024longmemeval} & S & gpt-4o-mini & 0.554 \\

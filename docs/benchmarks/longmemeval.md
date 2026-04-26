@@ -9,21 +9,27 @@
 
 ## TL;DR
 
-**Headline: Feather DB v0.8.0 + Gemini 2.5-flash scores 0.657 on LongMemEval_S — beating both Zep + GPT-4o-mini (0.638) and the paper's full-context GPT-4o ceiling (0.640) — using a free-tier model and ~$2.40 in API spend.**
+**Two headline numbers:**
+
+- **Feather DB v0.8.0 + Gemini-Flash on LongMemEval_S = 0.657** — beats Zep + paid GPT-4o-mini (0.638) and the LongMemEval paper's full-context GPT-4o ceiling (0.640), using a free-tier model and **~$2.40** in API spend.
+- **Feather DB v0.8.0 + GPT-4o on LongMemEval_S = 0.693** — same retrieval pipeline, stronger answerer, costs **~$7–9**. Beats Zep + GPT-4o (0.712) on **single-session-* axes**; below Supermemory + GPT-4o (0.816) on the **three reasoning axes** (knowledge-update, multi-session, temporal).
 
 | Run | Overall | Failures | Wall | Cost |
 |---|---|---|---|---|
-| Oracle, no decay | 0.656 | 0/500 | 38 min | ~$0.15 |
-| Oracle, decay on | 0.670 | 0/500 | 39 min | ~$0.15 |
-| **S, decay on** | **0.657** | 5/500 | 268 min | ~$2.40 |
+| Oracle, no decay (Gemini-Flash) | 0.656 | 0/500 | 38 min | ~$0.15 |
+| Oracle, decay on (Gemini-Flash) | 0.670 | 0/500 | 39 min | ~$0.15 |
+| **S, decay on (Gemini-Flash)** | **0.657** | 5/500 | 268 min | ~$2.40 |
+| **S, decay on (GPT-4o)** | **0.693** | 5/500 | 272 min | ~$7–9 |
 
-**Three claims this benchmark supports:**
+**Five claims this benchmark supports (across the two answerer tiers):**
 
-1. Feather + free-tier Gemini-Flash matches/beats Zep + paid GPT-4o-mini on the same dataset.
-2. Feather beats the paper's "full-context GPT-4o" ceiling — i.e. our retrieval pipeline is no worse than dumping the whole 115K-token haystack into a frontier model.
-3. We tie Supermemory on `single-session-assistant` (96.4% vs 96.4%) using a cheaper answerer model.
+1. **Feather + free-tier Gemini-Flash matches/beats Zep + paid GPT-4o-mini** on the same dataset (0.657 vs 0.638).
+2. **Feather beats the paper's "full-context GPT-4o" ceiling** — our retrieval pipeline is no worse than dumping the whole 115K-token haystack into a frontier model (0.657 vs 0.640).
+3. **GPT-4o lifts overall by +3.6pp** (0.657 → 0.693), with the lift concentrated on temporal-reasoning (+6pp), single-session-preference (+10pp), and single-session-user (+5.9pp, perfect 1.000).
+4. **Per-question-type, with GPT-4o we beat Supermemory + GPT-4o on simple axes**: single-session-user 1.000 vs 0.971, single-session-preference 0.767 vs 0.700.
+5. **Knowledge-update is unchanged across model classes** (0.714 in both runs) — model class is not the bottleneck on this axis. Mem0/Supermemory's lead here is structural (their LLM-based fact-extraction-at-ingest), not from a smarter answerer.
 
-**Where we lose:** temporal-reasoning 41.7% — below most competitors. Adaptive-decay tuning + "old + new in parallel" retrieval is the next attack surface (Phase 9).
+**Where we lose:** the entire 12pp gap between Feather + GPT-4o (0.693) and Supermemory + GPT-4o (0.816) is concentrated in **knowledge-update (-17pp), multi-session (-11pp), and temporal-reasoning (-29pp)**. The diagnostic is clear: **stronger answerer alone won't close it**. Closing it requires structural changes — Phase 9 LLM extractors at ingest time (what Supermemory advertises as "ontology-aware edges + automatic contradiction handling") and decay-aware retrieval that surfaces both old and new in parallel.
 
 **Honest read of the decay number on oracle (+1.4pp)**: oracle ships only evidence sessions, so decay has almost no noise to filter out. The same configuration on S (with ~40 distractor sessions per question) lets decay do real work.
 
@@ -109,13 +115,14 @@ Per-run JSON results land in `bench/results/`; rolled-up table in `bench/reports
 
 ## Headline result — Feather DB
 
-| Variant | Decay | overall | info-extr | multi-sess | temporal | knowledge-upd | per-q time | n_failures |
-|---|---|---|---|---|---|---|---|---|
-| oracle | off | 0.656 | 0.891 | 0.617 | 0.383 | 0.718 | 4.5s mean | 0/500 |
-| oracle | on  | 0.670 | 0.897 | 0.624 | 0.406 | 0.744 | 4.7s mean | 0/500 |
-| **s** | **on** | **0.657** | **0.896** | **0.583** | **0.417** | **0.714** | **32.0s mean** | **5/500** |
+| Variant | Decay | Answerer | overall | info-extr | multi-sess | temporal | knowledge-upd | per-q time | n_failures |
+|---|---|---|---|---|---|---|---|---|---|
+| oracle | off | gemini-2.5-flash | 0.656 | 0.891 | 0.617 | 0.383 | 0.718 | 4.5s | 0/500 |
+| oracle | on  | gemini-2.5-flash | 0.670 | 0.897 | 0.624 | 0.406 | 0.744 | 4.7s | 0/500 |
+| **s** | **on** | **gemini-2.5-flash** | **0.657** | **0.896** | **0.583** | **0.417** | **0.714** | **32.0s** | **5/500** |
+| **s** | **on** | **gpt-4o** | **0.693** | **0.942** | **0.606** | **0.477** | **0.714** | **32.4s** | **5/500** |
 
-Decay-on configuration: `half_life=14d`, `time_weight=0.4`. Oracle and S information-extraction are essentially identical (0.891 vs 0.896) — Feather's retrieval is robust to distractors on that axis. The drop on multi-session (0.617 → 0.583) reflects the harder retrieval problem with ~40 sessions per question.
+Decay-on configuration: `half_life=14d`, `time_weight=0.4`. Oracle and S information-extraction are essentially identical (0.891 vs 0.896) — Feather's retrieval is robust to distractors on that axis. **Going from gemini-2.5-flash to gpt-4o lifts overall +3.6pp**; the lift is concentrated on temporal-reasoning (+6pp), single-session-preference (+10pp), and single-session-user (+5.9pp, hitting 100%). Knowledge-update is unchanged across model classes, indicating it's a *structural* gap (lack of fact extraction at ingest), not a model-class gap.
 
 ---
 
@@ -130,6 +137,7 @@ Decay-on configuration: `half_life=14d`, `time_weight=0.4`. Oracle and S informa
 | **Feather DB v0.8.0 (oracle, no decay)** | oracle | gemini-2.5-flash | 0.656 | 0.943 | 0.946 | 0.667 | 0.718 | 0.383 | 0.617 | (this work) |
 | **Feather DB v0.8.0 (oracle, decay)** | oracle | gemini-2.5-flash | 0.670 | 0.943 | 0.946 | 0.700 | 0.744 | 0.406 | 0.624 | (this work) |
 | **Feather DB v0.8.0 (S, decay)** | **S** | **gemini-2.5-flash** | **0.657** | **0.941** | **0.964** | **0.667** | **0.714** | **0.417** | **0.583** | **(this work)** |
+| **Feather DB v0.8.0 (S, decay)** | **S** | **gpt-4o** | **0.693** | **1.000** | **0.964** | **0.767** | **0.714** | **0.477** | **0.606** | **(this work)** |
 | Full-context GPT-4o (paper ceiling, full history) | S | GPT-4o + CoN+JSON | 0.640 | 0.814 | 0.946 | 0.200 | 0.782 | 0.451 | 0.443 | [paper](https://arxiv.org/html/2410.10813v1) |
 | Oracle GPT-4o (paper ceiling, evidence-only) | oracle | GPT-4o + CoN+JSON | 0.924 | — | — | — | — | — | — | [paper](https://arxiv.org/html/2410.10813v1) |
 | Oracle GPT-4o (no CoN) | oracle | GPT-4o | 0.870 | — | — | — | — | — | — | [paper](https://arxiv.org/html/2410.10813v1) |

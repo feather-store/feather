@@ -447,7 +447,8 @@ Reproducible benchmark harness lives in [`bench/`](./bench/). Run any benchmark 
 
 | Run | Variant | Answerer | Overall | Notes |
 |---|---|---|---|---|
-| Feather DB v0.8.0 + decay | **S** | gemini-2.5-flash | **0.657** | apples-to-apples vs Mem0/Zep/Supermemory |
+| Feather DB v0.8.0 + decay | **S** | gpt-4o | **0.693** | best run; same model as Supermemory |
+| Feather DB v0.8.0 + decay | **S** | gemini-2.5-flash | **0.657** | cheap-tier; ~$2.40 per full run |
 | Feather DB v0.8.0 + decay | oracle | gemini-2.5-flash | 0.670 | retrieval-easy ceiling |
 
 | System | Variant | Answerer | Overall |
