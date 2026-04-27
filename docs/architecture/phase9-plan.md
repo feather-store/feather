@@ -1,9 +1,20 @@
 ---
 id: phase9-plan
 title: "Phase 9 — Agentic Context Engine: Architecture & GTM"
-status: draft
+status: locked
 audience: internal
 last_updated: 2026-04-27
+locked_decisions:
+  - "OSS = engine + extractors + reasoner; Cloud = verticals + ops + bundled inference + self-learning"
+  - "Two LLM roles: internal/system LLM (ours, fixed = Claude Haiku); answerer LLM (customer's choice, BYOL or bundled)"
+  - "BYOL = any OpenAI-compatible endpoint"
+  - "Self-learning module = Cloud only (depends on cross-tenant telemetry)"
+  - "Tier 1 launch verticals: Marketing + DevTools"
+  - "Tier 1 inbound connectors: Meta Ads, Google Ads, GA4, GitHub, Linear, Slack, Notion, S3/CSV+webhook"
+  - "Tier 1 outbound surfaces: MCP server, REST API, Python SDK, TypeScript SDK, Anthropic tool-use, OpenAI Agents SDK, ChatGPT Custom GPT"
+  - "Connector SDK ships with v0.9.0 (community plugin path)"
+  - "MCP server: both OSS and Cloud variants"
+  - "14-week rollout (4w extractors → 4w reasoner → 6w Cloud parallel)"
 ---
 
 # Phase 9 — Agentic Context Engine
@@ -448,7 +459,152 @@ When v0.9.0 lands:
 
 ---
 
-## 10. Decision needed from you (founder)
+## 10. LLM roles — system vs answerer
+
+After founder review, the LLM strategy is **two distinct roles**, not one:
+
+```
+                  ┌──────────────────────────────────┐
+                  │  INTERNAL / SYSTEM LLM           │
+                  │  (Cloud's choice — locked)       │
+                  │  Default: Claude Haiku 4.5       │
+                  │                                  │
+                  │  Used by:                        │
+                  │   • FactExtractor                │
+                  │   • EntityResolver               │
+                  │   • OntologyLinker               │
+                  │   • ContradictionResolver        │
+                  │   • QueryPlanner                 │
+                  │   • Self-learning telemetry      │
+                  │                                  │
+                  │  Customer never picks. Always us.│
+                  └──────────────────────────────────┘
+                                  │
+                                  ▼
+                          curated context
+                                  │
+                                  ▼
+                  ┌──────────────────────────────────┐
+                  │  ANSWERER LLM                    │
+                  │  (Customer choice)               │
+                  │                                  │
+                  │  Default tier:  bundled (Sonnet) │
+                  │  Pro tier:      bundled (GPT-4o  │
+                  │                  passthrough)    │
+                  │  BYOL:          any OpenAI-compat│
+                  │                  endpoint        │
+                  │  VPC:           customer-hosted  │
+                  └──────────────────────────────────┘
+```
+
+**Why two roles, not one:**
+
+- **Quality consistency.** Extraction quality must not drift per customer. If a customer picks a cheap LLM as their "everything," extracted facts come out worse, ontology edges come out wrong, contradiction resolution misses cases. The internal LLM stays constant so output stays consistent across all tenants.
+- **Self-learning works.** Cross-tenant telemetry on retrieval-plan effectiveness is only meaningful if the planner LLM is constant. Otherwise we're aggregating signal from incompatible baselines.
+- **Caching.** Same prompt + same model = cache hit (privacy-isolated by tenant). Possible with fixed internal LLM; impossible with BYOL extraction.
+- **Cost predictability.** We know exactly what extraction costs us; we charge a flat platform fee. Answerer cost is either bundled (we mark up) or BYOL (customer pays directly).
+
+**Privacy posture:** internal LLM is Anthropic Enterprise (no-train-on-data tier). VPC tier swaps to self-hosted Qwen 2.5 32B / Llama 3.3 70B via vLLM. Documented; same posture as Mem0 / Zep / Supermemory.
+
+## 11. Integration surfaces — Connector Strategy
+
+Customers don't adopt one access pattern; they adopt many. Two directions, three tiers.
+
+### 11.1 Inbound connectors (data → Feather Cloud)
+
+**Tier 1 (v0.9.0 Cloud beta — 8 connectors):**
+- Meta Ads, Google Ads, GA4 → Marketing vertical lighthouse
+- GitHub, Linear → DevTools vertical lighthouse
+- Slack, Notion → universal "company knowledge"
+- S3 / CSV upload + Webhooks → escape hatch for everything else
+
+**Tier 2 (v0.10 / Q4 2026):** Jira, HubSpot, Salesforce, Stripe, Google Drive, Dropbox, Mixpanel, Amplitude.
+
+**Tier 3 (community / marketplace, ongoing):** long tail (TikTok, Pinterest, Reddit, X, Zendesk, Intercom, custom DBs) — built via the Connector SDK.
+
+### 11.2 Outbound surfaces (Feather → consumers)
+
+**Tier 1 (v0.9.0 — 7 surfaces):**
+- **MCP server** — Cloud-aware, multi-tenant. The biggest distribution channel: Claude Desktop, Cursor, Cline, Windsurf all converge on MCP. (OSS also ships an embedded MCP server for self-hosters.)
+- **REST API** — bring-your-own-everything path; the foundation surface.
+- **Python SDK** — `pip install feather-cloud-sdk`; idiomatic wrapper over REST.
+- **TypeScript SDK** — for Cursor / VS Code / Vercel / Next.js audience.
+- **Anthropic tool-use schema** — drop-in `tools=[...]` for any Claude API user.
+- **OpenAI Agents SDK / function-calling schema** — same pattern, OpenAI ecosystem.
+- **ChatGPT Custom GPT** — published to GPT Store via OpenAPI Custom Action spec.
+
+**Tier 2:** LangChain plugin, LlamaIndex plugin, Slack bot, Microsoft Teams bot, browser extension (Chrome/Firefox), CLI.
+
+**Tier 3 / community:** app-specific integrations via outbound SDK.
+
+### 11.3 Connector SDK (ships in v0.9.0)
+
+The leverage move. Hard-coding 200 connectors is the trap Airbyte / Fivetran fell into. Ship a clean SDK, host the marketplace, let community fill the long tail.
+
+```python
+# Inbound connector contract
+from feather_cloud.connectors import InboundConnector, Record, OAuthAuth, StreamSchema
+
+class PinterestAdsConnector(InboundConnector):
+    name = "pinterest_ads"
+    auth = OAuthAuth(provider="pinterest", scopes=["ads:read"])
+
+    def discover(self) -> list[StreamSchema]:
+        return [StreamSchema("ads", primary_key="ad_id", cursor="updated_at")]
+
+    def read(self, stream: str, since: datetime) -> Iterator[Record]:
+        for raw in self._client.list_ads(since=since):
+            yield Record(stream=stream, data=raw, ts=raw["updated_at"])
+```
+
+```python
+# Outbound surface contract
+from feather_cloud.surfaces import OutboundSurface, Tool
+
+class CustomMCPTool(OutboundSurface):
+    name = "feather_search_filtered"
+    schema = {...}
+    def execute(self, args: dict, tenant: str) -> dict: ...
+```
+
+Marketplace at `huggingface.co/spaces/Hawky-ai/feather-connectors` (or similar). Revenue share for paid connectors; free for OSS-style.
+
+### 11.4 Two GTM narratives, same product
+
+| Audience | Hook |
+|---|---|
+| Engineers / OSS | "Embedded VDB · 0.693 LongMemEval · `pip install feather-db`" |
+| Buyers / teams | "Plug your Meta Ads, Slack, Notion, Linear once. Query from Claude, ChatGPT, your app — same memory." |
+
+## 12. Self-learning module (Cloud-only, new module)
+
+> **Tweak A from founder review:** self-learning gets its own module, not implicit.
+
+`feather_cloud.evolve` (Cloud-side, depends on cross-tenant telemetry):
+
+```
+Per query, log:
+  - Question (hashed if private)
+  - Plan emitted by QueryPlanner
+  - Evidence retrieved (IDs + scores)
+  - Final answer
+  - User feedback signal: thumbs-up/down · follow-up edit · pin/ignore
+  - Latency + cost
+
+Periodic (daily/weekly) jobs:
+  - Refine QueryPlanner: prompt-engineering tweaks based on which plans
+    correlated with positive feedback per query class.
+  - Tune decay parameters per tenant: half-life, time-weight; promote
+    "sticky" entities (frequently recalled) and demote stale facts.
+  - Promote new edge types in OntologyLinker that prove useful;
+    deprecate types that are never traversed.
+  - Re-extract on prompt-version drift: when we update the FactExtractor
+    prompt, queue background re-extraction of high-importance facts.
+```
+
+Why Cloud-only: needs cross-tenant aggregation, ML feedback loops, and observability infra that doesn't make sense in an embedded OSS. Self-hosters can opt into a single-tenant version of decay tuning later (Phase 9.4+).
+
+## 13. Decision needed from you (founder)
 
 To proceed, I need three calls from you:
 
