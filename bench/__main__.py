@@ -10,14 +10,16 @@ from .datasets.sift import load_sift
 from .datasets.longmemeval import load_longmemeval
 from .scenarios import vector_ann, vector_ann_real
 from .scenarios import longmemeval as lme_scenario
+from .scenarios import longmemeval_phase9 as lme9_scenario
 from .embedders import get_embedder
 from .judges import get_judge
 
 
 SCENARIOS = {
-    "vector_ann":      "synthetic only — brute-force GT computed locally",
-    "vector_ann_real": "datasets that ship pre-computed ground truth (sift1m, siftsmall)",
-    "longmemeval":     "long-term memory QA benchmark (Xu et al., 2024)",
+    "vector_ann":         "synthetic only — brute-force GT computed locally",
+    "vector_ann_real":    "datasets that ship pre-computed ground truth (sift1m, siftsmall)",
+    "longmemeval":        "long-term memory QA benchmark (Xu et al., 2024)",
+    "longmemeval_phase9": "longmemeval with Phase 9 fact extraction at ingest",
 }
 
 REAL_DATASETS = {"sift1m", "siftsmall"}
@@ -54,6 +56,54 @@ def cmd_run(args):
         result = runner.run(
             lambda _r: vector_ann_real.run(base, queries, gt, k=args.k, ef=ef_arg),
             n=n, dim=dim, k=args.k, ef=str(ef_arg), queries=len(queries),
+        )
+
+    elif args.scenario == "longmemeval_phase9":
+        if args.dataset not in LME_VARIANTS:
+            print(f"longmemeval_phase9 needs --dataset one of {sorted(LME_VARIANTS)}",
+                  file=sys.stderr)
+            return 2
+        questions = load_longmemeval(
+            variant=args.dataset,
+            limit=(args.limit if args.limit > 0 else None),
+        )
+        # Embedder
+        if args.embedder == "openai":
+            from .embedders_openai import OpenAIEmbedder
+            embedder = OpenAIEmbedder(model=args.embedder_model,
+                                      dim=(args.dim or None))
+        else:
+            embedder = get_embedder(args.embedder, dim=args.dim)
+        # Judge
+        if args.judge == "llm":
+            from .judges_llm import LLMJudge
+            judge = LLMJudge(provider=args.judge_provider,
+                             model=args.judge_model,
+                             answerer_provider=args.answerer_provider,
+                             answerer_model=args.answerer_model)
+        else:
+            judge = get_judge(args.judge)
+        # System LLM (always ours; Phase 9's "internal" role)
+        from .judges_llm import _provider_from_name
+        system_provider = _provider_from_name(
+            args.system_provider, args.system_model)
+        result = runner.run(
+            lambda _r: lme9_scenario.run(
+                questions, embedder=embedder, judge=judge,
+                system_provider=system_provider,
+                top_k=args.k, ef=args.ef,
+                scoring_half_life=args.decay_half_life,
+                scoring_time_weight=args.decay_time_weight,
+                max_facts_per_turn=args.max_facts_per_turn,
+            ),
+            n=len(questions), dim=embedder.dim, k=args.k,
+            ef=args.ef, embedder=embedder.name, judge=judge.name,
+            variant=args.dataset, scenario_variant="phase9",
+            system_provider=args.system_provider,
+            system_model=args.system_model,
+            decay_half_life=args.decay_half_life,
+            decay_time_weight=args.decay_time_weight,
+            max_facts_per_turn=args.max_facts_per_turn,
         )
 
     elif args.scenario == "longmemeval":
@@ -177,6 +227,17 @@ def main(argv=None):
     p_run.add_argument("--decay-time-weight", type=float, default=None,
                        help="Adaptive decay time-weight in [0,1]. Engages "
                             "ScoringConfig in retrieval. 0.3-0.5 typical.")
+    # Phase 9 scenario knobs
+    p_run.add_argument("--system-provider", default="gemini",
+                       choices=["gemini", "claude", "openai", "ollama",
+                                "azure", "azure-openai"],
+                       help="Phase 9: LLM used internally by extractors. "
+                            "Default = gemini (works with GOOGLE_API_KEY). "
+                            "Cloud will lock this to Claude Haiku.")
+    p_run.add_argument("--system-model", default=None,
+                       help="Phase 9: model for system_provider.")
+    p_run.add_argument("--max-facts-per-turn", type=int, default=8,
+                       help="Phase 9: cap facts extracted per haystack turn.")
 
     p_run.set_defaults(func=cmd_run)
 
