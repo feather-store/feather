@@ -83,6 +83,37 @@ class OntologyEdge:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ContradictionFinding:
+    """A surfaced conflict between a new fact and an existing one.
+
+    Detect-only: this is what the resolver returns. Whether to act on it
+    (auto-supersede, route to human review, mark both as low-confidence)
+    is a downstream policy decision — Cloud applies tenant rules.
+
+    severity:
+        - 'definite'  — same subject+predicate, different non-numeric
+                        object, overlapping or absent valid_at.
+        - 'probable'  — same subject+predicate, different numeric object
+                        outside tolerance.
+        - 'possible'  — same subject+predicate, different object, but
+                        the new fact's valid_at is later (likely
+                        supersedure rather than contradiction).
+
+    suggested_resolution:
+        - 'supersedes' — new fact replaces old (clear temporal ordering).
+        - 'review'     — surface to a human (default for definite/probable).
+        - 'merge'      — same numeric value within tolerance.
+    """
+    new_fact: Fact
+    conflicting_with: Fact
+    severity: str = "definite"
+    rationale: Optional[str] = None
+    suggested_resolution: str = "review"
+    detected_at: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 # ── Protocols ──────────────────────────────────────────────────────────────
 
 class Extractor(ABC):
