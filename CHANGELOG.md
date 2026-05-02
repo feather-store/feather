@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.0] — 2026-04-29
+
+### Added — Agentic Context Engine (Phase 9.1)
+
+#### `feather_db.extractors` — LLM-backed ingestion primitives
+- **`FactExtractor`** — converts raw text turns into atomic (subject, predicate, object) triples with confidence scores and temporal anchors. Pluggable on any `LLMProvider`.
+- **`EntityResolver`** — canonicalises entity mentions across turns; de-duplicates aliases into stable canonical IDs (e.g. "Alice" / "al" / "alice" → one node).
+- **`TemporalParser`** — rule-based ISO-8601 timestamp extraction; stamps `observed_at` / `valid_at` on facts without any LLM call.
+- **`OntologyLinker`** — LLM-backed typed-edge inference between facts and entities. Whitelisted `rel_type` set (supports, contradicts, supersedes, etc.). Detect-only — never auto-resolves. `contradicts` / `supersedes` edges require a `rationale` string.
+- **`ContradictionResolver`** — two-layer contradiction detection: rule pre-filter (same subject+predicate, numeric tolerance ±5%, temporal classification) + optional LLM severity scoring (`definite` / `probable` / `possible`). Returns `ContradictionFinding` list — never auto-resolves.
+- **`ContradictionFinding`** dataclass — `new_fact`, `conflicting_with`, `severity`, `rationale`, `suggested_resolution`, `detected_at`. Audit-trail-friendly.
+- Stable item IDs (`f_0`, `f_1` for Facts; `e_0`, `e_1` for Entities) used during LLM calls so edge endpoints can be mapped back to real Feather row IDs post-persistence.
+
+#### `feather_db.pipelines.IngestPipeline` — enhanced
+- **`enable_phase2` flag** — gates `OntologyLinker` + `ContradictionResolver`; off by default (OSS), intended for Cloud activation.
+- Phase 2 flow: fetch contradiction candidates via `FilterBuilder` before persisting → detect contradictions → `db.link("contradicts", severity_weight)` → apply ontology edges.
+- **`IngestStats`** gains `ontology_edges_added`, `contradictions_detected`, `contradictions_by_severity` fields.
+- `_apply_ontology_links()` maps stable `f_0`/`e_0` IDs back to real row IDs after persistence.
+
+#### `feather_db.feedback` — append-only audit log
+- **`FeedbackEvent`** — dataclass with `kind`, `target_id`, `namespace_id`, `timestamp`, `user_id`, `payload`, `notes`, deterministic `event_id` (sha256[:12]).
+- **`FeedbackLog`** — append-only JSONL; `log()`, `iter_events()` (filtered), `aggregate_for_target()`, skips corrupt lines.
+- **`feedback_decay_modifier()`** — layered on `recall_count`: retracted→0.0, corrections penalise (0.5^N, cap 3), endorsements boost (1+0.2*N, cap 5), namespace-isolated.
+
+#### `feather_db.hierarchy` — marketing attribution tree
+- **`Hierarchy`** class with `MARKETING_HIERARCHY` default (`Brand → Channel → Campaign → AdSet → Ad → Creative`).
+- `ancestors()`, `descendants()` (BFS), `common_ancestor()`, `is_descendant_of()`.
+- Parent-level ordering enforced on `add()`.
+
+#### `feather_db.reason` — QueryPlanner + PlanExecutor skeleton
+- **`QueryPlanner`** — emits a single-step `hybrid_search` plan by default; subclass hook for multi-step plans (Phase 11).
+- **`PlanExecutor`** — executes `hybrid_search` + `vector_search`, falls back to vector on hybrid failure, warns on unimplemented step kinds, captures `step_traces`.
+
+#### `feather_db.integrations` — Phase 9 MCP tools
+- **`feather_ingest`** MCP tool — runs `IngestPipeline` (Phase 9 structured extraction) when `system_provider` configured; falls back to raw-text storage. Per-call `namespace` override.
+- **`feather_recall`** MCP tool — hybrid search with adaptive decay (`ScoringConfig`); `half_life_days`, `time_weight` knobs. Total MCP tools: 14 → 16.
+- **`feather-serve` CLI** — new `--system-provider`, `--system-model`, `--namespace` args. Supports `claude`, `openai`, `gemini`, `ollama` system providers.
+
+### Tests
+- 108 new tests across 6 test files: `test_extractors_ontology` (20), `test_extractors_contradictions` (19), `test_feedback` (20), `test_hierarchy` (16), `test_reason` (11), `test_pipelines_phase2` (9), `test_mcp_phase9` (20), `test_phase9_smoke` (13). All pass; 0 regressions.
+
+### Changed
+- `feather_db.integrations.base.FeatherTools.__init__` accepts `system_provider` + `namespace` params.
+
+---
+
 ## [0.8.0] — 2026-04-04
 
 ### Added — BM25 Hybrid Search (Phase 6)
