@@ -34,7 +34,7 @@ Cursor config (.cursor/mcp.json):
       }
     }
 
-Tools exposed (14 total):
+Tools exposed (16 total):
   feather_search          Semantic search over the knowledge graph
   feather_context_chain   Vector search + BFS graph expansion (n hops)
   feather_get_node        Full metadata for a node by ID
@@ -49,6 +49,8 @@ Tools exposed (14 total):
   feather_consolidate     Cluster + merge similar nodes into summaries
   feather_episode_get     Retrieve ordered nodes in a named episode
   feather_expire          Scan and soft-delete TTL-expired nodes
+  feather_ingest          Phase 9 structured ingestion (FactExtractor + EntityResolver)
+  feather_recall          Hybrid retrieval with adaptive decay scoring
 """
 
 from __future__ import annotations
@@ -109,6 +111,8 @@ def create_server(
     dim: int = 3072,
     embed_fn=None,
     server_name: str = "feather-db",
+    system_provider=None,
+    namespace: str = "default",
 ) -> "Server":
     """
     Build and return an MCP Server instance with all Feather tools registered.
@@ -117,7 +121,10 @@ def create_server(
 
     from feather_db.integrations.base import FeatherTools, TOOL_SPECS
 
-    tools = FeatherTools(db_path=db_path, dim=dim, embedder=embed_fn)
+    tools = FeatherTools(
+        db_path=db_path, dim=dim, embedder=embed_fn,
+        system_provider=system_provider, namespace=namespace,
+    )
     server = Server(server_name)
 
     # ── Tool list handler ─────────────────────────────────────────────────────
@@ -214,6 +221,22 @@ def main():
         "--embedder", default=None,
         help="Optional: path to a Python module exporting an `embed(text) -> list[float]` function",
     )
+    parser.add_argument(
+        "--system-provider", default=None,
+        choices=["claude", "openai", "gemini", "ollama"],
+        help="Phase 9: LLM provider for FactExtractor + EntityResolver. "
+             "Requires the matching API key env var (ANTHROPIC_API_KEY, "
+             "OPENAI_API_KEY, GOOGLE_API_KEY). When omitted, feather_ingest "
+             "falls back to raw text storage.",
+    )
+    parser.add_argument(
+        "--system-model", default=None,
+        help="Phase 9: override model for --system-provider.",
+    )
+    parser.add_argument(
+        "--namespace", default="default",
+        help="Default namespace for Phase 9 ingestion (default: 'default').",
+    )
     args = parser.parse_args()
 
     _require_mcp()
@@ -232,11 +255,32 @@ def main():
                   file=sys.stderr)
             sys.exit(1)
 
+    # Optional Phase 9 system provider
+    system_provider = None
+    if args.system_provider:
+        try:
+            from feather_db.providers import (
+                ClaudeProvider, OpenAIProvider, GeminiProvider, OllamaProvider,
+            )
+            _pmap = {
+                "claude": lambda m: ClaudeProvider(model=m or "claude-haiku-4-5-20251001"),
+                "openai": lambda m: OpenAIProvider(model=m or "gpt-4o-mini"),
+                "gemini": lambda m: GeminiProvider(model=m or "gemini-2.0-flash"),
+                "ollama": lambda m: OllamaProvider(model=m or "llama3.1:8b"),
+            }
+            system_provider = _pmap[args.system_provider](args.system_model)
+            print(f"  Phase 9 system provider: {args.system_provider} "
+                  f"({args.system_model or 'default'})", file=sys.stderr)
+        except Exception as e:
+            print(f"WARNING: could not init system provider: {e}", file=sys.stderr)
+
     server = create_server(
-        db_path     = args.db,
-        dim         = args.dim,
-        embed_fn    = embed_fn,
-        server_name = args.name,
+        db_path         = args.db,
+        dim             = args.dim,
+        embed_fn        = embed_fn,
+        server_name     = args.name,
+        system_provider = system_provider,
+        namespace       = args.namespace,
     )
 
     print(f"Feather DB MCP server starting…", file=sys.stderr)

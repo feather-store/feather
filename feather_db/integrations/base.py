@@ -252,6 +252,44 @@ TOOL_SPECS: list[dict] = [
         "parameters": {},
         "required": [],
     },
+    # ── Phase 9 tools ──────────────────────────────────────────────────────────
+    {
+        "name": "feather_ingest",
+        "description": (
+            "Phase 9 structured ingestion: runs FactExtractor + EntityResolver "
+            "on a raw text turn and stores the atomic facts (subject–predicate–object "
+            "triples) alongside the source text. When an LLM system provider is "
+            "configured, extracted facts are independently searchable and graph-linked. "
+            "Falls back to raw-text storage when no provider is configured. "
+            "Use this to feed conversation turns, documents, or any raw text into "
+            "the knowledge graph."
+        ),
+        "parameters": {
+            "content":   {"type": "string", "description": "Raw text to ingest (a single turn, doc, or note)"},
+            "source_id": {"type": "string", "description": "Unique source identifier (e.g. 'session_42::turn_7')"},
+            "timestamp": {"type": "integer", "description": "Unix timestamp of the turn (0 = now)"},
+            "namespace": {"type": "string",  "description": "Namespace to store under (defaults to server namespace)"},
+        },
+        "required": ["content"],
+    },
+    {
+        "name": "feather_recall",
+        "description": (
+            "Hybrid retrieval with adaptive decay scoring. Combines vector similarity "
+            "(BM25 + HNSW) with recency weighting so frequently-accessed facts resist "
+            "decay. Use for questions that need temporally-aware context — e.g. "
+            "'what did the user say recently about X?' — where pure similarity search "
+            "would surface stale results."
+        ),
+        "parameters": {
+            "query":            {"type": "string",  "description": "Natural language recall query"},
+            "k":                {"type": "integer", "description": "Number of results to return (default 8)"},
+            "namespace":        {"type": "string",  "description": "Filter by namespace (optional)"},
+            "half_life_days":   {"type": "number",  "description": "Decay half-life in days (default 30)"},
+            "time_weight":      {"type": "number",  "description": "Blend weight for recency [0-1] (default 0.3)"},
+        },
+        "required": ["query"],
+    },
 ]
 
 
@@ -278,6 +316,11 @@ class FeatherTools:
         a lightweight mock embedder so the class works without an API key.
     auto_save : bool
         Call db.save() after every write operation (add_intel, link_nodes).
+    system_provider : LLMProvider, optional
+        Phase 9 system LLM (FactExtractor + EntityResolver).  When provided,
+        ``feather_ingest`` runs structured extraction; otherwise raw storage.
+    namespace : str
+        Default namespace for Phase 9 ingestion (default "default").
     """
 
     def __init__(
@@ -286,6 +329,8 @@ class FeatherTools:
         dim: int = 3072,
         embedder: Optional[Callable[[str], np.ndarray]] = None,
         auto_save: bool = True,
+        system_provider=None,
+        namespace: str = "default",
     ):
         if _fdb is None:
             raise ImportError("feather_db is not installed or not built.")
@@ -293,12 +338,39 @@ class FeatherTools:
         self.dim       = dim
         self.auto_save = auto_save
         self._next_id  = 90001   # auto-assigned IDs for add_intel
+        self._namespace = namespace
+        self._pipeline  = None   # built lazily when system_provider is set
 
         if embedder is not None:
             self._embed = embedder
         else:
             # Built-in lightweight mock (works offline, no API key needed)
             self._embed = self._mock_embed
+
+        if system_provider is not None:
+            self._init_pipeline(system_provider)
+
+    def _init_pipeline(self, system_provider) -> None:
+        try:
+            from feather_db.extractors import FactExtractor, EntityResolver
+            from feather_db.pipelines import IngestPipeline
+
+            class _EmbedAdapter:
+                def __init__(self, fn, dim):
+                    self.dim = dim
+                    self._fn = fn
+                def embed(self, text):
+                    return self._fn(text)
+
+            self._pipeline = IngestPipeline(
+                db=self.db,
+                embedder=_EmbedAdapter(self._embed, self.dim),
+                fact_extractor=FactExtractor(provider=system_provider),
+                entity_resolver=EntityResolver(provider=system_provider),
+                namespace=self._namespace,
+            )
+        except Exception:
+            self._pipeline = None
 
     # ── Embed ─────────────────────────────────────────────────────────────────
 
@@ -627,6 +699,114 @@ class FeatherTools:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    # ── Phase 9 tools ─────────────────────────────────────────────────────────
+
+    def feather_ingest(
+        self,
+        content: str,
+        source_id: str = "",
+        timestamp: int = 0,
+        namespace: Optional[str] = None,
+    ) -> str:
+        import time as _time
+        ts = timestamp or int(_time.time())
+        ns = namespace or self._namespace
+
+        if self._pipeline is not None:
+            try:
+                from feather_db.pipelines import IngestRecord
+                rec = IngestRecord(
+                    content=content,
+                    source_id=source_id or f"mcp::{ts}",
+                    timestamp=ts,
+                    metadata={},
+                )
+                # Temporarily override namespace if different
+                orig_ns = self._pipeline._namespace
+                self._pipeline._namespace = ns
+                stats = self._pipeline.ingest([rec])
+                self._pipeline._namespace = orig_ns
+                if self.auto_save:
+                    self.db.save()
+                return json.dumps({
+                    "status": "ok",
+                    "mode": "phase9",
+                    "facts_extracted": stats.facts_extracted,
+                    "entities_resolved": stats.entities_resolved,
+                    "records_ingested": stats.records_ingested,
+                    "extraction_failures": stats.extraction_failures,
+                }, indent=2)
+            except Exception as e:
+                return json.dumps({"error": str(e), "mode": "phase9"})
+        else:
+            # Raw storage fallback (no LLM provider configured)
+            try:
+                meta = _fdb.Metadata()
+                meta.content = content
+                meta.timestamp = ts
+                meta.namespace_id = ns
+                meta.source = source_id or "mcp"
+                meta.type = _fdb.ContextType.CONVERSATION
+                vec = self._embed(content)
+                nid = self._next_id
+                self._next_id += 1
+                self.db.add(id=nid, vec=vec, meta=meta)
+                if self.auto_save:
+                    self.db.save()
+                return json.dumps({
+                    "status": "ok",
+                    "mode": "raw",
+                    "id": nid,
+                    "note": "No system_provider configured — raw storage only. "
+                            "Start server with --system-provider to enable Phase 9.",
+                }, indent=2)
+            except Exception as e:
+                return json.dumps({"error": str(e), "mode": "raw"})
+
+    def feather_recall(
+        self,
+        query: str,
+        k: int = 8,
+        namespace: Optional[str] = None,
+        half_life_days: float = 30.0,
+        time_weight: float = 0.3,
+    ) -> str:
+        vec = self.embed(query)
+        try:
+            scoring = _fdb.ScoringConfig(
+                half_life=half_life_days,
+                weight=time_weight,
+                min=0.0,
+            )
+            try:
+                results = self.db.hybrid_search(
+                    vec, query, k=k * 2, modality="text", scoring=scoring
+                )
+            except Exception:
+                results = self.db.search(vec, k=k * 2, modality="text", scoring=scoring)
+
+            output = []
+            for r in results:
+                m = r.metadata
+                if namespace and m.namespace_id != namespace:
+                    continue
+                output.append({
+                    "id":       r.id,
+                    "score":    round(r.score, 4),
+                    "content":  m.content[:300],
+                    "namespace": m.namespace_id,
+                    "source":   m.source,
+                    "recall_count": m.recall_count,
+                })
+                if len(output) >= k:
+                    break
+
+            return json.dumps({"results": output, "count": len(output),
+                               "decay": {"half_life": half_life_days,
+                                         "time_weight": time_weight}}, indent=2)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
     # ── Dispatch ──────────────────────────────────────────────────────────────
 
     def handle(self, tool_name: str, tool_input: dict) -> str:
@@ -647,6 +827,9 @@ class FeatherTools:
             "feather_consolidate":   self.feather_consolidate,
             "feather_episode_get":   self.feather_episode_get,
             "feather_expire":        self.feather_expire,
+            # Phase 9
+            "feather_ingest":        self.feather_ingest,
+            "feather_recall":        self.feather_recall,
         }
         fn = dispatch.get(tool_name)
         if fn is None:
