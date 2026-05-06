@@ -39,7 +39,7 @@ from .db_manager import DBManager
 from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
     KeywordSearchRequest, HybridSearchRequest,
-    LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest,
+    LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest, PurgeRequest,
     MetadataOut, NamespaceStats, HealthResponse,
 )
 
@@ -237,6 +237,8 @@ def get_record(namespace: str, record_id: int):
     meta = db.get_metadata(record_id)
     if meta is None:
         raise HTTPException(404, f"Record {record_id} not found in namespace '{namespace}'")
+    if meta.source == "_forgotten" or meta.get_attribute("_deleted") == "true":
+        raise HTTPException(404, f"Record {record_id} not found in namespace '{namespace}'")
     return _meta_to_model(meta)
 
 
@@ -291,13 +293,47 @@ def delete_record(namespace: str, record_id: int):
     meta = db.get_metadata(record_id)
     if meta is None:
         raise HTTPException(404, f"Record {record_id} not found")
+    if meta.source == "_forgotten" or meta.get_attribute("_deleted") == "true":
+        raise HTTPException(404, f"Record {record_id} not found")
 
-    # HNSW doesn't support hard deletion — soft-delete: zero importance + mark flag
-    meta.importance = 0.0
-    meta.set_attribute("_deleted", "true")
     with manager.lock(namespace):
-        db.update_metadata(record_id, meta)
+        db.forget(record_id)
+        db.save()
     return {"id": record_id, "deleted": True}
+
+
+@app.post("/v1/{namespace}/purge", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+def purge_namespace(namespace: str, req: PurgeRequest):
+    """Hard-delete all records whose metadata.namespace_id matches req.namespace_id.
+    Removes from HNSW indices, metadata store, and reverse edge index. Returns count removed.
+    """
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    with manager.lock(namespace):
+        removed = db.purge(req.namespace_id)
+        db.save()
+    return {"namespace": namespace, "namespace_id": req.namespace_id, "removed": removed}
+
+
+@app.post("/v1/{namespace}/compact", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+def compact_namespace(namespace: str):
+    """Rebuild HNSW indices, physically dropping any soft-deleted records.
+    Returns the number of records reclaimed.
+    """
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    with manager.lock(namespace):
+        reclaimed = db.compact()
+        db.save()
+    return {"namespace": namespace, "reclaimed": reclaimed}
 
 
 @app.get("/v1/{namespace}/records", tags=["records"],

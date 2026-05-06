@@ -119,6 +119,10 @@ class UpdateMetadataRequest(BaseModel):
     metadata: MetadataIn
 
 
+class PurgeRequest(BaseModel):
+    namespace_id: str = Field(..., description="metadata.namespace_id to hard-delete (e.g. brand_id)")
+
+
 class NamespaceStats(BaseModel):
     namespace: str
     db_path: str

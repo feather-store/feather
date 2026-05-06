@@ -302,15 +302,29 @@ private:
         f.write((char*)&magic,   4);
         f.write((char*)&version, 4);
 
-        // Metadata section
-        uint32_t meta_count = static_cast<uint32_t>(metadata_store_.size());
+        // Build the set of valid IDs — exclude _forgotten and _deleted.
+        // This makes forget()/purge() actually persist across save+reload.
+        auto is_dead = [](const Metadata& m) -> bool {
+            if (m.source == "_forgotten") return true;
+            auto it = m.attributes.find("_deleted");
+            return it != m.attributes.end() && it->second == "true";
+        };
+        std::unordered_set<uint64_t> valid_ids;
+        valid_ids.reserve(metadata_store_.size());
+        for (const auto& [id, meta] : metadata_store_) {
+            if (!is_dead(meta)) valid_ids.insert(id);
+        }
+
+        // Metadata section — only write live records
+        uint32_t meta_count = static_cast<uint32_t>(valid_ids.size());
         f.write((char*)&meta_count, 4);
         for (const auto& [id, meta] : metadata_store_) {
+            if (!valid_ids.count(id)) continue;
             f.write((char*)&id, 8);
             meta.serialize(f);
         }
 
-        // Modality indices section
+        // Modality indices section — only write vectors whose ID is live
         uint32_t modal_count = static_cast<uint32_t>(modality_indices_.size());
         f.write((char*)&modal_count, 4);
         for (const auto& [name, m_idx] : modality_indices_) {
@@ -319,10 +333,17 @@ private:
             f.write(name.data(), name_len);
             uint32_t dim32 = static_cast<uint32_t>(m_idx.dim);
             f.write((char*)&dim32, 4);
-            uint32_t element_count = static_cast<uint32_t>(m_idx.index->cur_element_count);
-            f.write((char*)&element_count, 4);
-            for (size_t i = 0; i < element_count; ++i) {
+
+            size_t total = m_idx.index->cur_element_count;
+            uint32_t live_count = 0;
+            for (size_t i = 0; i < total; ++i) {
                 uint64_t id = m_idx.index->getExternalLabel(i);
+                if (valid_ids.count(id)) live_count++;
+            }
+            f.write((char*)&live_count, 4);
+            for (size_t i = 0; i < total; ++i) {
+                uint64_t id = m_idx.index->getExternalLabel(i);
+                if (!valid_ids.count(id)) continue;
                 const float* data = reinterpret_cast<const float*>(
                     m_idx.index->getDataByInternalId(i));
                 f.write((char*)&id, 8);
