@@ -1,0 +1,1876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Feather DB · Cloud</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23111827'/%3E%3Cpath d='M23 7C14 7 7 14 7 22L7 25L10 25C18 25 25 18 25 9L25 8C25 7.5 24.5 7 23 7Z' fill='%23a3e635'/%3E%3Cpath d='M8 24L24 8' stroke='%23fcfaf7' stroke-width='1.3' stroke-linecap='round'/%3E%3Ccircle cx='24' cy='8' r='1.6' fill='%23fcfaf7'/%3E%3C/svg%3E" />
+  <script>
+    /* Brand tokens — exported into Tailwind so utility classes match the brand book. */
+    tailwind = window.tailwind || {};
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            paper:  { DEFAULT: '#fcfaf7', deep: '#f5f1ea' },
+            ink:    { DEFAULT: '#0a0a0a', soft: '#111827', mid: '#374151', low: '#6b7280', faint: '#9ca3af' },
+            rule:   { DEFAULT: '#e5e7eb', soft: '#ececec' },
+            lime:   {
+              DEFAULT:  '#a3e635',
+              deep:     '#7ab800',
+              text:     '#5d8f00',
+              electric: '#ccff00',
+              shadow:   '#4a7300',
+            },
+          },
+          fontFamily: {
+            sans:  ['Geist', 'ui-sans-serif', 'system-ui', '-apple-system', 'sans-serif'],
+            mono:  ['"Geist Mono"', 'ui-monospace', '"SF Mono"', 'Menlo', 'monospace'],
+            serif: ['"Playfair Display"', 'Georgia', 'serif'],
+          },
+          letterSpacing: { caption: '0.18em' },
+          borderRadius: { card: '16px', mark: '7px' },
+        },
+      },
+    };
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&family=Playfair+Display:ital,wght@1,700;1,900&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #fcfaf7; --paper-deep: #f5f1ea;
+      --ink: #0a0a0a; --ink-soft: #111827; --ink-mid: #374151; --ink-low: #6b7280; --ink-faint: #9ca3af;
+      --rule: #e5e7eb;
+      --lime: #a3e635; --lime-deep: #7ab800; --lime-text: #5d8f00; --lime-shadow: #4a7300;
+    }
+    html { font-feature-settings: "cv02","cv03","cv04","cv11"; }
+    body {
+      font-family: 'Geist', ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--paper);
+      color: var(--ink-soft);
+    }
+    .mono { font-family: 'Geist Mono', 'SF Mono', Menlo, monospace; }
+    .serif-em { font-family: 'Playfair Display', Georgia, serif; font-style: italic; font-weight: 700; color: var(--lime-text); }
+    table { border-collapse: separate; border-spacing: 0; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
+    .nav-item.active { color: var(--lime-text); background: var(--paper-deep); }
+    .nav-item.active::before { content:""; position:absolute; left:0; top:8px; bottom:8px; width:2px; background: var(--lime-deep); border-radius:2px; }
+    tbody tr:hover { background: var(--paper-deep); }
+    .focus-ring:focus { outline:none; box-shadow: 0 0 0 3px rgba(122,184,0,.25); border-color: var(--lime-deep); }
+    .clamp-1 { display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; }
+    .clamp-2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+    .tab[aria-selected="true"] { color: var(--ink-soft); border-bottom-color: var(--lime-deep); }
+    .tab { color: var(--ink-low); border-bottom:2px solid transparent; }
+    pre.code { background: var(--ink); color: var(--paper); padding:12px 14px; border-radius:8px; font-family:'Geist Mono',monospace; font-size:12px; line-height:1.5; overflow:auto; }
+    pre.code .lim { color: var(--lime-electric, #ccff00); }
+    .tag { display:inline-flex; align-items:center; padding:2px 8px; border-radius:9999px; font-size:10px; font-weight:600; letter-spacing:.18em; text-transform:uppercase; font-family:'Geist Mono',monospace; }
+    .tag-lime  { background: #e8f7c8; color: var(--lime-text); }
+    .tag-slate { background: var(--paper-deep); color: var(--ink-mid); }
+    .tag-amber { background: #fef3c7; color: #a16207; }
+    .tag-rose  { background: #fee2e2; color: #b91c1c; }
+    .tag-ink   { background: var(--ink); color: var(--paper); }
+    .skel { position:relative; background: var(--paper-deep); border-radius:4px; overflow:hidden; }
+    .skel::after { content:""; position:absolute; inset:0; background:linear-gradient(90deg,transparent,rgba(255,255,255,.6),transparent); animation: shimmer 1.4s infinite; }
+    @keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+    .drawer { transition: transform .25s ease; }
+    .toast { animation: slideUp .25s ease; }
+    @keyframes slideUp { from { transform: translateY(20px); opacity:0; } to { transform: translateY(0); opacity:1; } }
+    .nice-scroll::-webkit-scrollbar { width:8px; height:8px; }
+    .nice-scroll::-webkit-scrollbar-thumb { background: var(--rule); border-radius:4px; }
+    .nice-scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-faint); }
+    /* card surface — white on cream, hairline border, no shadow per brand */
+    .card-surface { background:#fff; border:1px solid var(--rule); border-radius:16px; }
+    /* small caps */
+    .caption { font-family:'Geist Mono',monospace; font-size:11px; font-weight:600; letter-spacing:.18em; text-transform:uppercase; color: var(--ink-low); }
+    .caption-lime { color: var(--lime-text); }
+    /* primary button — ink, not lime; lime is gesture, not CTA */
+    .btn-primary { background: var(--ink); color: var(--paper); border-radius:9999px; padding:8px 16px; font-weight:600; font-size:13px; transition:opacity .18s; }
+    .btn-primary:hover { opacity:.9; }
+    .btn-primary:active { transform: scale(.98); }
+    .btn-primary:disabled { opacity:.4; cursor:not-allowed; }
+    /* secondary — paper bg + hairline */
+    .btn-secondary { background:#fff; border:1px solid var(--rule); color: var(--ink-soft); border-radius:9999px; padding:8px 16px; font-weight:500; font-size:13px; }
+    .btn-secondary:hover { background: var(--paper-deep); }
+    /* danger ghost */
+    .btn-danger { background:#fff; border:1px solid #fecaca; color:#b91c1c; border-radius:9999px; padding:8px 16px; font-weight:500; font-size:13px; }
+    .btn-danger:hover { background:#fef2f2; }
+    /* graph */
+    svg.graph { background: var(--paper); }
+    .graph .node circle { stroke: var(--paper); stroke-width:1.5px; cursor:pointer; }
+    .graph .node text { font-family:'Geist',sans-serif; font-size:10px; fill: var(--ink-mid); pointer-events:none; }
+    .graph .link { stroke: var(--ink-faint); stroke-opacity:.45; }
+    /* cmd-k palette */
+    .palette-item.active { background: var(--paper-deep); }
+    /* kbd */
+    kbd { display:inline-block; font-family:'Geist Mono',monospace; font-size:11px; background:#fff; color: var(--ink-mid); padding:1px 6px; border:1px solid var(--rule); border-bottom-width:2px; border-radius:4px; }
+    /* metric tile — for big numbers, use Playfair italic on the lead digit */
+    .metric { font-size:32px; font-weight:600; line-height:1; letter-spacing:-0.02em; color: var(--ink-soft); }
+    .metric em { font-family:'Playfair Display',Georgia,serif; font-style:italic; color: var(--lime-text); font-weight:700; }
+  </style>
+</head>
+<body x-data="app()" x-init="init()" class="h-screen overflow-hidden" @keydown.window.meta.k.prevent="palette.open=true" @keydown.window.ctrl.k.prevent="palette.open=true" @keydown.window.escape="palette.open=false">
+
+  <!-- ──────────────────────────  API key gate ────────────────────────── -->
+  <div x-show="!apiKey" x-cloak class="fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center">
+    <div class="bg-white rounded-lg w-[420px] p-6 shadow-xl border border-slate-200">
+      <div class="flex items-center gap-3">
+        <svg viewBox="0 0 32 32" class="w-9 h-9 flex-shrink-0" xmlns="http://www.w3.org/2000/svg"><rect width="32" height="32" rx="7" fill="#111827"/><path d="M23 7C14 7 7 14 7 22L7 25L10 25C18 25 25 18 25 9L25 8C25 7.5 24.5 7 23 7Z" fill="#a3e635"/><path d="M8 24L24 8" stroke="#fcfaf7" stroke-width="1.3" stroke-linecap="round"/><circle cx="24" cy="8" r="1.6" fill="#fcfaf7"/></svg>
+        <div>
+          <h2 class="text-[18px] font-bold leading-none" style="letter-spacing:-0.03em">Feather DB</h2>
+          <div class="caption mt-1.5">The Living <span class="serif-em" style="font-size:11px">context</span> Engine</div>
+        </div>
+      </div>
+      <p class="text-sm mt-5 mb-5" style="color:var(--ink-mid)">Enter the API key to continue.</p>
+      <input x-model="keyInput" @keydown.enter="saveKey()" type="password"
+        placeholder="feather-…"
+        class="mono w-full text-sm px-3 py-2 border border-slate-300 rounded-md focus-ring" autofocus>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="saveKey()" class="btn-primary text-sm">Continue</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────  Toast ────────────────────────── -->
+  <template x-for="t in toasts" :key="t.id">
+    <div class="toast fixed bottom-5 right-5 z-40 bg-slate-900 text-white text-sm px-4 py-2.5 rounded-md shadow-lg flex items-center gap-3 max-w-md"
+      :class="{'!bg-red-700': t.kind==='error', '!bg-emerald-700': t.kind==='success'}">
+      <span x-text="t.msg"></span>
+    </div>
+  </template>
+
+  <!-- ──────────────────────────  Cmd-K palette ────────────────────────── -->
+  <div x-show="palette.open" x-cloak class="fixed inset-0 z-50 flex items-start justify-center pt-[15vh] bg-slate-900/40" @click.self="palette.open=false">
+    <div class="bg-white w-[560px] rounded-lg shadow-2xl border border-slate-200 overflow-hidden">
+      <div class="border-b border-slate-200 px-4 py-3 flex items-center gap-2">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4 text-slate-400"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
+        <input x-model="palette.query" @keydown.arrow-down.prevent="palette.idx = Math.min(palette.idx+1, paletteItems().length-1)"
+          @keydown.arrow-up.prevent="palette.idx = Math.max(palette.idx-1, 0)"
+          @keydown.enter.prevent="paletteEnter()"
+          x-init="$watch('palette.open', v => { if (v) { setTimeout(()=>$el.focus(), 30); palette.idx=0; palette.query=''; } })"
+          placeholder="Search namespaces, records, actions…  (type 'ns:', 'id:', '/cmd')"
+          class="flex-1 outline-none text-sm placeholder-slate-400">
+        <kbd>esc</kbd>
+      </div>
+      <div class="max-h-[50vh] overflow-y-auto nice-scroll">
+        <template x-for="(item, i) in paletteItems()" :key="i">
+          <div class="palette-item flex items-center justify-between gap-3 px-4 py-2 cursor-pointer text-sm border-b border-slate-100 last:border-0"
+               :class="{ active: i === palette.idx }"
+               @mouseenter="palette.idx=i" @click="paletteEnter()">
+            <div class="flex items-center gap-3 min-w-0">
+              <span x-html="item.icon" class="w-4 h-4 text-slate-400 flex-shrink-0"></span>
+              <span class="truncate" x-text="item.label"></span>
+            </div>
+            <span class="tag tag-slate" x-text="item.kind"></span>
+          </div>
+        </template>
+        <div x-show="paletteItems().length === 0" class="px-4 py-8 text-center text-sm text-slate-400">
+          Type to search. Use <kbd>ns:name</kbd> for namespace, <kbd>id:123</kbd> to open a record, <kbd>/seed</kbd> for actions.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────  Layout shell ────────────────────────── -->
+  <div class="flex h-screen" x-show="apiKey">
+
+    <aside class="w-60 bg-white border-r border-slate-200 flex flex-col flex-shrink-0">
+      <div class="px-5 pt-5 pb-4 border-b border-slate-200">
+        <div class="flex items-center gap-2.5">
+          <svg viewBox="0 0 32 32" class="w-7 h-7 flex-shrink-0" xmlns="http://www.w3.org/2000/svg"><rect width="32" height="32" rx="7" fill="#111827"/><path d="M23 7C14 7 7 14 7 22L7 25L10 25C18 25 25 18 25 9L25 8C25 7.5 24.5 7 23 7Z" fill="#a3e635"/><path d="M8 24L24 8" stroke="#fcfaf7" stroke-width="1.3" stroke-linecap="round"/><circle cx="24" cy="8" r="1.6" fill="#fcfaf7"/></svg>
+          <div>
+            <div class="text-[15px] font-bold leading-none" style="letter-spacing:-0.03em">Feather DB</div>
+            <div class="caption mt-1" style="font-size:9px">Living <span class="serif-em" style="font-size:9px">context</span></div>
+          </div>
+        </div>
+        <div class="mt-3 mono text-[10px] text-slate-500 truncate" x-text="server.url"></div>
+      </div>
+
+      <nav class="flex-1 py-3 px-2 nice-scroll overflow-y-auto">
+        <template x-for="item in nav" :key="item.id">
+          <a href="#" @click.prevent="navigate(item.id)"
+            class="nav-item relative flex items-center gap-2.5 px-3 py-1.5 mx-1 my-0.5 text-sm rounded-md text-slate-600 hover:bg-slate-50 hover:text-slate-900 transition"
+            :class="{ active: view === item.id }">
+            <span x-html="item.icon" class="w-4 h-4 flex-shrink-0"></span>
+            <span x-text="item.label"></span>
+          </a>
+        </template>
+      </nav>
+
+      <div class="border-t border-slate-200 p-3 space-y-1">
+        <div class="text-[11px] text-slate-500 uppercase tracking-wide mb-1">Server</div>
+        <div class="text-[12px] flex justify-between"><span class="text-slate-500">version</span><span class="mono" x-text="server.version || '—'"></span></div>
+        <div class="text-[12px] flex justify-between"><span class="text-slate-500">namespaces</span><span class="mono" x-text="server.nsCount ?? '—'"></span></div>
+        <div class="text-[12px] flex justify-between"><span class="text-slate-500">records</span><span class="mono" x-text="(server.totalRecords ?? 0).toLocaleString()"></span></div>
+        <button @click="palette.open=true" class="w-full mt-2 text-[11px] text-slate-500 hover:text-slate-900 flex items-center justify-between border border-slate-200 rounded px-2 py-1">
+          <span>Quick search</span><kbd>⌘K</kbd>
+        </button>
+      </div>
+    </aside>
+
+    <main class="flex-1 flex flex-col overflow-hidden bg-white">
+
+      <header class="h-14 border-b border-slate-200 flex items-center justify-between px-6 flex-shrink-0">
+        <div class="flex items-center gap-3 min-w-0">
+          <template x-for="(crumb, idx) in crumbs" :key="idx">
+            <div class="flex items-center min-w-0">
+              <span x-show="idx > 0" class="text-slate-300 mx-2">/</span>
+              <a href="#" @click.prevent="crumb.go && crumb.go()" class="text-sm truncate"
+                :class="idx === crumbs.length - 1 ? 'text-slate-900 font-medium' : 'text-slate-500 hover:text-slate-900'">
+                <span x-text="crumb.label"></span>
+              </a>
+            </div>
+          </template>
+        </div>
+        <div class="flex items-center gap-2">
+          <button @click="reload()" title="Refresh" class="text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md p-1.5 transition">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><path d="M21 12a9 9 0 11-3.13-6.85L21 8M21 3v5h-5"/></svg>
+          </button>
+          <button @click="copyKey()" title="Copy API key" class="text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-md p-1.5 transition">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="flex-1 overflow-auto nice-scroll">
+
+        <!-- ───────── Overview ───────── -->
+        <section x-show="view === 'overview'" class="p-8 max-w-6xl mx-auto">
+          <h1 class="text-[22px] font-semibold tracking-tight mb-1">Overview</h1>
+          <p class="text-sm text-slate-500 mb-6">Aggregate state across every namespace on this server.</p>
+
+          <div class="grid grid-cols-4 gap-4 mb-6">
+            <template x-for="m in [
+              {label:'Namespaces', val: server.nsCount, accent:false},
+              {label:'Records', val: (server.totalRecords ?? 0).toLocaleString(), accent:true},
+              {label:'Version', val: server.version, mono:true},
+              {label:'Uptime', val: fmtUptime(server.uptime)},
+            ]" :key="m.label">
+              <div class="border border-slate-200 rounded-lg p-5">
+                <div class="text-[11px] text-slate-500 uppercase tracking-wide font-medium" x-text="m.label"></div>
+                <div class="mt-2 text-[28px] font-semibold leading-none"
+                  :class="{ 'text-lime-text': m.accent, 'mono text-[20px]': m.mono }"
+                  x-text="m.val ?? '—'"></div>
+              </div>
+            </template>
+          </div>
+
+          <!-- ops + latency tiles + sparkline -->
+          <div class="grid grid-cols-4 gap-4 mb-8">
+            <div class="border border-slate-200 rounded-lg p-5">
+              <div class="text-[11px] text-slate-500 uppercase tracking-wide font-medium">Ops · last hour</div>
+              <div class="mt-2 text-[28px] font-semibold leading-none" x-text="(metrics.opsTotal ?? 0).toLocaleString()"></div>
+              <div class="mt-1 text-[11px] text-slate-400">errors: <span x-text="metrics.errors ?? 0"></span></div>
+              <!-- sparkline -->
+              <div class="mt-3" x-html="renderSparkline(opsSeries.points || [])"></div>
+            </div>
+            <template x-for="lat in [
+              {label:'p50 latency', val: metrics.p50_ms},
+              {label:'p95 latency', val: metrics.p95_ms},
+              {label:'p99 latency', val: metrics.p99_ms},
+            ]" :key="lat.label">
+              <div class="border border-slate-200 rounded-lg p-5">
+                <div class="text-[11px] text-slate-500 uppercase tracking-wide font-medium" x-text="lat.label"></div>
+                <div class="mt-2 text-[28px] font-semibold leading-none mono">
+                  <span x-text="(lat.val ?? 0).toFixed(1)"></span>
+                  <span class="text-[14px] text-slate-400 ml-1">ms</span>
+                </div>
+              </div>
+            </template>
+          </div>
+
+          <div class="grid grid-cols-3 gap-6">
+            <!-- top namespaces -->
+            <div class="col-span-2 border border-slate-200 rounded-lg overflow-hidden">
+              <div class="px-5 py-3 border-b border-slate-200 flex items-center justify-between">
+                <h3 class="text-sm font-semibold">Top namespaces</h3>
+                <a href="#" @click.prevent="navigate('namespaces')" class="text-xs text-lime-text hover:text-lime-shadow">View all →</a>
+              </div>
+              <table class="w-full text-sm">
+                <thead class="text-[11px] uppercase tracking-wide text-slate-500 bg-slate-50 border-b border-slate-200">
+                  <tr>
+                    <th class="text-left px-5 py-2.5 font-medium">Name</th>
+                    <th class="text-right px-5 py-2.5 font-medium">Records</th>
+                    <th class="text-right px-5 py-2.5 font-medium">Dim</th>
+                    <th class="text-right px-5 py-2.5 font-medium pr-6">Modalities</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="ns in server.topNamespaces || []" :key="ns.name">
+                    <tr class="border-b border-slate-100 last:border-0 cursor-pointer" @click="openNamespace(ns.name)">
+                      <td class="px-5 py-3 mono text-slate-900" x-text="ns.name"></td>
+                      <td class="px-5 py-3 text-right" x-text="(ns.records ?? 0).toLocaleString()"></td>
+                      <td class="px-5 py-3 text-right text-slate-500" x-text="ns.dim"></td>
+                      <td class="px-5 py-3 text-right pr-6 text-slate-500" x-text="(ns.modalities||[]).join(', ')"></td>
+                    </tr>
+                  </template>
+                  <tr x-show="(server.topNamespaces||[]).length === 0">
+                    <td colspan="4" class="px-5 py-10 text-center text-slate-400 text-sm">No namespaces yet.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <!-- activity feed -->
+            <div class="col-span-1 border border-slate-200 rounded-lg overflow-hidden">
+              <div class="px-5 py-3 border-b border-slate-200 flex items-center justify-between">
+                <h3 class="text-sm font-semibold">Recent activity</h3>
+                <button @click="loadActivity()" class="text-xs text-slate-500 hover:text-slate-900">↻</button>
+              </div>
+              <div class="max-h-[400px] overflow-y-auto nice-scroll">
+                <template x-for="e in activity" :key="e.ts">
+                  <div class="px-5 py-2.5 border-b border-slate-100 last:border-0 text-[12px]">
+                    <div class="flex items-center justify-between">
+                      <span class="tag" :class="opTagClass(e.op)" x-text="e.op"></span>
+                      <span class="mono text-slate-400" x-text="fmtAgo(e.ts)"></span>
+                    </div>
+                    <div class="mt-1 mono text-slate-500 truncate" x-text="e.namespace || '—'"></div>
+                    <div class="mt-0.5 text-[11px] text-slate-400 mono">
+                      <span x-text="e.latency_ms.toFixed(1)+'ms'"></span> ·
+                      <span :class="{'text-red-500': e.status >= 400}" x-text="e.status"></span>
+                    </div>
+                  </div>
+                </template>
+                <div x-show="activity.length === 0" class="px-5 py-10 text-center text-slate-400 text-sm">No activity yet.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ───────── Namespaces list ───────── -->
+        <section x-show="view === 'namespaces'" class="p-8 max-w-6xl mx-auto">
+          <div class="flex items-center justify-between mb-6">
+            <div>
+              <h1 class="text-[22px] font-semibold tracking-tight">Namespaces</h1>
+              <p class="text-sm text-slate-500">All `.feather` files on this server.</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <input x-model="nsFilter" type="text" placeholder="Filter…"
+                class="text-sm px-3 py-1.5 border border-slate-300 rounded-md w-56 focus-ring">
+              <button @click="newNsModal.open=true; newNsModal.name=''"
+                class="btn-primary flex items-center gap-1.5">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="w-3.5 h-3.5"><path d="M12 5v14M5 12h14"/></svg>
+                New namespace
+              </button>
+            </div>
+          </div>
+
+          <div class="border border-slate-200 rounded-lg overflow-hidden">
+            <table class="w-full text-sm">
+              <thead class="text-[11px] uppercase tracking-wide text-slate-500 bg-slate-50 border-b border-slate-200">
+                <tr>
+                  <th class="text-left px-5 py-2.5 font-medium">Name</th>
+                  <th class="text-right px-5 py-2.5 font-medium">Records</th>
+                  <th class="text-right px-5 py-2.5 font-medium">Dim</th>
+                  <th class="text-right px-5 py-2.5 font-medium">Modalities</th>
+                  <th class="text-right px-5 py-2.5 font-medium pr-6"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="ns in filteredNamespaces()" :key="ns.name">
+                  <tr class="border-b border-slate-100 last:border-0">
+                    <td class="px-5 py-3 mono text-slate-900">
+                      <a href="#" @click.prevent="openNamespace(ns.name)" class="hover:text-lime-text" x-text="ns.name"></a>
+                    </td>
+                    <td class="px-5 py-3 text-right" x-text="(ns.records ?? 0).toLocaleString()"></td>
+                    <td class="px-5 py-3 text-right text-slate-500" x-text="ns.dim"></td>
+                    <td class="px-5 py-3 text-right text-slate-500" x-text="(ns.modalities||[]).join(', ')"></td>
+                    <td class="px-5 py-3 text-right pr-6">
+                      <button @click="openNamespace(ns.name)" class="text-xs text-slate-600 hover:text-slate-900 hover:bg-slate-100 px-2 py-1 rounded">Browse</button>
+                    </td>
+                  </tr>
+                </template>
+                <tr x-show="filteredNamespaces().length === 0">
+                  <td colspan="5" class="px-5 py-10 text-center text-slate-400 text-sm">No namespaces match.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- ───────── Namespace detail ───────── -->
+        <section x-show="view === 'ns_detail'" class="p-8 max-w-6xl mx-auto">
+
+          <div class="flex items-center justify-between mb-6">
+            <div>
+              <div class="flex items-center gap-3">
+                <h1 class="mono text-[22px] font-semibold tracking-tight" x-text="ns.name"></h1>
+                <span class="tag tag-slate" x-text="`dim ${ns.dim || '—'}`"></span>
+              </div>
+              <div class="text-sm text-slate-500 mt-1">
+                <span x-text="(ns.records ?? 0).toLocaleString()"></span> records
+                · modalities: <span x-text="(ns.modalities||['text']).join(', ')"></span>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button @click="seedModal.open=true; seedModal.count=100; seedModal.ns_id=ns.name"
+                class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 transition flex items-center gap-1.5">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-3.5 h-3.5"><path d="M12 2v6m0 14v-6m-7-7h6m6 0h6"/></svg>
+                Seed
+              </button>
+              <button @click="ingestModal.open=true; ingestModal.text=''; ingestModal.ns_id=ns.name"
+                class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 transition flex items-center gap-1.5"
+                :class="{ 'opacity-50': embedding.provider === 'none' }">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-3.5 h-3.5"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+                Ingest text
+              </button>
+              <button @click="importModal.open=true; importModal.json_text=''"
+                class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 transition flex items-center gap-1.5">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-3.5 h-3.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+                Import
+              </button>
+              <button @click="addRecModal.open=true; addRecModal.ns_id=ns.name; addRecModal.content=''; addRecModal.entity_id=''"
+                class="btn-primary flex items-center gap-1.5">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="w-3.5 h-3.5"><path d="M12 5v14M5 12h14"/></svg>
+                Add record
+              </button>
+              <button @click="compactNs()" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 transition">Compact</button>
+              <button @click="confirmPurgeAll()" class="text-sm px-3 py-1.5 border border-red-200 text-red-700 rounded-md hover:bg-red-50 transition">Purge</button>
+              <button @click="confirmDeleteNs()" class="text-sm px-3 py-1.5 border border-red-300 bg-red-50 text-red-700 rounded-md hover:bg-red-100 transition">Delete</button>
+            </div>
+          </div>
+
+          <div class="border-b border-slate-200 mb-6 flex gap-6">
+            <template x-for="t in ['records','search','schema','hierarchy','graph','context','console']" :key="t">
+              <button @click="setNsTab(t)" class="tab text-sm font-medium pb-3 px-1 transition" :aria-selected="nsTab === t">
+                <span x-text="t.charAt(0).toUpperCase()+t.slice(1)"></span>
+              </button>
+            </template>
+          </div>
+
+          <!-- Records tab -->
+          <div x-show="nsTab==='records'">
+            <div class="flex items-center justify-between mb-3">
+              <div class="text-xs text-slate-500">
+                Showing <span x-text="records.length"></span> records (page size 200)
+              </div>
+              <button @click="loadRecords(true)" class="text-xs px-2 py-1 border border-slate-300 rounded hover:bg-slate-50">Refresh</button>
+            </div>
+            <div class="border border-slate-200 rounded-lg overflow-hidden">
+              <table class="w-full text-sm">
+                <thead class="text-[11px] uppercase tracking-wide text-slate-500 bg-slate-50 border-b border-slate-200">
+                  <tr>
+                    <th class="text-left px-5 py-2.5 font-medium">ID</th>
+                    <th class="text-left px-5 py-2.5 font-medium">Content</th>
+                    <th class="text-left px-5 py-2.5 font-medium">namespace_id</th>
+                    <th class="text-left px-5 py-2.5 font-medium">entity_id</th>
+                    <th class="text-right px-5 py-2.5 font-medium">Importance</th>
+                    <th class="text-right px-5 py-2.5 font-medium">Recall</th>
+                    <th class="text-right px-5 py-2.5 font-medium pr-6"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="r in records" :key="r.id">
+                    <tr class="border-b border-slate-100 last:border-0">
+                      <td class="px-5 py-2.5 mono text-slate-900" x-text="r.id"></td>
+                      <td class="px-5 py-2.5 max-w-[280px]"><div class="clamp-1" x-text="r.metadata?.content || ''"></div></td>
+                      <td class="px-5 py-2.5 mono text-slate-500 text-[12px]" x-text="r.metadata?.namespace_id || '—'"></td>
+                      <td class="px-5 py-2.5 mono text-slate-500 text-[12px]" x-text="r.metadata?.entity_id || '—'"></td>
+                      <td class="px-5 py-2.5 text-right mono text-[12px]" x-text="(r.metadata?.importance ?? 1).toFixed(2)"></td>
+                      <td class="px-5 py-2.5 text-right mono text-[12px] text-slate-500" x-text="r.metadata?.recall_count ?? 0"></td>
+                      <td class="px-5 py-2.5 text-right pr-6 whitespace-nowrap">
+                        <button @click="openRecord(r.id)" class="text-xs text-slate-600 hover:text-slate-900 hover:bg-slate-100 px-2 py-1 rounded">View</button>
+                        <button @click="deleteRecord(r.id)" class="text-xs text-red-600 hover:bg-red-50 px-2 py-1 rounded ml-1">Delete</button>
+                      </td>
+                    </tr>
+                  </template>
+                  <tr x-show="records.length === 0 && !loadingRecords">
+                    <td colspan="7" class="px-5 py-10 text-center text-slate-400 text-sm">
+                      No records.
+                      <button @click="seedModal.open=true; seedModal.count=100; seedModal.ns_id=ns.name" class="text-lime-text hover:text-lime-shadow ml-1">Seed some?</button>
+                    </td>
+                  </tr>
+                  <tr x-show="loadingRecords">
+                    <td colspan="7" class="px-5 py-3"><div class="skel h-3 w-full"></div></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="mt-3 flex items-center justify-between text-xs">
+              <button @click="loadMoreRecords()" x-show="recordsHasMore" class="px-3 py-1.5 border border-slate-300 rounded hover:bg-slate-50">Load more</button>
+              <span class="text-slate-400" x-show="!recordsHasMore && records.length > 0">End of list</span>
+            </div>
+          </div>
+
+          <!-- Search tab -->
+          <div x-show="nsTab==='search'">
+            <div class="grid grid-cols-3 gap-6">
+              <div class="col-span-1 space-y-4">
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Mode</label>
+                  <div class="mt-1.5 flex gap-1 border border-slate-200 rounded-md p-1 bg-slate-50">
+                    <button @click="search.mode='vector'" :class="search.mode==='vector'?'bg-white shadow-sm text-slate-900':'text-slate-500'" class="flex-1 text-sm py-1 rounded">Vector</button>
+                    <button @click="search.mode='hybrid'" :class="search.mode==='hybrid'?'bg-white shadow-sm text-slate-900':'text-slate-500'" class="flex-1 text-sm py-1 rounded">Hybrid</button>
+                  </div>
+                </div>
+                <div x-show="search.mode==='hybrid'">
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Query text</label>
+                  <input x-model="search.query" type="text" placeholder="…" class="mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                </div>
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Vector seed</label>
+                  <div class="mt-1.5 flex gap-2">
+                    <input x-model.number="search.seed" type="number" class="mono w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                    <button @click="search.seed = Math.floor(Math.random()*99999)" class="text-xs px-2 py-1.5 border border-slate-300 rounded hover:bg-slate-50">Rand</button>
+                  </div>
+                </div>
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">k</label>
+                  <input x-model.number="search.k" type="number" min="1" max="200" class="mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                </div>
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Filter — namespace_id</label>
+                  <input x-model="search.filter_ns" type="text" placeholder="(any)" class="mt-1.5 mono w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                </div>
+
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Attribute filters</label>
+                  <div class="mt-1.5 space-y-1">
+                    <template x-for="(f, idx) in search.attrFilters" :key="idx">
+                      <div class="flex items-center gap-1 text-[12px] mono px-2 py-1 bg-slate-50 border border-slate-200 rounded">
+                        <span x-text="f.key"></span><span class="text-slate-400">=</span>
+                        <span class="flex-1 truncate" x-text="f.value"></span>
+                        <button @click="search.attrFilters.splice(idx,1)" class="text-slate-400 hover:text-red-600">×</button>
+                      </div>
+                    </template>
+                  </div>
+                  <div class="mt-2 flex gap-1">
+                    <input x-model="search.newAttrKey" placeholder="key" class="mono text-[12px] px-2 py-1 border border-slate-300 rounded w-1/2 focus-ring">
+                    <input x-model="search.newAttrVal" placeholder="value" @keydown.enter="addAttrFilter()" class="mono text-[12px] px-2 py-1 border border-slate-300 rounded flex-1 focus-ring">
+                    <button @click="addAttrFilter()" class="text-[11px] px-2 py-1 border border-slate-300 rounded hover:bg-slate-50">+</button>
+                  </div>
+                  <div x-show="schema.loaded && (schema.data?.attributes?.length)" class="mt-1.5 text-[10px] text-slate-400">
+                    keys:
+                    <template x-for="a in (schema.data?.attributes || []).slice(0,6)" :key="a.key">
+                      <a href="#" @click.prevent="search.newAttrKey = a.key" class="caption-lime hover:underline mr-1.5" x-text="a.key"></a>
+                    </template>
+                  </div>
+                </div>
+
+                <button @click="runSearch()" class="w-full btn-primary w-full">Search</button>
+              </div>
+              <div class="col-span-2">
+                <div class="border border-slate-200 rounded-lg overflow-hidden">
+                  <table class="w-full text-sm">
+                    <thead class="text-[11px] uppercase tracking-wide text-slate-500 bg-slate-50 border-b border-slate-200">
+                      <tr>
+                        <th class="text-left px-4 py-2.5 font-medium">ID</th>
+                        <th class="text-right px-4 py-2.5 font-medium">Score</th>
+                        <th class="text-left px-4 py-2.5 font-medium">Content</th>
+                        <th class="text-left px-4 py-2.5 font-medium">namespace_id</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="r in search.results" :key="r.id">
+                        <tr class="border-b border-slate-100 last:border-0 cursor-pointer" @click="openRecord(r.id)">
+                          <td class="px-4 py-2.5 mono" x-text="r.id"></td>
+                          <td class="px-4 py-2.5 text-right mono text-[12px]" x-text="r.score?.toFixed(4)"></td>
+                          <td class="px-4 py-2.5 max-w-[300px]"><div class="clamp-1" x-text="r.metadata?.content"></div></td>
+                          <td class="px-4 py-2.5 mono text-[12px] text-slate-500" x-text="r.metadata?.namespace_id||'—'"></td>
+                        </tr>
+                      </template>
+                      <tr x-show="search.results.length === 0">
+                        <td colspan="4" class="px-5 py-10 text-center text-slate-400 text-sm">Run a search to see results.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Schema tab -->
+          <div x-show="nsTab==='schema'">
+            <div class="flex items-center justify-between mb-3">
+              <div class="text-xs text-slate-500">Distinct attributes seen across live records. Drives the filter builder.</div>
+              <button @click="loadSchema()" class="text-xs px-2 py-1 border border-slate-300 rounded hover:bg-slate-50">Reload</button>
+            </div>
+            <div x-show="!schema.loaded && !schema.loading" class="border border-slate-200 rounded-lg p-10 text-center text-sm text-slate-400">
+              <button @click="loadSchema()" class="btn-primary text-sm">Scan namespace</button>
+              <div class="mt-2 text-[11px]">Walks every live record once to tally attribute keys + value samples.</div>
+            </div>
+            <div x-show="schema.loading" class="border border-slate-200 rounded-lg p-10 text-center text-sm text-slate-500">Scanning…</div>
+
+            <div x-show="schema.loaded" class="grid grid-cols-3 gap-6">
+              <div class="col-span-1 space-y-4">
+                <div class="border border-slate-200 rounded-lg p-4">
+                  <div class="caption">Records</div>
+                  <div class="metric mt-1.5"><span x-text="(schema.data?.record_count ?? 0).toLocaleString()"></span></div>
+                </div>
+                <div class="border border-slate-200 rounded-lg p-4">
+                  <div class="caption">namespace_id values</div>
+                  <div class="mt-2 space-y-1 max-h-[200px] overflow-y-auto nice-scroll">
+                    <template x-for="ns in schema.data?.namespace_ids || []" :key="ns">
+                      <div class="text-[12px] mono text-slate-700 truncate" x-text="ns"></div>
+                    </template>
+                    <div x-show="!(schema.data?.namespace_ids?.length)" class="text-[11px] text-slate-400">none</div>
+                  </div>
+                </div>
+                <div class="border border-slate-200 rounded-lg p-4">
+                  <div class="caption">Sources</div>
+                  <div class="mt-2 space-y-1 max-h-[150px] overflow-y-auto nice-scroll">
+                    <template x-for="s in schema.data?.sources || []" :key="s">
+                      <div class="text-[12px] mono text-slate-700 truncate" x-text="s"></div>
+                    </template>
+                    <div x-show="!(schema.data?.sources?.length)" class="text-[11px] text-slate-400">none</div>
+                  </div>
+                </div>
+              </div>
+              <div class="col-span-2">
+                <div class="border border-slate-200 rounded-lg overflow-hidden">
+                  <div class="px-5 py-3 border-b border-slate-200 flex items-center justify-between">
+                    <h3 class="text-sm font-semibold">Attributes</h3>
+                    <span class="text-[11px] text-slate-400" x-text="(schema.data?.attributes?.length ?? 0) + ' keys'"></span>
+                  </div>
+                  <table class="w-full text-sm">
+                    <thead class="text-[11px] uppercase tracking-wide text-slate-500 bg-slate-50 border-b border-slate-200">
+                      <tr>
+                        <th class="text-left px-5 py-2.5 font-medium">Key</th>
+                        <th class="text-left px-5 py-2.5 font-medium">Type</th>
+                        <th class="text-right px-5 py-2.5 font-medium">Count</th>
+                        <th class="text-right px-5 py-2.5 font-medium">Distinct</th>
+                        <th class="text-left px-5 py-2.5 font-medium">Samples</th>
+                        <th class="text-right px-5 py-2.5 font-medium pr-6"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="a in schema.data?.attributes || []" :key="a.key">
+                        <tr class="border-b border-slate-100 last:border-0">
+                          <td class="px-5 py-2.5 mono text-slate-900" x-text="a.key"></td>
+                          <td class="px-5 py-2.5"><span class="tag tag-slate" x-text="a.type"></span></td>
+                          <td class="px-5 py-2.5 text-right mono text-[12px]" x-text="a.count"></td>
+                          <td class="px-5 py-2.5 text-right mono text-[12px] text-slate-500" x-text="a.distinct"></td>
+                          <td class="px-5 py-2.5 text-[12px] mono text-slate-500"><div class="clamp-1" x-text="a.sample_values.join(' · ')"></div></td>
+                          <td class="px-5 py-2.5 text-right pr-6">
+                            <button @click="addFilterFromSchema(a.key, a.sample_values[0])"
+                              class="text-[11px] caption-lime hover:underline">+ filter</button>
+                          </td>
+                        </tr>
+                      </template>
+                      <tr x-show="!(schema.data?.attributes?.length)">
+                        <td colspan="6" class="px-5 py-10 text-center text-slate-400 text-sm">No attributes found.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Hierarchy tab (Brand → Channel → Campaign → AdSet → Ad → Creative) -->
+          <div x-show="nsTab==='hierarchy'">
+            <div class="flex items-center justify-between mb-3">
+              <div class="text-xs text-slate-500">
+                Built from <span class="mono">attributes.brand</span>, <span class="mono">.channel</span>, <span class="mono">.campaign</span>, <span class="mono">.adset</span>, <span class="mono">.ad</span>, <span class="mono">.creative</span> on each record.
+              </div>
+              <button @click="loadHierarchy()" class="text-xs px-2 py-1 border border-slate-300 rounded hover:bg-slate-50">Reload</button>
+            </div>
+            <div x-show="!hierarchy.loaded && !hierarchy.loading" class="border border-slate-200 rounded-lg p-10 text-center text-sm text-slate-400">
+              <button @click="loadHierarchy()" class="btn-primary text-sm">Build tree</button>
+            </div>
+            <div x-show="hierarchy.loading" class="border border-slate-200 rounded-lg p-10 text-center text-sm text-slate-500">Building…</div>
+            <div x-show="hierarchy.loaded" class="border border-slate-200 rounded-lg p-3">
+              <template x-if="hierarchy.data?.root?.length === 0">
+                <div class="p-8 text-center text-slate-400 text-sm">No marketing-shaped records found.</div>
+              </template>
+              <template x-for="node in hierarchy.data?.root || []" :key="node.name">
+                <div x-html="renderHierarchyNode(node, 0)"></div>
+              </template>
+            </div>
+          </div>
+
+          <!-- Graph tab -->
+          <div x-show="nsTab==='graph'">
+            <div class="flex items-center justify-between mb-3">
+              <div class="text-xs text-slate-500">Force-directed graph of typed edges. Drag nodes; click to inspect.</div>
+              <div class="flex items-center gap-2">
+                <input x-model="graph.nsFilter" placeholder="filter namespace_id (optional)"
+                  class="mono text-xs px-2 py-1 border border-slate-300 rounded w-56 focus-ring">
+                <button @click="loadGraph()" class="text-xs px-2 py-1 border border-slate-300 rounded hover:bg-slate-50">Reload</button>
+              </div>
+            </div>
+            <div class="border border-slate-200 rounded-lg overflow-hidden bg-white">
+              <div id="graph-canvas" class="w-full h-[560px]"></div>
+            </div>
+            <div class="text-[11px] text-slate-400 mt-2">
+              Showing <span x-text="graph.nodes.length"></span> nodes /
+              <span x-text="graph.links.length"></span> edges.
+            </div>
+          </div>
+
+          <!-- Context chain tab -->
+          <div x-show="nsTab==='context'">
+            <div class="grid grid-cols-3 gap-6">
+              <div class="col-span-1 space-y-4">
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Vector seed</label>
+                  <div class="mt-1.5 flex gap-2">
+                    <input x-model.number="context.seed" type="number" class="mono w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                    <button @click="context.seed = Math.floor(Math.random()*99999)" class="text-xs px-2 py-1.5 border border-slate-300 rounded hover:bg-slate-50">Rand</button>
+                  </div>
+                </div>
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">k (initial hits)</label>
+                  <input x-model.number="context.k" type="number" min="1" max="50" class="mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                </div>
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">hops (BFS depth)</label>
+                  <input x-model.number="context.hops" type="number" min="0" max="5" class="mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                </div>
+                <button @click="runContextChain()" class="w-full btn-primary w-full">Run chain</button>
+                <div class="text-[11px] text-slate-400 leading-relaxed">
+                  context_chain runs vector search for the top <span class="mono">k</span> hits, then BFS-expands through typed graph edges for <span class="mono">hops</span> steps. Returns a connected sub-graph rooted at the search hits.
+                </div>
+              </div>
+              <div class="col-span-2">
+                <div class="border border-slate-200 rounded-lg overflow-hidden">
+                  <table class="w-full text-sm">
+                    <thead class="text-[11px] uppercase tracking-wide text-slate-500 bg-slate-50 border-b border-slate-200">
+                      <tr>
+                        <th class="text-left px-4 py-2.5 font-medium">ID</th>
+                        <th class="text-right px-4 py-2.5 font-medium">Score</th>
+                        <th class="text-right px-4 py-2.5 font-medium">Hop</th>
+                        <th class="text-left px-4 py-2.5 font-medium">Content</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <template x-for="n in context.result?.nodes || []" :key="n.id">
+                        <tr class="border-b border-slate-100 last:border-0 cursor-pointer" @click="openRecord(n.id)">
+                          <td class="px-4 py-2.5 mono" x-text="n.id"></td>
+                          <td class="px-4 py-2.5 text-right mono text-[12px]" x-text="(n.score ?? 0).toFixed(4)"></td>
+                          <td class="px-4 py-2.5 text-right">
+                            <span class="tag" :class="n.hop_distance===0 ? 'tag-lime' : 'tag-slate'"
+                                  x-text="`hop ${n.hop_distance}`"></span>
+                          </td>
+                          <td class="px-4 py-2.5"><div class="clamp-1" x-text="n.metadata?.content || '—'"></div></td>
+                        </tr>
+                      </template>
+                      <tr x-show="!(context.result?.nodes?.length)">
+                        <td colspan="4" class="px-5 py-10 text-center text-slate-400 text-sm">Run a context chain to see expanded nodes.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div x-show="context.result?.edges?.length" class="mt-4">
+                  <div class="text-[11px] uppercase tracking-wide text-slate-500 font-medium mb-2">Edges traversed</div>
+                  <div class="space-y-1 max-h-[200px] overflow-y-auto nice-scroll">
+                    <template x-for="e in context.result?.edges || []" :key="e.source_id+'-'+e.target_id+'-'+e.rel_type">
+                      <div class="text-[12px] mono text-slate-600 px-3 py-1 bg-slate-50 rounded">
+                        <span x-text="e.source_id"></span> →
+                        <span class="text-lime-text" x-text="e.rel_type"></span> →
+                        <span x-text="e.target_id"></span>
+                        <span class="text-slate-400 ml-2" x-text="`w=${(e.weight??0).toFixed(2)}`"></span>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Console tab -->
+          <div x-show="nsTab==='console'">
+            <div class="grid grid-cols-3 gap-6">
+              <div class="col-span-1 space-y-3">
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Method</label>
+                  <select x-model="console.method" class="mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                    <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Path</label>
+                  <input x-model="console.path" type="text" :placeholder="`/v1/${ns.name}/…`"
+                    class="mt-1.5 mono w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                </div>
+                <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Body (JSON)</label>
+                  <textarea x-model="console.body" rows="10" class="mt-1.5 mono w-full text-[12px] px-3 py-2 border border-slate-300 rounded-md focus-ring nice-scroll" placeholder='{}'></textarea>
+                </div>
+                <button @click="runConsole()" class="w-full btn-primary w-full">Send</button>
+              </div>
+              <div class="col-span-2">
+                <div class="text-[11px] uppercase tracking-wide text-slate-500 font-medium mb-1.5">Response</div>
+                <pre class="code nice-scroll" style="min-height:300px; max-height:60vh;" x-text="console.response || '(no response yet)'"></pre>
+              </div>
+            </div>
+          </div>
+
+        </section>
+
+        <!-- ───────── Search (global) ───────── -->
+        <section x-show="view === 'search'" class="p-8 max-w-3xl mx-auto">
+          <h1 class="text-[22px] font-semibold tracking-tight mb-1">Search</h1>
+          <p class="text-sm text-slate-500 mb-6">Pick a namespace to run a search inside. Or press <kbd>⌘K</kbd> for the quick palette.</p>
+          <div class="border border-slate-200 rounded-lg p-5">
+            <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Namespace</label>
+            <select x-model="globalSearchNs" @change="if (globalSearchNs) openNamespace(globalSearchNs, 'search')"
+              class="mt-1.5 w-full text-sm px-3 py-2 border border-slate-300 rounded-md focus-ring">
+              <option value="">— select —</option>
+              <template x-for="ns in namespaces" :key="ns.name"><option x-text="ns.name" :value="ns.name"></option></template>
+            </select>
+          </div>
+        </section>
+
+        <!-- ───────── Settings ───────── -->
+        <section x-show="view === 'settings'" class="p-8 max-w-3xl mx-auto space-y-8">
+          <div>
+            <h1 class="text-[22px] font-semibold tracking-tight mb-1">Settings</h1>
+            <p class="text-sm text-slate-500">Server info and dashboard configuration.</p>
+          </div>
+          <div class="border border-slate-200 rounded-lg overflow-hidden">
+            <div class="px-5 py-3 border-b border-slate-200 bg-slate-50 text-sm font-semibold">Server</div>
+            <div class="p-5 grid grid-cols-2 gap-x-8 gap-y-3 text-sm">
+              <div class="text-slate-500">URL</div><div class="mono" x-text="server.url"></div>
+              <div class="text-slate-500">Version</div><div class="mono" x-text="server.version || '—'"></div>
+              <div class="text-slate-500">Namespaces</div><div class="mono" x-text="server.nsCount ?? '—'"></div>
+              <div class="text-slate-500">Total records</div><div class="mono" x-text="(server.totalRecords ?? 0).toLocaleString()"></div>
+              <div class="text-slate-500">Default dim</div><div class="mono" x-text="server.dim ?? '—'"></div>
+              <div class="text-slate-500">Uptime</div><div class="mono" x-text="fmtUptime(server.uptime)"></div>
+            </div>
+          </div>
+          <!-- Connection details -->
+          <div class="border border-slate-200 rounded-lg overflow-hidden">
+            <div class="px-5 py-3 border-b border-slate-200 bg-slate-50 text-sm font-semibold flex items-center justify-between">
+              <span>Connection</span>
+              <button @click="loadConnectionInfo()" class="text-[11px] text-slate-500 hover:text-slate-900">↻</button>
+            </div>
+            <div class="p-5 space-y-3 text-sm">
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <div class="caption">Base URL</div>
+                  <div class="mono mt-1 text-[12px] flex items-center gap-2">
+                    <span class="truncate" x-text="connectionInfo.base_url || server.url"></span>
+                    <button @click="copyText(connectionInfo.base_url || server.url, 'URL')" class="text-slate-400 hover:text-slate-900 text-[11px]">copy</button>
+                  </div>
+                </div>
+                <div>
+                  <div class="caption">Auth header</div>
+                  <div class="mono mt-1 text-[12px]">X-API-Key: feather-…</div>
+                </div>
+              </div>
+              <div x-show="connectionInfo.sample_curl">
+                <div class="caption">cURL</div>
+                <pre class="code mt-1.5" x-text="connectionInfo.sample_curl"></pre>
+                <button @click="copyText(connectionInfo.sample_curl, 'cURL')" class="text-[11px] text-slate-500 hover:text-slate-900 mt-1">copy snippet</button>
+              </div>
+              <div x-show="connectionInfo.sample_python">
+                <div class="caption">Python (requests)</div>
+                <pre class="code mt-1.5" x-text="connectionInfo.sample_python"></pre>
+                <button @click="copyText(connectionInfo.sample_python, 'Python')" class="text-[11px] text-slate-500 hover:text-slate-900 mt-1">copy snippet</button>
+              </div>
+              <div x-show="connectionInfo.sample_javascript">
+                <div class="caption">JavaScript (fetch)</div>
+                <pre class="code mt-1.5" x-text="connectionInfo.sample_javascript"></pre>
+                <button @click="copyText(connectionInfo.sample_javascript, 'JS')" class="text-[11px] text-slate-500 hover:text-slate-900 mt-1">copy snippet</button>
+              </div>
+              <a :href="connectionInfo.docs_url || (server.url + '/docs')" target="_blank" class="text-[12px] caption-lime hover:underline">Open OpenAPI docs ↗</a>
+            </div>
+          </div>
+
+          <!-- Embedding service -->
+          <div class="border border-slate-200 rounded-lg overflow-hidden">
+            <div class="px-5 py-3 border-b border-slate-200 bg-slate-50 text-sm font-semibold flex items-center justify-between">
+              <span>Embedding service</span>
+              <span class="caption" x-text="embedding.provider === 'none' ? 'NOT CONFIGURED' : 'CONFIGURED'"
+                    :class="embedding.provider === 'none' ? '' : 'caption-lime'"></span>
+            </div>
+            <div class="p-5 space-y-3 text-sm">
+              <p class="text-[12px]" style="color:var(--ink-mid)">When configured, "Ingest text" produces real semantic vectors via the chosen provider.  Random vectors otherwise.</p>
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="caption">Provider</label>
+                  <select x-model="embedding.provider" class="mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                    <option value="none">none (random vectors)</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="voyage">Voyage</option>
+                    <option value="cohere">Cohere</option>
+                    <option value="ollama">Ollama (local)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="caption">Model</label>
+                  <input x-model="embedding.model" placeholder="(provider default)" class="mono mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                </div>
+              </div>
+              <div x-show="embedding.provider === 'ollama'">
+                <label class="caption">Base URL (Ollama only)</label>
+                <input x-model="embedding.base_url" placeholder="http://localhost:11434" class="mono mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+              </div>
+              <div x-show="embedding.provider !== 'none' && embedding.provider !== 'ollama'">
+                <label class="caption">API key <span x-show="embedding.api_key_set" class="caption-lime ml-2">(currently set — leave blank to keep)</span></label>
+                <input x-model="embedding.api_key" type="password" placeholder="sk-…" class="mono mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+              </div>
+              <div>
+                <label class="caption">Vector dim</label>
+                <input x-model.number="embedding.dim" type="number" class="mono mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                <div class="text-[10px] mt-1" style="color:var(--ink-faint)">Must match your namespace's dim. Vectors are padded/truncated if not.</div>
+              </div>
+              <div class="flex justify-end">
+                <button @click="saveEmbeddingConfig()" class="btn-primary">Save</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="border border-slate-200 rounded-lg overflow-hidden">
+            <div class="px-5 py-3 border-b border-slate-200 bg-slate-50 text-sm font-semibold">API key</div>
+            <div class="p-5">
+              <p class="text-sm text-slate-500 mb-3">Stored locally in your browser.</p>
+              <div class="flex gap-2">
+                <input :value="apiKey" type="password" readonly class="mono flex-1 text-sm px-3 py-1.5 border border-slate-200 bg-slate-50 rounded-md text-slate-700">
+                <button @click="copyKey()" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Copy</button>
+                <button @click="rotateKeyPrompt()" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Replace</button>
+              </div>
+            </div>
+          </div>
+          <div class="border border-red-200 rounded-lg overflow-hidden">
+            <div class="px-5 py-3 border-b border-red-200 bg-red-50 text-sm font-semibold text-red-800">Danger zone</div>
+            <div class="p-5 flex items-center justify-between">
+              <div class="text-sm">
+                <div class="font-medium">Sign out</div>
+                <div class="text-slate-500 text-[13px]">Clears the API key from this browser.</div>
+              </div>
+              <button @click="signOut()" class="text-sm px-3 py-1.5 border border-red-300 text-red-700 rounded-md hover:bg-red-50">Sign out</button>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+  </div>
+
+  <!-- ──────────────────────────  Record drawer ────────────────────────── -->
+  <div x-show="recordDrawer.open" x-cloak class="fixed inset-0 z-30">
+    <div class="absolute inset-0 bg-slate-900/30" @click="recordDrawer.open=false"></div>
+    <div class="drawer absolute right-0 top-0 bottom-0 w-[540px] bg-white border-l border-slate-200 shadow-xl overflow-auto nice-scroll">
+      <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+        <div>
+          <div class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Record</div>
+          <div class="mono text-lg font-semibold" x-text="recordDrawer.id"></div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button @click="toggleEditRecord()" class="text-[11px] px-2 py-1 border border-slate-300 rounded hover:bg-slate-50" x-text="recordDrawer.editMode ? 'Cancel' : 'Edit'"></button>
+          <button @click="recordDrawer.open=false" class="text-slate-400 hover:text-slate-700"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-5 h-5"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+        </div>
+      </div>
+
+      <!-- tabs -->
+      <div class="px-6 pt-3 border-b border-slate-200 flex gap-5">
+        <template x-for="t in ['metadata','edges']" :key="t">
+          <button @click="recordDrawer.tab=t" class="tab text-xs font-medium pb-2.5 transition" :aria-selected="recordDrawer.tab===t">
+            <span x-text="t.charAt(0).toUpperCase()+t.slice(1)"></span>
+          </button>
+        </template>
+      </div>
+
+      <!-- metadata tab -->
+      <div x-show="recordDrawer.tab==='metadata'" class="p-6">
+        <!-- marketing profile card (renders if record has marketing-shaped attrs) -->
+        <div x-show="!recordDrawer.editMode && marketingFields(recordDrawer.parsed)" x-cloak class="mb-5 border border-slate-200 rounded-xl p-4 bg-paper-deep">
+          <div class="caption caption-lime">Marketing profile</div>
+          <div class="mt-2 grid grid-cols-3 gap-3">
+            <template x-for="kv in marketingProfileGrid()" :key="kv.label">
+              <div>
+                <div class="caption" x-text="kv.label"></div>
+                <div class="mt-1 text-sm font-medium" x-text="kv.value || '—'"></div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <div x-show="!recordDrawer.editMode">
+          <pre class="code nice-scroll" x-text="recordDrawer.body"></pre>
+        </div>
+        <div x-show="recordDrawer.editMode" class="space-y-4">
+          <div>
+            <label class="caption">Content</label>
+            <textarea x-model="recordDrawer.edit.content" rows="4" class="mt-1.5 w-full text-sm px-3 py-2 border border-slate-300 rounded-md focus-ring"></textarea>
+          </div>
+          <div>
+            <label class="caption">Importance</label>
+            <input x-model.number="recordDrawer.edit.importance" type="number" min="0" max="1" step="0.05" class="mono mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+          </div>
+          <div>
+            <label class="caption">Attributes (key=value, one per line)</label>
+            <textarea x-model="recordDrawer.edit.attrs" rows="4" placeholder="brand=acme&#10;channel=instagram" class="mono mt-1.5 w-full text-[12px] px-3 py-2 border border-slate-300 rounded-md focus-ring"></textarea>
+          </div>
+          <div class="flex gap-2 justify-end">
+            <button @click="toggleEditRecord()" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
+            <button @click="submitEditRecord()" class="btn-primary">Save</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- edges tab -->
+      <div x-show="recordDrawer.tab==='edges'" class="p-6 space-y-6">
+        <div>
+          <div class="text-[11px] uppercase tracking-wide text-slate-500 font-medium mb-2">Outgoing</div>
+          <div class="space-y-1.5">
+            <template x-for="e in recordDrawer.outgoing" :key="`o-${e.target_id}-${e.rel_type}`">
+              <div class="flex items-center justify-between text-[12px] mono px-3 py-1.5 bg-slate-50 rounded">
+                <div>
+                  <span class="text-lime-text" x-text="e.rel_type"></span>
+                  → <a href="#" class="text-slate-900 hover:text-lime-text" @click.prevent="openRecord(e.target_id)" x-text="e.target_id"></a>
+                </div>
+                <span class="text-slate-400" x-text="`w=${e.weight.toFixed(2)}`"></span>
+              </div>
+            </template>
+            <div x-show="recordDrawer.outgoing.length===0" class="text-[12px] text-slate-400">no outgoing edges.</div>
+          </div>
+        </div>
+        <div>
+          <div class="text-[11px] uppercase tracking-wide text-slate-500 font-medium mb-2">Incoming</div>
+          <div class="space-y-1.5">
+            <template x-for="e in recordDrawer.incoming" :key="`i-${e.source_id}-${e.rel_type}`">
+              <div class="flex items-center justify-between text-[12px] mono px-3 py-1.5 bg-slate-50 rounded">
+                <div>
+                  <a href="#" class="text-slate-900 hover:text-lime-text" @click.prevent="openRecord(e.source_id)" x-text="e.source_id"></a>
+                  → <span class="text-lime-text" x-text="e.rel_type"></span>
+                </div>
+                <span class="text-slate-400" x-text="`w=${e.weight.toFixed(2)}`"></span>
+              </div>
+            </template>
+            <div x-show="recordDrawer.incoming.length===0" class="text-[12px] text-slate-400">no incoming edges.</div>
+          </div>
+        </div>
+        <div class="border-t border-slate-200 pt-4">
+          <div class="text-[11px] uppercase tracking-wide text-slate-500 font-medium mb-2">Add edge from this record</div>
+          <div class="grid grid-cols-2 gap-2">
+            <input x-model.number="recordDrawer.newEdge.target" type="number" placeholder="target id"
+              class="mono text-[12px] px-2 py-1.5 border border-slate-300 rounded focus-ring col-span-1">
+            <input x-model="recordDrawer.newEdge.rel" type="text" placeholder="rel_type (e.g. caused_by)"
+              class="mono text-[12px] px-2 py-1.5 border border-slate-300 rounded focus-ring col-span-1">
+          </div>
+          <button @click="addEdge()" class="mt-2 w-full btn-primary w-full text-[12px]">Link</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────  New namespace modal ────────────────────────── -->
+  <div x-show="newNsModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="newNsModal.open=false">
+    <div class="bg-white rounded-lg w-[400px] p-6 shadow-xl border border-slate-200">
+      <h3 class="text-lg font-semibold">Create namespace</h3>
+      <p class="text-sm text-slate-500 mt-1">A new <span class="mono">.feather</span> file will be created on disk.</p>
+      <input x-model="newNsModal.name" placeholder="brand_acme"
+        @keydown.enter="createNamespace()"
+        class="mono mt-4 w-full text-sm px-3 py-2 border border-slate-300 rounded-md focus-ring">
+      <div class="text-[11px] text-slate-400 mt-1">letters · numbers · underscore · dash only</div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="newNsModal.open=false" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
+        <button @click="createNamespace()" :disabled="!newNsModal.name" class="text-sm px-3 py-1.5 btn-primary disabled:opacity-40">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────  Add record modal ────────────────────────── -->
+  <div x-show="addRecModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="addRecModal.open=false">
+    <div class="bg-white rounded-lg w-[480px] p-6 shadow-xl border border-slate-200">
+      <h3 class="text-lg font-semibold">Add record</h3>
+      <p class="text-[12px] text-slate-500 mt-1">Vector is randomly generated for now. Wire an embedding service later for real semantic search.</p>
+      <div class="space-y-3 mt-4">
+        <div>
+          <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Content</label>
+          <textarea x-model="addRecModal.content" rows="3" placeholder="The record's text content."
+            class="mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring"></textarea>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">namespace_id</label>
+            <input x-model="addRecModal.ns_id" class="mono mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+          </div>
+          <div>
+            <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">entity_id</label>
+            <input x-model="addRecModal.entity_id" placeholder="optional" class="mono mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+          </div>
+        </div>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="addRecModal.open=false" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
+        <button @click="submitAddRecord()" :disabled="!addRecModal.content" class="text-sm px-3 py-1.5 btn-primary disabled:opacity-40">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────  Ingest text modal ────────────────────────── -->
+  <div x-show="ingestModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="ingestModal.open=false">
+    <div class="bg-white rounded-lg w-[520px] p-6 shadow-xl border border-slate-200">
+      <h3 class="text-lg font-semibold">Ingest text</h3>
+      <p class="text-[12px] mt-1" style="color:var(--ink-mid)">Server embeds via the configured provider, then stores the record.</p>
+      <div x-show="embedding.provider === 'none'" class="mt-3 text-[12px] px-3 py-2 rounded border border-amber-200 bg-amber-50" style="color:#a16207">
+        Embedding service not configured. Set one in <a href="#" @click.prevent="ingestModal.open=false; navigate('settings')" class="underline">Settings</a> first.
+      </div>
+      <div class="space-y-3 mt-4">
+        <div>
+          <label class="caption">Text content</label>
+          <textarea x-model="ingestModal.text" rows="5" placeholder="The body of the record." class="mt-1.5 w-full text-sm px-3 py-2 border border-slate-300 rounded-md focus-ring"></textarea>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="caption">namespace_id</label>
+            <input x-model="ingestModal.ns_id" class="mono mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+          </div>
+          <div>
+            <label class="caption">entity_id (optional)</label>
+            <input x-model="ingestModal.entity_id" class="mono mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+          </div>
+        </div>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="ingestModal.open=false" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
+        <button @click="submitIngestText()" :disabled="!ingestModal.text || embedding.provider==='none'" class="btn-primary disabled:opacity-40">Embed + store</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────  Bulk import modal ────────────────────────── -->
+  <div x-show="importModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="importModal.open=false">
+    <div class="bg-white rounded-lg w-[640px] p-6 shadow-xl border border-slate-200">
+      <h3 class="text-lg font-semibold">Bulk import</h3>
+      <p class="text-[12px] mt-1" style="color:var(--ink-mid)">Paste a JSON array of <span class="mono">{id, vector, metadata}</span> records, or upload a .json file.</p>
+      <div class="mt-3">
+        <input type="file" accept=".json" @change="loadImportFile($event)" class="text-[12px]">
+      </div>
+      <textarea x-model="importModal.json_text" rows="14"
+        placeholder='[
+  { "id": 1, "vector": [0.1, 0.2, ...], "metadata": { "content": "first", "namespace_id": "brand_a", "attributes": { "channel": "instagram" } } }
+]'
+        class="mono mt-3 w-full text-[12px] px-3 py-2 border border-slate-300 rounded-md focus-ring nice-scroll"></textarea>
+      <div class="mt-1.5 text-[10px] text-slate-400">vectors must match this namespace's dim (<span class="mono" x-text="ns.dim || '768'"></span>)</div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="importModal.open=false" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
+        <button @click="submitImport()" :disabled="!importModal.json_text" class="btn-primary disabled:opacity-40">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────  Bulk seed modal ────────────────────────── -->
+  <div x-show="seedModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="seedModal.open=false">
+    <div class="bg-white rounded-lg w-[420px] p-6 shadow-xl border border-slate-200">
+      <h3 class="text-lg font-semibold">Bulk seed</h3>
+      <p class="text-[12px] text-slate-500 mt-1">Generates N random vectors with templated content. Server-side; instant.</p>
+      <div class="grid grid-cols-2 gap-3 mt-4">
+        <div>
+          <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Count</label>
+          <input x-model.number="seedModal.count" type="number" min="1" max="10000" class="mono mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+        </div>
+        <div>
+          <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">namespace_id</label>
+          <input x-model="seedModal.ns_id" class="mono mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+        </div>
+      </div>
+      <div class="mt-3">
+        <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Content template</label>
+        <input x-model="seedModal.template" placeholder="seed record {i}" class="mt-1 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+        <div class="text-[10px] text-slate-400 mt-1">Use <span class="mono">{i}</span> as a counter token.</div>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="seedModal.open=false" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
+        <button @click="submitSeed()" :disabled="!seedModal.count || !seedModal.ns_id" class="text-sm px-3 py-1.5 btn-primary disabled:opacity-40">Seed</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────  Confirm dialog ────────────────────────── -->
+  <div x-show="confirmDlg.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50">
+    <div class="bg-white rounded-lg w-[400px] p-6 shadow-xl border border-slate-200">
+      <h3 class="text-lg font-semibold" x-text="confirmDlg.title"></h3>
+      <p class="text-sm text-slate-500 mt-1" x-text="confirmDlg.body"></p>
+      <input x-show="confirmDlg.requireText" x-model="confirmDlg.input"
+        :placeholder="`type ${confirmDlg.requireText} to confirm`"
+        class="mono mt-3 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="confirmDlg.open=false" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
+        <button @click="confirmDlg.execute()" :disabled="confirmDlg.requireText && confirmDlg.input !== confirmDlg.requireText" class="text-sm px-3 py-1.5 bg-red-600 text-white rounded-md hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed">
+          <span x-text="confirmDlg.cta || 'Confirm'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────────  App logic ────────────────────────── -->
+  <script>
+    function app() {
+      return {
+        apiKey: '', keyInput: '',
+        view: 'overview', toasts: [],
+        nsFilter: '', globalSearchNs: '',
+        server: { url: window.location.origin, version: null, dim: null, nsCount: null, totalRecords: null, uptime: 0, topNamespaces: [] },
+        metrics: { opsTotal: 0, errors: 0, p50_ms: 0, p95_ms: 0, p99_ms: 0 },
+        activity: [],
+        namespaces: [],
+        ns: { name: '', dim: null, modalities: ['text'], records: 0 },
+        // Flat top-level mirror of ns.name. Some Alpine reactivity edge cases drop
+        // nested-property updates from x-bound templates; the flat string is the
+        // authoritative source used by all API calls.
+        activeNs: '',
+        nsTab: 'records',
+        records: [], recordsAfter: 0, recordsHasMore: false, loadingRecords: false,
+        search: { mode: 'vector', query: '', seed: 42, k: 20, filter_ns: '', results: [],
+                  attrFilters: [], newAttrKey: '', newAttrVal: '' },
+        context: { seed: 42, k: 5, hops: 2, result: null },
+        graph: { nsFilter: '', nodes: [], links: [] },
+        schema: { loading: false, loaded: false, data: null },
+        console: { method: 'POST', path: '', body: '', response: '' },
+        recordDrawer: { open: false, id: null, body: '', parsed: null, tab: 'metadata',
+                        outgoing: [], incoming: [], newEdge: { target: 0, rel: '' },
+                        editMode: false, edit: { content: '', importance: 1.0, attrs: '' } },
+        confirmDlg: { open: false, title: '', body: '', cta: '', requireText: '', input: '', execute() {} },
+        newNsModal: { open: false, name: '' },
+        addRecModal: { open: false, ns_id: '', content: '', entity_id: '' },
+        seedModal: { open: false, count: 100, ns_id: '', template: 'seed record {i}' },
+        ingestModal: { open: false, text: '', ns_id: '', entity_id: '' },
+        importModal: { open: false, json_text: '' },
+        embedding: { provider: 'none', model: '', base_url: '', api_key_set: false, api_key: '', dim: 768 },
+        connectionInfo: { base_url: '', sample_curl: '', sample_python: '', sample_javascript: '', docs_url: '' },
+        opsSeries: { bucketSeconds: 60, points: [] },
+        hierarchy: { loading: false, loaded: false, data: null },
+        palette: { open: false, query: '', idx: 0 },
+
+        nav: [
+          { id: 'overview',   label: 'Overview',    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>' },
+          { id: 'namespaces', label: 'Namespaces',  icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></svg>' },
+          { id: 'search',     label: 'Search',      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>' },
+          { id: 'settings',   label: 'Settings',    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 008 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 8a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9c0 .68.46 1.27 1.11 1.46h.4a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>' },
+        ],
+
+        get crumbs() {
+          const a = [{ label: 'Feather DB', go: () => this.navigate('overview') }];
+          if (this.view === 'overview')   a.push({ label: 'Overview' });
+          if (this.view === 'namespaces') a.push({ label: 'Namespaces' });
+          if (this.view === 'search')     a.push({ label: 'Search' });
+          if (this.view === 'settings')   a.push({ label: 'Settings' });
+          if (this.view === 'ns_detail') {
+            a.push({ label: 'Namespaces', go: () => this.navigate('namespaces') });
+            a.push({ label: this.ns.name });
+          }
+          return a;
+        },
+
+        // ── lifecycle
+        init() {
+          this.apiKey = localStorage.getItem('feather_admin_key') || '';
+          if (this.apiKey) this.bootstrap();
+          // refresh metrics every 15s on overview
+          setInterval(() => { if (this.view === 'overview') { this.loadMetrics(); this.loadActivity(); this.loadOpsSeries(); } }, 15000);
+        },
+        copyText(text, label='text') {
+          if (!text) return;
+          navigator.clipboard.writeText(text).then(() => this.toast(`${label} copied.`));
+        },
+        async bootstrap() {
+          await this.loadOverview();
+          await this.loadNamespaces();
+          await this.loadMetrics();
+          await this.loadActivity();
+          await this.loadOpsSeries();
+          await this.loadConnectionInfo();
+          await this.loadEmbeddingConfig();
+        },
+        saveKey() { if (!this.keyInput.trim()) return; this.apiKey = this.keyInput.trim(); localStorage.setItem('feather_admin_key', this.apiKey); this.keyInput = ''; this.bootstrap(); },
+        signOut() { localStorage.removeItem('feather_admin_key'); this.apiKey = ''; },
+        rotateKeyPrompt() { const k = prompt('Paste new API key.'); if (k && k.trim()) { this.apiKey = k.trim(); localStorage.setItem('feather_admin_key', this.apiKey); this.toast('API key updated.'); this.bootstrap(); } },
+
+        // ── helpers
+        async api(method, path, body) {
+          const opt = { method, headers: { 'X-API-Key': this.apiKey } };
+          if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+          const r = await fetch(path, opt);
+          const text = await r.text();
+          // CRITICAL: server returns 64-bit ids as JSON numbers, but JS Number can't
+          // represent integers above 2^53 exactly. Wrap any 16+ digit integer that
+          // appears as a JSON value (after :, [, or ,) in quotes so it survives parse
+          // as a string. All id-bearing dashboard code treats ids as opaque strings.
+          const safeText = text.replace(/([:\[,]\s*)(-?\d{16,})(?=\s*[,\]\}])/g, '$1"$2"');
+          let json = null;
+          try { json = safeText ? JSON.parse(safeText) : null; } catch { try { json = text ? JSON.parse(text) : null; } catch {} }
+          if (!r.ok) { const msg = json?.detail || text || r.statusText; throw new Error(`${r.status} ${msg}`); }
+          return json;
+        },
+        toast(msg, kind='success') { const id = Math.random(); this.toasts.push({ id, msg, kind }); setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, 2400); },
+        copyKey() { if (!this.apiKey) return; navigator.clipboard.writeText(this.apiKey).then(() => this.toast('API key copied.')); },
+        fmtUptime(s) { if (!s) return '—'; const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60); if (d) return `${d}d ${h}h`; if (h) return `${h}h ${m}m`; return `${m}m`; },
+        fmtAgo(ts) { const dt = (Date.now() / 1000 - ts); if (dt < 60) return Math.round(dt)+'s'; if (dt < 3600) return Math.round(dt/60)+'m'; if (dt < 86400) return Math.round(dt/3600)+'h'; return Math.round(dt/86400)+'d'; },
+        opTagClass(op) {
+          return { 'add':'tag-lime', 'seed':'tag-lime', 'search':'tag-ink',
+                   'context_chain':'tag-ink', 'edges':'tag-slate', 'link':'tag-slate',
+                   'delete':'tag-rose','purge':'tag-rose','compact':'tag-amber' }[op] || 'tag-slate';
+        },
+        navigate(id) { this.view = id; if (id === 'overview') { this.loadOverview(); this.loadMetrics(); this.loadActivity(); } if (id === 'namespaces') this.loadOverview(); },
+        reload() {
+          if (this.view === 'overview') { this.loadOverview(); this.loadMetrics(); this.loadActivity(); }
+          else if (this.view === 'namespaces') this.loadNamespaces();
+          else if (this.view === 'ns_detail') this.openNamespace(this.activeNs, this.nsTab);
+        },
+
+        // ── data loaders
+        async loadOverview() {
+          try { const d = await this.api('GET', '/v1/admin/overview'); this.server = { ...this.server, ...d }; }
+          catch (e) { this.toast(`Overview failed: ${e.message}`, 'error'); }
+        },
+        async loadMetrics() {
+          try { const d = await this.api('GET', '/v1/admin/metrics?window=3600'); this.metrics = d; }
+          catch (e) { /* silent */ }
+        },
+        async loadActivity() {
+          try { const d = await this.api('GET', '/v1/admin/activity?limit=30'); this.activity = d.events || []; }
+          catch (e) { /* silent */ }
+        },
+        async loadOpsSeries() {
+          try { const d = await this.api('GET', '/v1/admin/ops_timeseries?window=3600&bucket_seconds=60'); this.opsSeries = d; }
+          catch (e) { /* silent */ }
+        },
+        async loadConnectionInfo() {
+          try { this.connectionInfo = await this.api('GET', '/v1/admin/connection_info'); }
+          catch (e) { /* silent */ }
+        },
+        async loadEmbeddingConfig() {
+          try {
+            const d = await this.api('GET', '/v1/admin/embedding_config');
+            this.embedding = { ...this.embedding, ...d, api_key: '' };
+          } catch (e) { /* silent */ }
+        },
+        async saveEmbeddingConfig() {
+          try {
+            const body = {
+              provider: this.embedding.provider,
+              model: this.embedding.model,
+              base_url: this.embedding.base_url,
+              dim: this.embedding.dim,
+            };
+            if (this.embedding.api_key && this.embedding.api_key.trim()) body.api_key = this.embedding.api_key.trim();
+            const d = await this.api('PUT', '/v1/admin/embedding_config', body);
+            this.embedding = { ...this.embedding, ...d, api_key: '' };
+            this.toast('Embedding config saved.');
+          } catch (e) { this.toast(`Save failed: ${e.message}`, 'error'); }
+        },
+
+        // ── ingest text (uses configured embedder)
+        async submitIngestText() {
+          const t = (this.ingestModal.text || '').trim();
+          if (!t) return;
+          try {
+            const d = await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/ingest_text`, {
+              text: t, modality: 'text',
+              metadata: {
+                content: t,
+                namespace_id: this.ingestModal.ns_id || this.ns.name,
+                entity_id: this.ingestModal.entity_id || '',
+              },
+            });
+            this.ingestModal.open = false;
+            this.toast(`Ingested record ${d.id}.`);
+            await this.loadRecords(true); await this.loadOverview();
+          } catch (e) { this.toast(`Ingest failed: ${e.message}`, 'error'); }
+        },
+
+        // ── bulk import
+        loadImportFile(event) {
+          const f = event.target.files?.[0];
+          if (!f) return;
+          const reader = new FileReader();
+          reader.onload = e => { this.importModal.json_text = e.target.result || ''; };
+          reader.readAsText(f);
+        },
+        async submitImport() {
+          let items;
+          try { items = JSON.parse(this.importModal.json_text); }
+          catch (e) { return this.toast('Invalid JSON.', 'error'); }
+          if (!Array.isArray(items)) return this.toast('Top-level must be an array.', 'error');
+          try {
+            const d = await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/import`, {
+              items, modality: 'text',
+            });
+            this.importModal.open = false;
+            this.toast(`Imported ${d.inserted}, skipped ${d.skipped}.`, d.skipped ? 'error' : 'success');
+            if (d.errors?.length) console.warn('import errors:', d.errors);
+            await this.loadRecords(true); await this.loadOverview();
+          } catch (e) { this.toast(`Import failed: ${e.message}`, 'error'); }
+        },
+
+        // ── hierarchy
+        async loadHierarchy() {
+          this.hierarchy.loading = true;
+          try {
+            const d = await this.api('GET', `/v1/${encodeURIComponent(this.activeNs)}/hierarchy`);
+            this.hierarchy.data = d;
+            this.hierarchy.loaded = true;
+          } catch (e) { this.toast(`Hierarchy build failed: ${e.message}`, 'error'); }
+          finally { this.hierarchy.loading = false; }
+        },
+        renderHierarchyNode(node, depth) {
+          const pad = depth * 20;
+          const lvlColor = depth === 0 ? 'caption-lime' : '';
+          let html = `<div class="flex items-center justify-between py-1.5 hover:bg-paper-deep rounded px-2" style="padding-left:${pad+8}px">
+            <div class="flex items-center gap-2 text-[13px]">
+              <span class="caption ${lvlColor}">${node.level}</span>
+              <span class="mono">${node.name}</span>
+            </div>
+            <span class="text-[11px] mono text-slate-500">${node.record_count.toLocaleString()}</span>
+          </div>`;
+          for (const child of (node.children || [])) {
+            html += this.renderHierarchyNode(child, depth + 1);
+          }
+          return html;
+        },
+
+        // ── sparkline (no D3 — pure SVG path)
+        renderSparkline(points) {
+          if (!points.length) return '<div class="h-[28px] text-[10px] text-slate-300 flex items-center">no data yet</div>';
+          const w = 220, h = 28, pad = 1;
+          const maxV = Math.max(1, ...points.map(p => p.ops));
+          const dx = (w - pad*2) / Math.max(1, points.length - 1);
+          const path = points.map((p, i) => {
+            const x = pad + i * dx;
+            const y = h - pad - (p.ops / maxV) * (h - pad*2);
+            return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+          }).join(' ');
+          const area = path + ` L ${w-pad} ${h-pad} L ${pad} ${h-pad} Z`;
+          return `<svg width="100%" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" class="spark">
+            <path class="area" d="${area}"></path>
+            <path d="${path}"></path>
+          </svg>`;
+        },
+
+        // ── marketing profile detection (used in record drawer)
+        marketingFields(meta) {
+          const a = meta?.attributes || {};
+          const has = k => k in a;
+          if (!(has('brand') || has('channel') || has('campaign') || has('ctr') || has('roas'))) return null;
+          return {
+            brand: a.brand, channel: a.channel, campaign: a.campaign,
+            adset: a.adset, ad: a.ad, creative: a.creative,
+            ctr: a.ctr, roas: a.roas, cpc: a.cpc, cpm: a.cpm, conversions: a.conversions,
+          };
+        },
+        marketingProfileGrid() {
+          const m = this.marketingFields(this.recordDrawer.parsed);
+          if (!m) return [];
+          // Order: identity first, then KPIs
+          const labels = [
+            ['brand', 'Brand'], ['channel', 'Channel'], ['campaign', 'Campaign'],
+            ['adset', 'Ad set'], ['ad', 'Ad'], ['creative', 'Creative'],
+            ['ctr', 'CTR'], ['roas', 'ROAS'], ['cpc', 'CPC'],
+            ['cpm', 'CPM'], ['conversions', 'Conv.'],
+          ];
+          return labels.filter(([k]) => m[k] !== undefined && m[k] !== '').map(([k, lbl]) => ({ label: lbl, value: m[k] }));
+        },
+        async loadNamespaces() {
+          try {
+            const d = await this.api('GET', '/v1/namespaces');
+            const detailed = [];
+            for (const name of d.namespaces) {
+              try {
+                const stats = await this.api('GET', `/v1/namespaces/${encodeURIComponent(name)}/stats`);
+                detailed.push({ name, dim: stats.dim, modalities: stats.modalities, records: stats.records ?? null });
+              } catch { detailed.push({ name, dim: null, modalities: [], records: null }); }
+            }
+            this.namespaces = detailed;
+          } catch (e) { this.toast(`Namespace list failed: ${e.message}`, 'error'); }
+        },
+        filteredNamespaces() {
+          if (!this.nsFilter) return this.namespaces;
+          const q = this.nsFilter.toLowerCase();
+          return this.namespaces.filter(n => n.name.toLowerCase().includes(q));
+        },
+
+        // ── create namespace
+        async createNamespace() {
+          const name = (this.newNsModal.name || '').trim();
+          if (!name) return;
+          if (!/^[A-Za-z0-9_\-]+$/.test(name)) { this.toast('Invalid name.', 'error'); return; }
+          try {
+            await this.api('POST', '/v1/namespaces', { name });
+            this.newNsModal.open = false;
+            this.toast(`Created '${name}'.`);
+            await this.loadNamespaces(); await this.loadOverview();
+            this.openNamespace(name);
+          } catch (e) { this.toast(`Create failed: ${e.message}`, 'error'); }
+        },
+
+        // ── namespace detail
+        async openNamespace(name, tab) {
+          // Guard: empty name → bail and route to list (don't leave the user stranded
+          // on ns_detail view with an empty ns.name, which made every API call 404).
+          name = (name || '').trim();
+          if (!name) {
+            this.toast('No namespace selected.', 'error');
+            await this.loadNamespaces();
+            this.view = 'namespaces';
+            return;
+          }
+          // Try stats FIRST; only switch view if it succeeds. If it fails, the user
+          // stays on the namespaces list with a clear error toast.
+          try {
+            const stats = await this.api('GET', `/v1/namespaces/${encodeURIComponent(name)}/stats`);
+            // FIRST: set the flat top-level name. All API calls below read this.
+            this.activeNs      = name;
+            this.ns.name       = name;
+            this.ns.dim        = stats.dim;
+            this.ns.modalities = stats.modalities;
+            this.ns.records    = stats.records ?? 0;
+            console.info('[feather] openNamespace ok:', name, 'records=', stats.records);
+            this.nsTab = tab || 'records';
+            this.records = []; this.recordsAfter = 0; this.recordsHasMore = false;
+            this.search.results = []; this.context.result = null;
+            this.search.attrFilters = []; this.search.newAttrKey = ''; this.search.newAttrVal = '';
+            this.console.response = '';
+            this.console.method = 'GET';
+            this.console.path = `/v1/${name}/records?limit=5`;
+            this.console.body = '';
+            this.graph.nsFilter = ''; this.graph.nodes = []; this.graph.links = [];
+            this.schema.loading = false; this.schema.loaded = false; this.schema.data = null;
+            this.hierarchy.loading = false; this.hierarchy.loaded = false; this.hierarchy.data = null;
+            this.view = 'ns_detail';
+            await this.loadRecords(true);
+          } catch (e) {
+            this.toast(`Open '${name}' failed: ${e.message}`, 'error');
+            await this.loadNamespaces();
+            this.view = 'namespaces';
+          }
+        },
+        async setNsTab(t) {
+          this.nsTab = t;
+          if (t === 'graph' && this.graph.nodes.length === 0) await this.loadGraph();
+          if (t === 'schema' && !this.schema.loaded) await this.loadSchema();
+          if (t === 'hierarchy' && !this.hierarchy.loaded) await this.loadHierarchy();
+        },
+
+        // ── schema discovery
+        async loadSchema() {
+          this.schema.loading = true;
+          try {
+            const d = await this.api('GET', `/v1/${encodeURIComponent(this.activeNs)}/schema`);
+            this.schema.data = d;
+            this.schema.loaded = true;
+          } catch (e) { this.toast(`Schema scan failed: ${e.message}`, 'error'); }
+          finally { this.schema.loading = false; }
+        },
+        addAttrFilter() {
+          const k = (this.search.newAttrKey || '').trim();
+          const v = (this.search.newAttrVal || '').trim();
+          if (!k || !v) return;
+          this.search.attrFilters.push({ key: k, value: v });
+          this.search.newAttrKey = ''; this.search.newAttrVal = '';
+        },
+        addFilterFromSchema(k, v) {
+          if (!k) return;
+          this.search.attrFilters.push({ key: k, value: String(v ?? '') });
+          this.setNsTab('search');
+        },
+
+        // ── delete namespace
+        confirmDeleteNs() {
+          this.confirmDlg = {
+            open: true,
+            title: 'Delete namespace',
+            body: `Hard-delete "${this.ns.name}"? This removes the .feather + WAL files from disk. Cannot be undone.`,
+            cta: 'Delete', requireText: this.ns.name, input: '',
+            execute: async () => {
+              try {
+                await this.api('DELETE', `/v1/namespaces/${encodeURIComponent(this.activeNs)}`);
+                this.toast(`Deleted ${this.ns.name}.`);
+                this.confirmDlg.open = false;
+                this.navigate('namespaces');
+                await this.loadNamespaces(); await this.loadOverview();
+              } catch (e) { this.toast(`Delete failed: ${e.message}`, 'error'); this.confirmDlg.open = false; }
+            }
+          };
+        },
+        async loadRecords(reset=false) {
+          if (reset) { this.records = []; this.recordsAfter = 0; }
+          this.loadingRecords = true;
+          try {
+            const d = await this.api('GET', `/v1/${encodeURIComponent(this.activeNs)}/records?limit=200&after=${this.recordsAfter}`);
+            this.records = [...this.records, ...d.results];
+            this.recordsAfter = d.next_cursor;
+            this.recordsHasMore = d.has_more;
+          } catch (e) { this.toast(`Records failed: ${e.message}`, 'error'); }
+          finally { this.loadingRecords = false; }
+        },
+        async loadMoreRecords() { await this.loadRecords(false); },
+
+        async openRecord(id) {
+          try {
+            const d = await this.api('GET', `/v1/${encodeURIComponent(this.activeNs)}/records/${id}`);
+            this.recordDrawer.id = id;
+            this.recordDrawer.body = JSON.stringify(d, null, 2);
+            this.recordDrawer.parsed = d;
+            this.recordDrawer.tab = 'metadata';
+            try {
+              const e = await this.api('GET', `/v1/${encodeURIComponent(this.activeNs)}/records/${id}/edges`);
+              this.recordDrawer.outgoing = e.outgoing || [];
+              this.recordDrawer.incoming = e.incoming || [];
+            } catch { this.recordDrawer.outgoing = []; this.recordDrawer.incoming = []; }
+            this.recordDrawer.newEdge = { target: 0, rel: 'related_to' };
+            this.recordDrawer.editMode = false;
+            this.recordDrawer.open = true;
+          } catch (e) { this.toast(`Get failed: ${e.message}`, 'error'); }
+        },
+        toggleEditRecord() {
+          if (!this.recordDrawer.editMode) {
+            // populate edit form from current body
+            try {
+              const m = JSON.parse(this.recordDrawer.body || '{}');
+              const attrs = m.attributes || {};
+              this.recordDrawer.edit = {
+                content: m.content || '',
+                importance: typeof m.importance === 'number' ? m.importance : 1.0,
+                attrs: Object.entries(attrs).filter(([k]) => !k.startsWith('_')).map(([k,v]) => `${k}=${v}`).join('\n'),
+              };
+            } catch { this.recordDrawer.edit = { content: '', importance: 1.0, attrs: '' }; }
+          }
+          this.recordDrawer.editMode = !this.recordDrawer.editMode;
+        },
+        async submitEditRecord() {
+          let current;
+          try { current = JSON.parse(this.recordDrawer.body || '{}'); }
+          catch { return this.toast('Cannot parse current record.', 'error'); }
+          // merge: keep existing fields, override content + importance + attrs
+          const newAttrs = {};
+          // preserve internal markers like _deleted, _forgotten if present
+          for (const [k, v] of Object.entries(current.attributes || {})) {
+            if (k.startsWith('_')) newAttrs[k] = v;
+          }
+          for (const line of (this.recordDrawer.edit.attrs || '').split('\n')) {
+            const eq = line.indexOf('=');
+            if (eq < 0) continue;
+            const k = line.slice(0, eq).trim();
+            const v = line.slice(eq + 1).trim();
+            if (k) newAttrs[k] = v;
+          }
+          const meta = {
+            timestamp: current.timestamp || 0,
+            importance: this.recordDrawer.edit.importance,
+            type: current.type ?? 0,
+            source: current.source || '',
+            content: this.recordDrawer.edit.content,
+            tags_json: current.tags_json || '',
+            namespace_id: current.namespace_id || '',
+            entity_id: current.entity_id || '',
+            attributes: newAttrs,
+          };
+          try {
+            await this.api('PUT', `/v1/${encodeURIComponent(this.activeNs)}/records/${this.recordDrawer.id}`, { metadata: meta });
+            this.toast(`Updated ${this.recordDrawer.id}.`);
+            this.recordDrawer.editMode = false;
+            // refresh drawer + table
+            this.openRecord(this.recordDrawer.id);
+            this.loadRecords(true);
+          } catch (e) { this.toast(`Update failed: ${e.message}`, 'error'); }
+        },
+
+        async deleteRecord(id) {
+          if (!confirm(`Delete record ${id}?`)) return;
+          try {
+            await this.api('DELETE', `/v1/${encodeURIComponent(this.activeNs)}/records/${id}`);
+            this.records = this.records.filter(r => r.id !== id);
+            this.toast(`Deleted ${id}.`);
+          } catch (e) { this.toast(`Delete failed: ${e.message}`, 'error'); }
+        },
+        async addEdge() {
+          const t = this.recordDrawer.newEdge.target | 0;
+          const rel = (this.recordDrawer.newEdge.rel || '').trim();
+          if (!t || !rel) { this.toast('Need target id + rel_type', 'error'); return; }
+          try {
+            await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/records/${this.recordDrawer.id}/link`, { to_id: t });
+            this.toast(`Linked ${this.recordDrawer.id} → ${t}`);
+            this.recordDrawer.newEdge = { target: 0, rel: 'related_to' };
+            // refresh edges
+            const e = await this.api('GET', `/v1/${encodeURIComponent(this.activeNs)}/records/${this.recordDrawer.id}/edges`);
+            this.recordDrawer.outgoing = e.outgoing || [];
+            this.recordDrawer.incoming = e.incoming || [];
+          } catch (e) { this.toast(`Link failed: ${e.message}`, 'error'); }
+        },
+
+        confirmPurgeAll() {
+          this.confirmDlg = {
+            open: true,
+            title: 'Purge namespace',
+            body: `This will hard-delete ALL records in "${this.ns.name}" whose namespace_id matches. This cannot be undone.`,
+            cta: 'Purge', requireText: this.ns.name, input: '',
+            execute: async () => {
+              try {
+                await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/purge`, { namespace_id: this.activeNs });
+                this.toast(`Purged ${this.ns.name}.`); this.confirmDlg.open = false;
+                this.openNamespace(this.ns.name);
+              } catch (e) { this.toast(`Purge failed: ${e.message}`, 'error'); this.confirmDlg.open = false; }
+            }
+          };
+        },
+        async compactNs() { try { const d = await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/compact`); this.toast(`Compacted. Reclaimed ${d.reclaimed}.`); } catch (e) { this.toast(`Compact failed: ${e.message}`, 'error'); } },
+
+        // ── add record
+        async submitAddRecord() {
+          const c = this.addRecModal.content.trim();
+          if (!c) return;
+          const dim = this.ns.dim || 768;
+          const id = Math.floor(Math.random() * 1e15) + 1;
+          const vec = this.deterministicVec(id, dim);
+          try {
+            await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/vectors`, {
+              id, vector: vec, modality: 'text',
+              metadata: {
+                content: c,
+                namespace_id: this.addRecModal.ns_id || this.ns.name,
+                entity_id: this.addRecModal.entity_id || '',
+              }
+            });
+            this.addRecModal.open = false;
+            this.toast(`Added record ${id}.`);
+            await this.loadRecords(true);
+            await this.loadOverview();
+          } catch (e) { this.toast(`Add failed: ${e.message}`, 'error'); }
+        },
+
+        // ── seed
+        async submitSeed() {
+          if (!this.seedModal.count || !this.seedModal.ns_id) return;
+          try {
+            const d = await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/seed`, {
+              count: this.seedModal.count,
+              namespace_id: this.seedModal.ns_id,
+              content_template: this.seedModal.template || 'seed record {i}',
+              base_id: 0, seed: 42,
+            });
+            this.seedModal.open = false;
+            this.toast(`Seeded ${d.inserted} records.`);
+            await this.loadRecords(true);
+            await this.loadOverview();
+          } catch (e) { this.toast(`Seed failed: ${e.message}`, 'error'); }
+        },
+
+        // ── search
+        deterministicVec(seed, dim) {
+          let s = (seed >>> 0) || 1;
+          const out = new Array(dim);
+          for (let i = 0; i < dim; i++) {
+            s |= 0; s = s + 0x6D2B79F5 | 0;
+            let t = Math.imul(s ^ s >>> 15, 1 | s);
+            t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+            out[i] = ((t ^ t >>> 14) >>> 0) / 4294967296;
+          }
+          return out;
+        },
+        async runSearch() {
+          const dim = this.ns.dim || 768;
+          const vec = this.deterministicVec(this.search.seed | 0, dim);
+          const body = { vector: vec, k: this.search.k };
+          if (this.search.filter_ns) body.namespace_id = this.search.filter_ns;
+          if (this.search.attrFilters.length) {
+            body.attributes_match = {};
+            for (const f of this.search.attrFilters) body.attributes_match[f.key] = f.value;
+          }
+          let path = `/v1/${encodeURIComponent(this.activeNs)}/search`;
+          if (this.search.mode === 'hybrid') { path = `/v1/${encodeURIComponent(this.activeNs)}/hybrid_search`; body.query = this.search.query || ''; }
+          try { const d = await this.api('POST', path, body); this.search.results = d.results || []; this.toast(`${this.search.results.length} results.`); }
+          catch (e) { this.toast(`Search failed: ${e.message}`, 'error'); }
+        },
+
+        // ── context chain
+        async runContextChain() {
+          const dim = this.ns.dim || 768;
+          const vec = this.deterministicVec(this.context.seed | 0, dim);
+          try {
+            const d = await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/context_chain`, {
+              vector: vec, k: this.context.k, hops: this.context.hops, modality: 'text',
+            });
+            this.context.result = d;
+            this.toast(`${d.nodes.length} nodes, ${d.edges.length} edges.`);
+          } catch (e) { this.toast(`Context chain failed: ${e.message}`, 'error'); }
+        },
+
+        // ── graph
+        async loadGraph() {
+          try {
+            const path = `/v1/${encodeURIComponent(this.activeNs)}/graph` + (this.graph.nsFilter ? `?ns_filter=${encodeURIComponent(this.graph.nsFilter)}` : '');
+            const d = await this.api('GET', path);
+            this.graph.nodes = d.nodes || [];
+            this.graph.links = (d.links || d.edges || []).map(l => ({ source: l.source ?? l.source_id, target: l.target ?? l.target_id, rel_type: l.rel_type, weight: l.weight }));
+            await this.$nextTick();
+            this.renderGraph();
+          } catch (e) { this.toast(`Graph load failed: ${e.message}`, 'error'); }
+        },
+        renderGraph() {
+          const el = document.getElementById('graph-canvas');
+          if (!el) return;
+          el.innerHTML = '';
+          const w = el.clientWidth, h = el.clientHeight;
+          const svg = d3.select(el).append('svg').attr('class', 'graph').attr('width', w).attr('height', h).attr('viewBox', [0, 0, w, h]);
+          const link = svg.append('g').selectAll('line').data(this.graph.links).join('line').attr('class', 'link').attr('stroke-width', d => Math.max(1, (d.weight || 0.5) * 2));
+          const node = svg.append('g').selectAll('g').data(this.graph.nodes).join('g').attr('class', 'node')
+            .call(d3.drag()
+              .on('start', (event, d) => { if (!event.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+              .on('drag',  (event, d) => { d.fx = event.x; d.fy = event.y; })
+              .on('end',   (event, d) => { if (!event.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
+          node.append('circle').attr('r', 6).attr('fill', '#7ab800')
+              .on('click', (e, d) => this.openRecord(d.id));
+          node.append('title').text(d => `id=${d.id}  ${d.namespace_id || ''}`);
+          node.append('text').attr('dx', 10).attr('dy', 4).text(d => d.id);
+          const sim = d3.forceSimulation(this.graph.nodes)
+            .force('link', d3.forceLink(this.graph.links).id(d => d.id).distance(60))
+            .force('charge', d3.forceManyBody().strength(-180))
+            .force('center', d3.forceCenter(w/2, h/2));
+          sim.on('tick', () => {
+            link.attr('x1', d => d.source.x).attr('y1', d => d.source.y).attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+            node.attr('transform', d => `translate(${d.x},${d.y})`);
+          });
+        },
+
+        async runConsole() {
+          const path = this.console.path || '/health';
+          let body = undefined;
+          if (this.console.method !== 'GET' && this.console.body.trim()) {
+            try { body = JSON.parse(this.console.body); } catch (e) { this.toast('Body must be valid JSON.', 'error'); return; }
+          }
+          try { const d = await this.api(this.console.method, path, body); this.console.response = JSON.stringify(d, null, 2); }
+          catch (e) { this.console.response = e.message; this.toast(e.message, 'error'); }
+        },
+
+        // ── command palette
+        paletteItems() {
+          const q = (this.palette.query || '').trim();
+          if (!q) {
+            // top suggestions
+            return [
+              ...this.namespaces.slice(0, 5).map(n => ({ kind: 'namespace', label: n.name, icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-4 h-4"><ellipse cx="12" cy="5" rx="9" ry="3"/></svg>', go: () => this.openNamespace(n.name) })),
+              { kind: 'action', label: 'Create namespace', icon: '+', go: () => { this.palette.open = false; this.newNsModal.open = true; this.newNsModal.name = ''; } },
+              { kind: 'action', label: 'Open Overview',    icon: '📊', go: () => { this.palette.open = false; this.navigate('overview'); } },
+            ];
+          }
+          if (q.startsWith('id:') && this.view === 'ns_detail') {
+            const id = q.slice(3).trim();
+            return [{ kind: 'record', label: `Open record ${id}`, icon: '#', go: () => { this.palette.open = false; this.openRecord(parseInt(id)); } }];
+          }
+          if (q.startsWith('ns:')) {
+            const term = q.slice(3).toLowerCase();
+            return this.namespaces.filter(n => n.name.toLowerCase().includes(term)).map(n => ({ kind: 'namespace', label: n.name, icon: '🗂', go: () => { this.palette.open = false; this.openNamespace(n.name); } }));
+          }
+          if (q.startsWith('/')) {
+            const term = q.slice(1).toLowerCase();
+            const actions = [
+              { kind: 'action', label: 'New namespace', test: 'new namespace create', go: () => { this.palette.open = false; this.newNsModal.open = true; this.newNsModal.name = ''; } },
+              { kind: 'action', label: 'Bulk seed (in current ns)', test: 'seed bulk', go: () => { if (this.view !== 'ns_detail') return this.toast('Open a namespace first.', 'error'); this.palette.open = false; this.seedModal.open = true; this.seedModal.ns_id = this.ns.name; } },
+              { kind: 'action', label: 'Add record (in current ns)', test: 'add record', go: () => { if (this.view !== 'ns_detail') return this.toast('Open a namespace first.', 'error'); this.palette.open = false; this.addRecModal.open = true; this.addRecModal.ns_id = this.ns.name; } },
+              { kind: 'action', label: 'Run context chain', test: 'context chain', go: () => { if (this.view !== 'ns_detail') return this.toast('Open a namespace first.', 'error'); this.palette.open = false; this.setNsTab('context'); } },
+              { kind: 'action', label: 'View graph', test: 'graph', go: () => { if (this.view !== 'ns_detail') return this.toast('Open a namespace first.', 'error'); this.palette.open = false; this.setNsTab('graph'); } },
+            ];
+            return actions.filter(a => !term || a.test.includes(term));
+          }
+          // default: namespace name search
+          const term = q.toLowerCase();
+          return this.namespaces.filter(n => n.name.toLowerCase().includes(term)).slice(0, 8).map(n => ({ kind: 'namespace', label: n.name, icon: '🗂', go: () => { this.palette.open = false; this.openNamespace(n.name); } }));
+        },
+        paletteEnter() {
+          const items = this.paletteItems();
+          const it = items[this.palette.idx];
+          if (it && it.go) it.go();
+        },
+      };
+    }
+  </script>
+</body>
+</html>

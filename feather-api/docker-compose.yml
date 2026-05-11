@@ -23,23 +23,6 @@ services:
       retries: 3
       start_period: 15s
 
-  feather-dashboard:
-    build:
-      context: ..
-      dockerfile: feather-api/Dockerfile.dashboard
-    image: feather-db-dashboard:0.9.0
-    ports:
-      - "7863:7863"
-    environment:
-      FEATHER_API_BASE: "http://feather-api:8000"
-      FEATHER_API_KEY: "${FEATHER_API_KEY:-feather-9ad2c644da0d76a253b9326bd4d15d16}"
-      FEATHER_NS: "demo"
-      FEATHER_DIM: "768"
-      DASHBOARD_PORT: "7863"
-    depends_on:
-      - feather-api
-    restart: unless-stopped
-
 volumes:
   feather-data:
     driver: local

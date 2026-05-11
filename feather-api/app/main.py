@@ -24,24 +24,40 @@ If FEATHER_API_KEY is unset, auth is disabled (dev mode).
 import os
 import time
 import logging
+import pathlib
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
-from fastapi.responses import JSONResponse
-import gradio as gr
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 import feather_db
 from feather_db import Metadata, ContextType, ScoringConfig
 from feather_db.core import SearchFilter
 
 from .db_manager import DBManager
+from .metrics import METRICS, classify, namespace_from_path
+from .embedding import EMBEDDING
 from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
     KeywordSearchRequest, HybridSearchRequest,
     LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest, PurgeRequest,
-    MetadataOut, NamespaceStats, HealthResponse,
+    MetadataOut, NamespaceStats, HealthResponse, AdminOverview,
+    SeedRequest, ContextChainRequest, EdgesResponse, EdgeOut, IncomingEdgeOut,
+    ContextChainNode, ContextChainEdge, ContextChainResponse,
+    CreateNamespaceRequest, NamespaceSchema, SchemaAttribute,
+    TopRecalledItem, OpsTimeseriesResponse, OpsTimeseriesPoint,
+    ConnectionInfo, EmbeddingConfig, EmbeddingConfigUpdate,
+    ImportRequest, ImportResponse, IngestTextRequest,
+    HierarchyNode, HierarchyResponse,
 )
+import numpy as np
+import json
+import random
+
+
+_PROCESS_START = time.time()
 
 # ─────────────────────────────────────────────
 # Logging
@@ -71,13 +87,60 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    dt = (time.perf_counter() - t0) * 1000
+    path = request.url.path
+    if path.startswith("/admin") or path.startswith("/static"):
+        return response          # don't count static asset hits
+    METRICS.record(
+        op=classify(request.method, path),
+        latency_ms=dt,
+        namespace=namespace_from_path(path),
+        status=response.status_code,
+    )
+    return response
+
 # ─────────────────────────────────────────────
-# Mount Gradio dashboard at /dashboard
+# Mount Atlas-style admin SPA at /admin (static).
+# Custom route for /admin/ serves index.html with no-cache headers so a fresh
+# deploy is always picked up by the browser (was: aggressive caching of old JS
+# left users stuck on stale state after a deploy).
+# /dashboard redirects to /admin so old links keep working.
 # ─────────────────────────────────────────────
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-from dashboard import app as _dashboard_blocks
-app = gr.mount_gradio_app(app, _dashboard_blocks, path="/dashboard")
+from fastapi.responses import FileResponse
+
+_STATIC_DIR = pathlib.Path(__file__).parent.parent / "static" / "admin"
+_INDEX_HTML = _STATIC_DIR / "index.html"
+
+@app.get("/admin", include_in_schema=False)
+@app.get("/admin/", include_in_schema=False)
+def _admin_index():
+    if not _INDEX_HTML.is_file():
+        raise HTTPException(404, "admin SPA not deployed")
+    return FileResponse(
+        str(_INDEX_HTML),
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+if _STATIC_DIR.is_dir():
+    # any other static subpath (we don't have any today, but safe to keep)
+    app.mount("/admin/static", StaticFiles(directory=str(_STATIC_DIR)), name="admin_static")
+else:
+    logger.warning("admin static dir not found at %s", _STATIC_DIR)
+
+@app.get("/dashboard", include_in_schema=False)
+@app.get("/dashboard/", include_in_schema=False)
+def _dashboard_redirect():
+    return RedirectResponse(url="/admin/", status_code=308)
+
+@app.get("/", include_in_schema=False)
+def _root():
+    return RedirectResponse(url="/admin/", status_code=308)
 
 # ─────────────────────────────────────────────
 # Auth middleware
@@ -172,6 +235,40 @@ def list_namespaces():
     return {"namespaces": manager.list_namespaces()}
 
 
+@app.post("/v1/namespaces", status_code=201, tags=["meta"],
+          dependencies=[Depends(verify_api_key)])
+def create_namespace(req: CreateNamespaceRequest):
+    """Create an empty namespace (a new .feather file on disk)."""
+    db = manager.get(req.name)
+    db.save()
+    return {"name": req.name, "dim": db.dim(), "created": True}
+
+
+@app.delete("/v1/namespaces/{namespace}", tags=["meta"],
+            dependencies=[Depends(verify_api_key)])
+def delete_namespace(namespace: str):
+    """Hard-delete a namespace. Drops in-memory state + removes .feather + .wal from disk."""
+    if namespace not in manager.list_namespaces():
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    removed = manager.delete(namespace)
+    return {"namespace": namespace, "deleted": bool(removed)}
+
+
+def _live_record_count(db) -> int:
+    """Walk metadata, skipping soft-deleted ones."""
+    n = 0
+    for record_id in db.get_all_ids(modality="text"):
+        meta = db.get_metadata(record_id)
+        if meta is None:
+            continue
+        if meta.source == "_forgotten":
+            continue
+        if meta.get_attribute("_deleted") == "true":
+            continue
+        n += 1
+    return n
+
+
 @app.get("/v1/namespaces/{namespace}/stats", response_model=NamespaceStats,
          tags=["meta"], dependencies=[Depends(verify_api_key)])
 def namespace_stats(namespace: str):
@@ -183,7 +280,35 @@ def namespace_stats(namespace: str):
         namespace  = namespace,
         db_path    = f"{namespace}.feather",
         dim        = db.dim(),
-        modalities = ["text"],   # future: expose per-modality info
+        modalities = ["text"],
+        records    = _live_record_count(db),
+    )
+
+
+@app.get("/v1/admin/overview", response_model=AdminOverview,
+         tags=["meta"], dependencies=[Depends(verify_api_key)])
+def admin_overview():
+    """Aggregate stats for the dashboard overview screen."""
+    items = []
+    total = 0
+    for name in manager.list_namespaces():
+        try:
+            db = manager.get(name, create=False)
+            n = _live_record_count(db)
+            total += n
+            items.append({"name": name, "dim": db.dim(),
+                          "modalities": ["text"], "records": n})
+        except Exception:
+            continue
+    items.sort(key=lambda x: x["records"], reverse=True)
+
+    return AdminOverview(
+        version       = feather_db.__version__,
+        uptime        = int(time.time() - _PROCESS_START),
+        dim           = int(os.getenv("FEATHER_DB_DIM", "768")),
+        nsCount       = len(items),
+        totalRecords  = total,
+        topNamespaces = items[:10],
     )
 
 
@@ -413,3 +538,401 @@ def save_namespace(namespace: str):
     except Exception as e:
         raise HTTPException(500, str(e))
     return {"namespace": namespace, "saved": True}
+
+
+# ─────────────────────────────────────────────
+# Bulk seeder — generates N records with random vectors
+# ─────────────────────────────────────────────
+@app.post("/v1/{namespace}/seed", tags=["admin"], dependencies=[Depends(verify_api_key)])
+def seed_namespace(namespace: str, req: SeedRequest):
+    db = manager.get(namespace)
+    rng = np.random.default_rng(req.seed)
+    dim = db.dim()
+    ns_tag = req.namespace_id or namespace
+
+    inserted = []
+    with manager.lock(namespace):
+        for i in range(req.count):
+            # Cap random IDs at 2^53 - 1 so the dashboard (JavaScript) can address
+            # them precisely. Larger IDs lose precision on round-trip and can't be
+            # individually viewed/deleted.
+            rec_id = (req.base_id + i + 1) if req.base_id else int(rng.integers(1, 2**53))
+            meta = Metadata()
+            meta.timestamp    = int(time.time())
+            meta.importance   = 1.0
+            meta.type         = ContextType.FACT
+            meta.namespace_id = ns_tag
+            meta.entity_id    = f"seed_{rec_id}"
+            meta.content      = req.content_template.replace("{i}", str(i + 1))
+            vec = rng.random(dim).astype(np.float32)
+            db.add(id=rec_id, vec=vec, meta=meta, modality="text")
+            inserted.append(rec_id)
+        db.save()
+    return {"namespace": namespace, "inserted": len(inserted),
+            "first_id": inserted[0] if inserted else None,
+            "last_id":  inserted[-1] if inserted else None}
+
+
+# ─────────────────────────────────────────────
+# Edges — read outgoing + incoming for a record
+# ─────────────────────────────────────────────
+@app.get("/v1/{namespace}/records/{record_id}/edges",
+         response_model=EdgesResponse, tags=["graph"],
+         dependencies=[Depends(verify_api_key)])
+def get_record_edges(namespace: str, record_id: int):
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    out = [EdgeOut(target_id=e.target_id, rel_type=e.rel_type, weight=e.weight)
+           for e in db.get_edges(record_id)]
+    inc = [IncomingEdgeOut(source_id=e.source_id, rel_type=e.rel_type, weight=e.weight)
+           for e in db.get_incoming(record_id)]
+    return EdgesResponse(id=record_id, outgoing=out, incoming=inc)
+
+
+# ─────────────────────────────────────────────
+# Context chain — vector search + BFS expansion
+# ─────────────────────────────────────────────
+@app.post("/v1/{namespace}/context_chain", response_model=ContextChainResponse,
+          tags=["graph"], dependencies=[Depends(verify_api_key)])
+def context_chain(namespace: str, req: ContextChainRequest):
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    if req.vector is not None:
+        vec = np.asarray(req.vector, dtype=np.float32)
+    else:
+        rng = np.random.default_rng(req.seed)
+        vec = rng.random(db.dim()).astype(np.float32)
+
+    result = db.context_chain(q=vec, k=req.k, hops=req.hops, modality=req.modality)
+    nodes = [ContextChainNode(
+                id=n.id, score=float(n.score), hop_distance=int(n.hop),
+                metadata=_meta_to_model(n.metadata) if n.metadata else None)
+             for n in result.nodes]
+    edges = [ContextChainEdge(
+                source_id=e.source_id, target_id=e.target_id,
+                rel_type=e.rel_type, weight=float(e.weight))
+             for e in result.edges]
+    return ContextChainResponse(nodes=nodes, edges=edges)
+
+
+# ─────────────────────────────────────────────
+# Graph export — D3-friendly nodes + links JSON
+# ─────────────────────────────────────────────
+@app.get("/v1/{namespace}/graph", tags=["graph"],
+         dependencies=[Depends(verify_api_key)])
+def export_graph(namespace: str, ns_filter: str = "", entity_filter: str = ""):
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    raw = db.export_graph_json(ns_filter, entity_filter)
+    try:
+        return json.loads(raw)
+    except Exception:
+        raise HTTPException(500, "graph export returned invalid JSON")
+
+
+# ─────────────────────────────────────────────
+# Admin metrics + activity feed
+# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Schema discovery — distinct attribute keys + value frequencies
+# ─────────────────────────────────────────────
+@app.get("/v1/{namespace}/schema", response_model=NamespaceSchema, tags=["meta"],
+         dependencies=[Depends(verify_api_key)])
+def namespace_schema(namespace: str, sample_limit: int = 8):
+    """Walk live records, tally attributes + value samples + type inference."""
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    from collections import Counter, defaultdict
+    attr_count: Counter = Counter()
+    attr_values: dict = defaultdict(set)
+    namespace_ids: Counter = Counter()
+    entity_ids: list = []
+    sources: Counter = Counter()
+    n = 0
+    for record_id in db.get_all_ids(modality="text"):
+        meta = db.get_metadata(record_id)
+        if meta is None:
+            continue
+        if meta.source == "_forgotten":
+            continue
+        if meta.get_attribute("_deleted") == "true":
+            continue
+        n += 1
+        if meta.namespace_id:
+            namespace_ids[meta.namespace_id] += 1
+        if meta.entity_id and len(entity_ids) < 20:
+            entity_ids.append(meta.entity_id)
+        if meta.source:
+            sources[meta.source] += 1
+        for k, v in dict(meta.attributes).items():
+            if k.startswith("_"):
+                continue
+            attr_count[k] += 1
+            if len(attr_values[k]) < 64:
+                attr_values[k].add(v)
+
+    def infer(values: set) -> str:
+        types = set()
+        for v in list(values)[:32]:
+            if isinstance(v, bool): types.add("bool"); continue
+            try: int(v); types.add("int"); continue
+            except (TypeError, ValueError): pass
+            try: float(v); types.add("float"); continue
+            except (TypeError, ValueError): pass
+            if v in ("true", "false", "True", "False"):
+                types.add("bool"); continue
+            types.add("str")
+        if len(types) == 1:
+            return next(iter(types))
+        return "mixed" if types else "str"
+
+    attrs = []
+    for k, c in attr_count.most_common():
+        vals = list(attr_values[k])
+        attrs.append(SchemaAttribute(
+            key=k, count=c, distinct=len(vals),
+            sample_values=sorted(map(str, vals))[:sample_limit],
+            type=infer(vals),
+        ))
+
+    return NamespaceSchema(
+        namespace=namespace,
+        record_count=n,
+        attributes=attrs,
+        namespace_ids=[k for k, _ in namespace_ids.most_common(20)],
+        entity_ids_sample=entity_ids,
+        sources=[k for k, _ in sources.most_common(10)],
+    )
+
+
+@app.get("/v1/admin/metrics", tags=["meta"], dependencies=[Depends(verify_api_key)])
+def admin_metrics(window: int = 3600):
+    return METRICS.snapshot(since_seconds=float(window))
+
+
+@app.get("/v1/admin/activity", tags=["meta"], dependencies=[Depends(verify_api_key)])
+def admin_activity(limit: int = 50):
+    return {"events": METRICS.activity(limit=limit)}
+
+
+# ─────────────────────────────────────────────
+# v0.10.0 — Hawky edition: monitoring, connection info, hierarchy, embedding, import
+# ─────────────────────────────────────────────
+@app.get("/v1/admin/ops_timeseries", response_model=OpsTimeseriesResponse,
+         tags=["meta"], dependencies=[Depends(verify_api_key)])
+def ops_timeseries(window: int = 3600, bucket_seconds: int = 60):
+    pts = METRICS.bucketed(bucket_seconds=bucket_seconds, since_seconds=float(window))
+    return OpsTimeseriesResponse(
+        bucketSeconds=bucket_seconds,
+        points=[OpsTimeseriesPoint(**p) for p in pts],
+    )
+
+
+@app.get("/v1/{namespace}/top_recalled", response_model=List[TopRecalledItem],
+         tags=["meta"], dependencies=[Depends(verify_api_key)])
+def top_recalled(namespace: str, limit: int = 10):
+    """Records sorted by recall_count desc — what's actually being used."""
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    rows = []
+    for record_id in db.get_all_ids(modality="text"):
+        meta = db.get_metadata(record_id)
+        if meta is None or meta.source == "_forgotten":
+            continue
+        if meta.get_attribute("_deleted") == "true":
+            continue
+        rows.append(TopRecalledItem(
+            id=record_id,
+            recall_count=int(meta.recall_count),
+            last_recalled_at=int(meta.last_recalled_at),
+            importance=float(meta.importance),
+            content=(meta.content or "")[:200],
+            namespace_id=meta.namespace_id or "",
+        ))
+    rows.sort(key=lambda r: (-r.recall_count, -r.last_recalled_at))
+    return rows[:limit]
+
+
+@app.get("/v1/admin/connection_info", response_model=ConnectionInfo,
+         tags=["meta"], dependencies=[Depends(verify_api_key)])
+def connection_info(request: Request):
+    """Returns the canonical API base URL + ready-to-paste code samples."""
+    base = str(request.base_url).rstrip("/")
+    key_placeholder = "<YOUR_API_KEY>"
+    sample_curl = (
+        f'curl -X POST "{base}/v1/my_brand/search" \\\n'
+        f'  -H "X-API-Key: {key_placeholder}" -H "Content-Type: application/json" \\\n'
+        f'  -d \'{{"vector":[/* {EMBEDDING.snapshot()["dim"]} floats */],"k":10}}\''
+    )
+    sample_python = (
+        "import requests\n"
+        f'r = requests.post("{base}/v1/my_brand/search",\n'
+        f'                  headers={{"X-API-Key": "{key_placeholder}"}},\n'
+        '                  json={"vector": [...], "k": 10})\n'
+        "print(r.json())"
+    )
+    sample_js = (
+        f"await fetch('{base}/v1/my_brand/search', {{\n"
+        "  method: 'POST',\n"
+        f"  headers: {{ 'X-API-Key': '{key_placeholder}', 'Content-Type': 'application/json' }},\n"
+        "  body: JSON.stringify({ vector: [/* floats */], k: 10 }),\n"
+        "}}).then(r => r.json())"
+    )
+    return ConnectionInfo(
+        base_url=base,
+        api_key_header="X-API-Key",
+        sample_curl=sample_curl,
+        sample_python=sample_python,
+        sample_javascript=sample_js,
+        docs_url=f"{base}/docs",
+    )
+
+
+@app.get("/v1/admin/embedding_config", response_model=EmbeddingConfig,
+         tags=["meta"], dependencies=[Depends(verify_api_key)])
+def embedding_config_get():
+    return EmbeddingConfig(**EMBEDDING.snapshot())
+
+
+@app.put("/v1/admin/embedding_config", response_model=EmbeddingConfig,
+         tags=["meta"], dependencies=[Depends(verify_api_key)])
+def embedding_config_put(req: EmbeddingConfigUpdate):
+    snap = EMBEDDING.update(provider=req.provider, model=req.model,
+                            base_url=req.base_url, api_key=req.api_key, dim=req.dim)
+    return EmbeddingConfig(**snap)
+
+
+@app.post("/v1/{namespace}/ingest_text", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+def ingest_text(namespace: str, req: IngestTextRequest):
+    """Embed `text` via the configured provider, then ingest as a new record."""
+    try:
+        vec = EMBEDDING.embed(req.text)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+
+    db = manager.get(namespace)
+    rec_id = int(np.random.default_rng().integers(1, 2**53))   # JS-safe id
+    meta = _meta_from_model(req.metadata) if req.metadata else Metadata()
+    if not meta.namespace_id:
+        meta.namespace_id = namespace
+    meta.content = meta.content or req.text
+    if not meta.timestamp:
+        meta.timestamp = int(time.time())
+
+    with manager.lock(namespace):
+        db.add(id=rec_id, vec=np.asarray(vec, dtype=np.float32),
+               meta=meta, modality=req.modality)
+        db.save()
+    return {"id": rec_id, "namespace": namespace, "embedded": True, "dim": len(vec)}
+
+
+@app.post("/v1/{namespace}/import", response_model=ImportResponse, tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+def bulk_import(namespace: str, req: ImportRequest):
+    """Bulk insert N records {id, vector, metadata}. Vectors must match namespace dim."""
+    db = manager.get(namespace)
+    expected_dim = db.dim()
+    inserted = 0
+    skipped = 0
+    errors: List[str] = []
+    with manager.lock(namespace):
+        for i, item in enumerate(req.items):
+            try:
+                rec_id = int(item["id"])
+                vec = item["vector"]
+                if len(vec) != expected_dim:
+                    raise ValueError(f"dim mismatch: got {len(vec)}, expected {expected_dim}")
+                meta_data = item.get("metadata") or {}
+                meta = Metadata()
+                meta.timestamp    = int(meta_data.get("timestamp") or time.time())
+                meta.importance   = float(meta_data.get("importance", 1.0))
+                meta.type         = ContextType(int(meta_data.get("type", 0)))
+                meta.source       = str(meta_data.get("source", ""))
+                meta.content      = str(meta_data.get("content", ""))
+                meta.tags_json    = str(meta_data.get("tags_json", ""))
+                meta.namespace_id = str(meta_data.get("namespace_id", namespace))
+                meta.entity_id    = str(meta_data.get("entity_id", ""))
+                for k, v in (meta_data.get("attributes") or {}).items():
+                    meta.set_attribute(str(k), str(v))
+                db.add(id=rec_id, vec=np.asarray(vec, dtype=np.float32),
+                       meta=meta, modality=req.modality)
+                inserted += 1
+            except Exception as e:
+                skipped += 1
+                if len(errors) < 20:
+                    errors.append(f"item {i}: {e}")
+        db.save()
+    return ImportResponse(namespace=namespace, inserted=inserted,
+                          skipped=skipped, errors=errors)
+
+
+@app.get("/v1/{namespace}/hierarchy", response_model=HierarchyResponse,
+         tags=["meta"], dependencies=[Depends(verify_api_key)])
+def namespace_hierarchy(namespace: str):
+    """Build a Brand → Channel → Campaign → AdSet → Ad → Creative tree
+    from record metadata.attributes. Walks live records once, groups by levels.
+    """
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    LEVELS = ["brand", "channel", "campaign", "adset", "ad", "creative"]
+    counts: dict = {}    # tuple of values -> record_count
+    for record_id in db.get_all_ids(modality="text"):
+        meta = db.get_metadata(record_id)
+        if meta is None or meta.source == "_forgotten":
+            continue
+        if meta.get_attribute("_deleted") == "true":
+            continue
+        path = []
+        for lvl in LEVELS:
+            v = meta.get_attribute(lvl, "")
+            if not v:
+                break
+            path.append((lvl, v))
+        if not path:
+            # fallback to namespace_id as brand
+            if meta.namespace_id:
+                path = [("brand", meta.namespace_id)]
+            else:
+                continue
+        for depth in range(1, len(path) + 1):
+            key = tuple(path[:depth])
+            counts[key] = counts.get(key, 0) + 1
+
+    def build(prefix: tuple, depth: int) -> List[HierarchyNode]:
+        children: dict = {}   # name -> count
+        for key, c in counts.items():
+            if len(key) == depth + 1 and key[:depth] == prefix:
+                children[key[depth][1]] = c
+        nodes = []
+        for name, c in sorted(children.items(), key=lambda kv: -kv[1]):
+            new_prefix = prefix + ((LEVELS[depth], name),)
+            level_name = LEVELS[depth] if depth < len(LEVELS) else "leaf"
+            nodes.append(HierarchyNode(
+                level=level_name,
+                name=name,
+                record_count=c,
+                children=build(new_prefix, depth + 1),
+            ))
+        return nodes
+
+    return HierarchyResponse(
+        namespace=namespace,
+        levels=LEVELS,
+        root=build((), 0),
+    )

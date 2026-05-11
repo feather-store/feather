@@ -81,3 +81,29 @@ class DBManager:
     def save(self, namespace: str):
         if namespace in self._dbs:
             self._dbs[namespace].save()
+
+    def delete(self, namespace: str) -> bool:
+        """Hard-delete a namespace: drop in-memory state + remove .feather and WAL.
+        Returns True if anything was removed.
+        """
+        with self._global_lock:
+            removed = False
+            if namespace in self._dbs:
+                # Trigger destructor flush, then drop the reference so the file
+                # isn't reopened from a stale handle.
+                try:
+                    self._dbs[namespace].save()
+                except Exception:
+                    pass
+                del self._dbs[namespace]
+                self._locks.pop(namespace, None)
+                removed = True
+            path = self._namespace_path(namespace)
+            for p in (path, path + ".wal", path + ".tmp"):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                        removed = True
+                    except Exception:
+                        pass
+            return removed

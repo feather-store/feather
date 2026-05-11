@@ -41,3 +41,38 @@ examples/
 # Temporary
 *.tmp
 *.log
+
+# Local virtualenvs and dev caches (CRITICAL — repro_venv is multi-GB of dylibs)
+repro_venv/
+venv/
+.venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local datasets, benchmarks, recordings, generated artifacts
+real_data/
+benchmarks/
+bench/
+results/
+hf-space/
+Testing/
+units/
+docs/
+*.html
+*.mp4
+*.mov
+*.csv
+*.parquet
+*.wal
+*.dylib
+*.dSYM
+*.zip
+*.tar
+*.tar.gz
+
+# Other top-level dev artifacts
+node_modules/
+*.ipynb
+.ipynb_checkpoints/
