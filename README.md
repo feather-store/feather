@@ -20,6 +20,34 @@ Feather DB is an embedded vector database and living context engine — zero-ser
 
 ---
 
+## What's New in v0.10 — Feather DB Cloud Edition
+
+The `feather-api/` package now ships a **production-ready admin SPA** + a
+**pluggable embedding service**, so you can run Feather as a managed context
+engine for downstream consumers (e.g. brand teams, agents, internal tools).
+
+| Capability | Where | Notes |
+|---|---|---|
+| **Atlas-style admin SPA** | `/admin/` route on the FastAPI server | Custom HTML + Tailwind + Alpine.js, brand-aligned, zero build step |
+| **Pluggable embeddings** | Settings → Embedding service | OpenAI · Azure OpenAI · Gemini · Voyage · Cohere · Ollama with curated model dropdowns |
+| **Ingest text** | `POST /v1/{ns}/ingest_text` | Server embeds via the configured provider, then stores — single call |
+| **Bulk import** | `POST /v1/{ns}/import` | Paste a JSON array of `{id, vector, metadata}` |
+| **Hierarchy navigator** | Namespace detail → Hierarchy tab | Brand → Channel → Campaign → AdSet → Ad → Creative tree from `metadata.attributes` |
+| **Marketing profile card** | Record drawer | Auto-renders KPIs (CTR, ROAS, channel) when present |
+| **Cmd-K palette** | Press ⌘K / Ctrl+K | Fuzzy search namespaces · `id:123` to open a record · `/seed`, `/import` actions |
+| **Live observability** | Overview screen | p50 / p95 / p99 latency, ops-per-minute sparkline, recent activity feed |
+| **Delete + purge + compact** | Namespace header buttons | Per-record DELETE, bulk PURGE by `namespace_id`, COMPACT to reclaim |
+| **Schema discovery** | Namespace detail → Schema tab | Distinct attribute keys + type inference + sample values |
+| **Connection panel** | Settings → Connection | Copy-paste cURL / Python / JS snippets pre-filled with your URL |
+
+See [docs/quickstart.md](docs/quickstart.md) for a self-hosted setup walkthrough.
+
+> **Deployment note**: `feather-api/` runs single-tenant with one shared
+> `FEATHER_API_KEY`. Multi-tenant key isolation + HTTPS are on the roadmap
+> for v0.11.
+
+---
+
 ## What's Inside
 
 | Capability | Description |

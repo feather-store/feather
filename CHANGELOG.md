@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.0] — 2026-05-12
+
+### Added — Feather DB Cloud Edition
+
+This release replaces the legacy Gradio dashboard with a custom, brand-aligned
+admin SPA and adds the connective tissue needed to run Feather as a managed
+context engine for brand customers.
+
+#### `feather-api/static/admin/` — Atlas-style admin SPA
+- New single-page admin UI mounted at **`/admin/`** (HTML + Tailwind via CDN +
+  Alpine.js + D3, ~2k LOC, zero build step). Served by FastAPI with
+  `Cache-Control: no-cache` so each deploy is picked up without manual refresh.
+- **Overview screen** — 4 record-count tiles + 4 ops/latency tiles + ops-per-minute
+  sparkline + recent-activity feed.
+- **Namespaces list** with create-namespace modal.
+- **Namespace detail** with 7 tabs: Records · Search · Schema · Hierarchy ·
+  Graph · Context · Console.
+- **Record drawer** with Metadata + Edges tabs, add-edge form, edit-record form.
+- **Marketing profile card** — when a record has marketing-shaped attributes
+  (`brand`, `channel`, `campaign`, `ctr`, `roas`), render as a KPI card.
+- **Cmd-K command palette** — fuzzy search namespaces, jump to record by id,
+  trigger actions.
+- **Settings** — connection info (cURL / Python / JS snippets), embedding service
+  config, API key management.
+- Removed Gradio dashboard (~1300 LOC).
+- Brand-aligned per the Feather DB brand book: paper `#fcfaf7` surfaces,
+  Geist + Geist Mono + Playfair Display italic type, lime as gesture only,
+  ink-black primary CTAs, canonical hawk-feather logo.
+
+#### `feather-api/app/embedding.py` — pluggable embedding service
+- **Six providers** with curated model dropdowns:
+  - OpenAI (text-embedding-3-small/large, ada-002)
+  - Azure OpenAI (endpoint + deployment + api_version fields)
+  - Google AI / Gemini (gemini-embedding-001, exp, legacy)
+  - Voyage (voyage-3, voyage-3-lite, voyage-large-2, voyage-code-2)
+  - Cohere (embed-english-v3, multilingual-v3, light-v3)
+  - Ollama (nomic-embed-text, mxbai-embed-large, all-minilm)
+- Stored in-memory; API key never echoed back. Padding/truncation to namespace
+  dim if a different-dim model is configured.
+- New endpoints: `GET/PUT /v1/admin/embedding_config`,
+  `GET /v1/admin/embedding_models`.
+- **`POST /v1/{ns}/ingest_text`** — server-side embed + store in one call.
+
+#### `feather-api/app/metrics.py` — in-memory observability
+- Ring-buffer for HTTP ops (default 2000 events).
+- Snapshot endpoint with p50/p95/p99 latency.
+- Bucketed time-series for sparkline rendering.
+- HTTP middleware records every `/v1/*` request.
+
+#### New backend endpoints
+- `POST   /v1/namespaces` — create empty namespace
+- `DELETE /v1/namespaces/{ns}` — hard-delete namespace (.feather + WAL)
+- `GET    /v1/{ns}/schema` — distinct attribute keys + samples
+- `GET    /v1/{ns}/hierarchy` — Brand → … → Creative tree from attributes
+- `GET    /v1/{ns}/top_recalled` — records sorted by `recall_count`
+- `GET    /v1/{ns}/graph` — D3-shaped nodes + links
+- `POST   /v1/{ns}/context_chain` — vector search + BFS expansion
+- `POST   /v1/{ns}/purge` — bulk hard-delete by `metadata.namespace_id`
+- `POST   /v1/{ns}/compact` — rebuild HNSW dropping soft-deleted records
+- `POST   /v1/{ns}/seed` — bulk-insert N random records (test seeding)
+- `POST   /v1/{ns}/import` — bulk import inline `{id, vector, metadata}`
+- `POST   /v1/{ns}/ingest_text` — embed + store via configured provider
+- `GET    /v1/{ns}/records/{id}/edges` — outgoing + incoming edges
+- `GET    /v1/admin/{overview,metrics,activity,ops_timeseries,connection_info}`
+
+#### Bug fixes
+- **Delete persistence (C++ `save_vectors`)** — `forget()` and `purge()` now
+  properly skip records in the persisted file. Previously, forgotten vectors
+  resurrected on save+reload as orphans.
+- **Big-int id precision** — dashboard preserves >2^53 record ids as strings
+  through JSON parse so view/delete works on huge ids. Seeded ids capped at
+  2^53 - 1 going forward.
+- **Gemini default model** — switched to `gemini-embedding-001`
+  (Google deprecated `text-embedding-004`).
+
+#### Removed
+- `feather-api/dashboard.py` (Gradio).
+- `feather-api/Dockerfile.dashboard`.
+- `feather-dashboard` service from `docker-compose.yml`.
+
+---
+
 ## [0.9.0] — 2026-04-29
 
 ### Added — Agentic Context Engine (Phase 9.1)

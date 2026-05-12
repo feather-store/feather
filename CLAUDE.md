@@ -17,7 +17,20 @@
 - Graph visualizer — self-contained D3 force-graph HTML, fully offline
 - Single file persistence (`.feather` binary format, v5; v3/v4 files load transparently)
 
-**Version:** `0.5.0` (Context Graph + Living Context Engine)
+**Version:** `0.10.10` (Cloud Edition — admin SPA + pluggable embeddings)
+
+> **What changed since this doc was first written (v0.5.0 era):** the
+> `feather-api/` package was rewritten in v0.10. The Gradio dashboard is gone;
+> a custom HTML/Tailwind/Alpine.js SPA at `/admin/` replaces it. A pluggable
+> embedding service supports OpenAI / Azure OpenAI / Gemini / Voyage / Cohere
+> / Ollama. New modules: `app/embedding.py`, `app/metrics.py`. New endpoints:
+> create/delete namespace, schema discovery, hierarchy, top-recalled, graph
+> export, context_chain, purge, compact, ingest_text, import, ops_timeseries,
+> connection_info, embedding_config. The C++ `save_vectors()` was fixed so
+> `forget()`/`purge()` survive save+reload. Phase 9.1 Agentic Context Engine
+> (FactExtractor, EntityResolver, OntologyLinker, ContradictionResolver,
+> FeedbackLog, IngestPipeline, hierarchy module) shipped in v0.9.0 — see
+> `feather_db.extractors`, `.feedback`, `.hierarchy`, `.pipelines`, `.reason`.
 
 ---
 
@@ -54,11 +67,15 @@ feather/
 │   ├── src/main.rs          # CLI entry point
 │   ├── src/lib.rs           # CLI command implementations
 │   ├── build.rs             # Rust build script (links C++ core)
-│   └── Cargo.toml           # Rust package manifest (v0.5.0)
-├── feather-api/             # FastAPI Cloud wrapper
-│   ├── app/main.py          # FastAPI app
-│   ├── app/db_manager.py    # DB lifecycle management
-│   ├── app/models.py        # Pydantic models
+│   └── Cargo.toml           # Rust package manifest (v0.10.10)
+├── feather-api/             # FastAPI Cloud wrapper (v0.10 rewrite)
+│   ├── app/main.py          # FastAPI app + all /v1/* routes
+│   ├── app/db_manager.py    # DB lifecycle management + delete()
+│   ├── app/models.py        # Pydantic request/response models
+│   ├── app/embedding.py     # Pluggable embeddings (OpenAI/Azure/Gemini/Voyage/Cohere/Ollama)
+│   ├── app/metrics.py       # In-memory ring buffer for ops + latency
+│   ├── static/admin/        # Atlas-style admin SPA (mounted at /admin/)
+│   │   └── index.html       # Single-page app (Tailwind + Alpine.js + D3, no build step)
 │   ├── Dockerfile           # Multi-stage Docker build
 │   └── docker-compose.yml   # Local compose stack
 ├── examples/                # Working Python usage examples
@@ -70,7 +87,7 @@ feather/
 ├── real_data/               # Real dataset files (not committed)
 ├── p-test/                  # Rust CLI integration tests
 ├── setup.py                 # Python build (compiles C++ extension)
-├── pyproject.toml           # PEP 517 metadata (version: 0.5.0)
+├── pyproject.toml           # PEP 517 metadata (version: 0.10.10)
 ├── MANIFEST.in              # Source distribution manifest
 └── CHANGELOG.md             # Version history
 ```
@@ -230,7 +247,7 @@ final_score     = ((1 - time_weight) * similarity + time_weight * recency) * imp
 
 ### Install
 ```bash
-pip install feather-db  # v0.5.0 on PyPI
+pip install feather-db  # v0.10.10 on PyPI
 # or from source:
 python setup.py build_ext --inplace
 ```
@@ -344,7 +361,7 @@ data = export_graph(db, namespace_filter="nike")  # Python dict
 
 ## 6. Rust CLI (`feather-db-cli`)
 
-**Crate on Crates.io:** `feather-db-cli` v0.5.0
+**Crate on Crates.io:** `feather-db-cli` v0.10.10
 
 ```bash
 feather add    --db my.feather --id 1 --vec "0.1,0.2,0.3" --modality text
