@@ -38,7 +38,7 @@ from feather_db.core import SearchFilter
 
 from .db_manager import DBManager
 from .metrics import METRICS, classify, namespace_from_path
-from .embedding import EMBEDDING
+from .embedding import EMBEDDING, SUPPORTED_MODELS
 from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
     KeywordSearchRequest, HybridSearchRequest,
@@ -254,6 +254,67 @@ def delete_namespace(namespace: str):
     return {"namespace": namespace, "deleted": bool(removed)}
 
 
+def _is_dead_record(db, rec_id: int) -> bool:
+    """True if a record is missing, forgotten, or soft-deleted."""
+    meta = db.get_metadata(rec_id)
+    if meta is None:
+        return True
+    if meta.source == "_forgotten":
+        return True
+    if meta.get_attribute("_deleted") == "true":
+        return True
+    return False
+
+
+def _prune_edges_to(db, dead_id: int) -> int:
+    """Cascade: remove every edge in every record that points to `dead_id`.
+    Called whenever a record is deleted so graph state stays consistent.
+    Returns the number of edges removed.
+    """
+    removed = 0
+    for rec_id in db.get_all_ids(modality="text"):
+        if rec_id == dead_id:
+            continue
+        meta = db.get_metadata(rec_id)
+        if meta is None:
+            continue
+        current = list(meta.edges)
+        kept    = [e for e in current if e.target_id != dead_id]
+        if len(kept) != len(current):
+            meta.edges = kept
+            db.update_metadata(rec_id, meta)
+            removed += len(current) - len(kept)
+    return removed
+
+
+def _prune_dead_edges(db) -> int:
+    """Sweep every record's edges and drop ones pointing at deleted / forgotten /
+    missing records. Returns the number of dead edges removed.
+    """
+    all_ids = set(db.get_all_ids(modality="text"))
+    # cache liveness so we don't re-fetch metadata per edge
+    live: dict[int, bool] = {}
+    def is_live(rid: int) -> bool:
+        if rid in live:
+            return live[rid]
+        live[rid] = (rid in all_ids) and not _is_dead_record(db, rid)
+        return live[rid]
+    removed = 0
+    for rec_id in all_ids:
+        if not is_live(rec_id):
+            continue
+        meta = db.get_metadata(rec_id)
+        if meta is None:
+            continue
+        current = list(meta.edges)
+        kept    = [e for e in current if is_live(e.target_id)]
+        if len(kept) != len(current):
+            meta.edges = kept
+            db.update_metadata(rec_id, meta)
+            removed += len(current) - len(kept)
+    return removed
+
+
 def _live_record_count(db) -> int:
     """Walk metadata, skipping soft-deleted ones."""
     n = 0
@@ -423,8 +484,36 @@ def delete_record(namespace: str, record_id: int):
 
     with manager.lock(namespace):
         db.forget(record_id)
+        # Cascade: drop any edges pointing at this id so the graph isn't left
+        # with dangling pointers to a deleted record. Set ?cascade=false to opt
+        # out (rare; mostly for bulk-delete sequences that compact afterwards).
+        edges_pruned = _prune_edges_to(db, record_id)
         db.save()
-    return {"id": record_id, "deleted": True}
+    return {"id": record_id, "deleted": True, "edges_pruned": edges_pruned}
+
+
+@app.delete("/v1/{namespace}/records/{from_id}/link/{to_id}", tags=["records"],
+            dependencies=[Depends(verify_api_key)])
+def unlink_records(namespace: str, from_id: int, to_id: int):
+    """Remove a single edge from `from_id` to `to_id`. Returns the number of
+    edges removed (0 if the edge didn't exist, 1+ if multiple rel_types matched).
+    """
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    meta = db.get_metadata(from_id)
+    if meta is None:
+        raise HTTPException(404, f"Record {from_id} not found")
+    current = list(meta.edges)
+    kept    = [e for e in current if e.target_id != to_id]
+    removed = len(current) - len(kept)
+    if removed > 0:
+        with manager.lock(namespace):
+            meta.edges = kept
+            db.update_metadata(from_id, meta)
+            db.save()
+    return {"from_id": from_id, "to_id": to_id, "removed": removed}
 
 
 @app.post("/v1/{namespace}/purge", tags=["records"],
@@ -446,19 +535,24 @@ def purge_namespace(namespace: str, req: PurgeRequest):
 
 @app.post("/v1/{namespace}/compact", tags=["records"],
           dependencies=[Depends(verify_api_key)])
-def compact_namespace(namespace: str):
+def compact_namespace(namespace: str, prune_dead_edges: bool = True):
     """Rebuild HNSW indices, physically dropping any soft-deleted records.
-    Returns the number of records reclaimed.
+    By default also sweeps every record's outgoing edges and drops those that
+    point at a deleted / forgotten / missing record (set `?prune_dead_edges=false`
+    to skip). Returns counts for both reclamations.
     """
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
+    edges_pruned = 0
     with manager.lock(namespace):
         reclaimed = db.compact()
+        if prune_dead_edges:
+            edges_pruned = _prune_dead_edges(db)
         db.save()
-    return {"namespace": namespace, "reclaimed": reclaimed}
+    return {"namespace": namespace, "reclaimed": reclaimed, "edges_pruned": edges_pruned}
 
 
 @app.get("/v1/{namespace}/records", tags=["records"],
@@ -809,9 +903,19 @@ def embedding_config_get():
 @app.put("/v1/admin/embedding_config", response_model=EmbeddingConfig,
          tags=["meta"], dependencies=[Depends(verify_api_key)])
 def embedding_config_put(req: EmbeddingConfigUpdate):
-    snap = EMBEDDING.update(provider=req.provider, model=req.model,
-                            base_url=req.base_url, api_key=req.api_key, dim=req.dim)
+    snap = EMBEDDING.update(
+        provider=req.provider, model=req.model, base_url=req.base_url,
+        deployment=req.deployment, api_version=req.api_version,
+        api_key=req.api_key, dim=req.dim,
+    )
     return EmbeddingConfig(**snap)
+
+
+@app.get("/v1/admin/embedding_models", tags=["meta"],
+         dependencies=[Depends(verify_api_key)])
+def embedding_models():
+    """Per-provider curated model lists for the dashboard dropdown."""
+    return SUPPORTED_MODELS
 
 
 @app.post("/v1/{namespace}/ingest_text", tags=["records"],
