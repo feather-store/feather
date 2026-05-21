@@ -1,7 +1,11 @@
 """
-Feather DB Azure — Comprehensive Full-Stack Test
+Feather DB — Comprehensive Full-Stack Test
 =================================================
-Tests the live Azure deployment at http://20.219.140.90:8000
+Tests a running Feather DB API server.
+
+Configure via environment variables before running:
+  export FEATHER_BASE_URL="http://your-host:8000"
+  export FEATHER_API_KEY="your-api-key"
 
 What this does:
   1. Health + namespace check
@@ -30,8 +34,8 @@ from datetime import datetime
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
-BASE     = "http://20.219.140.90:8000"
-API_KEY  = "feather-9ad2c644da0d76a253b9326bd4d15d16"
+BASE     = os.environ.get("FEATHER_BASE_URL", "http://localhost:8000")
+API_KEY  = os.environ.get("FEATHER_API_KEY", "")
 NS_TEXT  = "test_text"
 NS_IMAGE = "test_images"
 NS_VIDEO = "test_video"

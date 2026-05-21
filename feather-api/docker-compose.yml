@@ -13,7 +13,9 @@ services:
     environment:
       FEATHER_DATA_DIR: /data
       FEATHER_DB_DIM: "768"
-      FEATHER_API_KEY: "${FEATHER_API_KEY:-feather-9ad2c644da0d76a253b9326bd4d15d16}"
+      # REQUIRED — set FEATHER_API_KEY in your environment or a .env file.
+      # If unset the API starts in dev mode (no auth). Never commit a real key.
+      FEATHER_API_KEY: "${FEATHER_API_KEY:-}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",

@@ -1,7 +1,7 @@
 # Feather DB Azure — Comprehensive Test Report
 
 **Generated:** 2026-04-05 15:08:48
-**Endpoint:** http://20.219.140.90:8000
+**Endpoint:** _(redacted — internal deployment)_
 **Total runtime:** 1214.4s
 
 ## Summary
