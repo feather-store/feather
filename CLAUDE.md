@@ -15,9 +15,20 @@
 - Adaptive Decay / Living Context — frequently accessed items resist temporal decay
 - Namespace + Entity + Attributes — generic partition + subject + KV metadata for any domain
 - Graph visualizer — self-contained D3 force-graph HTML, fully offline
-- Single file persistence (`.feather` binary format, v5; v3/v4 files load transparently)
+- Single file persistence (`.feather` binary format, v7, optional int8 compression; v3–v6 files load transparently)
 
-**Version:** `0.10.10` (Cloud Edition — admin SPA + pluggable embeddings)
+**Version:** `0.12.0` (Phase 7 — query performance & on-disk compression)
+
+> **Phase 7 (v0.11–v0.12) additions** — see `include/feather.h`:
+> - **Secondary metadata indexes** (`ns_index_`/`entity_index_`/`attr_index_`):
+>   O(matches) lookups via `ids_in_namespace`/`ids_for_entity`/`ids_with_attribute`/
+>   `namespace_size`/`list_namespaces`. Rebuilt on load, maintained on mutation.
+> - **Pre-filtered ANN search**: `search()` ranks exactly over the indexed
+>   candidate set for namespace/entity/attribute filters → complete top-k.
+> - **Incremental auto-compaction**: `set_auto_compact(ratio)`; `compact()` now
+>   reclaims forgotten records and is orphan-safe (won't resurrect purged ids).
+> - **On-disk int8 quantization**: `set_quantized(modality)` → file format v7,
+>   ~3× smaller `.feather`, dequantized to float32 on load (RAM index unchanged).
 
 > **What changed since this doc was first written (v0.5.0 era):** the
 > `feather-api/` package was rewritten in v0.10. The Gradio dashboard is gone;
@@ -67,7 +78,7 @@ feather/
 │   ├── src/main.rs          # CLI entry point
 │   ├── src/lib.rs           # CLI command implementations
 │   ├── build.rs             # Rust build script (links C++ core)
-│   └── Cargo.toml           # Rust package manifest (v0.10.10)
+│   └── Cargo.toml           # Rust package manifest (v0.12.0)
 ├── feather-api/             # FastAPI Cloud wrapper (v0.10 rewrite)
 │   ├── app/main.py          # FastAPI app + all /v1/* routes
 │   ├── app/db_manager.py    # DB lifecycle management + delete()
@@ -87,7 +98,7 @@ feather/
 ├── real_data/               # Real dataset files (not committed)
 ├── p-test/                  # Rust CLI integration tests
 ├── setup.py                 # Python build (compiles C++ extension)
-├── pyproject.toml           # PEP 517 metadata (version: 0.10.10)
+├── pyproject.toml           # PEP 517 metadata (version: 0.12.0)
 ├── MANIFEST.in              # Source distribution manifest
 └── CHANGELOG.md             # Version history
 ```
@@ -127,7 +138,7 @@ private:
 ### 3.2 File Format (`.feather` binary v5)
 
 ```
-[magic: 4B = 0x46454154 "FEAT"] [version: 4B = 5]
+[magic: 4B = 0x46454154 "FEAT"] [version: 4B = 7]
 --- Metadata Section ---
 [meta_count: 4B]
   for each record:
@@ -147,12 +158,14 @@ private:
 [modal_count: 4B]
   for each modality:
     [name_len: 2B] [name: N bytes]
-    [dim: 4B] [element_count: 4B]
+    [dim: 4B] [quantized: 1B] [element_count: 4B]      # quantized flag added in v7
     for each element:
-      [id: 8B] [float32 vector: dim * 4 bytes]
+      [id: 8B] then, per `quantized`:
+        0 → [float32 vector: dim * 4 bytes]
+        1 → [scale: 4B float] [int8 vector: dim bytes]  # set_quantized() — ~3x smaller
 ```
 
-**Backward compatibility**: v3 and v4 files load transparently — missing fields default to empty via `if (is.read(...))` guards in `metadata.cpp`.
+**Backward compatibility**: v3–v6 files load transparently — the `quantized` flag is only read for v7+ (`if (version >= 7)`), and missing metadata fields default to empty via `if (is.read(...))` guards in `metadata.cpp`. int8 vectors are dequantized to float32 on load, so the in-memory HNSW index is identical regardless of on-disk format.
 
 ---
 
@@ -247,7 +260,7 @@ final_score     = ((1 - time_weight) * similarity + time_weight * recency) * imp
 
 ### Install
 ```bash
-pip install feather-db  # v0.10.10 on PyPI
+pip install feather-db  # v0.12.0 on PyPI
 # or from source:
 python setup.py build_ext --inplace
 ```
@@ -361,7 +374,7 @@ data = export_graph(db, namespace_filter="nike")  # Python dict
 
 ## 6. Rust CLI (`feather-db-cli`)
 
-**Crate on Crates.io:** `feather-db-cli` v0.10.10
+**Crate on Crates.io:** `feather-db-cli` v0.12.0
 
 ```bash
 feather add    --db my.feather --id 1 --vec "0.1,0.2,0.3" --modality text
@@ -474,11 +487,12 @@ When adding a new feature to Feather DB, touch these files **in order**:
 | Issue | Details |
 |-------|---------|
 | No concurrent writes | HNSW is not thread-safe for simultaneous `addPoint` calls |
-| No vector deletion | HNSW marks deletions but data stays |
+| Soft deletes reclaimed on compaction | `forget()`/`purge()` mark vectors deleted; space is reclaimed by `compact()` or `set_auto_compact(ratio)` (Phase 7) |
+| int8 quantization is on-disk only | `set_quantized()` shrinks the file & load I/O; the in-RAM HNSW index stays float32 |
 | `tags_json` is a raw string | Tag filtering uses substring search, not JSON parsing |
 | Max 1M vectors per modality | Hardcoded in `get_or_create_index` |
 | `meta.attributes['k'] = v` no-op | pybind11 map copy; use `set_attribute()` |
-| Load time for large attribute DBs | v4/v5 attribute map deserialization is O(n * attrs) |
+| Load time for large attribute DBs | v4/v5 attribute map deserialization is O(n * attrs); namespace/attribute *lookups* are O(matches) via secondary indexes (Phase 7) |
 | Rust CLI missing v0.5.0 features | namespace/entity/context_chain are Python-only for now |
 
 ---
@@ -509,4 +523,7 @@ cd p-test && ./run_tests.sh   # Rust CLI tests
 | Phase 4a | Done | Generic namespace/entity/attributes (v0.4.0) |
 | Phase 4b | Done | FastAPI + Docker cloud wrapper in `feather-api/` |
 | Phase 5 | Done | Typed edges, reverse index, auto_link, context_chain, D3 visualizer (v0.5.0) |
-| Phase 6 | Planned | SIMD tuning, parallel ingestion, load-time optimization |
+| Phase 6 | Done | LLM connectors, MCP, LangChain/LlamaIndex, ContextEngine (v0.6–v0.9) |
+| Cloud | Done | FastAPI admin SPA + pluggable embeddings (v0.10 Cloud Edition) |
+| Phase 7 | Done | Secondary metadata indexes, pre-filtered ANN, auto-compaction (v0.11.0), on-disk int8 quantization / format v7 (v0.12.0) |
+| Phase 8 | Planned | In-RAM int8 indexing, SIMD tuning, parallel ingestion |

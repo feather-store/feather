@@ -20,6 +20,33 @@ Feather DB is an embedded vector database and living context engine — zero-ser
 
 ---
 
+## What's New in v0.11–v0.12 — Query Performance & Compression (Phase 7)
+
+| Capability | Version | Notes |
+|---|---|---|
+| **Secondary metadata indexes** | v0.11.0 | Inverted indexes on `namespace_id` / `entity_id` / `attributes` — namespace & attribute lookups go from O(n) scans to **O(matches)**. New `DB` methods: `ids_in_namespace`, `ids_for_entity`, `ids_with_attribute`, `namespace_size`, `list_namespaces`. |
+| **Pre-filtered ANN search** | v0.11.0 | `search(filter=…)` with a `namespace`/`entity`/`attribute` constraint now ranks **exactly** over the indexed candidate set, returning a **complete top-k** instead of HNSW's `ef`-bounded under-return — and is O(matches), so selective filters are *faster*. |
+| **Incremental auto-compaction** | v0.11.0 | `set_auto_compact(ratio)` rebuilds a modality index once its deleted/total ratio crosses a threshold, reclaiming `forget()`/`purge()`'d vectors automatically. `compact()` also fixed to reclaim forgotten records and never resurrect purged ones. |
+| **On-disk int8 quantization** | v0.12.0 | `set_quantized(modality)` persists vectors as int8 + per-vector scale (**file format v7**) — **~2.5–4× smaller `.feather` files**, dequantized to float32 on load (search unchanged). |
+
+```python
+# Pre-filtered exact search — reliably returns a full k even under a selective filter
+f = FilterBuilder().namespace("acme").attribute("channel", "instagram").build()
+results = db.search(query_vec, k=10, filter=f)        # complete top-10, exact ranking
+
+# Auto-compaction — reclaim deleted vectors past 20% dead
+db.set_auto_compact(0.2)
+
+# int8 on-disk compression — ~3x smaller files, opt-in per modality
+db.set_quantized("text", True)
+db.save()                                             # persisted as int8 (format v7)
+```
+
+> **Scope note:** int8 quantization reduces **disk footprint and load I/O**; the
+> in-memory HNSW index remains float32. In-RAM int8 indexing is a future step.
+
+---
+
 ## What's New in v0.10 — Feather DB Cloud Edition
 
 The `feather-api/` package now ships a **production-ready admin SPA** + a
@@ -43,8 +70,7 @@ engine for downstream consumers (e.g. brand teams, agents, internal tools).
 See [docs/quickstart.md](docs/quickstart.md) for a self-hosted setup walkthrough.
 
 > **Deployment note**: `feather-api/` runs single-tenant with one shared
-> `FEATHER_API_KEY`. Multi-tenant key isolation + HTTPS are on the roadmap
-> for v0.11.
+> `FEATHER_API_KEY`. Multi-tenant key isolation + HTTPS are on the roadmap.
 
 ---
 
@@ -63,7 +89,7 @@ See [docs/quickstart.md](docs/quickstart.md) for a self-hosted setup walkthrough
 | **MCP Server** | `feather-serve` — connects Feather to Claude Desktop, Cursor, and any MCP client |
 | **LangChain / LlamaIndex** | Drop-in `FeatherVectorStore`, `FeatherMemory`, `FeatherRetriever` adapters |
 | **Self-Aligned Context Engine** | LLM-powered ingestion: auto-classifies, scores, links, and namespaces every record |
-| **Single-file persistence** | `.feather` binary format (v5); v3/v4 files load transparently |
+| **Single-file persistence** | `.feather` binary format (v7, optional int8 compression); v3–v6 files load transparently |
 
 ---
 
@@ -353,6 +379,11 @@ results = db.search(
 )
 ```
 
+When the filter constrains a `namespace`, `entity`, or `attribute`, Feather
+resolves the candidate set from its secondary indexes and ranks **exactly** over
+just those vectors — so a selective filter returns a **complete top-k** (no
+`ef`-bounded under-return) and runs in O(matches).
+
 ### Living Context / Adaptive Decay
 
 ```python
@@ -465,7 +496,7 @@ feather save   --db my.feather
 | Recall@10 (500K × 128-dim, ef=50, real SIFT) | **0.972** |
 | Max vectors per modality | 1,000,000 (configurable) |
 | HNSW params | M=16, ef_construction=200, ef=50 (default in v0.8.0) |
-| File format | Binary `.feather` v6 |
+| File format | Binary `.feather` v7 (optional per-modality int8 compression, ~3× smaller) |
 
 SIMD (AVX2/AVX512) optimizations are available in `space_l2.h`. Enable with `-DUSE_AVX -march=native` in `setup.py`.
 
@@ -519,24 +550,28 @@ Standard ANN benchmark. Full sweep results in [`bench/results/`](./bench/results
 
 ## Cloud Deployment (Azure / Docker)
 
-Feather DB ships with a production-ready FastAPI wrapper and Gradio management dashboard you can deploy on any Linux VM.
+Feather DB ships with a production-ready FastAPI wrapper and the **Atlas-style
+admin SPA** (custom HTML + Tailwind + Alpine.js — no build step) you can deploy
+on any Linux VM.
 
 ```bash
 git clone https://github.com/feather-store/feather.git
 cd feather
-export FEATHER_API_KEY="your-secret-key"
-docker compose -f feather-api/docker-compose.yml up -d --build
+FEATHER_API_KEY="feather-$(openssl rand -hex 16)" \
+  docker compose -f feather-api/docker-compose.yml up -d --build
 ```
 
 | URL | Description |
 |-----|-------------|
 | `http://<VM_IP>:8000/health` | Health check |
 | `http://<VM_IP>:8000/docs` | Swagger / OpenAPI |
-| `http://<VM_IP>:8000/dashboard` | Management Dashboard UI |
+| `http://<VM_IP>:8000/admin/` | Admin SPA — namespaces, search, graph, embedding settings |
 
-**Full Azure deployment guide → [`docs/deploy-azure.md`](docs/deploy-azure.md)**
+**Self-hosted walkthrough → [`docs/quickstart.md`](docs/quickstart.md)** ·
+**Azure guide → [`docs/deploy-azure.md`](docs/deploy-azure.md)**
 
-> Data is stored in a Docker named volume (`feather-data → /data`) and persists across restarts and rebuilds.
+> Data is stored in a Docker named volume (`feather-data → /data`) and persists
+> across restarts and rebuilds.
 
 ---
 
@@ -603,7 +638,7 @@ feather-db-cli (FFI via extern "C" from src/feather_core.cpp)
 ## File Format
 
 ```
-[magic: 4B = "FEAT"] [version: 4B = 5]
+[magic: 4B = "FEAT"] [version: 4B = 7]
 --- Metadata Section ---
 [meta_count: 4B]
   for each record:
@@ -612,12 +647,15 @@ feather-db-cli (FFI via extern "C" from src/feather_core.cpp)
 [modal_count: 4B]
   for each modality:
     [name_len: 2B] [name: N bytes]
-    [dim: 4B] [element_count: 4B]
+    [dim: 4B] [quantized: 1B] [element_count: 4B]
     for each element:
-      [id: 8B] [float32 vector: dim * 4 bytes]
+      [id: 8B] then, per `quantized`:
+        0 → [float32 vector: dim * 4 bytes]
+        1 → [scale: 4B float] [int8 vector: dim bytes]
 ```
 
-v3 and v4 files load transparently — missing fields default to empty.
+v3–v6 files load transparently (the `quantized` flag is only present in v7+);
+missing fields default to empty.
 
 ---
 
@@ -626,7 +664,8 @@ v3 and v4 files load transparently — missing fields default to empty.
 | Issue | Detail |
 |-------|--------|
 | No concurrent writes | HNSW is not thread-safe for simultaneous adds |
-| No vector deletion | HNSW marks deletions; data stays until compaction |
+| Soft deletes reclaimed on compaction | `forget()`/`purge()` mark vectors deleted; space is reclaimed by `compact()` or `set_auto_compact(ratio)` |
+| int8 quantization is on-disk only | Reduces file size & load I/O; the in-memory HNSW index stays float32 |
 | Max 1M vectors/modality | Hardcoded in `get_or_create_index`; increase `max_elements` to raise |
 | `meta.attributes['k'] = v` silent no-op | pybind11 map copy; use `meta.set_attribute(k, v)` |
 | Rust CLI missing v0.6.0+ features | namespace/entity/context_chain/integrations are Python-only |
