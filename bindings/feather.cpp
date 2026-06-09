@@ -238,10 +238,15 @@ PYBIND11_MODULE(core, m) {
            py::arg("scoring") = nullptr, py::arg("modality") = "text",
            "Hybrid search: BM25 + dense vector merged via Reciprocal Rank Fusion (RRF).")
 
-        // -- Compact (rebuild HNSW without soft-deleted records) --
+        // -- Compact (rebuild HNSW without dead records) --
         .def("compact", &feather::DB::compact,
-             "Rebuild HNSW indices removing soft-deleted (_deleted=true, importance=0) records. "
-             "Returns count of records removed.")
+             "Rebuild HNSW indices removing dead (forgotten/_deleted) records and "
+             "orphaned vectors. Returns count of records removed.")
+        .def("set_auto_compact", &feather::DB::set_auto_compact, py::arg("ratio"),
+             "Auto-rebuild a modality index when its deleted/total ratio crosses "
+             "`ratio` after forget/purge/expire. 0 disables (default).")
+        .def("get_auto_compact", &feather::DB::get_auto_compact,
+             "Current auto-compaction threshold (0 = disabled).")
 
         // -- Memory lifecycle --
         .def("forget",         &feather::DB::forget,         py::arg("id"),

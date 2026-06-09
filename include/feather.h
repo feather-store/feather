@@ -56,6 +56,12 @@ private:
     std::unordered_map<std::string, std::unordered_set<uint64_t>> entity_index_; // entity_id    → ids
     std::unordered_map<std::string, std::unordered_set<uint64_t>> attr_index_;   // "key\x1fval" → ids
 
+    // ── Auto-compaction ──────────────────────────────────────────────
+    // When a modality index's deleted/total ratio crosses this threshold after
+    // a forget/purge/expire, the index is rebuilt to reclaim the dead vectors.
+    // 0.0 disables it (default) — compaction stays manual via compact().
+    float auto_compact_ratio_ = 0.0f;
+
     // ── BM25 Inverted Index ──────────────────────────────────────────
     struct PostingEntry { uint64_t doc_id; uint32_t term_freq; };
     std::unordered_map<std::string, std::vector<PostingEntry>> bm25_index_;
@@ -182,6 +188,68 @@ private:
             result.swap(next);
         }
         return result;
+    }
+
+    // ── Compaction (lock-free core) ──────────────────────────────────
+    // Rebuild every modality index keeping only records that are present AND
+    // live in metadata_store_. This reclaims the space held by markDelete'd
+    // vectors (forget/expire) and orphaned index elements (purge erased their
+    // metadata but left the vector marked-deleted in the graph). Caller MUST
+    // hold mutex_. Returns the number of dead metadata records removed.
+    size_t compact_nolock() {
+        std::unordered_set<uint64_t> dead;
+        for (const auto& [id, meta] : metadata_store_)
+            if (is_dead_meta(meta)) dead.insert(id);
+
+        // Anything to reclaim? dead metadata, or index elements with no live
+        // metadata (purged). If neither, this is a no-op.
+        bool work = !dead.empty();
+        if (!work)
+            for (auto& [name, m_idx] : modality_indices_)
+                if (m_idx.index->getDeletedCount() > 0) { work = true; break; }
+        if (!work) return 0;
+
+        for (auto& [name, m_idx] : modality_indices_) {
+            size_t n = m_idx.index->cur_element_count;
+            std::vector<std::pair<uint64_t, std::vector<float>>> survivors;
+            survivors.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                uint64_t id = m_idx.index->getExternalLabel(i);
+                auto mit = metadata_store_.find(id);
+                if (mit == metadata_store_.end()) continue;  // purged / orphaned
+                if (is_dead_meta(mit->second))      continue;  // forgotten / _deleted
+                const float* data = reinterpret_cast<const float*>(
+                    m_idx.index->getDataByInternalId(i));
+                survivors.push_back({id, std::vector<float>(data, data + m_idx.dim)});
+            }
+            auto space     = std::make_unique<hnswlib::L2Space>(m_idx.dim);
+            auto new_index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+                space.get(), 1'000'000, 16, 200);
+            for (const auto& [id, vec] : survivors)
+                new_index->addPoint(vec.data(), id);
+            m_idx.index = std::move(new_index);
+            m_idx.space  = std::move(space);
+        }
+
+        for (uint64_t id : dead) metadata_store_.erase(id);
+        build_reverse_index();
+        build_secondary_indexes();
+        rebuild_bm25_index();
+        return dead.size();
+    }
+
+    // Caller holds mutex_. If any modality's deleted/total ratio has crossed the
+    // configured threshold, rebuild to reclaim the dead vectors. One compaction
+    // rebuilds every modality, so a single pass suffices.
+    void maybe_auto_compact_nolock() {
+        if (auto_compact_ratio_ <= 0.0f) return;
+        for (const auto& [name, m_idx] : modality_indices_) {
+            size_t total = m_idx.index->getCurrentElementCount();
+            if (total == 0) continue;
+            float ratio = static_cast<float>(m_idx.index->getDeletedCount())
+                        / static_cast<float>(total);
+            if (ratio >= auto_compact_ratio_) { compact_nolock(); return; }
+        }
     }
 
     static const std::unordered_set<std::string>& stop_words() {
@@ -1235,6 +1303,7 @@ public:
             it->second.importance = 0.0f;
             it->second.ttl        = 0;
         }
+        maybe_auto_compact_nolock();
     }
 
     // Hard-delete: remove all nodes in namespace_id from indices +
@@ -1280,6 +1349,7 @@ public:
                 meta.edges.end());
         }
 
+        maybe_auto_compact_nolock();
         return to_purge.size();
     }
 
@@ -1309,6 +1379,7 @@ public:
             }
             ++count;
         }
+        maybe_auto_compact_nolock();
         return count;
     }
 
@@ -1317,49 +1388,19 @@ public:
     // ─────────────────────────────────────────────────────────────────
     size_t compact() {
         std::lock_guard<std::mutex> lock(mutex_);
+        return compact_nolock();
+    }
 
-        // Collect IDs marked as soft-deleted (_deleted="true" + importance==0)
-        std::unordered_set<uint64_t> to_remove;
-        for (const auto& [id, meta] : metadata_store_) {
-            bool deleted_flag = false;
-            auto attr_it = meta.attributes.find("_deleted");
-            if (attr_it != meta.attributes.end() && attr_it->second == "true")
-                deleted_flag = true;
-            if (deleted_flag && meta.importance == 0.0f)
-                to_remove.insert(id);
-        }
-        if (to_remove.empty()) return 0;
-
-        // Rebuild each modality index without the deleted IDs
-        for (auto& [name, m_idx] : modality_indices_) {
-            size_t n = m_idx.index->cur_element_count;
-            std::vector<std::pair<uint64_t, std::vector<float>>> survivors;
-            survivors.reserve(n);
-            for (size_t i = 0; i < n; ++i) {
-                uint64_t id = m_idx.index->getExternalLabel(i);
-                if (to_remove.count(id)) continue;
-                const float* data = reinterpret_cast<const float*>(
-                    m_idx.index->getDataByInternalId(i));
-                survivors.push_back({id, std::vector<float>(data, data + m_idx.dim)});
-            }
-            auto space     = std::make_unique<hnswlib::L2Space>(m_idx.dim);
-            auto new_index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-                space.get(), 1'000'000, 16, 200);
-            for (const auto& [id, vec] : survivors)
-                new_index->addPoint(vec.data(), id);
-            m_idx.index = std::move(new_index);
-            m_idx.space  = std::move(space);
-        }
-
-        // Remove metadata
-        for (uint64_t id : to_remove) metadata_store_.erase(id);
-
-        // Rebuild derived structures
-        build_reverse_index();
-        build_secondary_indexes();
-        rebuild_bm25_index();
-
-        return to_remove.size();
+    // Configure auto-compaction. ratio in (0,1] triggers a rebuild of a modality
+    // index once its deleted/total ratio crosses `ratio` after a forget/purge/
+    // expire. 0 disables it. e.g. set_auto_compact(0.2) → rebuild at 20% dead.
+    void set_auto_compact(float ratio) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto_compact_ratio_ = ratio;
+    }
+    float get_auto_compact() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return auto_compact_ratio_;
     }
 
     // ─────────────────────────────────────────────────────────────────

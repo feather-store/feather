@@ -37,6 +37,22 @@ Phase 7 — query performance. New capabilities land additively under this line.
   faster. Non-indexed-only filters (source/importance/tags/time) keep the
   existing HNSW path. No API or file-format change.
 
+### Added — Incremental auto-compaction
+- `set_auto_compact(ratio)` / `get_auto_compact()` — when a modality index's
+  deleted/total ratio crosses `ratio` after a `forget`/`purge`/`forget_expired`,
+  the index is rebuilt to reclaim the dead vectors (HNSW only marks deletions;
+  space was previously reclaimed only via a manual `compact()`). `0` disables
+  it (default), so behaviour is unchanged unless opted in.
+
+### Fixed — compact()
+- `compact()` now reclaims **forgotten** records too (it previously only removed
+  `_deleted=true` records, so `forget()`'d vectors lingered in the index
+  forever). The dead definition is unified on `is_dead_meta()` across save,
+  indexing, and compaction.
+- `compact()` is now **orphan-safe**: it keeps only records that are present and
+  live in the metadata store, so vectors whose metadata was hard-deleted by
+  `purge()` can no longer be resurrected into the rebuilt index.
+
 ---
 
 ## [0.10.13] — 2026-06-08
