@@ -62,6 +62,12 @@ private:
     // 0.0 disables it (default) — compaction stays manual via compact().
     float auto_compact_ratio_ = 0.0f;
 
+    // ── On-disk int8 quantization ────────────────────────────────────
+    // Modalities whose vectors are persisted as int8 + per-vector scale (file
+    // format v7) — ~4x smaller on disk and faster to load. The in-memory HNSW
+    // index stays float32; vectors are dequantized on load. Opt-in per modality.
+    std::unordered_set<std::string> quantized_modalities_;
+
     // ── BM25 Inverted Index ──────────────────────────────────────────
     struct PostingEntry { uint64_t doc_id; uint32_t term_freq; };
     std::unordered_map<std::string, std::vector<PostingEntry>> bm25_index_;
@@ -107,6 +113,27 @@ private:
                 reverse_index_[e.target_id].push_back({id, e.rel_type, e.weight});
             }
         }
+    }
+
+    // ── int8 quantization helpers (per-vector symmetric scalar) ──────
+    // scale = max|v| / 127; q_i = round(v_i / scale) clamped to [-127,127].
+    // Returns the scale needed to reconstruct. Lossy but typically retains
+    // very high recall for embedding-shaped vectors.
+    static float quantize_vec(const float* v, size_t dim, int8_t* out) {
+        float amax = 0.0f;
+        for (size_t i = 0; i < dim; ++i) amax = std::max(amax, std::fabs(v[i]));
+        float scale = (amax > 0.0f) ? amax / 127.0f : 1.0f;
+        float inv   = 1.0f / scale;
+        for (size_t i = 0; i < dim; ++i) {
+            long q = std::lround(v[i] * inv);
+            if (q >  127) q =  127;
+            if (q < -127) q = -127;
+            out[i] = static_cast<int8_t>(q);
+        }
+        return scale;
+    }
+    static void dequantize_vec(const int8_t* q, size_t dim, float scale, float* out) {
+        for (size_t i = 0; i < dim; ++i) out[i] = static_cast<float>(q[i]) * scale;
     }
 
     // ── Secondary index helpers ──────────────────────────────────────
@@ -457,7 +484,7 @@ private:
         if (!f) throw std::runtime_error("Cannot save to temp file: " + tmp_path);
 
         uint32_t magic   = 0x46454154; // "FEAT"
-        uint32_t version = 6;
+        uint32_t version = 7;          // v7 adds per-modality int8 quantization
         f.write((char*)&magic,   4);
         f.write((char*)&version, 4);
 
@@ -493,6 +520,9 @@ private:
             uint32_t dim32 = static_cast<uint32_t>(m_idx.dim);
             f.write((char*)&dim32, 4);
 
+            uint8_t quant = quantized_modalities_.count(name) ? 1 : 0;
+            f.write((char*)&quant, 1);
+
             size_t total = m_idx.index->cur_element_count;
             uint32_t live_count = 0;
             for (size_t i = 0; i < total; ++i) {
@@ -500,13 +530,20 @@ private:
                 if (valid_ids.count(id)) live_count++;
             }
             f.write((char*)&live_count, 4);
+            std::vector<int8_t> qbuf(quant ? m_idx.dim : 0);
             for (size_t i = 0; i < total; ++i) {
                 uint64_t id = m_idx.index->getExternalLabel(i);
                 if (!valid_ids.count(id)) continue;
                 const float* data = reinterpret_cast<const float*>(
                     m_idx.index->getDataByInternalId(i));
                 f.write((char*)&id, 8);
-                f.write((char*)data, m_idx.dim * sizeof(float));
+                if (quant) {
+                    float scale = quantize_vec(data, m_idx.dim, qbuf.data());
+                    f.write((char*)&scale, 4);
+                    f.write((char*)qbuf.data(), m_idx.dim);   // dim bytes
+                } else {
+                    f.write((char*)data, m_idx.dim * sizeof(float));
+                }
             }
         }
         f.close();
@@ -557,13 +594,24 @@ private:
                 f.read(&name[0], name_len);
                 uint32_t dim32, element_count;
                 f.read((char*)&dim32, 4);
+                uint8_t quant = 0;
+                if (version >= 7) f.read((char*)&quant, 1);
                 f.read((char*)&element_count, 4);
                 auto& m_idx = get_or_create_index(name, dim32);
-                std::vector<float> vec(dim32);
+                if (quant) quantized_modalities_.insert(name);
+                std::vector<float>  vec(dim32);
+                std::vector<int8_t> qbuf(quant ? dim32 : 0);
                 for (uint32_t i = 0; i < element_count; ++i) {
                     uint64_t id;
                     f.read((char*)&id, 8);
-                    f.read((char*)vec.data(), dim32 * sizeof(float));
+                    if (quant) {
+                        float scale = 1.0f;
+                        f.read((char*)&scale, 4);
+                        f.read((char*)qbuf.data(), dim32);   // dim bytes
+                        dequantize_vec(qbuf.data(), dim32, scale, vec.data());
+                    } else {
+                        f.read((char*)vec.data(), dim32 * sizeof(float));
+                    }
                     m_idx.index->addPoint(vec.data(), id);
                 }
             }
@@ -1401,6 +1449,19 @@ public:
     float get_auto_compact() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return auto_compact_ratio_;
+    }
+
+    // Persist a modality's vectors as int8 + per-vector scale (file format v7):
+    // ~4x smaller on disk, dequantized to float32 on load. Takes effect on the
+    // next save(). The in-memory index is unchanged. Opt-in; default off.
+    void set_quantized(const std::string& modality, bool on) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (on) quantized_modalities_.insert(modality);
+        else    quantized_modalities_.erase(modality);
+    }
+    bool is_quantized(const std::string& modality) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return quantized_modalities_.count(modality) > 0;
     }
 
     // ─────────────────────────────────────────────────────────────────

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.0] — 2026-06-09
+
+### Added — On-disk int8 quantization (file format v7)
+- `set_quantized(modality, on=True)` / `is_quantized(modality)` — persist a
+  modality's vectors as **int8 + per-vector scale** instead of float32.
+  ~**2.5–4× smaller `.feather` files** and faster load I/O; vectors are
+  dequantized back to float32 on load, so the in-memory HNSW index and search
+  are unchanged. Opt-in per modality, default off.
+- Per-vector symmetric scalar quantization (`scale = max|v|/127`). Measured on
+  500×128-dim vectors: file **2.87× smaller**, max element error **0.39%**,
+  top-10 recall **9/10** vs the float32 baseline.
+- **File format bumped to v7** — adds a 1-byte per-modality quantization flag
+  (and, when set, an int8 vector section). v3–v6 files load transparently (the
+  flag is only read for v7+); a non-quantized v7 save is byte-compatible in
+  spirit with v6 plus the flag.
+- The quantization choice is persisted in the file, so a reloaded DB keeps
+  saving that modality quantized.
+
+> Note: this reduces **disk footprint and load I/O**, not in-RAM size — the HNSW
+> index remains float32 in memory. In-RAM int8 indexing is a larger follow-up.
+
+---
+
 ## [0.11.0] — 2026-06-09
 
 Phase 7 — query performance. New capabilities land additively under this line.

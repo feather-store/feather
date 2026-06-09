@@ -248,6 +248,14 @@ PYBIND11_MODULE(core, m) {
         .def("get_auto_compact", &feather::DB::get_auto_compact,
              "Current auto-compaction threshold (0 = disabled).")
 
+        // -- On-disk int8 quantization (file format v7) --
+        .def("set_quantized", &feather::DB::set_quantized,
+             py::arg("modality"), py::arg("on") = true,
+             "Persist a modality's vectors as int8 + per-vector scale (~4x "
+             "smaller on disk). Takes effect on next save(); dequantized on load.")
+        .def("is_quantized", &feather::DB::is_quantized, py::arg("modality"),
+             "Whether a modality is persisted with int8 quantization.")
+
         // -- Memory lifecycle --
         .def("forget",         &feather::DB::forget,         py::arg("id"),
              "Soft-delete: remove from search + blank content. Graph shell preserved.")
