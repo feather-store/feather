@@ -202,6 +202,19 @@ PYBIND11_MODULE(core, m) {
         }, py::arg("id"), py::arg("modality") = "text")
         .def("get_all_ids", &feather::DB::get_all_ids, py::arg("modality") = "text")
 
+        // -- Secondary metadata indexes (O(matches) lookups) --
+        .def("ids_in_namespace", &feather::DB::ids_in_namespace, py::arg("namespace_id"),
+             "Live record ids in a namespace (O(matches) via secondary index).")
+        .def("ids_for_entity", &feather::DB::ids_for_entity, py::arg("entity_id"),
+             "Live record ids for an entity (O(matches) via secondary index).")
+        .def("ids_with_attribute", &feather::DB::ids_with_attribute,
+             py::arg("key"), py::arg("value"),
+             "Live record ids carrying attribute key=value (O(matches)).")
+        .def("namespace_size", &feather::DB::namespace_size, py::arg("namespace_id"),
+             "Live record count in a namespace (O(1)).")
+        .def("list_namespaces", &feather::DB::list_namespaces,
+             "All namespace ids that currently have at least one live record.")
+
         // -- BM25 keyword search --
         .def("keyword_search", [](feather::DB& db, const std::string& query, size_t k,
                                    feather::SearchFilter* filter) {

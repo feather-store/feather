@@ -47,6 +47,15 @@ private:
     // Reverse index: target_id → list of (source_id, rel_type, weight)
     std::unordered_map<uint64_t, std::vector<IncomingEdge>> reverse_index_;
 
+    // ── Secondary metadata indexes ───────────────────────────────────
+    // Inverted indexes for O(matches) filtered lookup instead of O(n) scans.
+    // Rebuilt on load (like reverse_index_), maintained incrementally on
+    // mutation. Only LIVE records are indexed (forgotten/deleted excluded),
+    // so the id sets double as candidate sets for filtered search.
+    std::unordered_map<std::string, std::unordered_set<uint64_t>> ns_index_;     // namespace_id → ids
+    std::unordered_map<std::string, std::unordered_set<uint64_t>> entity_index_; // entity_id    → ids
+    std::unordered_map<std::string, std::unordered_set<uint64_t>> attr_index_;   // "key\x1fval" → ids
+
     // ── BM25 Inverted Index ──────────────────────────────────────────
     struct PostingEntry { uint64_t doc_id; uint32_t term_freq; };
     std::unordered_map<std::string, std::vector<PostingEntry>> bm25_index_;
@@ -91,6 +100,48 @@ private:
             for (const auto& e : meta.edges) {
                 reverse_index_[e.target_id].push_back({id, e.rel_type, e.weight});
             }
+        }
+    }
+
+    // ── Secondary index helpers ──────────────────────────────────────
+    static std::string attr_key(const std::string& k, const std::string& v) {
+        // Unit separator (0x1f) can't appear in normal keys/values, so this
+        // composite key is collision-free across different (k,v) splits.
+        return k + std::string(1, '\x1f') + v;
+    }
+
+    static bool is_dead_meta(const Metadata& m) {
+        if (m.source == "_forgotten") return true;
+        auto it = m.attributes.find("_deleted");
+        return it != m.attributes.end() && it->second == "true";
+    }
+
+    void index_meta(uint64_t id, const Metadata& m) {
+        if (!m.namespace_id.empty()) ns_index_[m.namespace_id].insert(id);
+        if (!m.entity_id.empty())    entity_index_[m.entity_id].insert(id);
+        for (const auto& [k, v] : m.attributes) attr_index_[attr_key(k, v)].insert(id);
+    }
+
+    void deindex_meta(uint64_t id, const Metadata& m) {
+        auto drop = [id](std::unordered_map<std::string, std::unordered_set<uint64_t>>& idx,
+                         const std::string& key) {
+            auto it = idx.find(key);
+            if (it == idx.end()) return;
+            it->second.erase(id);
+            if (it->second.empty()) idx.erase(it);
+        };
+        if (!m.namespace_id.empty()) drop(ns_index_, m.namespace_id);
+        if (!m.entity_id.empty())    drop(entity_index_, m.entity_id);
+        for (const auto& [k, v] : m.attributes) drop(attr_index_, attr_key(k, v));
+    }
+
+    void build_secondary_indexes() {
+        ns_index_.clear();
+        entity_index_.clear();
+        attr_index_.clear();
+        for (const auto& [id, meta] : metadata_store_) {
+            if (is_dead_meta(meta)) continue;   // candidate sets are live-only
+            index_meta(id, meta);
         }
     }
 
@@ -263,6 +314,7 @@ private:
             }
         }
         build_reverse_index();
+        build_secondary_indexes();
         rebuild_bm25_index();
     }
 
@@ -411,6 +463,7 @@ private:
         }
 
         build_reverse_index();
+        build_secondary_indexes();
         rebuild_bm25_index();
         // Replay any uncommitted WAL entries (crash recovery)
         replay_wal();
@@ -458,6 +511,7 @@ public:
 
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end()) {
+            deindex_meta(id, it->second);   // drop stale secondary-index entries
             Metadata combined = meta;
             if (combined.edges.empty() && !it->second.edges.empty())
                 combined.edges = it->second.edges;
@@ -465,6 +519,7 @@ public:
         } else {
             metadata_store_[id] = meta;
         }
+        if (!is_dead_meta(metadata_store_[id])) index_meta(id, metadata_store_[id]);
         add_to_bm25_index(id, meta.content);
     }
 
@@ -760,7 +815,10 @@ public:
             meta.serialize(ws);
             wal_append(WalOp::UPDATE, id, ws.str());
         }
+        auto old = metadata_store_.find(id);
+        if (old != metadata_store_.end()) deindex_meta(id, old->second);
         metadata_store_[id] = meta;
+        if (!is_dead_meta(meta)) index_meta(id, meta);
         for (auto& [target, incoming_list] : reverse_index_) {
             incoming_list.erase(
                 std::remove_if(incoming_list.begin(), incoming_list.end(),
@@ -810,6 +868,47 @@ public:
             } catch (...) {}
         }
         return ids;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Secondary-index queries — O(matches), LIVE records only.
+    // Back the API's namespace/entity/attribute scans and feed feature A's
+    // pre-filtered search with ready-made candidate sets.
+    // ─────────────────────────────────────────────────────────────────
+    std::vector<uint64_t> ids_in_namespace(const std::string& ns) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = ns_index_.find(ns);
+        if (it == ns_index_.end()) return {};
+        return {it->second.begin(), it->second.end()};
+    }
+
+    std::vector<uint64_t> ids_for_entity(const std::string& eid) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entity_index_.find(eid);
+        if (it == entity_index_.end()) return {};
+        return {it->second.begin(), it->second.end()};
+    }
+
+    std::vector<uint64_t> ids_with_attribute(const std::string& key,
+                                             const std::string& val) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = attr_index_.find(attr_key(key, val));
+        if (it == attr_index_.end()) return {};
+        return {it->second.begin(), it->second.end()};
+    }
+
+    size_t namespace_size(const std::string& ns) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = ns_index_.find(ns);
+        return it == ns_index_.end() ? 0 : it->second.size();
+    }
+
+    std::vector<std::string> list_namespaces() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> out;
+        out.reserve(ns_index_.size());
+        for (const auto& [ns, _] : ns_index_) out.push_back(ns);
+        return out;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1053,6 +1152,7 @@ public:
         }
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end()) {
+            deindex_meta(id, it->second);   // forgotten records leave candidate sets
             it->second.content    = "";
             it->second.source     = "_forgotten";
             it->second.importance = 0.0f;
@@ -1074,8 +1174,12 @@ public:
                 try { m_idx.index->markDelete(id); } catch (...) {}
             }
         }
-        // Erase metadata
-        for (uint64_t id : to_purge) metadata_store_.erase(id);
+        // Erase metadata (deindex first so secondary indexes stay in sync)
+        for (uint64_t id : to_purge) {
+            auto it = metadata_store_.find(id);
+            if (it != metadata_store_.end()) deindex_meta(id, it->second);
+            metadata_store_.erase(id);
+        }
 
         // Clean reverse index: remove entries sourced from purged nodes
         for (auto& [target, incoming] : reverse_index_) {
@@ -1120,6 +1224,7 @@ public:
             }
             auto it = metadata_store_.find(id);
             if (it != metadata_store_.end()) {
+                deindex_meta(id, it->second);   // drop from candidate sets
                 it->second.content    = "";
                 it->second.source     = "_forgotten";
                 it->second.importance = 0.0f;
@@ -1174,6 +1279,7 @@ public:
 
         // Rebuild derived structures
         build_reverse_index();
+        build_secondary_indexes();
         rebuild_bm25_index();
 
         return to_remove.size();

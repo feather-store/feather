@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.0] — 2026-06-09
+
+Phase 7 — query performance. New capabilities land additively under this line.
+
+### Added — Secondary metadata indexes
+- **Inverted indexes** on `namespace_id`, `entity_id`, and each `attribute`
+  key=value, mirroring the existing `reverse_index_` pattern. Rebuilt on load
+  and maintained incrementally on `add`/`update_metadata`/`forget`/`purge`, so
+  namespace/entity/attribute lookups go from **O(n) scans to O(matches)** —
+  directly attacking the "slow filtered queries / load on large attribute DBs"
+  limitation.
+- Only **live** records are indexed (forgotten/deleted excluded), so the id
+  sets double as ready-made candidate sets for the upcoming pre-filtered ANN
+  search.
+- New Python methods on `DB`: `ids_in_namespace(ns)`, `ids_for_entity(eid)`,
+  `ids_with_attribute(key, value)`, `namespace_size(ns)`, `list_namespaces()`.
+- No file-format change — indexes are derived in-memory on load.
+
+---
+
 ## [0.10.13] — 2026-06-08
 
 Consolidated patch line on top of the 0.10.0 Cloud Edition release. Packaging
