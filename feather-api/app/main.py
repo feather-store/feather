@@ -219,6 +219,21 @@ def _build_scoring(req: SearchRequest) -> Optional[ScoringConfig]:
         min       = req.scoring_min       or 0.0,
     )
 
+
+def _check_query_dim(db, vector, modality: str):
+    """Reject a query vector whose length doesn't match the index dim, with a
+    clean 400 instead of letting the C++ HNSW read out of bounds."""
+    try:
+        expected = db.dim(modality)
+    except Exception:
+        return  # modality not present yet; let downstream raise its own error
+    if expected and len(vector) != expected:
+        raise HTTPException(
+            400,
+            f"Query vector dim {len(vector)} != index dim {expected} "
+            f"for modality '{modality}'",
+        )
+
 # ─────────────────────────────────────────────
 # Routes — health & meta
 # ─────────────────────────────────────────────
@@ -402,6 +417,7 @@ def search_vectors(namespace: str, req: SearchRequest):
 
     sf = _build_filter(req)
     sc = _build_scoring(req)
+    _check_query_dim(db, req.vector, req.modality)
 
     raw = db.search(req.vector, k=req.k, filter=sf, scoring=sc, modality=req.modality)
 
@@ -615,6 +631,7 @@ def hybrid_search(namespace: str, req: HybridSearchRequest):
 
     sf = _build_filter(req)
     sc = _build_scoring(req)
+    _check_query_dim(db, req.vector, req.modality)
     raw = db.hybrid_search(req.vector, req.query, k=req.k,
                             rrf_k=req.rrf_k, filter=sf, scoring=sc,
                             modality=req.modality)
@@ -697,6 +714,7 @@ def context_chain(namespace: str, req: ContextChainRequest):
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
     if req.vector is not None:
+        _check_query_dim(db, req.vector, req.modality)
         vec = np.asarray(req.vector, dtype=np.float32)
     else:
         rng = np.random.default_rng(req.seed)

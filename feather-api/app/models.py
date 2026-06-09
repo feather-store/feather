@@ -41,7 +41,7 @@ class AddVectorRequest(BaseModel):
 
 class SearchRequest(BaseModel):
     vector: List[float]
-    k: int = 10
+    k: int = Field(10, ge=1, le=1000)
     modality: str = "text"
     # Filters
     namespace_id: Optional[str] = None
@@ -72,7 +72,7 @@ class SearchResponse(BaseModel):
 
 class KeywordSearchRequest(BaseModel):
     query: str
-    k: int = 10
+    k: int = Field(10, ge=1, le=1000)
     # Filters (same as SearchRequest)
     namespace_id: Optional[str] = None
     entity_id: Optional[str] = None
@@ -88,8 +88,8 @@ class KeywordSearchRequest(BaseModel):
 class HybridSearchRequest(BaseModel):
     vector: List[float]
     query: str
-    k: int = 10
-    rrf_k: int = 60
+    k: int = Field(10, ge=1, le=1000)
+    rrf_k: int = Field(60, ge=1, le=10000)
     modality: str = "text"
     # Filters
     namespace_id: Optional[str] = None
@@ -175,9 +175,11 @@ class ConnectionInfo(BaseModel):
 
 
 class EmbeddingConfig(BaseModel):
-    provider: str = "none"             # "openai" | "voyage" | "cohere" | "ollama" | "none"
+    provider: str = "none"             # openai | azure_openai | gemini | voyage | cohere | ollama | none
     model: str = ""
-    base_url: str = ""                 # for self-hosted (e.g. ollama)
+    base_url: str = ""                 # azure endpoint, ollama URL, or gemini override
+    deployment: str = ""               # Azure OpenAI deployment name (required for azure_openai)
+    api_version: str = "2024-02-01"    # Azure OpenAI API version
     api_key_set: bool = False          # never echo the key — just whether configured
     dim: int = 768
 
@@ -186,6 +188,8 @@ class EmbeddingConfigUpdate(BaseModel):
     provider: str
     model: str = ""
     base_url: str = ""
+    deployment: str = ""
+    api_version: str = ""
     api_key: Optional[str] = None      # set to update; omit to leave unchanged
     dim: int = 768
 
@@ -257,8 +261,8 @@ class SeedRequest(BaseModel):
 class ContextChainRequest(BaseModel):
     vector: Optional[List[float]] = None     # if omitted, server generates random with `seed`
     seed: int = 42
-    k: int = 5
-    hops: int = 2
+    k: int = Field(5, ge=1, le=1000)
+    hops: int = Field(2, ge=0, le=10)
     modality: str = "text"
 
 

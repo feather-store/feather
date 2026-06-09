@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.13] — 2026-06-08
+
+Consolidated patch line on top of the 0.10.0 Cloud Edition release. Packaging
+metadata (`pyproject.toml`, `setup.py`, `Cargo.toml`) is now aligned to
+`0.10.13` to match `feather_db.__version__` — it had drifted to `0.9.0`.
+
+### Fixed
+- **Dangling edges on record delete** — deleting a record now also strips
+  inbound/outbound edges that referenced it, so `export_graph_json` and the
+  graph view no longer surface phantom nodes (was v0.10.11).
+- **Delete persistence** — `forget()`/`purge()` now survive save+reload; the
+  C++ `save_vectors()` path was rewritten so deletions are not resurrected on
+  load.
+
+### Added
+- **Admin SPA (Hawky edition)** — delete-namespace, schema discovery, filter
+  chips, edit-record form, embedding-config panel, bulk import, hierarchy view,
+  marketing KPI card, ops-per-minute sparkline, top-recalled list, connection
+  panel. `Cache-Control: no-cache` on the SPA so deploys are picked up live.
+- **Bulk endpoints** — `/purge` and `/compact`.
+
+### Hardened (Cloud API)
+- **Search input bounds** — `k` is now validated `1..1000` (and `hops` `0..10`,
+  `rrf_k` `1..10000`) on `/search`, `/keyword_search`, `/hybrid_search`,
+  `/context_chain`. A negative or absurd `k` previously flowed straight into the
+  C++ `size_t` search width and could OOM/crash the worker; it now returns 422.
+- **Query-dimension guard** — search endpoints reject a query vector whose
+  length ≠ the index dim with a clean `400` instead of risking an out-of-bounds
+  read inside the HNSW index.
+- **Embedding response robustness** — all six providers now raise the documented
+  `RuntimeError` (→ clean error to the client) when an upstream returns an
+  error-shaped or otherwise unexpected payload, instead of a bare
+  `KeyError`/`IndexError` surfacing as a 500.
+
+### Security
+- Removed a leaked production API key and VM IP from previously tracked files.
+
+---
+
 ## [0.10.0] — 2026-05-12
 
 ### Added — Feather DB Cloud Edition
