@@ -3,9 +3,11 @@
 Loads the compiled C++ extension (.so) directly, bypassing feather_db/__init__.py
 (which imports heavy ML submodules we don't need and that aren't in the test venv).
 """
-import os, glob, tempfile, importlib.util, numpy as np
+import os, sys, glob, tempfile, importlib.util, numpy as np
 
-_so = sorted(glob.glob("feather_db/core*.so"))[0]
+_tag = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
+_cands = [p for p in glob.glob("feather_db/core*.so") if _tag in p]
+_so = (_cands or sorted(glob.glob("feather_db/core*.so")))[0]
 _spec = importlib.util.spec_from_file_location("core", _so)
 feather_db = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(feather_db)

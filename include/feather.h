@@ -145,6 +145,45 @@ private:
         }
     }
 
+    // Candidate ids for a filter's INDEXED fields (namespace/entity/attributes),
+    // computed as the intersection of the relevant secondary-index sets.
+    // Sets `indexed` = true if the filter constrained at least one indexed field
+    // (so the caller knows the result is an authoritative candidate set rather
+    // than "no constraint"). An empty return with indexed=true means the filter
+    // genuinely matches nothing.
+    std::unordered_set<uint64_t>
+    candidates_for_filter(const SearchFilter& f, bool& indexed) const {
+        indexed = false;
+        std::vector<const std::unordered_set<uint64_t>*> sets;
+        auto pick = [&](const std::unordered_map<std::string, std::unordered_set<uint64_t>>& idx,
+                        const std::string& key) -> bool {
+            indexed = true;
+            auto it = idx.find(key);
+            if (it == idx.end()) return false;   // signals empty intersection
+            sets.push_back(&it->second);
+            return true;
+        };
+        if (f.namespace_id && !pick(ns_index_, *f.namespace_id))     return {};
+        if (f.entity_id    && !pick(entity_index_, *f.entity_id))    return {};
+        if (f.attributes_match)
+            for (const auto& [k, v] : *f.attributes_match)
+                if (!pick(attr_index_, attr_key(k, v)))              return {};
+
+        if (!indexed) return {};                 // no indexed constraint at all
+
+        // Intersect smallest-first to minimise work.
+        std::sort(sets.begin(), sets.end(),
+                  [](auto* a, auto* b) { return a->size() < b->size(); });
+        std::unordered_set<uint64_t> result(sets[0]->begin(), sets[0]->end());
+        for (size_t i = 1; i < sets.size() && !result.empty(); ++i) {
+            std::unordered_set<uint64_t> next;
+            for (uint64_t id : result)
+                if (sets[i]->count(id)) next.insert(id);
+            result.swap(next);
+        }
+        return result;
+    }
+
     static const std::unordered_set<std::string>& stop_words() {
         static const std::unordered_set<std::string> sw = {
             "a","an","the","and","or","but","in","on","at","to","for",
@@ -928,6 +967,44 @@ public:
         auto m_it = modality_indices_.find(modality);
         if (m_it == modality_indices_.end()) return {};
         auto& m_idx = m_it->second;
+
+        // ── Pre-filtered exact path (feature A) ──────────────────────
+        // When the filter constrains an indexed field (namespace/entity/
+        // attribute), resolve the candidate set from the secondary indexes and
+        // rank EXACTLY over just those vectors. Unlike HNSW's ef-bounded
+        // filtered traversal — which silently returns far fewer than k when the
+        // filter is selective — this returns up to k matches whenever ≥k records
+        // match, and is O(matches) so a selective filter is also fast.
+        if (filter) {
+            bool indexed = false;
+            auto cand = candidates_for_filter(*filter, indexed);
+            if (indexed) {
+                auto dist_func  = m_idx.space->get_dist_func();
+                auto dist_param = m_idx.space->get_dist_func_param();
+                double now_ts = static_cast<double>(std::time(nullptr));
+                std::vector<SearchResult> results;
+                results.reserve(cand.size());
+                for (uint64_t id : cand) {
+                    auto it = metadata_store_.find(id);
+                    if (it == metadata_store_.end() || is_dead_meta(it->second)) continue;
+                    if (!filter->matches(it->second)) continue;   // non-indexed predicates
+                    std::vector<float> vec;
+                    try { vec = m_idx.index->template getDataByLabel<float>(id); }
+                    catch (...) { continue; }                     // not in this modality
+                    if (vec.size() != m_idx.dim) continue;
+                    float dist = dist_func(q.data(), vec.data(), dist_param);
+                    touch_nolock(id);
+                    float score = scoring
+                        ? Scorer::calculate_score(dist, it->second, *scoring, now_ts)
+                        : 1.0f / (1.0f + dist);
+                    results.push_back({id, score, it->second});
+                }
+                std::sort(results.begin(), results.end(),
+                    [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
+                if (results.size() > k) results.resize(k);
+                return results;
+            }
+        }
 
         struct FilterWrapper : public hnswlib::BaseFilterFunctor {
             const SearchFilter* filter_;

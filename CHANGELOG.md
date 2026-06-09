@@ -25,6 +25,18 @@ Phase 7 — query performance. New capabilities land additively under this line.
   `ids_with_attribute(key, value)`, `namespace_size(ns)`, `list_namespaces()`.
 - No file-format change — indexes are derived in-memory on load.
 
+### Added — Pre-filtered ANN search
+- `search(..., filter=...)` now takes an **exact pre-filtered path** when the
+  filter constrains an indexed field (namespace/entity/attribute): it resolves
+  the candidate set from the secondary indexes, applies any remaining
+  (non-indexed) predicates, and ranks **exactly** over just those vectors.
+- Fixes the long-standing **"selective filter returns far fewer than k"** bug —
+  HNSW's `ef`-bounded filtered traversal would stop after exploring `ef`
+  neighbours and silently under-return. The new path returns up to k matches
+  whenever ≥k records match, and is **O(matches)** so a selective filter is also
+  faster. Non-indexed-only filters (source/importance/tags/time) keep the
+  existing HNSW path. No API or file-format change.
+
 ---
 
 ## [0.10.13] — 2026-06-08
