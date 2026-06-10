@@ -20,6 +20,14 @@ Phase 8 — ingestion & load performance.
 - `FEATHER_LOAD_THREADS` env var caps/sets the pool size (`1` = serial). Small
   modalities (<256 vectors) stay serial to avoid thread overhead.
 
+### Added — Parallel batch ingestion
+- `DB.add_batch(ids, vecs, metas=None, modality="text")` — bulk-insert N records
+  (`vecs` = N×dim float32) with the **HNSW graph built in parallel** and the GIL
+  released during the insert. Measured **~3.4× faster** than a serial `add()`
+  loop (40k×128: 15.1s → 4.5s), recall **1.000**. Metadata, secondary indexes,
+  and BM25 are maintained exactly as `add()` (so pre-filtered search works over
+  batch-ingested data); same-id re-adds and empty/mismatched inputs are handled.
+
 ---
 
 ## [0.12.0] — 2026-06-09

@@ -717,6 +717,59 @@ public:
         add_to_bm25_index(id, meta.content);
     }
 
+    // Bulk insert. Same per-item semantics as add(), but the HNSW graph (the
+    // expensive part) is built in PARALLEL — much faster for bulk ingestion.
+    // `metas` may be empty (default Metadata for all) or must match ids.size().
+    void add_batch(const std::vector<uint64_t>& ids,
+                   const std::vector<std::vector<float>>& vecs,
+                   const std::vector<Metadata>& metas,
+                   const std::string& modality = "text") {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const size_t n = ids.size();
+        if (n == 0) return;
+        if (vecs.size() != n)
+            throw std::runtime_error("add_batch: ids and vecs size mismatch");
+        if (!metas.empty() && metas.size() != n)
+            throw std::runtime_error("add_batch: metas size mismatch");
+
+        auto& m_idx = get_or_create_index(modality, vecs[0].size());
+        static const Metadata kDefault;
+
+        // WAL + metadata + secondary indexes serially (cheap), collect vectors.
+        std::vector<std::pair<uint64_t, std::vector<float>>> items;
+        items.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            const Metadata& meta = metas.empty() ? kDefault : metas[i];
+            if (vecs[i].size() != m_idx.dim)
+                throw std::runtime_error("Dimension mismatch for modality " + modality);
+            {
+                std::ostringstream ws;
+                uint16_t mod_len = static_cast<uint16_t>(modality.size());
+                ws.write(reinterpret_cast<const char*>(&mod_len), 2);
+                ws.write(modality.data(), mod_len);
+                uint32_t dim32 = static_cast<uint32_t>(vecs[i].size());
+                ws.write(reinterpret_cast<const char*>(&dim32), 4);
+                ws.write(reinterpret_cast<const char*>(vecs[i].data()), vecs[i].size() * 4);
+                meta.serialize(ws);
+                wal_append(WalOp::ADD, ids[i], ws.str());
+            }
+            auto it = metadata_store_.find(ids[i]);
+            if (it != metadata_store_.end()) {
+                deindex_meta(ids[i], it->second);
+                Metadata combined = meta;
+                if (combined.edges.empty() && !it->second.edges.empty())
+                    combined.edges = it->second.edges;
+                metadata_store_[ids[i]] = combined;
+            } else {
+                metadata_store_[ids[i]] = meta;
+            }
+            if (!is_dead_meta(metadata_store_[ids[i]])) index_meta(ids[i], metadata_store_[ids[i]]);
+            add_to_bm25_index(ids[i], meta.content);
+            items.emplace_back(ids[i], vecs[i]);
+        }
+        parallel_add(m_idx, items);   // concurrent graph construction
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Salience
     // ─────────────────────────────────────────────────────────────────

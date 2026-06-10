@@ -147,6 +147,33 @@ PYBIND11_MODULE(core, m) {
            py::arg("meta") = std::nullopt,
            py::arg("modality") = "text")
 
+        // -- Bulk ingestion: parallel HNSW build --
+        .def("add_batch", [](feather::DB& db,
+                              const std::vector<uint64_t>& ids,
+                              py::array_t<float, py::array::c_style | py::array::forcecast> vecs,
+                              const std::optional<std::vector<feather::Metadata>>& metas,
+                              const std::string& modality) {
+            auto buf = vecs.request();
+            if (buf.ndim != 2)
+                throw std::runtime_error("add_batch: vecs must be a 2D array (N x dim)");
+            size_t n = static_cast<size_t>(buf.shape[0]);
+            size_t dim = static_cast<size_t>(buf.shape[1]);
+            if (ids.size() != n)
+                throw std::runtime_error("add_batch: len(ids) != vecs.shape[0]");
+            const float* ptr = static_cast<const float*>(buf.ptr);
+            std::vector<std::vector<float>> vv(n);
+            for (size_t i = 0; i < n; ++i)
+                vv[i].assign(ptr + i * dim, ptr + (i + 1) * dim);
+            std::vector<feather::Metadata> mv =
+                metas ? *metas : std::vector<feather::Metadata>();
+            {
+                py::gil_scoped_release rel;   // run the parallel insert without the GIL
+                db.add_batch(ids, vv, mv, modality);
+            }
+        }, py::arg("ids"), py::arg("vecs"), py::arg("metas") = std::nullopt,
+           py::arg("modality") = "text",
+           "Bulk-insert N records (vecs: N x dim float32). HNSW graph built in parallel.")
+
         // -- Search --
         .def("search", [](feather::DB& db, py::array_t<float> q, size_t k,
                            const feather::SearchFilter* filter,
