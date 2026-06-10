@@ -28,6 +28,15 @@ Phase 8 — ingestion & load performance.
   and BM25 are maintained exactly as `add()` (so pre-filtered search works over
   batch-ingested data); same-id re-adds and empty/mismatched inputs are handled.
 
+### Changed — SIMD distance kernels enabled on x86
+- `setup.py` now compiles the hand-written **SSE/AVX** L2 kernels in `space_l2.h`
+  (previously dormant — the `USE_*` macros were never defined, so every distance
+  was scalar). Enabled **only on x86_64** with runtime CPU dispatch (`AVXCapable()`)
+  — SSE2 is baseline, AVX selected at runtime. On arm64/aarch64 the build is
+  unchanged (relies on `-O3` NEON auto-vectorization). Override via
+  `FEATHER_SIMD=none|sse|avx|avx512`. Speeds up dense search and the pre-filtered
+  exact path on x86 servers/containers (the deployment target).
+
 ---
 
 ## [0.12.0] — 2026-06-09
