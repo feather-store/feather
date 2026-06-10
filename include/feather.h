@@ -12,6 +12,8 @@
 #include <cmath>
 #include <queue>
 #include <mutex>
+#include <thread>
+#include <atomic>
 #include <cstdio>
 #include "hnswlib.h"
 #include "metadata.h"
@@ -134,6 +136,38 @@ private:
     }
     static void dequantize_vec(const int8_t* q, size_t dim, float scale, float* out) {
         for (size_t i = 0; i < dim; ++i) out[i] = static_cast<float>(q[i]) * scale;
+    }
+
+    // Insert many (id, vector) pairs into a modality index using a thread pool.
+    // hnswlib addPoint is thread-safe (per-node link locks + label/lookup locks),
+    // so the graph is built concurrently. Caller must guarantee exclusive
+    // structural access (no concurrent resize) — true at load and batch-ingest,
+    // and we never exceed max_elements here so no resize is triggered.
+    static void parallel_add(ModalityIndex& m_idx,
+                             std::vector<std::pair<uint64_t, std::vector<float>>>& items) {
+        const size_t n = items.size();
+        if (n == 0) return;
+        unsigned hw = std::thread::hardware_concurrency();
+        size_t nthreads = std::min<size_t>(hw ? hw : 4, n);
+        if (const char* env = std::getenv("FEATHER_LOAD_THREADS")) {
+            long v = std::atol(env);                // override / cap thread count
+            if (v >= 1) nthreads = std::min<size_t>(static_cast<size_t>(v), n);
+        }
+        if (nthreads <= 1 || n < 256) {           // small sets: serial is faster
+            for (auto& [id, v] : items) m_idx.index->addPoint(v.data(), id);
+            return;
+        }
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        pool.reserve(nthreads);
+        for (size_t t = 0; t < nthreads; ++t) {
+            pool.emplace_back([&]() {
+                size_t i;
+                while ((i = next.fetch_add(1)) < n)
+                    m_idx.index->addPoint(items[i].second.data(), items[i].first);
+            });
+        }
+        for (auto& th : pool) th.join();
     }
 
     // ── Secondary index helpers ──────────────────────────────────────
@@ -599,11 +633,15 @@ private:
                 f.read((char*)&element_count, 4);
                 auto& m_idx = get_or_create_index(name, dim32);
                 if (quant) quantized_modalities_.insert(name);
-                std::vector<float>  vec(dim32);
+                // Read all vectors serially (sequential I/O), then build the
+                // HNSW graph in parallel — graph construction dominates load.
+                std::vector<std::pair<uint64_t, std::vector<float>>> items;
+                items.reserve(element_count);
                 std::vector<int8_t> qbuf(quant ? dim32 : 0);
                 for (uint32_t i = 0; i < element_count; ++i) {
                     uint64_t id;
                     f.read((char*)&id, 8);
+                    std::vector<float> vec(dim32);
                     if (quant) {
                         float scale = 1.0f;
                         f.read((char*)&scale, 4);
@@ -612,8 +650,9 @@ private:
                     } else {
                         f.read((char*)vec.data(), dim32 * sizeof(float));
                     }
-                    m_idx.index->addPoint(vec.data(), id);
+                    items.emplace_back(id, std::move(vec));
                 }
+                parallel_add(m_idx, items);
             }
         }
 

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.0] — 2026-06-10
+
+Phase 8 — ingestion & load performance.
+
+### Added — Parallel load
+- `load_vectors()` now reads vectors serially (sequential I/O) and rebuilds the
+  HNSW graph **in parallel** across a thread pool (hnswlib `addPoint` is
+  thread-safe). Measured **~4.5–4.8× faster load** on 8 cores (40k×128: 7.6s →
+  1.7s) with **identical recall** (0.950 serial vs 0.950 parallel — both builds
+  are valid approximate graphs).
+- `FEATHER_LOAD_THREADS` env var caps/sets the pool size (`1` = serial). Small
+  modalities (<256 vectors) stay serial to avoid thread overhead.
+
+---
+
 ## [0.12.0] — 2026-06-09
 
 ### Added — On-disk int8 quantization (file format v7)
