@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.1] — 2026-06-11
+
+Cloud API + admin dashboard — surface the Phase 7–8 capabilities and fix a few gaps.
+
+### Added — Cloud API (`feather-api/`)
+- `GET /v1/{ns}/admin/index_stats` — record count, dim, on-disk quantization
+  state, auto-compaction threshold, and per-namespace **secondary-index** sizes.
+- `PUT /v1/{ns}/admin/auto_compact` `{ratio}` — enable/adjust incremental
+  auto-compaction.
+- `PUT /v1/{ns}/admin/quantize` `{modality, on}` — toggle on-disk int8
+  quantization (persists on save).
+- `POST /v1/{ns}/import` now inserts via **`add_batch`** (parallel HNSW build)
+  instead of one-at-a-time — much faster bulk import.
+
+### Added — Admin dashboard (`static/admin/`)
+- New **Maintenance** tab per namespace: index stats, secondary-index namespace
+  sizes, auto-compaction control, on-disk int8 toggle, and compact-now.
+- **Keyword** search mode (BM25) alongside Vector / Hybrid; query-text field
+  shown for keyword, vector-seed hidden.
+
+### Changed / Fixed
+- API key moved from **localStorage → sessionStorage** (no longer persists
+  across browser sessions).
+- Cmd-K palette "open record" no longer truncates ids > 2^53 (`parseInt`
+  removed — id passed through as-is).
+
+---
+
 ## [0.13.0] — 2026-06-10
 
 Phase 8 — ingestion & load performance.

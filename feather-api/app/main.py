@@ -51,6 +51,7 @@ from .models import (
     ConnectionInfo, EmbeddingConfig, EmbeddingConfigUpdate,
     ImportRequest, ImportResponse, IngestTextRequest,
     HierarchyNode, HierarchyResponse,
+    AutoCompactRequest, QuantizeRequest, IndexStatsResponse,
 )
 import numpy as np
 import json
@@ -571,6 +572,58 @@ def compact_namespace(namespace: str, prune_dead_edges: bool = True):
     return {"namespace": namespace, "reclaimed": reclaimed, "edges_pruned": edges_pruned}
 
 
+# ── Index maintenance / stats (Phase 7–8 capabilities) ──────────────
+@app.get("/v1/{namespace}/admin/index_stats", response_model=IndexStatsResponse,
+         tags=["admin"], dependencies=[Depends(verify_api_key)])
+def index_stats(namespace: str):
+    """Operational index health: record count, dim, on-disk quantization state,
+    auto-compaction threshold, and the per-namespace secondary-index sizes."""
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    mns = [{"id": n, "size": db.namespace_size(n)} for n in db.list_namespaces()]
+    mns.sort(key=lambda x: -x["size"])
+    return IndexStatsResponse(
+        namespace=namespace,
+        record_count=db.size(),
+        dim=db.dim(),
+        text_quantized=db.is_quantized("text"),
+        auto_compact_ratio=db.get_auto_compact(),
+        metadata_namespaces=mns[:50],
+    )
+
+
+@app.put("/v1/{namespace}/admin/auto_compact", tags=["admin"],
+         dependencies=[Depends(verify_api_key)])
+def set_auto_compact(namespace: str, req: AutoCompactRequest):
+    """Enable/adjust incremental auto-compaction (rebuild a modality once its
+    deleted/total ratio crosses `ratio`). 0 disables."""
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    with manager.lock(namespace):
+        db.set_auto_compact(req.ratio)
+    return {"namespace": namespace, "auto_compact_ratio": db.get_auto_compact()}
+
+
+@app.put("/v1/{namespace}/admin/quantize", tags=["admin"],
+         dependencies=[Depends(verify_api_key)])
+def set_quantize(namespace: str, req: QuantizeRequest):
+    """Toggle on-disk int8 quantization for a modality (~3x smaller .feather).
+    Takes effect on save, which we do immediately so it's persisted now."""
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    with manager.lock(namespace):
+        db.set_quantized(req.modality, req.on)
+        db.save()
+    return {"namespace": namespace, "modality": req.modality,
+            "quantized": db.is_quantized(req.modality)}
+
+
 @app.get("/v1/{namespace}/records", tags=["records"],
          dependencies=[Depends(verify_api_key)])
 def list_records(namespace: str, limit: int = 50, after: int = 0, modality: str = "text"):
@@ -967,37 +1020,43 @@ def bulk_import(namespace: str, req: ImportRequest):
     """Bulk insert N records {id, vector, metadata}. Vectors must match namespace dim."""
     db = manager.get(namespace)
     expected_dim = db.dim()
-    inserted = 0
     skipped = 0
     errors: List[str] = []
+    # Validate + build everything first, then insert the whole batch in parallel
+    # via add_batch (HNSW graph built across threads) instead of one-at-a-time.
+    ids: List[int] = []
+    vecs: List[np.ndarray] = []
+    metas: List[Metadata] = []
+    for i, item in enumerate(req.items):
+        try:
+            rec_id = int(item["id"])
+            vec = item["vector"]
+            if len(vec) != expected_dim:
+                raise ValueError(f"dim mismatch: got {len(vec)}, expected {expected_dim}")
+            meta_data = item.get("metadata") or {}
+            meta = Metadata()
+            meta.timestamp    = int(meta_data.get("timestamp") or time.time())
+            meta.importance   = float(meta_data.get("importance", 1.0))
+            meta.type         = ContextType(int(meta_data.get("type", 0)))
+            meta.source       = str(meta_data.get("source", ""))
+            meta.content      = str(meta_data.get("content", ""))
+            meta.tags_json    = str(meta_data.get("tags_json", ""))
+            meta.namespace_id = str(meta_data.get("namespace_id", namespace))
+            meta.entity_id    = str(meta_data.get("entity_id", ""))
+            for k, v in (meta_data.get("attributes") or {}).items():
+                meta.set_attribute(str(k), str(v))
+            ids.append(rec_id)
+            vecs.append(np.asarray(vec, dtype=np.float32))
+            metas.append(meta)
+        except Exception as e:
+            skipped += 1
+            if len(errors) < 20:
+                errors.append(f"item {i}: {e}")
     with manager.lock(namespace):
-        for i, item in enumerate(req.items):
-            try:
-                rec_id = int(item["id"])
-                vec = item["vector"]
-                if len(vec) != expected_dim:
-                    raise ValueError(f"dim mismatch: got {len(vec)}, expected {expected_dim}")
-                meta_data = item.get("metadata") or {}
-                meta = Metadata()
-                meta.timestamp    = int(meta_data.get("timestamp") or time.time())
-                meta.importance   = float(meta_data.get("importance", 1.0))
-                meta.type         = ContextType(int(meta_data.get("type", 0)))
-                meta.source       = str(meta_data.get("source", ""))
-                meta.content      = str(meta_data.get("content", ""))
-                meta.tags_json    = str(meta_data.get("tags_json", ""))
-                meta.namespace_id = str(meta_data.get("namespace_id", namespace))
-                meta.entity_id    = str(meta_data.get("entity_id", ""))
-                for k, v in (meta_data.get("attributes") or {}).items():
-                    meta.set_attribute(str(k), str(v))
-                db.add(id=rec_id, vec=np.asarray(vec, dtype=np.float32),
-                       meta=meta, modality=req.modality)
-                inserted += 1
-            except Exception as e:
-                skipped += 1
-                if len(errors) < 20:
-                    errors.append(f"item {i}: {e}")
+        if ids:
+            db.add_batch(ids, np.asarray(vecs, dtype=np.float32), metas, modality=req.modality)
         db.save()
-    return ImportResponse(namespace=namespace, inserted=inserted,
+    return ImportResponse(namespace=namespace, inserted=len(ids),
                           skipped=skipped, errors=errors)
 
 

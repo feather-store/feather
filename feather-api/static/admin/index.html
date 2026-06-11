@@ -434,7 +434,7 @@
           </div>
 
           <div class="border-b border-slate-200 mb-6 flex gap-6">
-            <template x-for="t in ['records','search','schema','hierarchy','graph','context','console']" :key="t">
+            <template x-for="t in ['records','search','schema','hierarchy','graph','context','maintenance','console']" :key="t">
               <button @click="setNsTab(t)" class="tab text-sm font-medium pb-3 px-1 transition" :aria-selected="nsTab === t">
                 <span x-text="t.charAt(0).toUpperCase()+t.slice(1)"></span>
               </button>
@@ -504,13 +504,14 @@
                   <div class="mt-1.5 flex gap-1 border border-slate-200 rounded-md p-1 bg-slate-50">
                     <button @click="search.mode='vector'" :class="search.mode==='vector'?'bg-white shadow-sm text-slate-900':'text-slate-500'" class="flex-1 text-sm py-1 rounded">Vector</button>
                     <button @click="search.mode='hybrid'" :class="search.mode==='hybrid'?'bg-white shadow-sm text-slate-900':'text-slate-500'" class="flex-1 text-sm py-1 rounded">Hybrid</button>
+                    <button @click="search.mode='keyword'" :class="search.mode==='keyword'?'bg-white shadow-sm text-slate-900':'text-slate-500'" class="flex-1 text-sm py-1 rounded">Keyword</button>
                   </div>
                 </div>
-                <div x-show="search.mode==='hybrid'">
+                <div x-show="search.mode==='hybrid' || search.mode==='keyword'">
                   <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Query text</label>
                   <input x-model="search.query" type="text" placeholder="…" class="mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
                 </div>
-                <div>
+                <div x-show="search.mode!=='keyword'">
                   <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Vector seed</label>
                   <div class="mt-1.5 flex gap-2">
                     <input x-model.number="search.seed" type="number" class="mono w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
@@ -766,6 +767,59 @@
                       </div>
                     </template>
                   </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Maintenance tab -->
+          <div x-show="nsTab==='maintenance'">
+            <div class="grid grid-cols-3 gap-6">
+              <div class="col-span-1 space-y-4">
+                <div class="border border-slate-200 rounded-lg p-4">
+                  <div class="text-[11px] uppercase tracking-wide text-slate-500 font-medium mb-3">Index</div>
+                  <template x-if="maint.stats">
+                    <div class="space-y-2 text-sm">
+                      <div class="flex justify-between"><span class="text-slate-500">Records</span><span class="mono" x-text="maint.stats.record_count"></span></div>
+                      <div class="flex justify-between"><span class="text-slate-500">Dim</span><span class="mono" x-text="maint.stats.dim"></span></div>
+                      <div class="flex justify-between"><span class="text-slate-500">On-disk int8</span><span class="mono" :class="maint.stats.text_quantized?'text-emerald-600':'text-slate-400'" x-text="maint.stats.text_quantized?'on':'off'"></span></div>
+                      <div class="flex justify-between"><span class="text-slate-500">Auto-compact</span><span class="mono" x-text="maint.stats.auto_compact_ratio>0?Math.round(maint.stats.auto_compact_ratio*100)+'%':'off'"></span></div>
+                    </div>
+                  </template>
+                  <template x-if="!maint.stats"><div class="text-sm text-slate-400">Loading…</div></template>
+                </div>
+                <div class="border border-slate-200 rounded-lg p-4" x-show="maint.stats && maint.stats.metadata_namespaces.length">
+                  <div class="text-[11px] uppercase tracking-wide text-slate-500 font-medium mb-2">Namespaces · secondary index</div>
+                  <div class="space-y-1 text-sm max-h-48 overflow-auto">
+                    <template x-for="m in (maint.stats ? maint.stats.metadata_namespaces : [])" :key="m.id">
+                      <div class="flex justify-between gap-2"><span class="truncate" x-text="m.id || '(none)'"></span><span class="mono text-slate-500" x-text="m.size"></span></div>
+                    </template>
+                  </div>
+                </div>
+              </div>
+              <div class="col-span-2 space-y-4">
+                <div class="border border-slate-200 rounded-lg p-4">
+                  <div class="text-sm font-medium mb-1">Auto-compaction</div>
+                  <div class="text-xs text-slate-500 mb-3">Rebuild the index automatically once deleted/total crosses the threshold. 0 disables.</div>
+                  <div class="flex items-center gap-3">
+                    <input x-model.number="maint.ratio" type="number" min="0" max="1" step="0.05" class="mono w-28 text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                    <button @click="applyAutoCompact()" :disabled="maint.busy" class="btn-primary text-sm px-3 py-1.5 rounded-md disabled:opacity-40">Apply</button>
+                    <span class="text-xs text-slate-400" x-show="maint.busy==='ac'">saving…</span>
+                  </div>
+                </div>
+                <div class="border border-slate-200 rounded-lg p-4">
+                  <div class="text-sm font-medium mb-1">On-disk int8 quantization</div>
+                  <div class="text-xs text-slate-500 mb-3">Persist vectors as int8 — ~3× smaller <span class="mono">.feather</span>, dequantized to float32 on load. Applies on next save.</div>
+                  <div class="flex items-center gap-3">
+                    <button @click="applyQuantize(true)" :disabled="maint.busy" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-40">Enable</button>
+                    <button @click="applyQuantize(false)" :disabled="maint.busy" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-40">Disable</button>
+                    <span class="text-xs text-slate-400" x-show="maint.busy==='q'">saving…</span>
+                  </div>
+                </div>
+                <div class="border border-slate-200 rounded-lg p-4">
+                  <div class="text-sm font-medium mb-1">Compact now</div>
+                  <div class="text-xs text-slate-500 mb-3">Reclaim space from forgotten/deleted vectors and prune dead edges.</div>
+                  <button @click="compactNs()" :disabled="maint.busy" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-40">Run compaction</button>
                 </div>
               </div>
             </div>
@@ -1209,9 +1263,10 @@
         activeNs: '',
         nsTab: 'records',
         records: [], recordsAfter: 0, recordsHasMore: false, loadingRecords: false,
-        search: { mode: 'vector', query: '', seed: 42, k: 20, filter_ns: '', results: [],
+        search: { mode: 'vector', query: '', seed: 42, k: 20, filter_ns: '', results: [], running: false,
                   attrFilters: [], newAttrKey: '', newAttrVal: '' },
         context: { seed: 42, k: 5, hops: 2, result: null },
+        maint: { stats: null, ratio: 0, loading: false, busy: '' },
         graph: { nsFilter: '', nodes: [], links: [] },
         schema: { loading: false, loaded: false, data: null },
         console: { method: 'POST', path: '', body: '', response: '' },
@@ -1252,7 +1307,7 @@
 
         // ── lifecycle
         init() {
-          this.apiKey = localStorage.getItem('feather_admin_key') || '';
+          this.apiKey = sessionStorage.getItem("feather_admin_key") || '';
           if (this.apiKey) this.bootstrap();
           // refresh metrics every 15s on overview
           setInterval(() => { if (this.view === 'overview') { this.loadMetrics(); this.loadActivity(); this.loadOpsSeries(); } }, 15000);
@@ -1270,9 +1325,9 @@
           await this.loadConnectionInfo();
           await this.loadEmbeddingConfig();
         },
-        saveKey() { if (!this.keyInput.trim()) return; this.apiKey = this.keyInput.trim(); localStorage.setItem('feather_admin_key', this.apiKey); this.keyInput = ''; this.bootstrap(); },
-        signOut() { localStorage.removeItem('feather_admin_key'); this.apiKey = ''; },
-        rotateKeyPrompt() { const k = prompt('Paste new API key.'); if (k && k.trim()) { this.apiKey = k.trim(); localStorage.setItem('feather_admin_key', this.apiKey); this.toast('API key updated.'); this.bootstrap(); } },
+        saveKey() { if (!this.keyInput.trim()) return; this.apiKey = this.keyInput.trim(); sessionStorage.setItem("feather_admin_key", this.apiKey); this.keyInput = ''; this.bootstrap(); },
+        signOut() { sessionStorage.removeItem("feather_admin_key"); this.apiKey = ''; },
+        rotateKeyPrompt() { const k = prompt('Paste new API key.'); if (k && k.trim()) { this.apiKey = k.trim(); sessionStorage.setItem("feather_admin_key", this.apiKey); this.toast('API key updated.'); this.bootstrap(); } },
 
         // ── helpers
         async api(method, path, body) {
@@ -1537,6 +1592,35 @@
           if (t === 'graph' && this.graph.nodes.length === 0) await this.loadGraph();
           if (t === 'schema' && !this.schema.loaded) await this.loadSchema();
           if (t === 'hierarchy' && !this.hierarchy.loaded) await this.loadHierarchy();
+          if (t === 'maintenance') await this.loadIndexStats();
+        },
+
+        // ── index maintenance / stats (Phase 7–8 capabilities)
+        async loadIndexStats() {
+          this.maint.stats = null;
+          try {
+            const d = await this.api('GET', `/v1/${encodeURIComponent(this.activeNs)}/admin/index_stats`);
+            this.maint.stats = d;
+            this.maint.ratio = d.auto_compact_ratio || 0;
+          } catch (e) { this.toast(`Index stats failed: ${e.message}`, 'error'); }
+        },
+        async applyAutoCompact() {
+          this.maint.busy = 'ac';
+          try {
+            await this.api('PUT', `/v1/${encodeURIComponent(this.activeNs)}/admin/auto_compact`, { ratio: this.maint.ratio || 0 });
+            this.toast('Auto-compaction updated.');
+            await this.loadIndexStats();
+          } catch (e) { this.toast(`Failed: ${e.message}`, 'error'); }
+          finally { this.maint.busy = ''; }
+        },
+        async applyQuantize(on) {
+          this.maint.busy = 'q';
+          try {
+            await this.api('PUT', `/v1/${encodeURIComponent(this.activeNs)}/admin/quantize`, { modality: 'text', on });
+            this.toast(`On-disk int8 ${on ? 'enabled' : 'disabled'}.`);
+            await this.loadIndexStats();
+          } catch (e) { this.toast(`Failed: ${e.message}`, 'error'); }
+          finally { this.maint.busy = ''; }
         },
 
         // ── schema discovery
@@ -1756,18 +1840,32 @@
           return out;
         },
         async runSearch() {
-          const dim = this.ns.dim || 768;
-          const vec = this.deterministicVec(this.search.seed | 0, dim);
-          const body = { vector: vec, k: this.search.k };
+          const ns = encodeURIComponent(this.activeNs);
+          const body = { k: this.search.k };
           if (this.search.filter_ns) body.namespace_id = this.search.filter_ns;
           if (this.search.attrFilters.length) {
             body.attributes_match = {};
             for (const f of this.search.attrFilters) body.attributes_match[f.key] = f.value;
           }
-          let path = `/v1/${encodeURIComponent(this.activeNs)}/search`;
-          if (this.search.mode === 'hybrid') { path = `/v1/${encodeURIComponent(this.activeNs)}/hybrid_search`; body.query = this.search.query || ''; }
+          let path;
+          if (this.search.mode === 'keyword') {
+            // BM25 over content — no vector
+            path = `/v1/${ns}/keyword_search`;
+            body.query = this.search.query || '';
+          } else {
+            const dim = this.ns.dim || 768;
+            body.vector = this.deterministicVec(this.search.seed | 0, dim);
+            if (this.search.mode === 'hybrid') {
+              path = `/v1/${ns}/hybrid_search`;
+              body.query = this.search.query || '';
+            } else {
+              path = `/v1/${ns}/search`;
+            }
+          }
+          this.search.running = true;
           try { const d = await this.api('POST', path, body); this.search.results = d.results || []; this.toast(`${this.search.results.length} results.`); }
           catch (e) { this.toast(`Search failed: ${e.message}`, 'error'); }
+          finally { this.search.running = false; }
         },
 
         // ── context chain
@@ -1843,7 +1941,7 @@
           }
           if (q.startsWith('id:') && this.view === 'ns_detail') {
             const id = q.slice(3).trim();
-            return [{ kind: 'record', label: `Open record ${id}`, icon: '#', go: () => { this.palette.open = false; this.openRecord(parseInt(id)); } }];
+            return [{ kind: 'record', label: `Open record ${id}`, icon: '#', go: () => { this.palette.open = false; this.openRecord(id); } }];
           }
           if (q.startsWith('ns:')) {
             const term = q.slice(3).toLowerCase();

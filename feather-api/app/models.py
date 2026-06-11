@@ -207,6 +207,26 @@ class ImportResponse(BaseModel):
     errors: List[str] = []
 
 
+# ── Maintenance / index admin (Phase 7–8 capabilities) ──────────────
+class AutoCompactRequest(BaseModel):
+    ratio: float = Field(0.0, ge=0.0, le=1.0,
+                         description="Rebuild a modality once deleted/total ≥ ratio. 0 disables.")
+
+
+class QuantizeRequest(BaseModel):
+    modality: str = "text"
+    on: bool = True
+
+
+class IndexStatsResponse(BaseModel):
+    namespace: str
+    record_count: int
+    dim: int
+    text_quantized: bool
+    auto_compact_ratio: float
+    metadata_namespaces: List[Dict[str, Any]] = []   # [{id, size}] from secondary index
+
+
 class HierarchyNode(BaseModel):
     level: str            # 'brand' | 'channel' | 'campaign' | 'adset' | 'ad' | 'creative'
     name: str
