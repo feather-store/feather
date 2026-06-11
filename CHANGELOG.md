@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.2] — 2026-06-11
+
+### Fixed
+- **Admin dashboard sign-out regression**: 0.13.1 moved the API key to
+  `sessionStorage`, which silently logged out operators whose key lived in
+  `localStorage` (dashboard rendered empty until the key was re-entered).
+  Reverted to `localStorage` so the key auto-loads as before. No data was
+  affected — this was purely the browser's stored key. (Proper key-handling
+  hardening can return later as an opt-in, without breaking existing sessions.)
+
+---
+
 ## [0.13.1] — 2026-06-11
 
 Cloud API + admin dashboard — surface the Phase 7–8 capabilities and fix a few gaps.

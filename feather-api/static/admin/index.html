@@ -1307,7 +1307,7 @@
 
         // ── lifecycle
         init() {
-          this.apiKey = sessionStorage.getItem("feather_admin_key") || '';
+          this.apiKey = localStorage.getItem("feather_admin_key") || '';
           if (this.apiKey) this.bootstrap();
           // refresh metrics every 15s on overview
           setInterval(() => { if (this.view === 'overview') { this.loadMetrics(); this.loadActivity(); this.loadOpsSeries(); } }, 15000);
@@ -1325,9 +1325,9 @@
           await this.loadConnectionInfo();
           await this.loadEmbeddingConfig();
         },
-        saveKey() { if (!this.keyInput.trim()) return; this.apiKey = this.keyInput.trim(); sessionStorage.setItem("feather_admin_key", this.apiKey); this.keyInput = ''; this.bootstrap(); },
-        signOut() { sessionStorage.removeItem("feather_admin_key"); this.apiKey = ''; },
-        rotateKeyPrompt() { const k = prompt('Paste new API key.'); if (k && k.trim()) { this.apiKey = k.trim(); sessionStorage.setItem("feather_admin_key", this.apiKey); this.toast('API key updated.'); this.bootstrap(); } },
+        saveKey() { if (!this.keyInput.trim()) return; this.apiKey = this.keyInput.trim(); localStorage.setItem("feather_admin_key", this.apiKey); this.keyInput = ''; this.bootstrap(); },
+        signOut() { localStorage.removeItem("feather_admin_key"); this.apiKey = ''; },
+        rotateKeyPrompt() { const k = prompt('Paste new API key.'); if (k && k.trim()) { this.apiKey = k.trim(); localStorage.setItem("feather_admin_key", this.apiKey); this.toast('API key updated.'); this.bootstrap(); } },
 
         // ── helpers
         async api(method, path, body) {
