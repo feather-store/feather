@@ -779,7 +779,7 @@ def context_chain(namespace: str, req: ContextChainRequest):
                 metadata=_meta_to_model(n.metadata) if n.metadata else None)
              for n in result.nodes]
     edges = [ContextChainEdge(
-                source_id=e.source_id, target_id=e.target_id,
+                source_id=e.source, target_id=e.target,
                 rel_type=e.rel_type, weight=float(e.weight))
              for e in result.edges]
     return ContextChainResponse(nodes=nodes, edges=edges)

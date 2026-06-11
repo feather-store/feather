@@ -7,34 +7,49 @@ Claude Desktop, Cursor, and any MCP-compatible agent can plug into this server
 and get all 14 Feather tools as first-class MCP tools — zero code required.
 
 Install:
-    pip install mcp feather-db
+    pip install "feather-db[mcp]"        # feather_db + the mcp SDK
 
-Run:
-    python -m feather_db.integrations.mcp_server --db my.feather --dim 3072
-    # or via entry point:
-    feather-serve --db my.feather --dim 3072
+Two backends:
+    LOCAL   — open a .feather file directly (full 16-tool set):
+        feather-serve --db my.feather --dim 3072
+    REMOTE  — talk to a deployed Feather Cloud API (persona context engine);
+              embedding runs client-side, so the server needs no embedder:
+        feather-serve --api-url http://HOST:8000 --api-key KEY --namespace persona --dim 768
+        # (or set FEATHER_API_URL / FEATHER_API_KEY in the env)
 
-Claude Desktop config (~/.claude/claude_desktop_config.json):
-    {
-      "mcpServers": {
-        "feather": {
+── Claude Desktop  (~/Library/Application Support/Claude/claude_desktop_config.json)
+    LOCAL:
+      { "mcpServers": { "feather": {
           "command": "feather-serve",
-          "args": ["--db", "/path/to/my.feather", "--dim", "3072"]
-        }
-      }
-    }
-
-Cursor config (.cursor/mcp.json):
-    {
-      "mcpServers": {
-        "feather": {
+          "args": ["--db", "/path/to/my.feather", "--dim", "3072"] } } }
+    REMOTE:
+      { "mcpServers": { "feather": {
           "command": "feather-serve",
-          "args": ["--db", "/path/to/my.feather", "--dim", "3072"]
-        }
-      }
-    }
+          "args": ["--api-url", "http://HOST:8000", "--namespace", "persona", "--dim", "768"],
+          "env": { "FEATHER_API_KEY": "your-key" } } } }
 
-Tools exposed (16 total):
+── Claude Code   (project .mcp.json, or `claude mcp add`)
+    LOCAL:
+      { "mcpServers": { "feather": {
+          "command": "feather-serve",
+          "args": ["--db", "./persona.feather", "--dim", "3072"] } } }
+    REMOTE:
+      { "mcpServers": { "feather": {
+          "command": "feather-serve",
+          "args": ["--api-url", "http://HOST:8000", "--namespace", "persona", "--dim", "768"],
+          "env": { "FEATHER_API_KEY": "your-key" } } } }
+    # CLI shortcut:
+    #   claude mcp add feather -- feather-serve --api-url http://HOST:8000 --namespace persona --dim 768
+
+Tip: pass --embedder to use a real embedder (a module exporting `embed(text)->list[float]`);
+the default is a deterministic hash embedder — fine for wiring, weak for real semantics.
+The --dim must match the embedder AND (remote) the namespace dim.
+
+Remote tools (8, persona context engine): feather_ingest, feather_recall,
+feather_keyword_recall, feather_context_chain, feather_get_record, feather_link,
+feather_stats, feather_list_namespaces.
+
+Local tools (16 total):
   feather_search          Semantic search over the knowledge graph
   feather_context_chain   Vector search + BFS graph expansion (n hops)
   feather_get_node        Full metadata for a node by ID
@@ -107,24 +122,41 @@ def _spec_to_mcp_schema(spec: dict) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def create_server(
-    db_path: str,
+    db_path: str = None,
     dim: int = 3072,
     embed_fn=None,
     server_name: str = "feather-db",
     system_provider=None,
     namespace: str = "default",
+    api_url: str = None,
+    api_key: str = "",
 ) -> "Server":
     """
     Build and return an MCP Server instance with all Feather tools registered.
+
+    Two backends:
+      • local  — opens a `.feather` file directly (pass db_path).
+      • remote — talks to a deployed Feather Cloud API over HTTP (pass api_url);
+                 embedding happens client-side here so no server embedding config
+                 is needed.
     """
     _require_mcp()
 
-    from feather_db.integrations.base import FeatherTools, TOOL_SPECS
+    if api_url:
+        from feather_db.integrations.mcp_remote import RemoteFeatherTools, REMOTE_TOOL_SPECS
+        tools = RemoteFeatherTools(
+            api_url=api_url, api_key=api_key, namespace=namespace,
+            dim=dim, embedder=embed_fn,
+        )
+        specs = REMOTE_TOOL_SPECS
+    else:
+        from feather_db.integrations.base import FeatherTools, TOOL_SPECS
+        tools = FeatherTools(
+            db_path=db_path, dim=dim, embedder=embed_fn,
+            system_provider=system_provider, namespace=namespace,
+        )
+        specs = TOOL_SPECS
 
-    tools = FeatherTools(
-        db_path=db_path, dim=dim, embedder=embed_fn,
-        system_provider=system_provider, namespace=namespace,
-    )
     server = Server(server_name)
 
     # ── Tool list handler ─────────────────────────────────────────────────────
@@ -132,7 +164,7 @@ def create_server(
     @server.list_tools()
     async def list_tools() -> list[mcp_types.Tool]:
         result: list[mcp_types.Tool] = []
-        for spec in TOOL_SPECS:
+        for spec in specs:
             result.append(mcp_types.Tool(
                 name        = spec["name"],
                 description = spec["description"],
@@ -185,10 +217,12 @@ def create_server(
     async def read_resource(uri: str) -> str:
         if "info" in str(uri):
             return json.dumps({
-                "db_path":    db_path,
+                "backend":    "remote" if api_url else "local",
+                "target":     api_url or db_path,
+                "namespace":  namespace,
                 "dim":        dim,
-                "tool_count": len(TOOL_SPECS),
-                "tools":      [s["name"] for s in TOOL_SPECS],
+                "tool_count": len(specs),
+                "tools":      [s["name"] for s in specs],
             }, indent=2)
         return json.dumps({"error": "Unknown resource"})
 
@@ -206,12 +240,24 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument(
-        "--db",    required=True,
-        help="Path to the .feather file (created if it does not exist)",
+        "--db",    default=None,
+        help="LOCAL backend: path to the .feather file (created if absent). "
+             "Omit when using --api-url.",
+    )
+    parser.add_argument(
+        "--api-url", default=os.getenv("FEATHER_API_URL"),
+        help="REMOTE backend: base URL of a deployed Feather Cloud API "
+             "(e.g. http://host:8000). Env: FEATHER_API_URL. Embedding runs "
+             "client-side, so the server needs no embedding config.",
+    )
+    parser.add_argument(
+        "--api-key", default=os.getenv("FEATHER_API_KEY", ""),
+        help="REMOTE backend: X-API-Key for the Cloud API. Env: FEATHER_API_KEY.",
     )
     parser.add_argument(
         "--dim",   type=int, default=3072,
-        help="Vector dimension (default: 3072 for Gemini Embedding 2)",
+        help="Vector dimension. Must match the embedder AND (remote) the "
+             "namespace dim. Default 3072; use 768 for the hosted dim-768 namespaces.",
     )
     parser.add_argument(
         "--name",  default="feather-db",
@@ -240,6 +286,11 @@ def main():
     args = parser.parse_args()
 
     _require_mcp()
+
+    if not args.api_url and not args.db:
+        print("ERROR: provide either --db <file.feather> (local) or "
+              "--api-url <url> (remote).", file=sys.stderr)
+        sys.exit(1)
 
     # Optional custom embedder
     embed_fn = None
@@ -281,16 +332,22 @@ def main():
         server_name     = args.name,
         system_provider = system_provider,
         namespace       = args.namespace,
+        api_url         = args.api_url,
+        api_key         = args.api_key,
     )
 
     print(f"Feather DB MCP server starting…", file=sys.stderr)
-    print(f"  DB:   {args.db}", file=sys.stderr)
+    print(f"  Backend: {'remote ' + args.api_url if args.api_url else 'local ' + str(args.db)}", file=sys.stderr)
+    print(f"  Namespace: {args.namespace}", file=sys.stderr)
     print(f"  Dim:  {args.dim}", file=sys.stderr)
     print(f"  Name: {args.name}", file=sys.stderr)
 
-    from feather_db.integrations.base import TOOL_SPECS
-    print(f"  Tools ({len(TOOL_SPECS)}):", file=sys.stderr)
-    for spec in TOOL_SPECS:
+    if args.api_url:
+        from feather_db.integrations.mcp_remote import REMOTE_TOOL_SPECS as _specs
+    else:
+        from feather_db.integrations.base import TOOL_SPECS as _specs
+    print(f"  Tools ({len(_specs)}):", file=sys.stderr)
+    for spec in _specs:
         print(f"    • {spec['name']}", file=sys.stderr)
     print("", file=sys.stderr)
 

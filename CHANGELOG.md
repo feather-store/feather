@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.14.0] — 2026-06-11
+
+### Added — MCP remote backend (persona context engine)
+- `feather-serve` can now talk to a **deployed Feather Cloud API** over HTTP
+  (`--api-url` / `--api-key`, or `FEATHER_API_URL` / `FEATHER_API_KEY`) instead
+  of opening a local `.feather` file — so Claude (Desktop or Code) can use a
+  hosted, shared Feather instance as a persona context engine. Local `--db`
+  mode is unchanged.
+- New `feather_db.integrations.mcp_remote.RemoteFeatherTools` — embeds
+  **client-side** and calls the plain REST endpoints, so the server needs no
+  embedding configuration and any namespace dim works.
+- Remote tool set (8): `feather_ingest`, `feather_recall`,
+  `feather_keyword_recall`, `feather_context_chain`, `feather_get_record`,
+  `feather_link`, `feather_stats`, `feather_list_namespaces`.
+- Docstring documents Claude Desktop **and** Claude Code config for both local
+  and remote backends.
+
+### Fixed
+- **`/v1/{ns}/context_chain` 500** whenever the chain contained edges — the
+  endpoint read `e.source_id`/`e.target_id` but the `ContextEdge` binding
+  exposes `.source`/`.target`. (Found while testing the MCP connector.)
+
+---
+
 ## [0.13.2] — 2026-06-11
 
 ### Fixed
