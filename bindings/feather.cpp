@@ -283,6 +283,15 @@ PYBIND11_MODULE(core, m) {
         .def("is_quantized", &feather::DB::is_quantized, py::arg("modality"),
              "Whether a modality is persisted with int8 quantization.")
 
+        // -- In-RAM int8 quantization (4x less memory) --
+        .def("set_int8_ram", &feather::DB::set_int8_ram,
+             py::arg("modality"), py::arg("max_abs") = 1.0f,
+             "Store this modality's vectors as int8 IN MEMORY (~4x less RAM) "
+             "using a global scale = max_abs/127. Must be called BEFORE the first "
+             "add to that modality. Components beyond max_abs are clamped.")
+        .def("is_int8_ram", &feather::DB::is_int8_ram, py::arg("modality"),
+             "Whether a modality's in-memory index stores int8 vectors.")
+
         // -- Memory lifecycle --
         .def("forget",         &feather::DB::forget,         py::arg("id"),
              "Soft-delete: remove from search + blank content. Graph shell preserved.")

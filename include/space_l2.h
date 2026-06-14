@@ -252,6 +252,53 @@ class L2Space : public SpaceInterface<float> {
     ~L2Space() {}
 };
 
+// ── In-RAM int8 scalar-quantized L2 space ────────────────────────────────
+// Stores each vector as int8[dim] (4x smaller than float32) using a single
+// GLOBAL scale s per modality: q_i = clamp(round(v_i / s), -127, 127).
+// Distance is the exact L2 of the dequantized vectors: because both operands
+// share s, ||s*qa - s*qb||^2 = s^2 * sum_i (qa_i - qb_i)^2 — integer math + one
+// float multiply. Returns float so it plugs into HierarchicalNSW<float>.
+// Param layout { size_t dim; float scale } — dim MUST be first so hnswlib's
+// getDataByLabel<int8_t>() (which reads *(size_t*)param) returns the vector.
+struct Int8Params {
+    size_t dim;
+    float  scale;
+};
+
+static float
+Int8L2SqrGlobal(const void *pa, const void *pb, const void *param_ptr) {
+    const Int8Params *p = static_cast<const Int8Params *>(param_ptr);
+    const int8_t *a = static_cast<const int8_t *>(pa);
+    const int8_t *b = static_cast<const int8_t *>(pb);
+    int64_t acc = 0;
+    for (size_t i = 0; i < p->dim; i++) {
+        int32_t d = static_cast<int32_t>(a[i]) - static_cast<int32_t>(b[i]);
+        acc += static_cast<int64_t>(d) * d;
+    }
+    return p->scale * p->scale * static_cast<float>(acc);
+}
+
+class Int8L2Space : public SpaceInterface<float> {
+    DISTFUNC<float> fstdistfunc_;
+    Int8Params params_;
+    size_t data_size_;
+
+ public:
+    Int8L2Space(size_t dim, float scale) {
+        params_.dim = dim;
+        params_.scale = scale;
+        data_size_ = dim * sizeof(int8_t);
+        fstdistfunc_ = Int8L2SqrGlobal;
+    }
+
+    size_t get_data_size() { return data_size_; }
+    DISTFUNC<float> get_dist_func() { return fstdistfunc_; }
+    void *get_dist_func_param() { return &params_; }
+    float scale() const { return params_.scale; }
+
+    ~Int8L2Space() {}
+};
+
 static int
 L2SqrI4x(const void *__restrict pVect1, const void *__restrict pVect2, const void *__restrict qty_ptr) {
     size_t qty = *((size_t *) qty_ptr);

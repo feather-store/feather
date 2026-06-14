@@ -34,13 +34,16 @@ class DB {
 private:
     struct ModalityIndex {
         std::unique_ptr<hnswlib::HierarchicalNSW<float>> index;
-        std::unique_ptr<hnswlib::L2Space> space;
+        std::unique_ptr<hnswlib::SpaceInterface<float>> space;  // L2Space or Int8L2Space
         size_t dim;
+        bool  int8  = false;   // in-RAM int8 storage (4x smaller)
+        float scale = 0.0f;    // global quant scale when int8 (= max_abs / 127)
     };
 
     std::unordered_map<std::string, ModalityIndex> modality_indices_;
     std::string path_;
     std::string wal_path_;
+    size_t default_dim_ = 768;   // dim reported before any modality index exists
     std::unordered_map<uint64_t, Metadata> metadata_store_;
 
     // Thread safety — one mutex per DB instance
@@ -70,6 +73,12 @@ private:
     // index stays float32; vectors are dequantized on load. Opt-in per modality.
     std::unordered_set<std::string> quantized_modalities_;
 
+    // ── In-RAM int8 quantization ─────────────────────────────────────
+    // Modalities whose HNSW index stores int8[dim] vectors (4x less RAM) under a
+    // global scale = max_abs/127. Must be configured before the modality's index
+    // is created (i.e. before the first add). Persisted in file format v8.
+    std::unordered_map<std::string, float> int8_ram_scale_;
+
     // ── BM25 Inverted Index ──────────────────────────────────────────
     struct PostingEntry { uint64_t doc_id; uint32_t term_freq; };
     std::unordered_map<std::string, std::vector<PostingEntry>> bm25_index_;
@@ -98,14 +107,84 @@ private:
     ModalityIndex& get_or_create_index(const std::string& modality, size_t dim) {
         auto it = modality_indices_.find(modality);
         if (it == modality_indices_.end()) {
-            auto space = std::make_unique<hnswlib::L2Space>(dim);
+            auto cfg = int8_ram_scale_.find(modality);
+            bool int8 = cfg != int8_ram_scale_.end();
+            float scale = int8 ? cfg->second : 0.0f;
+            std::unique_ptr<hnswlib::SpaceInterface<float>> space;
+            if (int8) space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
+            else      space = std::make_unique<hnswlib::L2Space>(dim);
             auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
                 space.get(), 1'000'000, 16, 200);
             index->setEf(DEFAULT_EF);
-            modality_indices_[modality] = {std::move(index), std::move(space), dim};
+            modality_indices_[modality] = {std::move(index), std::move(space), dim, int8, scale};
             return modality_indices_[modality];
         }
         return it->second;
+    }
+
+    // Build the int8 storage payload for one vector under a global scale.
+    static void quantize_global(const float* v, size_t dim, float scale, int8_t* out) {
+        float inv = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+        for (size_t i = 0; i < dim; ++i) {
+            long q = std::lround(v[i] * inv);
+            if (q >  127) q =  127;
+            if (q < -127) q = -127;
+            out[i] = static_cast<int8_t>(q);
+        }
+    }
+
+    // Insert a float vector into a modality index, quantizing to int8 first if
+    // the modality is in-RAM int8. Centralises the float-vs-int8 store decision.
+    static void add_point(ModalityIndex& m_idx, uint64_t id, const float* vec) {
+        if (m_idx.int8) {
+            // Reusable per-thread buffer — a fresh std::vector per call across the
+            // parallel insert pool churns the allocator and inflates RSS by ~MBs.
+            static thread_local std::vector<int8_t> q;
+            q.resize(m_idx.dim);
+            quantize_global(vec, m_idx.dim, m_idx.scale, q.data());
+            m_idx.index->addPoint(q.data(), id);
+        } else {
+            m_idx.index->addPoint(vec, id);
+        }
+    }
+
+    // Encode a query in the modality's storage format (int8 blob or float bytes)
+    // so it can be passed straight to searchKnn / the distance function.
+    static std::vector<char> encode_query(const ModalityIndex& m_idx, const float* q) {
+        if (m_idx.int8) {
+            std::vector<char> blob(m_idx.dim);
+            quantize_global(q, m_idx.dim, m_idx.scale,
+                            reinterpret_cast<int8_t*>(blob.data()));
+            return blob;
+        }
+        const char* p = reinterpret_cast<const char*>(q);
+        return std::vector<char>(p, p + m_idx.dim * sizeof(float));
+    }
+
+    // Read a stored vector back as float32 (dequantizing if the modality is int8).
+    static std::vector<float> read_vector_internal(const ModalityIndex& m_idx, size_t internal_id) {
+        const char* raw = m_idx.index->getDataByInternalId(internal_id);
+        std::vector<float> out(m_idx.dim);
+        if (m_idx.int8) {
+            const int8_t* q = reinterpret_cast<const int8_t*>(raw);
+            for (size_t i = 0; i < m_idx.dim; ++i) out[i] = static_cast<float>(q[i]) * m_idx.scale;
+        } else {
+            const float* f = reinterpret_cast<const float*>(raw);
+            for (size_t i = 0; i < m_idx.dim; ++i) out[i] = f[i];
+        }
+        return out;
+    }
+
+    // Read a stored vector back as float32 by external id. Throws if absent.
+    static std::vector<float> read_vector_label(const ModalityIndex& m_idx, uint64_t id) {
+        if (m_idx.int8) {
+            auto q = m_idx.index->template getDataByLabel<int8_t>(id);  // dim int8s
+            std::vector<float> out(q.size());
+            for (size_t i = 0; i < q.size(); ++i)
+                out[i] = static_cast<float>(q[i]) * m_idx.scale;
+            return out;
+        }
+        return m_idx.index->template getDataByLabel<float>(id);
     }
 
     void build_reverse_index() {
@@ -154,7 +233,7 @@ private:
             if (v >= 1) nthreads = std::min<size_t>(static_cast<size_t>(v), n);
         }
         if (nthreads <= 1 || n < 256) {           // small sets: serial is faster
-            for (auto& [id, v] : items) m_idx.index->addPoint(v.data(), id);
+            for (auto& [id, v] : items) add_point(m_idx, id, v.data());
             return;
         }
         std::atomic<size_t> next{0};
@@ -164,7 +243,7 @@ private:
             pool.emplace_back([&]() {
                 size_t i;
                 while ((i = next.fetch_add(1)) < n)
-                    m_idx.index->addPoint(items[i].second.data(), items[i].first);
+                    add_point(m_idx, items[i].first, items[i].second.data());
             });
         }
         for (auto& th : pool) th.join();
@@ -279,17 +358,19 @@ private:
                 auto mit = metadata_store_.find(id);
                 if (mit == metadata_store_.end()) continue;  // purged / orphaned
                 if (is_dead_meta(mit->second))      continue;  // forgotten / _deleted
-                const float* data = reinterpret_cast<const float*>(
-                    m_idx.index->getDataByInternalId(i));
-                survivors.push_back({id, std::vector<float>(data, data + m_idx.dim)});
+                survivors.push_back({id, read_vector_internal(m_idx, i)});  // float (deq if int8)
             }
-            auto space     = std::make_unique<hnswlib::L2Space>(m_idx.dim);
+            // Rebuild preserving the storage type (float L2 or int8).
+            std::unique_ptr<hnswlib::SpaceInterface<float>> space;
+            if (m_idx.int8) space = std::make_unique<hnswlib::Int8L2Space>(m_idx.dim, m_idx.scale);
+            else            space = std::make_unique<hnswlib::L2Space>(m_idx.dim);
             auto new_index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
                 space.get(), 1'000'000, 16, 200);
-            for (const auto& [id, vec] : survivors)
-                new_index->addPoint(vec.data(), id);
+            new_index->setEf(DEFAULT_EF);
             m_idx.index = std::move(new_index);
-            m_idx.space  = std::move(space);
+            m_idx.space = std::move(space);
+            for (const auto& [id, vec] : survivors)
+                add_point(m_idx, id, vec.data());
         }
 
         for (uint64_t id : dead) metadata_store_.erase(id);
@@ -435,7 +516,7 @@ private:
                 ss.read(reinterpret_cast<char*>(vec.data()), dim32 * 4);
                 Metadata meta = Metadata::deserialize(ss);
                 auto& m_idx = get_or_create_index(modality, dim32);
-                try { m_idx.index->addPoint(vec.data(), id); } catch (...) {}
+                try { add_point(m_idx, id, vec.data()); } catch (...) {}
                 metadata_store_[id] = std::move(meta);
 
             } else if (op == WalOp::UPDATE) {
@@ -518,7 +599,7 @@ private:
         if (!f) throw std::runtime_error("Cannot save to temp file: " + tmp_path);
 
         uint32_t magic   = 0x46454154; // "FEAT"
-        uint32_t version = 7;          // v7 adds per-modality int8 quantization
+        uint32_t version = 8;          // v7: on-disk int8; v8: in-RAM int8 flag + scale
         f.write((char*)&magic,   4);
         f.write((char*)&version, 4);
 
@@ -556,6 +637,10 @@ private:
 
             uint8_t quant = quantized_modalities_.count(name) ? 1 : 0;
             f.write((char*)&quant, 1);
+            // v8: persist in-RAM int8 mode + its global scale so reload restores it
+            uint8_t int8ram = m_idx.int8 ? 1 : 0;
+            f.write((char*)&int8ram, 1);
+            if (int8ram) f.write((char*)&m_idx.scale, 4);
 
             size_t total = m_idx.index->cur_element_count;
             uint32_t live_count = 0;
@@ -568,15 +653,15 @@ private:
             for (size_t i = 0; i < total; ++i) {
                 uint64_t id = m_idx.index->getExternalLabel(i);
                 if (!valid_ids.count(id)) continue;
-                const float* data = reinterpret_cast<const float*>(
-                    m_idx.index->getDataByInternalId(i));
+                // dequantize int8 nodes to float; on-disk quant is independent
+                std::vector<float> data = read_vector_internal(m_idx, i);
                 f.write((char*)&id, 8);
                 if (quant) {
-                    float scale = quantize_vec(data, m_idx.dim, qbuf.data());
+                    float scale = quantize_vec(data.data(), m_idx.dim, qbuf.data());
                     f.write((char*)&scale, 4);
                     f.write((char*)qbuf.data(), m_idx.dim);   // dim bytes
                 } else {
-                    f.write((char*)data, m_idx.dim * sizeof(float));
+                    f.write((char*)data.data(), m_idx.dim * sizeof(float));
                 }
             }
         }
@@ -607,7 +692,7 @@ private:
             while (f.read((char*)&id, 8)) {
                 Metadata meta = Metadata::deserialize(f);
                 f.read((char*)vec.data(), dim32 * sizeof(float));
-                m_idx.index->addPoint(vec.data(), id);
+                add_point(m_idx, id, vec.data());
                 metadata_store_[id] = std::move(meta);
             }
         } else if (version >= 3) {
@@ -630,7 +715,16 @@ private:
                 f.read((char*)&dim32, 4);
                 uint8_t quant = 0;
                 if (version >= 7) f.read((char*)&quant, 1);
+                uint8_t int8ram = 0;
+                float   int8scale = 0.0f;
+                if (version >= 8) {
+                    f.read((char*)&int8ram, 1);
+                    if (int8ram) f.read((char*)&int8scale, 4);
+                }
                 f.read((char*)&element_count, 4);
+                // configure int8-RAM BEFORE the index is created so it is built
+                // as an int8 index; vectors below are re-quantized via add_point.
+                if (int8ram) int8_ram_scale_[name] = int8scale;
                 auto& m_idx = get_or_create_index(name, dim32);
                 if (quant) quantized_modalities_.insert(name);
                 // Read all vectors serially (sequential I/O), then build the
@@ -669,11 +763,15 @@ public:
     // ─────────────────────────────────────────────────────────────────
     static std::unique_ptr<DB> open(const std::string& path, size_t default_dim = 768) {
         auto db = std::make_unique<DB>();
-        db->path_     = path;
-        db->wal_path_ = path + ".wal";
+        db->path_        = path;
+        db->wal_path_    = path + ".wal";
+        db->default_dim_ = default_dim;
         db->load_vectors();
-        if (db->modality_indices_.empty())
-            db->get_or_create_index("text", default_dim);
+        // Intentionally do NOT pre-create the "text" index. An empty HNSW index
+        // preallocates ~70MB (1M-element link locks etc.); pre-creating it forced
+        // set_int8_ram()/set_quantized() to build a *second* index, doubling RAM.
+        // The modality is created lazily on the first add() — by which point
+        // set_int8_ram() has taken effect — and dim() falls back to default_dim_.
         return db;
     }
 
@@ -701,7 +799,7 @@ public:
         auto& m_idx = get_or_create_index(modality, vec.size());
         if (vec.size() != m_idx.dim)
             throw std::runtime_error("Dimension mismatch for modality " + modality);
-        m_idx.index->addPoint(vec.data(), id);
+        add_point(m_idx, id, vec.data());
 
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end()) {
@@ -839,11 +937,10 @@ public:
 
         for (size_t i = 0; i < n; ++i) {
             uint64_t from_id = m_idx.index->getExternalLabel(i);
-            const float* raw = reinterpret_cast<const float*>(
-                m_idx.index->getDataByInternalId(i));
-            std::vector<float> query(raw, raw + m_idx.dim);
-
-            auto res = m_idx.index->searchKnn(query.data(), candidates + 1);
+            // stored data is already in the index's storage format (float or
+            // int8), so it can be used directly as the query.
+            const void* qdata = m_idx.index->getDataByInternalId(i);
+            auto res = m_idx.index->searchKnn(qdata, candidates + 1);
             while (!res.empty()) {
                 auto [dist, to_id] = res.top(); res.pop();
                 if (to_id == from_id) continue;
@@ -895,8 +992,9 @@ public:
         if (m_it == modality_indices_.end()) return {};
         auto& m_idx = m_it->second;
 
-        // Step 1: vector search → seed nodes
-        auto raw = m_idx.index->searchKnn(query.data(), k);
+        // Step 1: vector search → seed nodes (encode query to storage format)
+        auto qbytes = encode_query(m_idx, query.data());
+        auto raw = m_idx.index->searchKnn(qbytes.data(), k);
         std::unordered_map<uint64_t, float> sim_scores;
         while (!raw.empty()) {
             auto [dist, id] = raw.top(); raw.pop();
@@ -1095,7 +1193,7 @@ public:
         auto it = modality_indices_.find(modality);
         if (it == modality_indices_.end()) return {};
         try {
-            return it->second.index->template getDataByLabel<float>(id);
+            return read_vector_label(it->second, id);   // dequantizes if int8
         } catch (...) {
             return {};
         }
@@ -1110,7 +1208,7 @@ public:
         ids.reserve(it->second.index->getCurrentElementCount());
         for (const auto& [id, _] : metadata_store_) {
             try {
-                it->second.index->template getDataByLabel<float>(id);
+                read_vector_label(it->second, id);   // throws if not in this modality
                 ids.push_back(id);
             } catch (...) {}
         }
@@ -1187,8 +1285,6 @@ public:
             bool indexed = false;
             auto cand = candidates_for_filter(*filter, indexed);
             if (indexed) {
-                auto dist_func  = m_idx.space->get_dist_func();
-                auto dist_param = m_idx.space->get_dist_func_param();
                 double now_ts = static_cast<double>(std::time(nullptr));
                 std::vector<SearchResult> results;
                 results.reserve(cand.size());
@@ -1197,10 +1293,14 @@ public:
                     if (it == metadata_store_.end() || is_dead_meta(it->second)) continue;
                     if (!filter->matches(it->second)) continue;   // non-indexed predicates
                     std::vector<float> vec;
-                    try { vec = m_idx.index->template getDataByLabel<float>(id); }
+                    try { vec = read_vector_label(m_idx, id); }   // float (deq if int8)
                     catch (...) { continue; }                     // not in this modality
                     if (vec.size() != m_idx.dim) continue;
-                    float dist = dist_func(q.data(), vec.data(), dist_param);
+                    float dist = 0.0f;                            // exact L2 in float space
+                    for (size_t d = 0; d < m_idx.dim; ++d) {
+                        float diff = q[d] - vec[d];
+                        dist += diff * diff;
+                    }
                     touch_nolock(id);
                     float score = scoring
                         ? Scorer::calculate_score(dist, it->second, *scoring, now_ts)
@@ -1230,7 +1330,8 @@ public:
 
         FilterWrapper hnsw_filter(filter, metadata_store_);
         size_t candidates = (scoring) ? k * 3 : k;
-        auto res = m_idx.index->searchKnn(q.data(), candidates,
+        auto qbytes = encode_query(m_idx, q.data());   // float bytes or int8 blob
+        auto res = m_idx.index->searchKnn(qbytes.data(), candidates,
                                           filter ? &hnsw_filter : nullptr);
 
         std::vector<SearchResult> results;
@@ -1344,7 +1445,8 @@ public:
                     }
                 } fw(filter, metadata_store_);
                 size_t cands = scoring ? candidates * 3 : candidates;
-                auto res = m_idx.index->searchKnn(vec.data(), cands, filter ? &fw : nullptr);
+                auto qbytes = encode_query(m_idx, vec.data());
+                auto res = m_idx.index->searchKnn(qbytes.data(), cands, filter ? &fw : nullptr);
                 double now_ts = static_cast<double>(std::time(nullptr));
                 while (!res.empty()) {
                     auto [dist, id] = res.top(); res.pop();
@@ -1556,6 +1658,37 @@ public:
         return quantized_modalities_.count(modality) > 0;
     }
 
+    // Store this modality's vectors as int8[dim] IN MEMORY (4x less RAM) using a
+    // global scale = max_abs/127. Must be called BEFORE the first vector is added
+    // to the modality (it sets the index storage type). `max_abs` should bound
+    // the largest |component| in your vectors (values beyond it are clamped);
+    // for unit-norm embeddings a small value like 0.3–1.0 is typical.
+    void set_int8_ram(const std::string& modality, float max_abs = 1.0f) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = modality_indices_.find(modality);
+        if (it != modality_indices_.end() &&
+            it->second.index->getCurrentElementCount() > 0)
+            throw std::runtime_error(
+                "set_int8_ram('" + modality + "') must be called before any "
+                "vectors are added to that modality");
+        if (max_abs <= 0.0f) max_abs = 1.0f;
+        float scale = max_abs / 127.0f;
+        int8_ram_scale_[modality] = scale;
+        // open() pre-creates an empty "text" index; rebuild it as int8 in place.
+        if (it != modality_indices_.end()) {
+            size_t dim = it->second.dim;
+            auto space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
+            auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+                space.get(), 1'000'000, 16, 200);
+            index->setEf(DEFAULT_EF);
+            it->second = {std::move(index), std::move(space), dim, true, scale};
+        }
+    }
+    bool is_int8_ram(const std::string& modality) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return int8_ram_scale_.count(modality) > 0;
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Persistence & info
     // ─────────────────────────────────────────────────────────────────
@@ -1572,7 +1705,8 @@ public:
     size_t dim(const std::string& modality = "text") const {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = modality_indices_.find(modality);
-        return (it != modality_indices_.end()) ? it->second.dim : 0;
+        if (it != modality_indices_.end()) return it->second.dim;
+        return default_dim_;   // modality not created yet → report the open() default
     }
 
     size_t size() const {

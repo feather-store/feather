@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.15.0] — 2026-06-14
+
+### Added — In-RAM int8 quantization (file format v8)
+- `set_int8_ram(modality, max_abs)` / `is_int8_ram(modality)` — store a
+  modality's vectors as **int8 in memory** (not just on disk) via a new
+  `Int8L2Space` (global scale = `max_abs/127`, integer-L2 distance). Measured
+  **~1.6–1.8× less RAM** at 60k×768 (227 MB → 129 MB) with recall **0.88** vs
+  the float baseline. Query/insert quantize transparently; `get_vector`
+  dequantizes. Persisted in **file format v8** (per-modality int8-RAM flag +
+  scale); v3–v7 files load unchanged.
+- Best for embedding-shaped vectors; the global scale resolves moderate dynamic
+  ranges well. int8 is lossy by design — a small recall drop trades for memory.
+
+### Fixed
+- **`open()` no longer pre-creates an empty "text" index.** That throwaway index
+  preallocated ~70 MB (1M-element link locks) and forced `set_int8_ram()` /
+  `set_quantized()` to build a *second* index — doubling RAM. The modality is
+  now created lazily on the first `add()`; `dim()` falls back to the configured
+  default so the Cloud API still validates before any vectors exist.
+- `add_point()` reuses a thread-local int8 buffer during parallel inserts
+  (avoids per-call allocation churn).
+
+---
+
 ## [0.14.0] — 2026-06-11
 
 ### Added — MCP remote backend (persona context engine)
