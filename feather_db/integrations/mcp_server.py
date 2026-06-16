@@ -33,16 +33,21 @@ Two backends:
       { "mcpServers": { "feather": {
           "command": "feather-serve",
           "args": ["--db", "./persona.feather", "--dim", "3072"] } } }
-    REMOTE:
+    REMOTE (with a real embedder so recall is genuinely semantic):
       { "mcpServers": { "feather": {
           "command": "feather-serve",
-          "args": ["--api-url", "http://HOST:8000", "--namespace", "persona", "--dim", "768"],
-          "env": { "FEATHER_API_KEY": "your-key" } } } }
+          "args": ["--api-url", "http://HOST:8000", "--namespace", "persona",
+                   "--dim", "768", "--embed-provider", "gemini"],
+          "env": { "FEATHER_API_KEY": "your-key", "GOOGLE_API_KEY": "your-gemini-key" } } } }
     # CLI shortcut:
-    #   claude mcp add feather -- feather-serve --api-url http://HOST:8000 --namespace persona --dim 768
+    #   GOOGLE_API_KEY=… claude mcp add feather -- feather-serve \
+    #     --api-url http://HOST:8000 --namespace persona --dim 768 --embed-provider gemini
 
-Tip: pass --embedder to use a real embedder (a module exporting `embed(text)->list[float]`);
-the default is a deterministic hash embedder — fine for wiring, weak for real semantics.
+Embedder: pass --embed-provider gemini|openai|voyage|cohere|ollama for REAL semantic
+embeddings (Gemini text-embedding-004 is native 768 and matches the hosted namespaces;
+OpenAI text-embedding-3-small honours --dim 768 directly). Key via --embed-key or
+FEATHER_EMBED_API_KEY / GOOGLE_API_KEY / OPENAI_API_KEY. Or --embedder <module.py>.
+With neither, a deterministic HASH embedder is used — fine for wiring, weak for semantics.
 The --dim must match the embedder AND (remote) the namespace dim.
 
 Remote tools (8, persona context engine): feather_ingest, feather_recall,
@@ -268,6 +273,20 @@ def main():
         help="Optional: path to a Python module exporting an `embed(text) -> list[float]` function",
     )
     parser.add_argument(
+        "--embed-provider", default=os.getenv("FEATHER_EMBED_PROVIDER"),
+        choices=["gemini", "openai", "voyage", "cohere", "ollama", "hash"],
+        help="Real embedder for the persona engine: gemini (text-embedding-004, "
+             "native 768) / openai / voyage / cohere / ollama / hash. Key from "
+             "--embed-key or FEATHER_EMBED_API_KEY / GOOGLE_API_KEY / OPENAI_API_KEY. "
+             "Env: FEATHER_EMBED_PROVIDER. Takes precedence over --embedder.",
+    )
+    parser.add_argument("--embed-model", default=os.getenv("FEATHER_EMBED_MODEL"),
+                        help="Override the embedding model for --embed-provider.")
+    parser.add_argument("--embed-key", default=None,
+                        help="API key for --embed-provider (else taken from env).")
+    parser.add_argument("--embed-base-url", default=os.getenv("FEATHER_EMBED_BASE_URL"),
+                        help="Override base URL (e.g. Ollama host, Azure endpoint).")
+    parser.add_argument(
         "--system-provider", default=None,
         choices=["claude", "openai", "gemini", "ollama"],
         help="Phase 9: LLM provider for FactExtractor + EntityResolver. "
@@ -292,9 +311,21 @@ def main():
               "--api-url <url> (remote).", file=sys.stderr)
         sys.exit(1)
 
-    # Optional custom embedder
+    # Embedder: --embed-provider (real, built-in providers) takes precedence;
+    # otherwise a custom --embedder module; otherwise the backend's default.
     embed_fn = None
-    if args.embedder:
+    if args.embed_provider:
+        from feather_db.integrations.embedders import make_embedder
+        try:
+            embed_fn = make_embedder(args.embed_provider, model=args.embed_model,
+                                     api_key=args.embed_key, dim=args.dim,
+                                     base_url=args.embed_base_url)
+            print(f"  Embedder: {args.embed_provider} "
+                  f"({args.embed_model or 'default'}, dim={args.dim})", file=sys.stderr)
+        except Exception as e:
+            print(f"ERROR: embedder init failed: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif args.embedder:
         import importlib.util, pathlib
         spec = importlib.util.spec_from_file_location("_custom_embedder",
                                                        pathlib.Path(args.embedder))

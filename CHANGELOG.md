@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.15.1] — 2026-06-16
+
+### Added — Real embedders for the MCP connector
+- `feather-serve --embed-provider gemini|openai|voyage|cohere|ollama` builds a
+  real client-side embedder so the persona MCP's `feather_recall` is genuinely
+  semantic (was a deterministic hash embedder). Gemini `text-embedding-004` is
+  native **768-dim** (matches the hosted namespaces); OpenAI `text-embedding-3-small`
+  honours `--dim 768` directly. Key via `--embed-key` / `FEATHER_EMBED_API_KEY` /
+  `GOOGLE_API_KEY` / `OPENAI_API_KEY`. New module
+  `feather_db.integrations.embedders.make_embedder` (urllib-only, dim-fitting).
+- Docstring shows Claude Desktop / Code config with a real embedder.
+
+---
+
 ## [0.15.0] — 2026-06-14
 
 ### Added — In-RAM int8 quantization (file format v8)
