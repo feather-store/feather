@@ -20,6 +20,33 @@ Feather DB is an embedded vector database and living context engine — zero-ser
 
 ---
 
+## What's New in v0.13–v0.15 — Ingestion, Memory & Claude (Phase 8)
+
+| Capability | Version | Notes |
+|---|---|---|
+| **Parallel HNSW load** | v0.13.0 | Graph rebuilt across a thread pool on open — **~4.7× faster load** (7.6s→1.7s for 40k×128), identical recall. `FEATHER_LOAD_THREADS` to cap. |
+| **Parallel batch ingest** | v0.13.0 | `DB.add_batch(ids, vecs, metas=None)` builds the graph in parallel with the GIL released — **~3.4× faster** bulk insert. |
+| **SIMD on x86** | v0.13.0 | SSE/AVX L2 kernels (runtime-dispatched) compiled on x86_64; arm64 uses `-O3` NEON. `FEATHER_SIMD=none\|sse\|avx\|avx512`. |
+| **In-RAM int8 quantization** | v0.15.0 | `set_int8_ram(modality, max_abs)` stores vectors as int8 **in memory** — **~1.7× less RAM** (227→129 MB at 60k×768), recall ~0.88. **File format v8.** |
+| **MCP connector for Claude** | v0.14.0 | `feather-serve` exposes Feather as a persona context engine to **Claude Desktop / Code** — local `.feather` *or* remote Cloud API (`--api-url`). |
+| **Real embedders** | v0.15.1 | `feather-serve --embed-provider gemini\|openai\|voyage\|cohere\|ollama` — semantic recall over a hosted instance (Gemini `text-embedding-004` = native 768). |
+
+```python
+# Bulk-ingest a persona's history fast (parallel HNSW build)
+db.add_batch(ids, vecs, metas)
+
+# Store vectors as int8 in RAM — ~1.7x less memory (opt-in, lossy)
+db.set_int8_ram("text", max_abs=1.0)
+```
+
+```bash
+# Claude Code → hosted Feather as a persona context engine (real embeddings)
+GOOGLE_API_KEY=… claude mcp add feather -- feather-serve \
+  --api-url http://HOST:8000 --namespace persona --dim 768 --embed-provider gemini
+```
+
+---
+
 ## What's New in v0.11–v0.12 — Query Performance & Compression (Phase 7)
 
 | Capability | Version | Notes |
@@ -89,7 +116,7 @@ See [docs/quickstart.md](docs/quickstart.md) for a self-hosted setup walkthrough
 | **MCP Server** | `feather-serve` — connects Feather to Claude Desktop, Cursor, and any MCP client |
 | **LangChain / LlamaIndex** | Drop-in `FeatherVectorStore`, `FeatherMemory`, `FeatherRetriever` adapters |
 | **Self-Aligned Context Engine** | LLM-powered ingestion: auto-classifies, scores, links, and namespaces every record |
-| **Single-file persistence** | `.feather` binary format (v7, optional int8 compression); v3–v6 files load transparently |
+| **Single-file persistence** | `.feather` binary format (v8, optional int8 compression on-disk and in-RAM); v3–v7 files load transparently |
 
 ---
 
@@ -496,7 +523,7 @@ feather save   --db my.feather
 | Recall@10 (500K × 128-dim, ef=50, real SIFT) | **0.972** |
 | Max vectors per modality | 1,000,000 (configurable) |
 | HNSW params | M=16, ef_construction=200, ef=50 (default in v0.8.0) |
-| File format | Binary `.feather` v7 (optional per-modality int8 compression, ~3× smaller) |
+| File format | Binary `.feather` v8 (optional int8: ~3× smaller on disk, ~1.7× less RAM) |
 
 SIMD (AVX2/AVX512) optimizations are available in `space_l2.h`. Enable with `-DUSE_AVX -march=native` in `setup.py`.
 
@@ -638,7 +665,7 @@ feather-db-cli (FFI via extern "C" from src/feather_core.cpp)
 ## File Format
 
 ```
-[magic: 4B = "FEAT"] [version: 4B = 7]
+[magic: 4B = "FEAT"] [version: 4B = 8]
 --- Metadata Section ---
 [meta_count: 4B]
   for each record:
@@ -647,15 +674,17 @@ feather-db-cli (FFI via extern "C" from src/feather_core.cpp)
 [modal_count: 4B]
   for each modality:
     [name_len: 2B] [name: N bytes]
-    [dim: 4B] [quantized: 1B] [element_count: 4B]
+    [dim: 4B] [quantized: 1B]            # on-disk int8 flag (v7+)
+    [int8_ram: 1B] [scale: 4B if int8_ram]   # in-RAM int8 flag + global scale (v8+)
+    [element_count: 4B]
     for each element:
       [id: 8B] then, per `quantized`:
         0 → [float32 vector: dim * 4 bytes]
         1 → [scale: 4B float] [int8 vector: dim bytes]
 ```
 
-v3–v6 files load transparently (the `quantized` flag is only present in v7+);
-missing fields default to empty.
+v3–v7 files load transparently (the `quantized` flag is read for v7+, the
+`int8_ram` flag for v8+); missing fields default to empty.
 
 ---
 
@@ -665,7 +694,7 @@ missing fields default to empty.
 |-------|--------|
 | No concurrent writes | HNSW is not thread-safe for simultaneous adds |
 | Soft deletes reclaimed on compaction | `forget()`/`purge()` mark vectors deleted; space is reclaimed by `compact()` or `set_auto_compact(ratio)` |
-| int8 quantization is on-disk only | Reduces file size & load I/O; the in-memory HNSW index stays float32 |
+| int8 quantization (two kinds) | `set_quantized()` = smaller files; `set_int8_ram()` = ~1.7× less RAM (opt-in, lossy) |
 | Max 1M vectors/modality | Hardcoded in `get_or_create_index`; increase `max_elements` to raise |
 | `meta.attributes['k'] = v` silent no-op | pybind11 map copy; use `meta.set_attribute(k, v)` |
 | Rust CLI missing v0.6.0+ features | namespace/entity/context_chain/integrations are Python-only |
