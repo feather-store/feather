@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.15.2] — 2026-06-17
+
+### Admin dashboard polish
+- **Records table virtualized** — only the ~30 rows in the scroll window are in
+  the DOM (spacer rows preserve scroll height), so a heavily paged list stays
+  light instead of accumulating thousands of `<tr>`s. Sticky header.
+- **API key — "Remember on this device" toggle** — checked → `localStorage`
+  (persists, the default, no sign-out surprise); unchecked → `sessionStorage`
+  (clears when the tab closes). Reads from either store on load; sign-out clears
+  both. Replaces the bare localStorage handling with an explicit, secure choice.
+- **Focus-trap in modals & drawer** — added the Alpine Focus plugin and `x-trap`
+  to the key dialog, record drawer, new-namespace / import / confirm modals, so
+  keyboard focus stays inside the open dialog.
+
+---
+
 ## [0.15.1] — 2026-06-16
 
 ### Added — Real embedders for the MCP connector

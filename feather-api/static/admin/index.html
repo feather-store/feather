@@ -35,6 +35,8 @@
     };
   </script>
   <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Focus plugin (must load before Alpine core) — powers x-trap focus-trapping in modals -->
+  <script defer src="https://unpkg.com/@alpinejs/focus@3.x.x/dist/cdn.min.js"></script>
   <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <script src="https://d3js.org/d3.v7.min.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&family=Playfair+Display:ital,wght@1,700;1,900&display=swap" rel="stylesheet">
@@ -115,7 +117,7 @@
 <body x-data="app()" x-init="init()" class="h-screen overflow-hidden" @keydown.window.meta.k.prevent="palette.open=true" @keydown.window.ctrl.k.prevent="palette.open=true" @keydown.window.escape="palette.open=false">
 
   <!-- ──────────────────────────  API key gate ────────────────────────── -->
-  <div x-show="!apiKey" x-cloak class="fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center">
+  <div x-show="!apiKey" x-trap.noscroll="!apiKey" x-cloak class="fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center">
     <div class="bg-white rounded-lg w-[420px] p-6 shadow-xl border border-slate-200">
       <div class="flex items-center gap-3">
         <svg viewBox="0 0 32 32" class="w-9 h-9 flex-shrink-0" xmlns="http://www.w3.org/2000/svg"><rect width="32" height="32" rx="7" fill="#111827"/><path d="M23 7C14 7 7 14 7 22L7 25L10 25C18 25 25 18 25 9L25 8C25 7.5 24.5 7 23 7Z" fill="#a3e635"/><path d="M8 24L24 8" stroke="#fcfaf7" stroke-width="1.3" stroke-linecap="round"/><circle cx="24" cy="8" r="1.6" fill="#fcfaf7"/></svg>
@@ -128,6 +130,11 @@
       <input x-model="keyInput" @keydown.enter="saveKey()" type="password"
         placeholder="feather-…"
         class="mono w-full text-sm px-3 py-2 border border-slate-300 rounded-md focus-ring" autofocus>
+      <label class="mt-3 flex items-center gap-2 text-[12px] text-slate-500 cursor-pointer select-none">
+        <input type="checkbox" x-model="rememberKey" class="accent-slate-900">
+        Remember on this device
+        <span class="text-slate-400" x-text="rememberKey ? '(stored until you sign out)' : '(cleared when the tab closes)'"></span>
+      </label>
       <div class="mt-5 flex justify-end gap-2">
         <button @click="saveKey()" class="btn-primary text-sm">Continue</button>
       </div>
@@ -450,8 +457,9 @@
               <button @click="loadRecords(true)" class="text-xs px-2 py-1 border border-slate-300 rounded hover:bg-slate-50">Refresh</button>
             </div>
             <div class="border border-slate-200 rounded-lg overflow-hidden">
+              <div class="overflow-y-auto" style="max-height:600px" @scroll.passive="vScroll = $event.target.scrollTop">
               <table class="w-full text-sm">
-                <thead class="text-[11px] uppercase tracking-wide text-slate-500 bg-slate-50 border-b border-slate-200">
+                <thead class="text-[11px] uppercase tracking-wide text-slate-500 bg-slate-50 border-b border-slate-200 sticky top-0 z-10">
                   <tr>
                     <th class="text-left px-5 py-2.5 font-medium">ID</th>
                     <th class="text-left px-5 py-2.5 font-medium">Content</th>
@@ -463,7 +471,9 @@
                   </tr>
                 </thead>
                 <tbody>
-                  <template x-for="r in records" :key="r.id">
+                  <!-- virtualized window: only in-view rows are in the DOM; spacer rows preserve scroll height -->
+                  <tr x-show="vStart() > 0"><td colspan="7" class="p-0" :style="`height:${vStart()*41}px`"></td></tr>
+                  <template x-for="r in records.slice(vStart(), vEnd())" :key="r.id">
                     <tr class="border-b border-slate-100 last:border-0">
                       <td class="px-5 py-2.5 mono text-slate-900" x-text="r.id"></td>
                       <td class="px-5 py-2.5 max-w-[280px]"><div class="clamp-1" x-text="r.metadata?.content || ''"></div></td>
@@ -477,6 +487,7 @@
                       </td>
                     </tr>
                   </template>
+                  <tr x-show="records.length - vEnd() > 0"><td colspan="7" class="p-0" :style="`height:${(records.length-vEnd())*41}px`"></td></tr>
                   <tr x-show="records.length === 0 && !loadingRecords">
                     <td colspan="7" class="px-5 py-10 text-center text-slate-400 text-sm">
                       No records.
@@ -488,6 +499,7 @@
                   </tr>
                 </tbody>
               </table>
+              </div>
             </div>
             <div class="mt-3 flex items-center justify-between text-xs">
               <button @click="loadMoreRecords()" x-show="recordsHasMore" class="px-3 py-1.5 border border-slate-300 rounded hover:bg-slate-50">Load more</button>
@@ -997,7 +1009,7 @@
   </div>
 
   <!-- ──────────────────────────  Record drawer ────────────────────────── -->
-  <div x-show="recordDrawer.open" x-cloak class="fixed inset-0 z-30">
+  <div x-show="recordDrawer.open" x-trap="recordDrawer.open" x-cloak class="fixed inset-0 z-30">
     <div class="absolute inset-0 bg-slate-900/30" @click="recordDrawer.open=false"></div>
     <div class="drawer absolute right-0 top-0 bottom-0 w-[540px] bg-white border-l border-slate-200 shadow-xl overflow-auto nice-scroll">
       <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
@@ -1105,7 +1117,7 @@
   </div>
 
   <!-- ──────────────────────────  New namespace modal ────────────────────────── -->
-  <div x-show="newNsModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="newNsModal.open=false">
+  <div x-show="newNsModal.open" x-trap.noscroll="newNsModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="newNsModal.open=false">
     <div class="bg-white rounded-lg w-[400px] p-6 shadow-xl border border-slate-200">
       <h3 class="text-lg font-semibold">Create namespace</h3>
       <p class="text-sm text-slate-500 mt-1">A new <span class="mono">.feather</span> file will be created on disk.</p>
@@ -1181,7 +1193,7 @@
   </div>
 
   <!-- ──────────────────────────  Bulk import modal ────────────────────────── -->
-  <div x-show="importModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="importModal.open=false">
+  <div x-show="importModal.open" x-trap.noscroll="importModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="importModal.open=false">
     <div class="bg-white rounded-lg w-[640px] p-6 shadow-xl border border-slate-200">
       <h3 class="text-lg font-semibold">Bulk import</h3>
       <p class="text-[12px] mt-1" style="color:var(--ink-mid)">Paste a JSON array of <span class="mono">{id, vector, metadata}</span> records, or upload a .json file.</p>
@@ -1229,7 +1241,7 @@
   </div>
 
   <!-- ──────────────────────────  Confirm dialog ────────────────────────── -->
-  <div x-show="confirmDlg.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50">
+  <div x-show="confirmDlg.open" x-trap.noscroll="confirmDlg.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50">
     <div class="bg-white rounded-lg w-[400px] p-6 shadow-xl border border-slate-200">
       <h3 class="text-lg font-semibold" x-text="confirmDlg.title"></h3>
       <p class="text-sm text-slate-500 mt-1" x-text="confirmDlg.body"></p>
@@ -1249,7 +1261,7 @@
   <script>
     function app() {
       return {
-        apiKey: '', keyInput: '',
+        apiKey: '', keyInput: '', rememberKey: true,
         view: 'overview', toasts: [],
         nsFilter: '', globalSearchNs: '',
         server: { url: window.location.origin, version: null, dim: null, nsCount: null, totalRecords: null, uptime: 0, topNamespaces: [] },
@@ -1262,7 +1274,7 @@
         // authoritative source used by all API calls.
         activeNs: '',
         nsTab: 'records',
-        records: [], recordsAfter: 0, recordsHasMore: false, loadingRecords: false,
+        records: [], recordsAfter: 0, recordsHasMore: false, loadingRecords: false, vScroll: 0,
         search: { mode: 'vector', query: '', seed: 42, k: 20, filter_ns: '', results: [], running: false,
                   attrFilters: [], newAttrKey: '', newAttrVal: '' },
         context: { seed: 42, k: 5, hops: 2, result: null },
@@ -1307,7 +1319,9 @@
 
         // ── lifecycle
         init() {
-          this.apiKey = localStorage.getItem("feather_admin_key") || '';
+          // read from either store (migration-friendly); remember-on reflects where it was found
+          this.apiKey = localStorage.getItem("feather_admin_key") || sessionStorage.getItem("feather_admin_key") || '';
+          this.rememberKey = !!localStorage.getItem("feather_admin_key") || !sessionStorage.getItem("feather_admin_key");
           if (this.apiKey) this.bootstrap();
           // refresh metrics every 15s on overview
           setInterval(() => { if (this.view === 'overview') { this.loadMetrics(); this.loadActivity(); this.loadOpsSeries(); } }, 15000);
@@ -1325,9 +1339,10 @@
           await this.loadConnectionInfo();
           await this.loadEmbeddingConfig();
         },
-        saveKey() { if (!this.keyInput.trim()) return; this.apiKey = this.keyInput.trim(); localStorage.setItem("feather_admin_key", this.apiKey); this.keyInput = ''; this.bootstrap(); },
-        signOut() { localStorage.removeItem("feather_admin_key"); this.apiKey = ''; },
-        rotateKeyPrompt() { const k = prompt('Paste new API key.'); if (k && k.trim()) { this.apiKey = k.trim(); localStorage.setItem("feather_admin_key", this.apiKey); this.toast('API key updated.'); this.bootstrap(); } },
+        _storeKey() { const s = this.rememberKey ? localStorage : sessionStorage, o = this.rememberKey ? sessionStorage : localStorage; s.setItem("feather_admin_key", this.apiKey); o.removeItem("feather_admin_key"); },
+        saveKey() { if (!this.keyInput.trim()) return; this.apiKey = this.keyInput.trim(); this._storeKey(); this.keyInput = ''; this.bootstrap(); },
+        signOut() { localStorage.removeItem("feather_admin_key"); sessionStorage.removeItem("feather_admin_key"); this.apiKey = ''; },
+        rotateKeyPrompt() { const k = prompt('Paste new API key.'); if (k && k.trim()) { this.apiKey = k.trim(); this._storeKey(); this.toast('API key updated.'); this.bootstrap(); } },
 
         // ── helpers
         async api(method, path, body) {
@@ -1664,8 +1679,12 @@
             }
           };
         },
+        // record-table virtualization: render only the ~31 rows in the scroll
+        // window (row height ≈ 41px), so a heavily "load-more"'d list stays light.
+        vStart() { return Math.max(0, Math.floor(this.vScroll / 41) - 8); },
+        vEnd()   { return Math.min(this.records.length, Math.floor(this.vScroll / 41) + 23); },
         async loadRecords(reset=false) {
-          if (reset) { this.records = []; this.recordsAfter = 0; }
+          if (reset) { this.records = []; this.recordsAfter = 0; this.vScroll = 0; }
           this.loadingRecords = true;
           try {
             const d = await this.api('GET', `/v1/${encodeURIComponent(this.activeNs)}/records?limit=200&after=${this.recordsAfter}`);
