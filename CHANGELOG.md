@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.15.3] — 2026-06-17
+
+### Adaptive index capacity (major RAM reduction)
+- **HNSW indices now grow on demand instead of preallocating 1M elements.**
+  Each modality index previously allocated `max_elements = 1,000,000` up front,
+  touching hundreds of MB of `link_list_locks_` + base-layer memory per index
+  regardless of how many vectors it actually held. Indices now start at
+  `INITIAL_MAX_ELEMENTS = 4096` and double via `resizeIndex()` as needed, so RAM
+  tracks the real working set.
+- **~7.7× less RAM for many-namespace deployments.** A 19-namespace workload
+  with ~70 vectors each went from **709 MB → 92 MB** of index overhead; a single
+  small DB drops correspondingly. No upper limit — indices grow past the old 1M
+  cap if you actually store that many vectors.
+- **Growth is reservation-based and thread-safe at the call sites.** `reserve()`
+  is invoked before every insert path — single `add()`/WAL replay reserve `+1`;
+  `add_batch()` and parallel load reserve the whole batch *before* the
+  concurrent `parallel_add` (since `resizeIndex` reallocs buffers and is not
+  thread-safe); `compact()` sizes the rebuilt index to the survivor count.
+- No format change (still v8) and no API change. Recall, parallel-load speedup
+  (4.79×), int8-RAM savings, pre-filtered search, and auto-compaction all
+  verified unchanged by the regression suite.
+
 ## [0.15.2] — 2026-06-17
 
 ### Admin dashboard polish

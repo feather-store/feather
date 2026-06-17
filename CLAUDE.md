@@ -148,7 +148,7 @@ private:
 **Key Design Decisions:**
 - **Multimodal via multiple HNSW indices**: each call to `add(id, vec, meta, modality)` routes to the correct named `ModalityIndex`. New modalities are created on-demand.
 - **Shared metadata by ID**: a single `Metadata` object tracks all cross-modal data (edges, recall_count, importance, timestamps) for a given entity ID.
-- **HNSW params**: `M=16`, `ef_construction=200`, `max_elements=1,000,000` per modality index (hardcoded in `get_or_create_index`).
+- **HNSW params**: `M=16`, `ef_construction=200`. `max_elements` is **adaptive** (v0.15.3): each modality index starts at `INITIAL_MAX_ELEMENTS = 4096` and doubles via `resizeIndex()` on demand (`reserve()` is called before every insert), so RAM tracks the working set instead of preallocating 1M elements per index.
 - **`ef` (search beam width)** defaults to `10`. Higher = more accurate but slower.
 - **Reverse edge index**: rebuilt from `metadata_store_` edges on every `load()`. Not persisted separately.
 
@@ -474,8 +474,8 @@ Every `search()` increments `recall_count` for all returned records. Call `touch
 ### Import cache when recompiling C++ `.so`
 `importlib.reload()` does NOT reload compiled `.so` files. Start a fresh Python process to pick up recompiled bindings.
 
-### Max elements per index
-Each modality index is initialized with `max_elements=1,000,000`. Inserting beyond this crashes. Modify `get_or_create_index()` in `include/feather.h` to change this limit.
+### Max elements per index (adaptive since v0.15.3)
+Each modality index starts at `INITIAL_MAX_ELEMENTS = 4096` and grows on demand: `reserve()` calls `resizeIndex()` (doubling) before any insert exceeds capacity. There is no hard ceiling — indices grow to fit whatever you store. `resizeIndex` is **not thread-safe**, so `reserve()` runs before `parallel_add` for the full batch size, never from inside it.
 
 ### File saved on close
 `feather::DB::~DB()` calls `save()`. Call `db.save()` explicitly in long-running processes.
@@ -509,7 +509,7 @@ When adding a new feature to Feather DB, touch these files **in order**:
 | Soft deletes reclaimed on compaction | `forget()`/`purge()` mark vectors deleted; space is reclaimed by `compact()` or `set_auto_compact(ratio)` (Phase 7) |
 | int8 quantization (two modes) | `set_quantized()` shrinks the file; `set_int8_ram()` shrinks RAM (~1.7×, opt-in, lossy) via `Int8L2Space` |
 | `tags_json` is a raw string | Tag filtering uses substring search, not JSON parsing |
-| Max 1M vectors per modality | Hardcoded in `get_or_create_index` |
+| ~~Max 1M vectors per modality~~ | **Fixed in v0.15.3**: index capacity is adaptive (starts 4096, grows via `resizeIndex`); no hard cap |
 | `meta.attributes['k'] = v` no-op | pybind11 map copy; use `set_attribute()` |
 | Load time for large attribute DBs | v4/v5 attribute map deserialization is O(n * attrs); namespace/attribute *lookups* are O(matches) via secondary indexes (Phase 7) |
 | Rust CLI missing v0.5.0 features | namespace/entity/context_chain are Python-only for now |

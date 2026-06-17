@@ -521,7 +521,7 @@ feather save   --db my.feather
 | Search latency p50 (k=10, 500K × 128-dim, real SIFT data) | **0.19 ms** |
 | Search latency p99 (k=10, 500K × 128-dim, real SIFT data) | **0.13 ms @ ef=10**, **1.03 ms @ ef=200** |
 | Recall@10 (500K × 128-dim, ef=50, real SIFT) | **0.972** |
-| Max vectors per modality | 1,000,000 (configurable) |
+| Max vectors per modality | unbounded — capacity grows adaptively (starts 4096) |
 | HNSW params | M=16, ef_construction=200, ef=50 (default in v0.8.0) |
 | File format | Binary `.feather` v8 (optional int8: ~3× smaller on disk, ~1.7× less RAM) |
 
@@ -695,7 +695,7 @@ v3–v7 files load transparently (the `quantized` flag is read for v7+, the
 | No concurrent writes | HNSW is not thread-safe for simultaneous adds |
 | Soft deletes reclaimed on compaction | `forget()`/`purge()` mark vectors deleted; space is reclaimed by `compact()` or `set_auto_compact(ratio)` |
 | int8 quantization (two kinds) | `set_quantized()` = smaller files; `set_int8_ram()` = ~1.7× less RAM (opt-in, lossy) |
-| Max 1M vectors/modality | Hardcoded in `get_or_create_index`; increase `max_elements` to raise |
+| Index capacity | Adaptive (v0.15.3): starts at 4096, grows via `resizeIndex` on demand — no hard cap, RAM tracks the working set |
 | `meta.attributes['k'] = v` silent no-op | pybind11 map copy; use `meta.set_attribute(k, v)` |
 | Rust CLI missing v0.6.0+ features | namespace/entity/context_chain/integrations are Python-only |
 

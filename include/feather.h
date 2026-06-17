@@ -103,6 +103,21 @@ private:
     // spaces. 50 trades ~5x more work per query for near-exact recall and
     // still leaves p99 well under 10ms in our benchmarks.
     static constexpr size_t DEFAULT_EF = 50;
+    // Adaptive index capacity: start small, grow on demand via resizeIndex().
+    // Old behaviour preallocated 1M elements per modality index (~hundreds of MB
+    // of link_list_locks_ + data_level0_memory_ touched per index regardless of
+    // how many vectors were actually stored). We now start at INITIAL_MAX and
+    // double as needed, so RAM tracks the real working set, not the worst case.
+    static constexpr size_t INITIAL_MAX_ELEMENTS = 4096;
+
+    // Ensure the index can hold at least `target` elements. NOT thread-safe
+    // (resizeIndex reallocs every backing buffer) — call before any add, and
+    // before parallel_add for the full batch size, never from inside it.
+    static void reserve(ModalityIndex& m_idx, size_t target) {
+        size_t cap = m_idx.index->getMaxElements();
+        if (target > cap)
+            m_idx.index->resizeIndex(std::max(target, cap * 2));
+    }
 
     ModalityIndex& get_or_create_index(const std::string& modality, size_t dim) {
         auto it = modality_indices_.find(modality);
@@ -114,7 +129,7 @@ private:
             if (int8) space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
             else      space = std::make_unique<hnswlib::L2Space>(dim);
             auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-                space.get(), 1'000'000, 16, 200);
+                space.get(), INITIAL_MAX_ELEMENTS, 16, 200);
             index->setEf(DEFAULT_EF);
             modality_indices_[modality] = {std::move(index), std::move(space), dim, int8, scale};
             return modality_indices_[modality];
@@ -365,7 +380,7 @@ private:
             if (m_idx.int8) space = std::make_unique<hnswlib::Int8L2Space>(m_idx.dim, m_idx.scale);
             else            space = std::make_unique<hnswlib::L2Space>(m_idx.dim);
             auto new_index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-                space.get(), 1'000'000, 16, 200);
+                space.get(), std::max(INITIAL_MAX_ELEMENTS, survivors.size()), 16, 200);
             new_index->setEf(DEFAULT_EF);
             m_idx.index = std::move(new_index);
             m_idx.space = std::move(space);
@@ -516,6 +531,7 @@ private:
                 ss.read(reinterpret_cast<char*>(vec.data()), dim32 * 4);
                 Metadata meta = Metadata::deserialize(ss);
                 auto& m_idx = get_or_create_index(modality, dim32);
+                reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
                 try { add_point(m_idx, id, vec.data()); } catch (...) {}
                 metadata_store_[id] = std::move(meta);
 
@@ -692,6 +708,7 @@ private:
             while (f.read((char*)&id, 8)) {
                 Metadata meta = Metadata::deserialize(f);
                 f.read((char*)vec.data(), dim32 * sizeof(float));
+                reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
                 add_point(m_idx, id, vec.data());
                 metadata_store_[id] = std::move(meta);
             }
@@ -746,6 +763,7 @@ private:
                     }
                     items.emplace_back(id, std::move(vec));
                 }
+                reserve(m_idx, m_idx.index->getCurrentElementCount() + items.size());
                 parallel_add(m_idx, items);
             }
         }
@@ -799,6 +817,7 @@ public:
         auto& m_idx = get_or_create_index(modality, vec.size());
         if (vec.size() != m_idx.dim)
             throw std::runtime_error("Dimension mismatch for modality " + modality);
+        reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
         add_point(m_idx, id, vec.data());
 
         auto it = metadata_store_.find(id);
@@ -865,6 +884,7 @@ public:
             add_to_bm25_index(ids[i], meta.content);
             items.emplace_back(ids[i], vecs[i]);
         }
+        reserve(m_idx, m_idx.index->getCurrentElementCount() + items.size());
         parallel_add(m_idx, items);   // concurrent graph construction
     }
 
@@ -1679,7 +1699,7 @@ public:
             size_t dim = it->second.dim;
             auto space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
             auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-                space.get(), 1'000'000, 16, 200);
+                space.get(), INITIAL_MAX_ELEMENTS, 16, 200);
             index->setEf(DEFAULT_EF);
             it->second = {std::move(index), std::move(space), dim, true, scale};
         }
