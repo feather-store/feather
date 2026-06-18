@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.16.0] — 2026-06-18
+
+### Persisted HNSW graph — file format v9 (much faster cold load)
+- **`save()` now embeds the prebuilt HNSW graph in the `.feather` file**, so
+  `load()` restores it verbatim instead of rebuilding the graph from vectors.
+  Cold load stops paying the dominant graph-construction cost on every open.
+- **5–6× faster than the parallel rebuild, ~25× faster than serial** on a
+  40k×128 DB (random data: 1.8s vs 10.6s parallel / 44s serial; clustered data:
+  **48 ms vs 2.7s parallel / 13.4s serial**). The win grows with N — HNSW build
+  is super-linear, a sequential read is not.
+- **Higher, deterministic recall.** The persisted graph is the serial-build
+  graph (recall 0.988), so reload no longer inherits the parallel-rebuild
+  recall loss (0.963) — every load is identical and reproducible.
+- **Single-file property preserved.** New `saveIndexStream`/`loadIndexStream` in
+  the hnswlib fork write/read the graph (header + base layer, which already
+  holds the vectors, + per-element link lists) inline in the one `.feather`
+  stream — no sidecar files.
+- **Transparent + safe fallback.** The graph is persisted only when it holds
+  exactly the live set (no `forget()`/`purge()` nodes to filter) and the
+  modality isn't on-disk-quantized. Otherwise — and for any v3–v8 file — load
+  rebuilds via the existing (parallel) path. `compact()` re-enables the fast
+  path. in-RAM int8 modalities persist their int8 graph and round-trip exactly.
+- Trade-off: the file grows ~25% (the link lists) in exchange for the load
+  speedup. On-disk int8 quantization (`set_quantized()`) is unaffected and still
+  shrinks files (it opts out of graph-persist by design).
+
 ## [0.15.3] — 2026-06-17
 
 ### Adaptive index capacity (major RAM reduction)

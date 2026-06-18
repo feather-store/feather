@@ -15,9 +15,9 @@
 - Adaptive Decay / Living Context — frequently accessed items resist temporal decay
 - Namespace + Entity + Attributes — generic partition + subject + KV metadata for any domain
 - Graph visualizer — self-contained D3 force-graph HTML, fully offline
-- Single file persistence (`.feather` binary format, v8, optional int8 on-disk and in-RAM; v3–v7 files load transparently)
+- Single file persistence (`.feather` binary format, v9 with persisted HNSW graph for fast cold load, optional int8 on-disk and in-RAM; v3–v8 files load transparently)
 
-**Version:** `0.15.1` (Phase 8 — ingestion/load performance, in-RAM int8, Claude MCP connector)
+**Version:** `0.16.0` (Phase 8 — ingestion/load performance, in-RAM int8, Claude MCP connector, persisted HNSW graph / format v9)
 
 > **Phase 8 (v0.13–v0.15) additions** — see `include/feather.h`, `feather_db/integrations/`:
 > - **Parallel HNSW load** (`parallel_add`): graph rebuilt across a thread pool on
@@ -152,7 +152,7 @@ private:
 - **`ef` (search beam width)** defaults to `10`. Higher = more accurate but slower.
 - **Reverse edge index**: rebuilt from `metadata_store_` edges on every `load()`. Not persisted separately.
 
-### 3.2 File Format (`.feather` binary v5)
+### 3.2 File Format (`.feather` binary v9)
 
 ```
 [magic: 4B = 0x46454154 "FEAT"] [version: 4B = 8]
@@ -177,14 +177,20 @@ private:
     [name_len: 2B] [name: N bytes]
     [dim: 4B] [quantized: 1B]                          # on-disk int8 flag (v7+)
     [int8_ram: 1B] [scale: 4B if int8_ram]             # in-RAM int8 flag + scale (v8+)
-    [element_count: 4B]
-    for each element:
-      [id: 8B] then, per `quantized`:
-        0 → [float32 vector: dim * 4 bytes]
-        1 → [scale: 4B float] [int8 vector: dim bytes]  # set_quantized() — ~3x smaller
+    [persist_graph: 1B]                                # v9: 1 → graph blob follows
+    if persist_graph == 1:                             # fast path (clean, non-on-disk-quant)
+      [HNSW graph blob via saveIndexStream]            # header + base layer (vectors) + link lists
+    else:                                              # rebuild path (dirty DB / on-disk quant)
+      [element_count: 4B]
+      for each element:
+        [id: 8B] then, per `quantized`:
+          0 → [float32 vector: dim * 4 bytes]
+          1 → [scale: 4B float] [int8 vector: dim bytes]  # set_quantized() — ~3x smaller
 ```
 
-**Backward compatibility**: v3–v7 files load transparently — the `quantized` flag is read for v7+, the `int8_ram` flag + scale for v8+ (`if (version >= 8)`); missing metadata fields default to empty via `if (is.read(...))` guards in `metadata.cpp`. On-disk int8 vectors are dequantized to float32 on load; if the modality is configured for in-RAM int8 they are then re-quantized into the int8 index (otherwise the in-memory index is float32).
+**Backward compatibility**: v3–v8 files load transparently — the `quantized` flag is read for v7+, the `int8_ram` flag + scale for v8+, the `persist_graph` flag for v9+ (`if (version >= 9)`); missing metadata fields default to empty via `if (is.read(...))` guards in `metadata.cpp`. When `persist_graph` is set, `load()` restores the graph via `loadIndexStream` (no rebuild) and calls `setEf(DEFAULT_EF)`; otherwise it reads vectors and rebuilds the HNSW graph (parallel). On-disk int8 vectors are dequantized to float32 on load; in-RAM int8 modalities persist/restore their int8 base layer directly (the graph blob is storage-agnostic — reconstructed against the matching `Int8L2Space`).
+
+**When is the graph persisted?** Only when the index holds exactly the live set (`live_count == total`, i.e. no `forget()`/`purge()` nodes pending) **and** the modality isn't on-disk-quantized. A DB with pending deletions falls back to the rebuild path; `compact()` clears the dead nodes and re-enables fast load. The trade-off is ~25% larger files (the link lists) for a 5–25× faster cold load.
 
 ---
 
@@ -545,5 +551,5 @@ cd p-test && ./run_tests.sh   # Rust CLI tests
 | Phase 6 | Done | LLM connectors, MCP, LangChain/LlamaIndex, ContextEngine (v0.6–v0.9) |
 | Cloud | Done | FastAPI admin SPA + pluggable embeddings (v0.10 Cloud Edition) |
 | Phase 7 | Done | Secondary metadata indexes, pre-filtered ANN, auto-compaction (v0.11.0), on-disk int8 quantization / format v7 (v0.12.0) |
-| Phase 8 | Done | Parallel load + `add_batch`, SIMD-on-x86 (v0.13.0), in-RAM int8 / format v8 (v0.15.0), Claude MCP connector + real embedders (v0.14–v0.15) |
+| Phase 8 | Done | Parallel load + `add_batch`, SIMD-on-x86 (v0.13.0), in-RAM int8 / format v8 (v0.15.0), Claude MCP connector + real embedders (v0.14–v0.15), adaptive index capacity (v0.15.3), persisted HNSW graph / format v9 (v0.16.0) |
 | Phase 9 | Planned | Multi-tenant auth, in-RAM int8 SIMD distance, GTM (PyPI/crates publish) |

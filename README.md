@@ -24,7 +24,9 @@ Feather DB is an embedded vector database and living context engine — zero-ser
 
 | Capability | Version | Notes |
 |---|---|---|
-| **Parallel HNSW load** | v0.13.0 | Graph rebuilt across a thread pool on open — **~4.7× faster load** (7.6s→1.7s for 40k×128), identical recall. `FEATHER_LOAD_THREADS` to cap. |
+| **Persisted HNSW graph** | v0.16.0 | `save()` embeds the prebuilt graph (**file format v9**) so `load()` restores it instead of rebuilding — **5–25× faster cold load** (48 ms vs 2.7s/13.4s on 40k×128 clustered) and deterministic serial-build recall (0.988). Falls back to rebuild for dirty DBs / old files; ~25% larger files. |
+| **Adaptive index capacity** | v0.15.3 | HNSW indices start at 4096 elements and grow via `resizeIndex()` on demand instead of preallocating 1M — **~7.7× less RAM** for many-namespace deployments (709→92 MB across 19 namespaces), no hard cap. |
+| **Parallel HNSW load** | v0.13.0 | Graph rebuilt across a thread pool on open — **~4.7× faster load** (7.6s→1.7s for 40k×128), identical recall. `FEATHER_LOAD_THREADS` to cap. Still used for old files / DBs with pending deletions. |
 | **Parallel batch ingest** | v0.13.0 | `DB.add_batch(ids, vecs, metas=None)` builds the graph in parallel with the GIL released — **~3.4× faster** bulk insert. |
 | **SIMD on x86** | v0.13.0 | SSE/AVX L2 kernels (runtime-dispatched) compiled on x86_64; arm64 uses `-O3` NEON. `FEATHER_SIMD=none\|sse\|avx\|avx512`. |
 | **In-RAM int8 quantization** | v0.15.0 | `set_int8_ram(modality, max_abs)` stores vectors as int8 **in memory** — **~1.7× less RAM** (227→129 MB at 60k×768), recall ~0.88. **File format v8.** |
@@ -116,7 +118,7 @@ See [docs/quickstart.md](docs/quickstart.md) for a self-hosted setup walkthrough
 | **MCP Server** | `feather-serve` — connects Feather to Claude Desktop, Cursor, and any MCP client |
 | **LangChain / LlamaIndex** | Drop-in `FeatherVectorStore`, `FeatherMemory`, `FeatherRetriever` adapters |
 | **Self-Aligned Context Engine** | LLM-powered ingestion: auto-classifies, scores, links, and namespaces every record |
-| **Single-file persistence** | `.feather` binary format (v8, optional int8 compression on-disk and in-RAM); v3–v7 files load transparently |
+| **Single-file persistence** | `.feather` binary format (v9, persisted HNSW graph for fast cold load + optional int8 compression on-disk and in-RAM); v3–v8 files load transparently |
 
 ---
 
@@ -523,7 +525,7 @@ feather save   --db my.feather
 | Recall@10 (500K × 128-dim, ef=50, real SIFT) | **0.972** |
 | Max vectors per modality | unbounded — capacity grows adaptively (starts 4096) |
 | HNSW params | M=16, ef_construction=200, ef=50 (default in v0.8.0) |
-| File format | Binary `.feather` v8 (optional int8: ~3× smaller on disk, ~1.7× less RAM) |
+| File format | Binary `.feather` v9 (persisted HNSW graph: 5–25× faster cold load; optional int8: ~3× smaller on disk, ~1.7× less RAM) |
 
 SIMD (AVX2/AVX512) optimizations are available in `space_l2.h`. Enable with `-DUSE_AVX -march=native` in `setup.py`.
 
@@ -676,15 +678,21 @@ feather-db-cli (FFI via extern "C" from src/feather_core.cpp)
     [name_len: 2B] [name: N bytes]
     [dim: 4B] [quantized: 1B]            # on-disk int8 flag (v7+)
     [int8_ram: 1B] [scale: 4B if int8_ram]   # in-RAM int8 flag + global scale (v8+)
-    [element_count: 4B]
-    for each element:
-      [id: 8B] then, per `quantized`:
-        0 → [float32 vector: dim * 4 bytes]
-        1 → [scale: 4B float] [int8 vector: dim bytes]
+    [persist_graph: 1B]                  # v9: 1 → prebuilt HNSW graph blob follows
+    if persist_graph:                    # fast cold load — no rebuild
+      [HNSW graph: header + base layer (vectors) + per-element link lists]
+    else:
+      [element_count: 4B]
+      for each element:
+        [id: 8B] then, per `quantized`:
+          0 → [float32 vector: dim * 4 bytes]
+          1 → [scale: 4B float] [int8 vector: dim bytes]
 ```
 
-v3–v7 files load transparently (the `quantized` flag is read for v7+, the
-`int8_ram` flag for v8+); missing fields default to empty.
+v3–v8 files load transparently (the `quantized` flag is read for v7+, the
+`int8_ram` flag for v8+, the `persist_graph` flag for v9+); missing fields
+default to empty. The graph is persisted only for a clean, non-on-disk-quantized
+modality; otherwise load rebuilds it (parallel).
 
 ---
 

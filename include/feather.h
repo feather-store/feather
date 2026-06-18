@@ -615,7 +615,7 @@ private:
         if (!f) throw std::runtime_error("Cannot save to temp file: " + tmp_path);
 
         uint32_t magic   = 0x46454154; // "FEAT"
-        uint32_t version = 8;          // v7: on-disk int8; v8: in-RAM int8 flag + scale
+        uint32_t version = 9;          // v7: on-disk int8; v8: in-RAM int8 flag+scale; v9: persisted HNSW graph
         f.write((char*)&magic,   4);
         f.write((char*)&version, 4);
 
@@ -664,6 +664,20 @@ private:
                 uint64_t id = m_idx.index->getExternalLabel(i);
                 if (valid_ids.count(id)) live_count++;
             }
+
+            // v9 fast path: persist the prebuilt HNSW graph verbatim so load()
+            // restores it instead of rebuilding from vectors (~10x faster cold
+            // load, and keeps the higher-quality serial-build graph). Only safe
+            // when the graph holds exactly the live set (no forgotten/purged
+            // nodes to filter) and the modality isn't on-disk-quantized (which
+            // re-encodes vectors to int8, incompatible with the graph blob).
+            uint8_t persist_graph = (live_count == total && !quant) ? 1 : 0;
+            f.write((char*)&persist_graph, 1);
+            if (persist_graph) {
+                m_idx.index->saveIndexStream(f);
+                continue;
+            }
+
             f.write((char*)&live_count, 4);
             std::vector<int8_t> qbuf(quant ? m_idx.dim : 0);
             for (size_t i = 0; i < total; ++i) {
@@ -738,14 +752,26 @@ private:
                     f.read((char*)&int8ram, 1);
                     if (int8ram) f.read((char*)&int8scale, 4);
                 }
-                f.read((char*)&element_count, 4);
+                uint8_t persist_graph = 0;
+                if (version >= 9) f.read((char*)&persist_graph, 1);
                 // configure int8-RAM BEFORE the index is created so it is built
                 // as an int8 index; vectors below are re-quantized via add_point.
                 if (int8ram) int8_ram_scale_[name] = int8scale;
                 auto& m_idx = get_or_create_index(name, dim32);
                 if (quant) quantized_modalities_.insert(name);
+
+                if (persist_graph) {
+                    // v9: restore the prebuilt HNSW graph verbatim — no rebuild.
+                    // The blob carries the base layer (vectors) + link lists; the
+                    // space matches (Int8L2Space if int8ram, else L2Space).
+                    m_idx.index->loadIndexStream(f, m_idx.space.get(), 0);
+                    m_idx.index->setEf(DEFAULT_EF);
+                    continue;
+                }
+
                 // Read all vectors serially (sequential I/O), then build the
                 // HNSW graph in parallel — graph construction dominates load.
+                f.read((char*)&element_count, 4);
                 std::vector<std::pair<uint64_t, std::vector<float>>> items;
                 items.reserve(element_count);
                 std::vector<int8_t> qbuf(quant ? dim32 : 0);

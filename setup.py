@@ -37,7 +37,7 @@ ext_modules = [
 
 setup(
     name="feather-db",
-    version="0.15.3",
+    version="0.16.0",
     packages=["feather_db", "feather_db.integrations"],
     package_data={"feather_db": ["d3.min.js"]},
     ext_modules=ext_modules,
