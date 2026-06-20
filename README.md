@@ -20,7 +20,7 @@ Feather DB is an embedded vector database and living context engine — zero-ser
 
 ---
 
-## What's New in v0.13–v0.15 — Ingestion, Memory & Claude (Phase 8)
+## What's New in v0.13–v0.16 — Ingestion, Memory, Claude & Fast Load (Phase 8)
 
 | Capability | Version | Notes |
 |---|---|---|
