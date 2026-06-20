@@ -45,6 +45,23 @@ GOOGLE_API_KEY=... python benchmarks/longmemeval.py --data /tmp/lme_s.json \
     --mode hybrid --embed-provider gemini
 ```
 
+## QA accuracy (end-to-end) — harness ready
+
+`benchmarks/longmemeval_qa.py` adds the end-to-end metric: retrieve → an LLM
+answers from the retrieved context → an LLM judges vs the gold answer (the
+metric vendor "92%" headlines refer to). It's built and dry-run-validated
+(assembles prompts with zero API calls via `--dry-run`); the real run needs a
+chat key:
+
+```bash
+# BM25 retrieval + Gemini answer/judge (no embedder needed)
+GOOGLE_API_KEY=... python benchmarks/longmemeval_qa.py --data /tmp/lme_s.json \
+    --mode keyword --answer-provider gemini --judge-provider gemini --limit 100
+```
+
+The judge is a single-rubric semantic-match prompt (simpler than LongMemEval's
+official per-type GPT-4o rubric), so treat the number as an internal signal.
+
 ## Honest scope
 
 This is **retrieval recall** (did the evidence session make the top-k), not
