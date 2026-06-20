@@ -6,7 +6,15 @@
 #include <memory>
 #include <stdexcept>
 #include <fstream>
+#include <sstream>
 #include <unordered_map>
+#include <unordered_set>
+#include <cmath>
+#include <queue>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <cstdio>
 #include "hnswlib.h"
 #include "metadata.h"
 #include "filter.h"
@@ -14,67 +22,685 @@
 #include <optional>
 
 namespace feather {
+
+// ── Reverse-index entry: who points to a given node ──────────────
+struct IncomingEdge {
+    uint64_t    source_id;
+    std::string rel_type;
+    float       weight;
+};
+
 class DB {
 private:
     struct ModalityIndex {
         std::unique_ptr<hnswlib::HierarchicalNSW<float>> index;
-        std::unique_ptr<hnswlib::L2Space> space;
+        std::unique_ptr<hnswlib::SpaceInterface<float>> space;  // L2Space or Int8L2Space
         size_t dim;
+        bool  int8  = false;   // in-RAM int8 storage (4x smaller)
+        float scale = 0.0f;    // global quant scale when int8 (= max_abs / 127)
     };
 
     std::unordered_map<std::string, ModalityIndex> modality_indices_;
     std::string path_;
+    std::string wal_path_;
+    size_t default_dim_ = 768;   // dim reported before any modality index exists
     std::unordered_map<uint64_t, Metadata> metadata_store_;
+
+    // Thread safety — one mutex per DB instance
+    mutable std::mutex mutex_;
+
+    // Reverse index: target_id → list of (source_id, rel_type, weight)
+    std::unordered_map<uint64_t, std::vector<IncomingEdge>> reverse_index_;
+
+    // ── Secondary metadata indexes ───────────────────────────────────
+    // Inverted indexes for O(matches) filtered lookup instead of O(n) scans.
+    // Rebuilt on load (like reverse_index_), maintained incrementally on
+    // mutation. Only LIVE records are indexed (forgotten/deleted excluded),
+    // so the id sets double as candidate sets for filtered search.
+    std::unordered_map<std::string, std::unordered_set<uint64_t>> ns_index_;     // namespace_id → ids
+    std::unordered_map<std::string, std::unordered_set<uint64_t>> entity_index_; // entity_id    → ids
+    std::unordered_map<std::string, std::unordered_set<uint64_t>> attr_index_;   // "key\x1fval" → ids
+
+    // ── Auto-compaction ──────────────────────────────────────────────
+    // When a modality index's deleted/total ratio crosses this threshold after
+    // a forget/purge/expire, the index is rebuilt to reclaim the dead vectors.
+    // 0.0 disables it (default) — compaction stays manual via compact().
+    float auto_compact_ratio_ = 0.0f;
+
+    // ── On-disk int8 quantization ────────────────────────────────────
+    // Modalities whose vectors are persisted as int8 + per-vector scale (file
+    // format v7) — ~4x smaller on disk and faster to load. The in-memory HNSW
+    // index stays float32; vectors are dequantized on load. Opt-in per modality.
+    std::unordered_set<std::string> quantized_modalities_;
+
+    // ── In-RAM int8 quantization ─────────────────────────────────────
+    // Modalities whose HNSW index stores int8[dim] vectors (4x less RAM) under a
+    // global scale = max_abs/127. Must be configured before the modality's index
+    // is created (i.e. before the first add). Persisted in file format v8.
+    std::unordered_map<std::string, float> int8_ram_scale_;
+
+    // ── BM25 Inverted Index ──────────────────────────────────────────
+    struct PostingEntry { uint64_t doc_id; uint32_t term_freq; };
+    std::unordered_map<std::string, std::vector<PostingEntry>> bm25_index_;
+    std::unordered_map<uint64_t, uint32_t> doc_lengths_;
+    double avg_dl_ = 0.0;
+    static constexpr float BM25_K1 = 1.2f;
+    static constexpr float BM25_B  = 0.75f;
+
+    // ── WAL op codes ─────────────────────────────────────────────────
+    enum class WalOp : uint8_t {
+        ADD    = 0x01,
+        UPDATE = 0x02,
+        UIMP   = 0x03,
+        LINK   = 0x04,
+        FORGET = 0x05,
+    };
+
+    // ── Helpers ─────────────────────────────────────────────────────
+
+    // Default HNSW search beam width. hnswlib's built-in default is 10,
+    // which gives poor recall (~0.2) at 50k+ vectors in high-dimensional
+    // spaces. 50 trades ~5x more work per query for near-exact recall and
+    // still leaves p99 well under 10ms in our benchmarks.
+    static constexpr size_t DEFAULT_EF = 50;
+    // Adaptive index capacity: start small, grow on demand via resizeIndex().
+    // Old behaviour preallocated 1M elements per modality index (~hundreds of MB
+    // of link_list_locks_ + data_level0_memory_ touched per index regardless of
+    // how many vectors were actually stored). We now start at INITIAL_MAX and
+    // double as needed, so RAM tracks the real working set, not the worst case.
+    static constexpr size_t INITIAL_MAX_ELEMENTS = 4096;
+
+    // Ensure the index can hold at least `target` elements. NOT thread-safe
+    // (resizeIndex reallocs every backing buffer) — call before any add, and
+    // before parallel_add for the full batch size, never from inside it.
+    static void reserve(ModalityIndex& m_idx, size_t target) {
+        size_t cap = m_idx.index->getMaxElements();
+        if (target > cap)
+            m_idx.index->resizeIndex(std::max(target, cap * 2));
+    }
 
     ModalityIndex& get_or_create_index(const std::string& modality, size_t dim) {
         auto it = modality_indices_.find(modality);
         if (it == modality_indices_.end()) {
-            auto space = std::make_unique<hnswlib::L2Space>(dim);
-            auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(space.get(), 1'000'000, 16, 200);
-            modality_indices_[modality] = {std::move(index), std::move(space), dim};
+            auto cfg = int8_ram_scale_.find(modality);
+            bool int8 = cfg != int8_ram_scale_.end();
+            float scale = int8 ? cfg->second : 0.0f;
+            std::unique_ptr<hnswlib::SpaceInterface<float>> space;
+            if (int8) space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
+            else      space = std::make_unique<hnswlib::L2Space>(dim);
+            auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+                space.get(), INITIAL_MAX_ELEMENTS, 16, 200);
+            index->setEf(DEFAULT_EF);
+            modality_indices_[modality] = {std::move(index), std::move(space), dim, int8, scale};
             return modality_indices_[modality];
         }
         return it->second;
     }
 
-    void save_vectors() const {
-        std::ofstream f(path_, std::ios::binary);
-        if (!f) throw std::runtime_error("Cannot save file");
+    // Build the int8 storage payload for one vector under a global scale.
+    static void quantize_global(const float* v, size_t dim, float scale, int8_t* out) {
+        float inv = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+        for (size_t i = 0; i < dim; ++i) {
+            long q = std::lround(v[i] * inv);
+            if (q >  127) q =  127;
+            if (q < -127) q = -127;
+            out[i] = static_cast<int8_t>(q);
+        }
+    }
 
-        uint32_t magic = 0x46454154; // "FEAT"
-        uint32_t version = 3;
-        f.write((char*)&magic, 4);
+    // Insert a float vector into a modality index, quantizing to int8 first if
+    // the modality is in-RAM int8. Centralises the float-vs-int8 store decision.
+    static void add_point(ModalityIndex& m_idx, uint64_t id, const float* vec) {
+        if (m_idx.int8) {
+            // Reusable per-thread buffer — a fresh std::vector per call across the
+            // parallel insert pool churns the allocator and inflates RSS by ~MBs.
+            static thread_local std::vector<int8_t> q;
+            q.resize(m_idx.dim);
+            quantize_global(vec, m_idx.dim, m_idx.scale, q.data());
+            m_idx.index->addPoint(q.data(), id);
+        } else {
+            m_idx.index->addPoint(vec, id);
+        }
+    }
+
+    // Encode a query in the modality's storage format (int8 blob or float bytes)
+    // so it can be passed straight to searchKnn / the distance function.
+    static std::vector<char> encode_query(const ModalityIndex& m_idx, const float* q) {
+        if (m_idx.int8) {
+            std::vector<char> blob(m_idx.dim);
+            quantize_global(q, m_idx.dim, m_idx.scale,
+                            reinterpret_cast<int8_t*>(blob.data()));
+            return blob;
+        }
+        const char* p = reinterpret_cast<const char*>(q);
+        return std::vector<char>(p, p + m_idx.dim * sizeof(float));
+    }
+
+    // Read a stored vector back as float32 (dequantizing if the modality is int8).
+    static std::vector<float> read_vector_internal(const ModalityIndex& m_idx, size_t internal_id) {
+        const char* raw = m_idx.index->getDataByInternalId(internal_id);
+        std::vector<float> out(m_idx.dim);
+        if (m_idx.int8) {
+            const int8_t* q = reinterpret_cast<const int8_t*>(raw);
+            for (size_t i = 0; i < m_idx.dim; ++i) out[i] = static_cast<float>(q[i]) * m_idx.scale;
+        } else {
+            const float* f = reinterpret_cast<const float*>(raw);
+            for (size_t i = 0; i < m_idx.dim; ++i) out[i] = f[i];
+        }
+        return out;
+    }
+
+    // Read a stored vector back as float32 by external id. Throws if absent.
+    static std::vector<float> read_vector_label(const ModalityIndex& m_idx, uint64_t id) {
+        if (m_idx.int8) {
+            auto q = m_idx.index->template getDataByLabel<int8_t>(id);  // dim int8s
+            std::vector<float> out(q.size());
+            for (size_t i = 0; i < q.size(); ++i)
+                out[i] = static_cast<float>(q[i]) * m_idx.scale;
+            return out;
+        }
+        return m_idx.index->template getDataByLabel<float>(id);
+    }
+
+    void build_reverse_index() {
+        reverse_index_.clear();
+        for (const auto& [id, meta] : metadata_store_) {
+            for (const auto& e : meta.edges) {
+                reverse_index_[e.target_id].push_back({id, e.rel_type, e.weight});
+            }
+        }
+    }
+
+    // ── int8 quantization helpers (per-vector symmetric scalar) ──────
+    // scale = max|v| / 127; q_i = round(v_i / scale) clamped to [-127,127].
+    // Returns the scale needed to reconstruct. Lossy but typically retains
+    // very high recall for embedding-shaped vectors.
+    static float quantize_vec(const float* v, size_t dim, int8_t* out) {
+        float amax = 0.0f;
+        for (size_t i = 0; i < dim; ++i) amax = std::max(amax, std::fabs(v[i]));
+        float scale = (amax > 0.0f) ? amax / 127.0f : 1.0f;
+        float inv   = 1.0f / scale;
+        for (size_t i = 0; i < dim; ++i) {
+            long q = std::lround(v[i] * inv);
+            if (q >  127) q =  127;
+            if (q < -127) q = -127;
+            out[i] = static_cast<int8_t>(q);
+        }
+        return scale;
+    }
+    static void dequantize_vec(const int8_t* q, size_t dim, float scale, float* out) {
+        for (size_t i = 0; i < dim; ++i) out[i] = static_cast<float>(q[i]) * scale;
+    }
+
+    // Insert many (id, vector) pairs into a modality index using a thread pool.
+    // hnswlib addPoint is thread-safe (per-node link locks + label/lookup locks),
+    // so the graph is built concurrently. Caller must guarantee exclusive
+    // structural access (no concurrent resize) — true at load and batch-ingest,
+    // and we never exceed max_elements here so no resize is triggered.
+    static void parallel_add(ModalityIndex& m_idx,
+                             std::vector<std::pair<uint64_t, std::vector<float>>>& items) {
+        const size_t n = items.size();
+        if (n == 0) return;
+        unsigned hw = std::thread::hardware_concurrency();
+        size_t nthreads = std::min<size_t>(hw ? hw : 4, n);
+        if (const char* env = std::getenv("FEATHER_LOAD_THREADS")) {
+            long v = std::atol(env);                // override / cap thread count
+            if (v >= 1) nthreads = std::min<size_t>(static_cast<size_t>(v), n);
+        }
+        if (nthreads <= 1 || n < 256) {           // small sets: serial is faster
+            for (auto& [id, v] : items) add_point(m_idx, id, v.data());
+            return;
+        }
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        pool.reserve(nthreads);
+        for (size_t t = 0; t < nthreads; ++t) {
+            pool.emplace_back([&]() {
+                size_t i;
+                while ((i = next.fetch_add(1)) < n)
+                    add_point(m_idx, items[i].first, items[i].second.data());
+            });
+        }
+        for (auto& th : pool) th.join();
+    }
+
+    // ── Secondary index helpers ──────────────────────────────────────
+    static std::string attr_key(const std::string& k, const std::string& v) {
+        // Unit separator (0x1f) can't appear in normal keys/values, so this
+        // composite key is collision-free across different (k,v) splits.
+        return k + std::string(1, '\x1f') + v;
+    }
+
+    static bool is_dead_meta(const Metadata& m) {
+        if (m.source == "_forgotten") return true;
+        auto it = m.attributes.find("_deleted");
+        return it != m.attributes.end() && it->second == "true";
+    }
+
+    void index_meta(uint64_t id, const Metadata& m) {
+        if (!m.namespace_id.empty()) ns_index_[m.namespace_id].insert(id);
+        if (!m.entity_id.empty())    entity_index_[m.entity_id].insert(id);
+        for (const auto& [k, v] : m.attributes) attr_index_[attr_key(k, v)].insert(id);
+    }
+
+    void deindex_meta(uint64_t id, const Metadata& m) {
+        auto drop = [id](std::unordered_map<std::string, std::unordered_set<uint64_t>>& idx,
+                         const std::string& key) {
+            auto it = idx.find(key);
+            if (it == idx.end()) return;
+            it->second.erase(id);
+            if (it->second.empty()) idx.erase(it);
+        };
+        if (!m.namespace_id.empty()) drop(ns_index_, m.namespace_id);
+        if (!m.entity_id.empty())    drop(entity_index_, m.entity_id);
+        for (const auto& [k, v] : m.attributes) drop(attr_index_, attr_key(k, v));
+    }
+
+    void build_secondary_indexes() {
+        ns_index_.clear();
+        entity_index_.clear();
+        attr_index_.clear();
+        for (const auto& [id, meta] : metadata_store_) {
+            if (is_dead_meta(meta)) continue;   // candidate sets are live-only
+            index_meta(id, meta);
+        }
+    }
+
+    // Candidate ids for a filter's INDEXED fields (namespace/entity/attributes),
+    // computed as the intersection of the relevant secondary-index sets.
+    // Sets `indexed` = true if the filter constrained at least one indexed field
+    // (so the caller knows the result is an authoritative candidate set rather
+    // than "no constraint"). An empty return with indexed=true means the filter
+    // genuinely matches nothing.
+    std::unordered_set<uint64_t>
+    candidates_for_filter(const SearchFilter& f, bool& indexed) const {
+        indexed = false;
+        std::vector<const std::unordered_set<uint64_t>*> sets;
+        auto pick = [&](const std::unordered_map<std::string, std::unordered_set<uint64_t>>& idx,
+                        const std::string& key) -> bool {
+            indexed = true;
+            auto it = idx.find(key);
+            if (it == idx.end()) return false;   // signals empty intersection
+            sets.push_back(&it->second);
+            return true;
+        };
+        if (f.namespace_id && !pick(ns_index_, *f.namespace_id))     return {};
+        if (f.entity_id    && !pick(entity_index_, *f.entity_id))    return {};
+        if (f.attributes_match)
+            for (const auto& [k, v] : *f.attributes_match)
+                if (!pick(attr_index_, attr_key(k, v)))              return {};
+
+        if (!indexed) return {};                 // no indexed constraint at all
+
+        // Intersect smallest-first to minimise work.
+        std::sort(sets.begin(), sets.end(),
+                  [](auto* a, auto* b) { return a->size() < b->size(); });
+        std::unordered_set<uint64_t> result(sets[0]->begin(), sets[0]->end());
+        for (size_t i = 1; i < sets.size() && !result.empty(); ++i) {
+            std::unordered_set<uint64_t> next;
+            for (uint64_t id : result)
+                if (sets[i]->count(id)) next.insert(id);
+            result.swap(next);
+        }
+        return result;
+    }
+
+    // ── Compaction (lock-free core) ──────────────────────────────────
+    // Rebuild every modality index keeping only records that are present AND
+    // live in metadata_store_. This reclaims the space held by markDelete'd
+    // vectors (forget/expire) and orphaned index elements (purge erased their
+    // metadata but left the vector marked-deleted in the graph). Caller MUST
+    // hold mutex_. Returns the number of dead metadata records removed.
+    size_t compact_nolock() {
+        std::unordered_set<uint64_t> dead;
+        for (const auto& [id, meta] : metadata_store_)
+            if (is_dead_meta(meta)) dead.insert(id);
+
+        // Anything to reclaim? dead metadata, or index elements with no live
+        // metadata (purged). If neither, this is a no-op.
+        bool work = !dead.empty();
+        if (!work)
+            for (auto& [name, m_idx] : modality_indices_)
+                if (m_idx.index->getDeletedCount() > 0) { work = true; break; }
+        if (!work) return 0;
+
+        for (auto& [name, m_idx] : modality_indices_) {
+            size_t n = m_idx.index->cur_element_count;
+            std::vector<std::pair<uint64_t, std::vector<float>>> survivors;
+            survivors.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                uint64_t id = m_idx.index->getExternalLabel(i);
+                auto mit = metadata_store_.find(id);
+                if (mit == metadata_store_.end()) continue;  // purged / orphaned
+                if (is_dead_meta(mit->second))      continue;  // forgotten / _deleted
+                survivors.push_back({id, read_vector_internal(m_idx, i)});  // float (deq if int8)
+            }
+            // Rebuild preserving the storage type (float L2 or int8).
+            std::unique_ptr<hnswlib::SpaceInterface<float>> space;
+            if (m_idx.int8) space = std::make_unique<hnswlib::Int8L2Space>(m_idx.dim, m_idx.scale);
+            else            space = std::make_unique<hnswlib::L2Space>(m_idx.dim);
+            auto new_index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+                space.get(), std::max(INITIAL_MAX_ELEMENTS, survivors.size()), 16, 200);
+            new_index->setEf(DEFAULT_EF);
+            m_idx.index = std::move(new_index);
+            m_idx.space = std::move(space);
+            for (const auto& [id, vec] : survivors)
+                add_point(m_idx, id, vec.data());
+        }
+
+        for (uint64_t id : dead) metadata_store_.erase(id);
+        build_reverse_index();
+        build_secondary_indexes();
+        rebuild_bm25_index();
+        return dead.size();
+    }
+
+    // Caller holds mutex_. If any modality's deleted/total ratio has crossed the
+    // configured threshold, rebuild to reclaim the dead vectors. One compaction
+    // rebuilds every modality, so a single pass suffices.
+    void maybe_auto_compact_nolock() {
+        if (auto_compact_ratio_ <= 0.0f) return;
+        for (const auto& [name, m_idx] : modality_indices_) {
+            size_t total = m_idx.index->getCurrentElementCount();
+            if (total == 0) continue;
+            float ratio = static_cast<float>(m_idx.index->getDeletedCount())
+                        / static_cast<float>(total);
+            if (ratio >= auto_compact_ratio_) { compact_nolock(); return; }
+        }
+    }
+
+    static const std::unordered_set<std::string>& stop_words() {
+        static const std::unordered_set<std::string> sw = {
+            "a","an","the","and","or","but","in","on","at","to","for",
+            "of","with","by","from","is","are","was","were","be","been",
+            "have","has","had","do","does","did","will","would","could",
+            "should","may","might","shall","can","not","no","it","its",
+            "this","that","these","those","i","me","my","we","us","our",
+            "you","your","he","him","his","she","her","they","them","their"
+        };
+        return sw;
+    }
+
+    static std::vector<std::string> tokenize(const std::string& text) {
+        std::vector<std::string> tokens;
+        std::string tok;
+        const auto& sw = stop_words();
+        for (unsigned char c : text) {
+            if (std::isalnum(c)) {
+                tok += static_cast<char>(std::tolower(c));
+            } else {
+                if (tok.size() >= 2 && sw.find(tok) == sw.end())
+                    tokens.push_back(tok);
+                tok.clear();
+            }
+        }
+        if (tok.size() >= 2 && sw.find(tok) == sw.end())
+            tokens.push_back(tok);
+        return tokens;
+    }
+
+    void add_to_bm25_index(uint64_t id, const std::string& content) {
+        if (content.empty()) return;
+        auto tokens = tokenize(content);
+        if (tokens.empty()) return;
+
+        // Remove old posting entries for this doc (handles updates)
+        auto old_it = doc_lengths_.find(id);
+        if (old_it != doc_lengths_.end()) {
+            for (auto& [term, postings] : bm25_index_) {
+                postings.erase(
+                    std::remove_if(postings.begin(), postings.end(),
+                        [id](const PostingEntry& p) { return p.doc_id == id; }),
+                    postings.end());
+            }
+        }
+
+        // Count term frequencies
+        std::unordered_map<std::string, uint32_t> tf;
+        for (const auto& t : tokens) tf[t]++;
+
+        // Update doc length and posting lists
+        doc_lengths_[id] = static_cast<uint32_t>(tokens.size());
+        for (const auto& [term, freq] : tf)
+            bm25_index_[term].push_back({id, freq});
+
+        // Recompute avg_dl
+        double total = 0.0;
+        for (const auto& [_, len] : doc_lengths_) total += len;
+        avg_dl_ = doc_lengths_.empty() ? 1.0 : total / static_cast<double>(doc_lengths_.size());
+    }
+
+    void rebuild_bm25_index() {
+        bm25_index_.clear();
+        doc_lengths_.clear();
+        avg_dl_ = 0.0;
+        for (const auto& [id, meta] : metadata_store_)
+            add_to_bm25_index(id, meta.content);
+    }
+
+    // ── Touch (no lock) — call from within already-locked methods ────
+    void touch_nolock(uint64_t id) {
+        auto it = metadata_store_.find(id);
+        if (it != metadata_store_.end()) {
+            it->second.recall_count++;
+            it->second.last_recalled_at = static_cast<uint64_t>(std::time(nullptr));
+        }
+    }
+
+    // ── WAL helpers ──────────────────────────────────────────────────
+    void wal_append(WalOp op, uint64_t id, const std::string& payload) {
+        if (wal_path_.empty()) return;
+        std::ofstream wf(wal_path_, std::ios::binary | std::ios::app);
+        if (!wf) return;
+        auto op_b = static_cast<uint8_t>(op);
+        uint32_t plen = static_cast<uint32_t>(payload.size());
+        wf.write(reinterpret_cast<const char*>(&op_b), 1);
+        wf.write(reinterpret_cast<const char*>(&id),   8);
+        wf.write(reinterpret_cast<const char*>(&plen), 4);
+        if (plen > 0) wf.write(payload.data(), plen);
+    }
+
+    void wal_clear() const {
+        if (!wal_path_.empty()) std::remove(wal_path_.c_str());
+    }
+
+    void replay_wal() {
+        if (wal_path_.empty()) return;
+        std::ifstream wf(wal_path_, std::ios::binary);
+        if (!wf) return;
+
+        while (true) {
+            uint8_t op_b; uint64_t id; uint32_t plen;
+            if (!wf.read(reinterpret_cast<char*>(&op_b), 1)) break;
+            if (!wf.read(reinterpret_cast<char*>(&id),   8)) break;
+            if (!wf.read(reinterpret_cast<char*>(&plen), 4)) break;
+            std::string payload(plen, '\0');
+            if (plen > 0 && !wf.read(&payload[0], plen)) break;
+
+            std::istringstream ss(payload);
+            auto op = static_cast<WalOp>(op_b);
+
+            if (op == WalOp::ADD) {
+                uint16_t mod_len = 0;
+                ss.read(reinterpret_cast<char*>(&mod_len), 2);
+                std::string modality(mod_len, '\0');
+                if (mod_len > 0) ss.read(&modality[0], mod_len);
+                uint32_t dim32 = 0;
+                ss.read(reinterpret_cast<char*>(&dim32), 4);
+                std::vector<float> vec(dim32);
+                ss.read(reinterpret_cast<char*>(vec.data()), dim32 * 4);
+                Metadata meta = Metadata::deserialize(ss);
+                auto& m_idx = get_or_create_index(modality, dim32);
+                reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
+                try { add_point(m_idx, id, vec.data()); } catch (...) {}
+                metadata_store_[id] = std::move(meta);
+
+            } else if (op == WalOp::UPDATE) {
+                Metadata meta = Metadata::deserialize(ss);
+                metadata_store_[id] = std::move(meta);
+
+            } else if (op == WalOp::UIMP) {
+                float imp = 0.0f;
+                ss.read(reinterpret_cast<char*>(&imp), 4);
+                auto it = metadata_store_.find(id);
+                if (it != metadata_store_.end()) it->second.importance = imp;
+
+            } else if (op == WalOp::LINK) {
+                uint64_t to_id = 0;
+                ss.read(reinterpret_cast<char*>(&to_id), 8);
+                uint8_t rel_len = 0;
+                ss.read(reinterpret_cast<char*>(&rel_len), 1);
+                std::string rel_type(rel_len, '\0');
+                if (rel_len > 0) ss.read(&rel_type[0], rel_len);
+                float weight = 1.0f;
+                ss.read(reinterpret_cast<char*>(&weight), 4);
+                auto it = metadata_store_.find(id);
+                if (it != metadata_store_.end()) {
+                    bool exists = false;
+                    for (const auto& e : it->second.edges)
+                        if (e.target_id == to_id && e.rel_type == rel_type) { exists = true; break; }
+                    if (!exists) {
+                        it->second.edges.push_back({to_id, rel_type, weight});
+                        reverse_index_[to_id].push_back({id, rel_type, weight});
+                    }
+                }
+
+            } else if (op == WalOp::FORGET) {
+                for (auto& [name, m_idx] : modality_indices_) {
+                    try { m_idx.index->markDelete(id); } catch (...) {}
+                }
+                auto it = metadata_store_.find(id);
+                if (it != metadata_store_.end()) {
+                    it->second.content    = "";
+                    it->second.source     = "_forgotten";
+                    it->second.importance = 0.0f;
+                    it->second.ttl        = 0;
+                }
+            }
+        }
+        build_reverse_index();
+        build_secondary_indexes();
+        rebuild_bm25_index();
+    }
+
+    static std::string escape_json(const std::string& s) {
+        std::string out;
+        out.reserve(s.size() + 4);
+        for (unsigned char c : s) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if (c < 0x20) {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        out += buf;
+                    } else {
+                        out += c;
+                    }
+            }
+        }
+        return out;
+    }
+
+    // ── Persistence ─────────────────────────────────────────────────
+
+    void save_vectors() const {
+        // Atomic save: write to .tmp, then rename — prevents corruption on crash
+        std::string tmp_path = path_ + ".tmp";
+        std::ofstream f(tmp_path, std::ios::binary);
+        if (!f) throw std::runtime_error("Cannot save to temp file: " + tmp_path);
+
+        uint32_t magic   = 0x46454154; // "FEAT"
+        uint32_t version = 9;          // v7: on-disk int8; v8: in-RAM int8 flag+scale; v9: persisted HNSW graph
+        f.write((char*)&magic,   4);
         f.write((char*)&version, 4);
 
-        // Save Metadata Store
-        uint32_t meta_count = static_cast<uint32_t>(metadata_store_.size());
+        // Build the set of valid IDs — exclude _forgotten and _deleted.
+        // This makes forget()/purge() actually persist across save+reload.
+        auto is_dead = [](const Metadata& m) -> bool {
+            if (m.source == "_forgotten") return true;
+            auto it = m.attributes.find("_deleted");
+            return it != m.attributes.end() && it->second == "true";
+        };
+        std::unordered_set<uint64_t> valid_ids;
+        valid_ids.reserve(metadata_store_.size());
+        for (const auto& [id, meta] : metadata_store_) {
+            if (!is_dead(meta)) valid_ids.insert(id);
+        }
+
+        // Metadata section — only write live records
+        uint32_t meta_count = static_cast<uint32_t>(valid_ids.size());
         f.write((char*)&meta_count, 4);
         for (const auto& [id, meta] : metadata_store_) {
+            if (!valid_ids.count(id)) continue;
             f.write((char*)&id, 8);
             meta.serialize(f);
         }
 
-        // Save Modality Indices
+        // Modality indices section — only write vectors whose ID is live
         uint32_t modal_count = static_cast<uint32_t>(modality_indices_.size());
         f.write((char*)&modal_count, 4);
         for (const auto& [name, m_idx] : modality_indices_) {
             uint16_t name_len = static_cast<uint16_t>(name.size());
             f.write((char*)&name_len, 2);
             f.write(name.data(), name_len);
-            
             uint32_t dim32 = static_cast<uint32_t>(m_idx.dim);
             f.write((char*)&dim32, 4);
-            
-            uint32_t element_count = static_cast<uint32_t>(m_idx.index->cur_element_count);
-            f.write((char*)&element_count, 4);
-            
-            for (size_t i = 0; i < element_count; ++i) {
+
+            uint8_t quant = quantized_modalities_.count(name) ? 1 : 0;
+            f.write((char*)&quant, 1);
+            // v8: persist in-RAM int8 mode + its global scale so reload restores it
+            uint8_t int8ram = m_idx.int8 ? 1 : 0;
+            f.write((char*)&int8ram, 1);
+            if (int8ram) f.write((char*)&m_idx.scale, 4);
+
+            size_t total = m_idx.index->cur_element_count;
+            uint32_t live_count = 0;
+            for (size_t i = 0; i < total; ++i) {
                 uint64_t id = m_idx.index->getExternalLabel(i);
-                const float* data = reinterpret_cast<const float*>(m_idx.index->getDataByInternalId(i));
+                if (valid_ids.count(id)) live_count++;
+            }
+
+            // v9 fast path: persist the prebuilt HNSW graph verbatim so load()
+            // restores it instead of rebuilding from vectors (~10x faster cold
+            // load, and keeps the higher-quality serial-build graph). Only safe
+            // when the graph holds exactly the live set (no forgotten/purged
+            // nodes to filter) and the modality isn't on-disk-quantized (which
+            // re-encodes vectors to int8, incompatible with the graph blob).
+            uint8_t persist_graph = (live_count == total && !quant) ? 1 : 0;
+            f.write((char*)&persist_graph, 1);
+            if (persist_graph) {
+                m_idx.index->saveIndexStream(f);
+                continue;
+            }
+
+            f.write((char*)&live_count, 4);
+            std::vector<int8_t> qbuf(quant ? m_idx.dim : 0);
+            for (size_t i = 0; i < total; ++i) {
+                uint64_t id = m_idx.index->getExternalLabel(i);
+                if (!valid_ids.count(id)) continue;
+                // dequantize int8 nodes to float; on-disk quant is independent
+                std::vector<float> data = read_vector_internal(m_idx, i);
                 f.write((char*)&id, 8);
-                f.write((char*)data, m_idx.dim * sizeof(float));
+                if (quant) {
+                    float scale = quantize_vec(data.data(), m_idx.dim, qbuf.data());
+                    f.write((char*)&scale, 4);
+                    f.write((char*)qbuf.data(), m_idx.dim);   // dim bytes
+                } else {
+                    f.write((char*)data.data(), m_idx.dim * sizeof(float));
+                }
             }
         }
+        f.close();
+        // Atomic rename: tmp → real path (POSIX atomic)
+        if (std::rename(tmp_path.c_str(), path_.c_str()) != 0)
+            throw std::runtime_error("Atomic rename failed: " + tmp_path + " → " + path_);
+        // Checkpoint: clear WAL now that the full state is on disk
+        wal_clear();
     }
 
     void load_vectors() {
@@ -82,13 +708,12 @@ private:
         if (!f) return;
 
         uint32_t magic, version;
-        f.read((char*)&magic, 4);
+        f.read((char*)&magic,   4);
         f.read((char*)&version, 4);
-        
         if (magic != 0x46454154) return;
 
         if (version == 2) {
-            // Backward compatibility for v2 (single default "text" index)
+            // v2: single "text" index, metadata interleaved with vectors
             uint32_t dim32;
             f.read((char*)&dim32, 4);
             auto& m_idx = get_or_create_index("text", dim32);
@@ -97,10 +722,12 @@ private:
             while (f.read((char*)&id, 8)) {
                 Metadata meta = Metadata::deserialize(f);
                 f.read((char*)vec.data(), dim32 * sizeof(float));
-                m_idx.index->addPoint(vec.data(), id);
+                reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
+                add_point(m_idx, id, vec.data());
                 metadata_store_[id] = std::move(meta);
             }
-        } else if (version == 3) {
+        } else if (version >= 3) {
+            // v3/v4/v5: separate metadata section then modality indices
             uint32_t meta_count;
             f.read((char*)&meta_count, 4);
             for (uint32_t i = 0; i < meta_count; ++i) {
@@ -108,7 +735,6 @@ private:
                 f.read((char*)&id, 8);
                 metadata_store_[id] = Metadata::deserialize(f);
             }
-
             uint32_t modal_count;
             f.read((char*)&modal_count, 4);
             for (uint32_t m = 0; m < modal_count; ++m) {
@@ -116,158 +742,1050 @@ private:
                 f.read((char*)&name_len, 2);
                 std::string name(name_len, ' ');
                 f.read(&name[0], name_len);
-                
-                uint32_t dim32;
+                uint32_t dim32, element_count;
                 f.read((char*)&dim32, 4);
-                
-                uint32_t element_count;
-                f.read((char*)&element_count, 4);
-                
+                uint8_t quant = 0;
+                if (version >= 7) f.read((char*)&quant, 1);
+                uint8_t int8ram = 0;
+                float   int8scale = 0.0f;
+                if (version >= 8) {
+                    f.read((char*)&int8ram, 1);
+                    if (int8ram) f.read((char*)&int8scale, 4);
+                }
+                uint8_t persist_graph = 0;
+                if (version >= 9) f.read((char*)&persist_graph, 1);
+                // configure int8-RAM BEFORE the index is created so it is built
+                // as an int8 index; vectors below are re-quantized via add_point.
+                if (int8ram) int8_ram_scale_[name] = int8scale;
                 auto& m_idx = get_or_create_index(name, dim32);
-                std::vector<float> vec(dim32);
+                if (quant) quantized_modalities_.insert(name);
+
+                if (persist_graph) {
+                    // v9: restore the prebuilt HNSW graph verbatim — no rebuild.
+                    // The blob carries the base layer (vectors) + link lists; the
+                    // space matches (Int8L2Space if int8ram, else L2Space).
+                    m_idx.index->loadIndexStream(f, m_idx.space.get(), 0);
+                    m_idx.index->setEf(DEFAULT_EF);
+                    continue;
+                }
+
+                // Read all vectors serially (sequential I/O), then build the
+                // HNSW graph in parallel — graph construction dominates load.
+                f.read((char*)&element_count, 4);
+                std::vector<std::pair<uint64_t, std::vector<float>>> items;
+                items.reserve(element_count);
+                std::vector<int8_t> qbuf(quant ? dim32 : 0);
                 for (uint32_t i = 0; i < element_count; ++i) {
                     uint64_t id;
                     f.read((char*)&id, 8);
-                    f.read((char*)vec.data(), dim32 * sizeof(float));
-                    m_idx.index->addPoint(vec.data(), id);
+                    std::vector<float> vec(dim32);
+                    if (quant) {
+                        float scale = 1.0f;
+                        f.read((char*)&scale, 4);
+                        f.read((char*)qbuf.data(), dim32);   // dim bytes
+                        dequantize_vec(qbuf.data(), dim32, scale, vec.data());
+                    } else {
+                        f.read((char*)vec.data(), dim32 * sizeof(float));
+                    }
+                    items.emplace_back(id, std::move(vec));
                 }
+                reserve(m_idx, m_idx.index->getCurrentElementCount() + items.size());
+                parallel_add(m_idx, items);
             }
         }
+
+        build_reverse_index();
+        build_secondary_indexes();
+        rebuild_bm25_index();
+        // Replay any uncommitted WAL entries (crash recovery)
+        replay_wal();
     }
 
 public:
+    // ─────────────────────────────────────────────────────────────────
+    // Factory
+    // ─────────────────────────────────────────────────────────────────
     static std::unique_ptr<DB> open(const std::string& path, size_t default_dim = 768) {
         auto db = std::make_unique<DB>();
-        db->path_ = path;
+        db->path_        = path;
+        db->wal_path_    = path + ".wal";
+        db->default_dim_ = default_dim;
         db->load_vectors();
-        
-        // If no index was loaded, create a default "text" index
-        if (db->modality_indices_.empty()) {
-            db->get_or_create_index("text", default_dim);
-        }
+        // Intentionally do NOT pre-create the "text" index. An empty HNSW index
+        // preallocates ~70MB (1M-element link locks etc.); pre-creating it forced
+        // set_int8_ram()/set_quantized() to build a *second* index, doubling RAM.
+        // The modality is created lazily on the first add() — by which point
+        // set_int8_ram() has taken effect — and dim() falls back to default_dim_.
         return db;
     }
 
-    void add(uint64_t id, const std::vector<float>& vec, const Metadata& meta = Metadata(), const std::string& modality = "text") {
+    // ─────────────────────────────────────────────────────────────────
+    // Ingestion
+    // ─────────────────────────────────────────────────────────────────
+    void add(uint64_t id, const std::vector<float>& vec,
+             const Metadata& meta = Metadata(),
+             const std::string& modality = "text") {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // WAL: log before mutating in-memory state
+        {
+            std::ostringstream ws;
+            uint16_t mod_len = static_cast<uint16_t>(modality.size());
+            ws.write(reinterpret_cast<const char*>(&mod_len), 2);
+            ws.write(modality.data(), mod_len);
+            uint32_t dim32 = static_cast<uint32_t>(vec.size());
+            ws.write(reinterpret_cast<const char*>(&dim32), 4);
+            ws.write(reinterpret_cast<const char*>(vec.data()), vec.size() * 4);
+            meta.serialize(ws);
+            wal_append(WalOp::ADD, id, ws.str());
+        }
+
         auto& m_idx = get_or_create_index(modality, vec.size());
-        if (vec.size() != m_idx.dim) throw std::runtime_error("Dimension mismatch for modality " + modality);
-        
-        m_idx.index->addPoint(vec.data(), id);
-        
-        // Merge metadata if record already exists
+        if (vec.size() != m_idx.dim)
+            throw std::runtime_error("Dimension mismatch for modality " + modality);
+        reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
+        add_point(m_idx, id, vec.data());
+
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end()) {
-            // Keep existing metadata, maybe update some fields?
-            // For now, we prefer the new metadata if provided, but keep links
+            deindex_meta(id, it->second);   // drop stale secondary-index entries
             Metadata combined = meta;
-            if (combined.links.empty() && !it->second.links.empty()) {
-                combined.links = it->second.links;
-            }
+            if (combined.edges.empty() && !it->second.edges.empty())
+                combined.edges = it->second.edges;
             metadata_store_[id] = combined;
         } else {
             metadata_store_[id] = meta;
         }
+        if (!is_dead_meta(metadata_store_[id])) index_meta(id, metadata_store_[id]);
+        add_to_bm25_index(id, meta.content);
     }
 
-    void touch(uint64_t id) {
-        auto it = metadata_store_.find(id);
-        if (it != metadata_store_.end()) {
-            it->second.recall_count++;
-            it->second.last_recalled_at = static_cast<uint64_t>(std::time(nullptr));
+    // Bulk insert. Same per-item semantics as add(), but the HNSW graph (the
+    // expensive part) is built in PARALLEL — much faster for bulk ingestion.
+    // `metas` may be empty (default Metadata for all) or must match ids.size().
+    void add_batch(const std::vector<uint64_t>& ids,
+                   const std::vector<std::vector<float>>& vecs,
+                   const std::vector<Metadata>& metas,
+                   const std::string& modality = "text") {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const size_t n = ids.size();
+        if (n == 0) return;
+        if (vecs.size() != n)
+            throw std::runtime_error("add_batch: ids and vecs size mismatch");
+        if (!metas.empty() && metas.size() != n)
+            throw std::runtime_error("add_batch: metas size mismatch");
+
+        auto& m_idx = get_or_create_index(modality, vecs[0].size());
+        static const Metadata kDefault;
+
+        // WAL + metadata + secondary indexes serially (cheap), collect vectors.
+        std::vector<std::pair<uint64_t, std::vector<float>>> items;
+        items.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            const Metadata& meta = metas.empty() ? kDefault : metas[i];
+            if (vecs[i].size() != m_idx.dim)
+                throw std::runtime_error("Dimension mismatch for modality " + modality);
+            {
+                std::ostringstream ws;
+                uint16_t mod_len = static_cast<uint16_t>(modality.size());
+                ws.write(reinterpret_cast<const char*>(&mod_len), 2);
+                ws.write(modality.data(), mod_len);
+                uint32_t dim32 = static_cast<uint32_t>(vecs[i].size());
+                ws.write(reinterpret_cast<const char*>(&dim32), 4);
+                ws.write(reinterpret_cast<const char*>(vecs[i].data()), vecs[i].size() * 4);
+                meta.serialize(ws);
+                wal_append(WalOp::ADD, ids[i], ws.str());
+            }
+            auto it = metadata_store_.find(ids[i]);
+            if (it != metadata_store_.end()) {
+                deindex_meta(ids[i], it->second);
+                Metadata combined = meta;
+                if (combined.edges.empty() && !it->second.edges.empty())
+                    combined.edges = it->second.edges;
+                metadata_store_[ids[i]] = combined;
+            } else {
+                metadata_store_[ids[i]] = meta;
+            }
+            if (!is_dead_meta(metadata_store_[ids[i]])) index_meta(ids[i], metadata_store_[ids[i]]);
+            add_to_bm25_index(ids[i], meta.content);
+            items.emplace_back(ids[i], vecs[i]);
         }
+        reserve(m_idx, m_idx.index->getCurrentElementCount() + items.size());
+        parallel_add(m_idx, items);   // concurrent graph construction
     }
 
-    void link(uint64_t from_id, uint64_t to_id) {
+    // ─────────────────────────────────────────────────────────────────
+    // Salience
+    // ─────────────────────────────────────────────────────────────────
+    void touch(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        touch_nolock(id);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Graph: link
+    // ─────────────────────────────────────────────────────────────────
+    void link(uint64_t from_id, uint64_t to_id,
+              const std::string& rel_type = "related_to",
+              float weight = 1.0f) {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto it = metadata_store_.find(from_id);
-        if (it != metadata_store_.end()) {
-            if (std::find(it->second.links.begin(), it->second.links.end(), to_id) == it->second.links.end()) {
-                it->second.links.push_back(to_id);
+        if (it == metadata_store_.end()) return;
+
+        for (const auto& e : it->second.edges)
+            if (e.target_id == to_id && e.rel_type == rel_type) return;
+
+        // WAL
+        {
+            std::ostringstream ws;
+            ws.write(reinterpret_cast<const char*>(&to_id), 8);
+            auto rel_len = static_cast<uint8_t>(std::min(rel_type.size(), size_t(255)));
+            ws.write(reinterpret_cast<const char*>(&rel_len), 1);
+            ws.write(rel_type.data(), rel_len);
+            ws.write(reinterpret_cast<const char*>(&weight), 4);
+            wal_append(WalOp::LINK, from_id, ws.str());
+        }
+
+        it->second.edges.push_back({to_id, rel_type, weight});
+        reverse_index_[to_id].push_back({from_id, rel_type, weight});
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Graph: query edges
+    // ─────────────────────────────────────────────────────────────────
+    std::vector<Edge> get_edges(uint64_t id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = metadata_store_.find(id);
+        if (it == metadata_store_.end()) return {};
+        return it->second.edges;
+    }
+
+    std::vector<IncomingEdge> get_incoming(uint64_t id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = reverse_index_.find(id);
+        if (it == reverse_index_.end()) return {};
+        return it->second;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Graph: auto-link by vector similarity
+    // ─────────────────────────────────────────────────────────────────
+    size_t auto_link(const std::string& modality = "text",
+                     float threshold = 0.80f,
+                     const std::string& rel_type = "related_to",
+                     size_t candidates = 15) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto m_it = modality_indices_.find(modality);
+        if (m_it == modality_indices_.end()) return 0;
+        auto& m_idx = m_it->second;
+        size_t n = m_idx.index->cur_element_count;
+        size_t links_created = 0;
+
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t from_id = m_idx.index->getExternalLabel(i);
+            // stored data is already in the index's storage format (float or
+            // int8), so it can be used directly as the query.
+            const void* qdata = m_idx.index->getDataByInternalId(i);
+            auto res = m_idx.index->searchKnn(qdata, candidates + 1);
+            while (!res.empty()) {
+                auto [dist, to_id] = res.top(); res.pop();
+                if (to_id == from_id) continue;
+                float sim = 1.0f / (1.0f + dist);
+                if (sim < threshold) continue;
+                auto& meta = metadata_store_[from_id];
+                bool exists = false;
+                for (const auto& e : meta.edges)
+                    if (e.target_id == to_id && e.rel_type == rel_type) { exists = true; break; }
+                if (!exists) {
+                    meta.edges.push_back({to_id, rel_type, sim});
+                    reverse_index_[to_id].push_back({from_id, rel_type, sim});
+                    ++links_created;
+                }
             }
         }
+        return links_created;
     }
 
-    struct SearchResult {
+    // ─────────────────────────────────────────────────────────────────
+    // Context Chain: vector search + n-hop graph expansion
+    // ─────────────────────────────────────────────────────────────────
+    struct ContextNode {
         uint64_t id;
-        float score;
+        float    score;
+        float    similarity;  // 0 if reached via graph expansion
+        int      hop;         // 0 = direct search hit, 1+ = graph hops
         Metadata metadata;
     };
 
-    std::vector<SearchResult> search(const std::vector<float>& q, size_t k = 5,
-                                     const SearchFilter* filter = nullptr,
-                                     const ScoringConfig* scoring = nullptr,
+    struct ContextEdge {
+        uint64_t    source;
+        uint64_t    target;
+        std::string rel_type;
+        float       weight;
+    };
+
+    struct ContextChainResult {
+        std::vector<ContextNode> nodes;
+        std::vector<ContextEdge> edges;
+    };
+
+    ContextChainResult context_chain(const std::vector<float>& query,
+                                     size_t k = 5,
+                                     int hops = 2,
                                      const std::string& modality = "text") {
-        
+        std::lock_guard<std::mutex> lock(mutex_);
         auto m_it = modality_indices_.find(modality);
-        if (m_it == modality_indices_.end()) return {}; // Modality not found
+        if (m_it == modality_indices_.end()) return {};
         auto& m_idx = m_it->second;
 
-        struct FilterWrapper : public hnswlib::BaseFilterFunctor {
-            const SearchFilter* filter_;
-            const std::unordered_map<uint64_t, Metadata>& metadata_store_;
-            FilterWrapper(const SearchFilter* f, const std::unordered_map<uint64_t, Metadata>& m)
-                : filter_(f), metadata_store_(m) {}
-            bool operator()(hnswlib::labeltype id) override {
-                if (!filter_) return true;
-                auto it = metadata_store_.find(id);
-                if (it == metadata_store_.end()) return false;
-                return filter_->matches(it->second);
+        // Step 1: vector search → seed nodes (encode query to storage format)
+        auto qbytes = encode_query(m_idx, query.data());
+        auto raw = m_idx.index->searchKnn(qbytes.data(), k);
+        std::unordered_map<uint64_t, float> sim_scores;
+        while (!raw.empty()) {
+            auto [dist, id] = raw.top(); raw.pop();
+            float sim = 1.0f / (1.0f + dist);
+            sim_scores[id] = sim;
+            touch_nolock(id);
+        }
+
+        // Step 2: BFS expansion over edges (outgoing + incoming)
+        std::unordered_map<uint64_t, int> visited;   // id → best hop
+        std::queue<std::pair<uint64_t, int>> bfs;
+        for (const auto& [id, _] : sim_scores) {
+            visited[id] = 0;
+            bfs.push({id, 0});
+        }
+
+        std::vector<ContextEdge> collected_edges;
+
+        while (!bfs.empty()) {
+            auto [cur_id, cur_hop] = bfs.front(); bfs.pop();
+            if (cur_hop >= hops) continue;
+
+            // Outgoing edges
+            auto it = metadata_store_.find(cur_id);
+            if (it != metadata_store_.end()) {
+                for (const auto& e : it->second.edges) {
+                    collected_edges.push_back({cur_id, e.target_id, e.rel_type, e.weight});
+                    if (visited.find(e.target_id) == visited.end()) {
+                        visited[e.target_id] = cur_hop + 1;
+                        bfs.push({e.target_id, cur_hop + 1});
+                    }
+                }
             }
-        };
+            // Incoming edges
+            auto rit = reverse_index_.find(cur_id);
+            if (rit != reverse_index_.end()) {
+                for (const auto& ie : rit->second) {
+                    collected_edges.push_back({ie.source_id, cur_id, ie.rel_type, ie.weight});
+                    if (visited.find(ie.source_id) == visited.end()) {
+                        visited[ie.source_id] = cur_hop + 1;
+                        bfs.push({ie.source_id, cur_hop + 1});
+                    }
+                }
+            }
+        }
 
-        FilterWrapper hnsw_filter(filter, metadata_store_);
-        size_t candidates_to_search = (scoring) ? k * 3 : k;
-        auto res = m_idx.index->searchKnn(q.data(), candidates_to_search, filter ? &hnsw_filter : nullptr);
-
-        std::vector<SearchResult> results;
+        // Step 3: build result nodes with scores
+        ContextChainResult result;
         double now_ts = static_cast<double>(std::time(nullptr));
 
-        while (!res.empty()) {
-            auto [dist, id] = res.top();
-            res.pop();
+        for (const auto& [id, hop] : visited) {
+            auto mit = metadata_store_.find(id);
+            Metadata meta = (mit != metadata_store_.end()) ? mit->second : Metadata();
 
-            // Update recall metrics (Salience)
-            touch(id);
+            float sim = 0.0f;
+            auto sit = sim_scores.find(id);
+            if (sit != sim_scores.end()) sim = sit->second;
 
-            auto it = metadata_store_.find(id);
-            Metadata meta = (it != metadata_store_.end()) ? it->second : Metadata();
+            // Score: similarity decays by hop, modulated by importance + stickiness
+            float stickiness = 1.0f + std::log(1.0f + static_cast<float>(meta.recall_count));
+            float hop_decay  = 1.0f / (1.0f + static_cast<float>(hop));
+            float base       = (hop == 0) ? sim : hop_decay;
+            float score      = base * meta.importance * stickiness;
 
-            float final_score;
-            if (scoring) {
-                final_score = Scorer::calculate_score(dist, meta, *scoring, now_ts);
-            } else {
-                final_score = 1.0f / (1.0f + dist); // Default similarity score
-            }
-
-            results.push_back({id, final_score, std::move(meta)});
+            result.nodes.push_back({id, score, sim, hop, std::move(meta)});
         }
 
-        // Sort by score descending
-        std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
-            return a.score > b.score;
-        });
+        // Deduplicate edges
+        std::sort(collected_edges.begin(), collected_edges.end(),
+            [](const ContextEdge& a, const ContextEdge& b) {
+                return std::tie(a.source, a.target, a.rel_type) <
+                       std::tie(b.source, b.target, b.rel_type);
+            });
+        collected_edges.erase(std::unique(collected_edges.begin(), collected_edges.end(),
+            [](const ContextEdge& a, const ContextEdge& b) {
+                return a.source == b.source && a.target == b.target &&
+                       a.rel_type == b.rel_type;
+            }), collected_edges.end());
+        result.edges = std::move(collected_edges);
 
-        // Limit to k
-        if (results.size() > k) {
-            results.resize(k);
-        }
+        // Sort nodes by score descending
+        std::sort(result.nodes.begin(), result.nodes.end(),
+            [](const ContextNode& a, const ContextNode& b) { return a.score > b.score; });
 
-        return results;
+        return result;
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // Graph export: D3 / Cytoscape-compatible JSON
+    // ─────────────────────────────────────────────────────────────────
+    std::string export_graph_json(const std::string& ns_filter   = "",
+                                  const std::string& eid_filter  = "") const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ostringstream oss;
+        oss << "{\"nodes\":[";
+        bool first = true;
+        for (const auto& [id, meta] : metadata_store_) {
+            if (!ns_filter.empty()  && meta.namespace_id != ns_filter)  continue;
+            if (!eid_filter.empty() && meta.entity_id    != eid_filter) continue;
+            if (!first) oss << ","; first = false;
+
+            oss << "{\"id\":"         << id;
+            oss << ",\"label\":\""    << escape_json(meta.content.substr(0, 60)) << "\"";
+            oss << ",\"namespace_id\":\"" << escape_json(meta.namespace_id)      << "\"";
+            oss << ",\"entity_id\":\"" << escape_json(meta.entity_id)            << "\"";
+            oss << ",\"type\":"       << static_cast<int>(meta.type);
+            oss << ",\"source\":\""   << escape_json(meta.source)                << "\"";
+            oss << ",\"importance\":" << meta.importance;
+            oss << ",\"recall_count\":" << meta.recall_count;
+            oss << ",\"timestamp\":"  << meta.timestamp;
+            oss << ",\"attributes\":{";
+            bool fa = true;
+            for (const auto& [k,v] : meta.attributes) {
+                if (!fa) oss << ","; fa = false;
+                oss << "\"" << escape_json(k) << "\":\"" << escape_json(v) << "\"";
+            }
+            oss << "}}";
+        }
+
+        // Build set of exported node IDs so we can filter dangling edges
+        std::unordered_set<uint64_t> exported_ids;
+        for (const auto& [id, meta] : metadata_store_) {
+            if (!ns_filter.empty()  && meta.namespace_id != ns_filter)  continue;
+            if (!eid_filter.empty() && meta.entity_id    != eid_filter) continue;
+            exported_ids.insert(id);
+        }
+
+        oss << "],\"edges\":[";
+        first = true;
+        for (const auto& [from_id, meta] : metadata_store_) {
+            if (!ns_filter.empty()  && meta.namespace_id != ns_filter)  continue;
+            if (!eid_filter.empty() && meta.entity_id    != eid_filter) continue;
+            for (const auto& e : meta.edges) {
+                // Only emit edge if target also exists in the exported node set
+                if (exported_ids.find(e.target_id) == exported_ids.end()) continue;
+                if (!first) oss << ","; first = false;
+                oss << "{\"source\":"      << from_id;
+                oss << ",\"target\":"      << e.target_id;
+                oss << ",\"rel_type\":\"" << escape_json(e.rel_type) << "\"";
+                oss << ",\"weight\":"      << e.weight;
+                oss << "}";
+            }
+        }
+        oss << "]}";
+        return oss.str();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Metadata CRUD
+    // ─────────────────────────────────────────────────────────────────
     std::optional<Metadata> get_metadata(uint64_t id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end()) return it->second;
         return std::nullopt;
     }
 
-    void save() { save_vectors(); }
-    ~DB() { save(); }
+    void update_metadata(uint64_t id, const Metadata& meta) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // WAL
+        {
+            std::ostringstream ws;
+            meta.serialize(ws);
+            wal_append(WalOp::UPDATE, id, ws.str());
+        }
+        auto old = metadata_store_.find(id);
+        if (old != metadata_store_.end()) deindex_meta(id, old->second);
+        metadata_store_[id] = meta;
+        if (!is_dead_meta(meta)) index_meta(id, meta);
+        for (auto& [target, incoming_list] : reverse_index_) {
+            incoming_list.erase(
+                std::remove_if(incoming_list.begin(), incoming_list.end(),
+                    [id](const IncomingEdge& ie) { return ie.source_id == id; }),
+                incoming_list.end());
+        }
+        for (const auto& e : meta.edges)
+            reverse_index_[e.target_id].push_back({id, e.rel_type, e.weight});
+        add_to_bm25_index(id, meta.content);
+    }
 
-    // ← PUBLIC GETTER
-    size_t dim(const std::string& modality = "text") const { 
+    void update_importance(uint64_t id, float importance) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // WAL
+        {
+            std::ostringstream ws;
+            ws.write(reinterpret_cast<const char*>(&importance), 4);
+            wal_append(WalOp::UIMP, id, ws.str());
+        }
+        auto it = metadata_store_.find(id);
+        if (it != metadata_store_.end()) it->second.importance = importance;
+    }
+
+    // Get raw vector for a given id and modality (empty if not found)
+    std::vector<float> get_vector(uint64_t id, const std::string& modality = "text") const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = modality_indices_.find(modality);
+        if (it == modality_indices_.end()) return {};
+        try {
+            return read_vector_label(it->second, id);   // dequantizes if int8
+        } catch (...) {
+            return {};
+        }
+    }
+
+    // Get all IDs present in a modality index
+    std::vector<uint64_t> get_all_ids(const std::string& modality = "text") const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = modality_indices_.find(modality);
+        if (it == modality_indices_.end()) return {};
+        std::vector<uint64_t> ids;
+        ids.reserve(it->second.index->getCurrentElementCount());
+        for (const auto& [id, _] : metadata_store_) {
+            try {
+                read_vector_label(it->second, id);   // throws if not in this modality
+                ids.push_back(id);
+            } catch (...) {}
+        }
+        return ids;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Secondary-index queries — O(matches), LIVE records only.
+    // Back the API's namespace/entity/attribute scans and feed feature A's
+    // pre-filtered search with ready-made candidate sets.
+    // ─────────────────────────────────────────────────────────────────
+    std::vector<uint64_t> ids_in_namespace(const std::string& ns) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = ns_index_.find(ns);
+        if (it == ns_index_.end()) return {};
+        return {it->second.begin(), it->second.end()};
+    }
+
+    std::vector<uint64_t> ids_for_entity(const std::string& eid) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entity_index_.find(eid);
+        if (it == entity_index_.end()) return {};
+        return {it->second.begin(), it->second.end()};
+    }
+
+    std::vector<uint64_t> ids_with_attribute(const std::string& key,
+                                             const std::string& val) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = attr_index_.find(attr_key(key, val));
+        if (it == attr_index_.end()) return {};
+        return {it->second.begin(), it->second.end()};
+    }
+
+    size_t namespace_size(const std::string& ns) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = ns_index_.find(ns);
+        return it == ns_index_.end() ? 0 : it->second.size();
+    }
+
+    std::vector<std::string> list_namespaces() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> out;
+        out.reserve(ns_index_.size());
+        for (const auto& [ns, _] : ns_index_) out.push_back(ns);
+        return out;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Search
+    // ─────────────────────────────────────────────────────────────────
+    struct SearchResult {
+        uint64_t id;
+        float    score;
+        Metadata metadata;
+    };
+
+    std::vector<SearchResult> search(const std::vector<float>& q, size_t k = 5,
+                                     const SearchFilter*   filter  = nullptr,
+                                     const ScoringConfig*  scoring = nullptr,
+                                     const std::string&    modality = "text") {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto m_it = modality_indices_.find(modality);
+        if (m_it == modality_indices_.end()) return {};
+        auto& m_idx = m_it->second;
+
+        // ── Pre-filtered exact path (feature A) ──────────────────────
+        // When the filter constrains an indexed field (namespace/entity/
+        // attribute), resolve the candidate set from the secondary indexes and
+        // rank EXACTLY over just those vectors. Unlike HNSW's ef-bounded
+        // filtered traversal — which silently returns far fewer than k when the
+        // filter is selective — this returns up to k matches whenever ≥k records
+        // match, and is O(matches) so a selective filter is also fast.
+        if (filter) {
+            bool indexed = false;
+            auto cand = candidates_for_filter(*filter, indexed);
+            if (indexed) {
+                double now_ts = static_cast<double>(std::time(nullptr));
+                std::vector<SearchResult> results;
+                results.reserve(cand.size());
+                for (uint64_t id : cand) {
+                    auto it = metadata_store_.find(id);
+                    if (it == metadata_store_.end() || is_dead_meta(it->second)) continue;
+                    if (!filter->matches(it->second)) continue;   // non-indexed predicates
+                    std::vector<float> vec;
+                    try { vec = read_vector_label(m_idx, id); }   // float (deq if int8)
+                    catch (...) { continue; }                     // not in this modality
+                    if (vec.size() != m_idx.dim) continue;
+                    float dist = 0.0f;                            // exact L2 in float space
+                    for (size_t d = 0; d < m_idx.dim; ++d) {
+                        float diff = q[d] - vec[d];
+                        dist += diff * diff;
+                    }
+                    touch_nolock(id);
+                    float score = scoring
+                        ? Scorer::calculate_score(dist, it->second, *scoring, now_ts)
+                        : 1.0f / (1.0f + dist);
+                    results.push_back({id, score, it->second});
+                }
+                std::sort(results.begin(), results.end(),
+                    [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
+                if (results.size() > k) results.resize(k);
+                return results;
+            }
+        }
+
+        struct FilterWrapper : public hnswlib::BaseFilterFunctor {
+            const SearchFilter* filter_;
+            const std::unordered_map<uint64_t, Metadata>& store_;
+            FilterWrapper(const SearchFilter* f,
+                          const std::unordered_map<uint64_t, Metadata>& s)
+                : filter_(f), store_(s) {}
+            bool operator()(hnswlib::labeltype id) override {
+                if (!filter_) return true;
+                auto it = store_.find(id);
+                if (it == store_.end()) return false;
+                return filter_->matches(it->second);
+            }
+        };
+
+        FilterWrapper hnsw_filter(filter, metadata_store_);
+        size_t candidates = (scoring) ? k * 3 : k;
+        auto qbytes = encode_query(m_idx, q.data());   // float bytes or int8 blob
+        auto res = m_idx.index->searchKnn(qbytes.data(), candidates,
+                                          filter ? &hnsw_filter : nullptr);
+
+        std::vector<SearchResult> results;
+        double now_ts = static_cast<double>(std::time(nullptr));
+        (void)now_ts; // used conditionally when scoring != nullptr
+
+        while (!res.empty()) {
+            auto [dist, id] = res.top(); res.pop();
+            touch_nolock(id);
+            auto it = metadata_store_.find(id);
+            Metadata meta = (it != metadata_store_.end()) ? it->second : Metadata();
+            float score = scoring
+                ? Scorer::calculate_score(dist, meta, *scoring, now_ts)
+                : 1.0f / (1.0f + dist);
+            results.push_back({id, score, std::move(meta)});
+        }
+
+        std::sort(results.begin(), results.end(),
+            [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
+        if (results.size() > k) results.resize(k);
+        return results;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // BM25 keyword search
+    // ─────────────────────────────────────────────────────────────────
+    std::vector<SearchResult> keyword_search(const std::string& query, size_t k = 10,
+                                             const SearchFilter* filter = nullptr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto terms = tokenize(query);
+        if (terms.empty() || doc_lengths_.empty()) return {};
+
+        size_t N = doc_lengths_.size();
+        double avdl = avg_dl_ > 0.0 ? avg_dl_ : 1.0;
+
+        // Unique query terms
+        std::unordered_set<std::string> unique_terms(terms.begin(), terms.end());
+
+        std::unordered_map<uint64_t, float> scores;
+
+        for (const auto& term : unique_terms) {
+            auto it = bm25_index_.find(term);
+            if (it == bm25_index_.end()) continue;
+            const auto& postings = it->second;
+            size_t n_t = postings.size();
+
+            // IDF (BM25+): log((N - n_t + 0.5) / (n_t + 0.5) + 1)
+            double idf = std::log(
+                (static_cast<double>(N) - static_cast<double>(n_t) + 0.5) /
+                (static_cast<double>(n_t) + 0.5) + 1.0);
+
+            for (const auto& p : postings) {
+                if (filter) {
+                    auto mit = metadata_store_.find(p.doc_id);
+                    if (mit == metadata_store_.end() || !filter->matches(mit->second))
+                        continue;
+                }
+                auto dl_it = doc_lengths_.find(p.doc_id);
+                uint32_t dl = (dl_it != doc_lengths_.end()) ? dl_it->second : 1;
+                double tf_norm =
+                    (static_cast<double>(p.term_freq) * (BM25_K1 + 1.0)) /
+                    (static_cast<double>(p.term_freq) +
+                     BM25_K1 * (1.0 - BM25_B + BM25_B * static_cast<double>(dl) / avdl));
+                scores[p.doc_id] += static_cast<float>(idf * tf_norm);
+            }
+        }
+
+        // Sort by score descending
+        std::vector<std::pair<float, uint64_t>> ranked;
+        ranked.reserve(scores.size());
+        for (const auto& [id, sc] : scores) ranked.push_back({sc, id});
+        std::sort(ranked.begin(), ranked.end(), std::greater<std::pair<float,uint64_t>>());
+        if (ranked.size() > k) ranked.resize(k);
+
+        std::vector<SearchResult> results;
+        results.reserve(ranked.size());
+        for (const auto& [sc, id] : ranked) {
+            touch_nolock(id);
+            auto mit = metadata_store_.find(id);
+            Metadata meta = (mit != metadata_store_.end()) ? mit->second : Metadata();
+            results.push_back({id, sc, std::move(meta)});
+        }
+        return results;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Hybrid search: BM25 + vector via Reciprocal Rank Fusion (RRF)
+    // ─────────────────────────────────────────────────────────────────
+    std::vector<SearchResult> hybrid_search(const std::vector<float>& vec,
+                                            const std::string& query,
+                                            size_t k = 10,
+                                            size_t rrf_k = 60,
+                                            const SearchFilter* filter = nullptr,
+                                            const ScoringConfig* scoring = nullptr,
+                                            const std::string& modality = "text") {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t candidates = k * 3;
+
+        // ── Inline vector search (no re-lock) ─────────────────────────
+        std::vector<SearchResult> vec_results;
+        {
+            auto m_it = modality_indices_.find(modality);
+            if (m_it != modality_indices_.end()) {
+                auto& m_idx = m_it->second;
+                struct FW : public hnswlib::BaseFilterFunctor {
+                    const SearchFilter* f_; const std::unordered_map<uint64_t,Metadata>& s_;
+                    FW(const SearchFilter* f, const std::unordered_map<uint64_t,Metadata>& s): f_(f),s_(s){}
+                    bool operator()(hnswlib::labeltype id) override {
+                        if (!f_) return true;
+                        auto it = s_.find(id); return it!=s_.end() && f_->matches(it->second);
+                    }
+                } fw(filter, metadata_store_);
+                size_t cands = scoring ? candidates * 3 : candidates;
+                auto qbytes = encode_query(m_idx, vec.data());
+                auto res = m_idx.index->searchKnn(qbytes.data(), cands, filter ? &fw : nullptr);
+                double now_ts = static_cast<double>(std::time(nullptr));
+                while (!res.empty()) {
+                    auto [dist, id] = res.top(); res.pop();
+                    auto it = metadata_store_.find(id);
+                    Metadata meta = (it != metadata_store_.end()) ? it->second : Metadata();
+                    float score = scoring
+                        ? Scorer::calculate_score(dist, meta, *scoring, now_ts)
+                        : 1.0f / (1.0f + dist);
+                    vec_results.push_back({id, score, std::move(meta)});
+                }
+                std::sort(vec_results.begin(), vec_results.end(),
+                    [](const SearchResult& a, const SearchResult& b){ return a.score > b.score; });
+                if (vec_results.size() > candidates) vec_results.resize(candidates);
+            }
+        }
+
+        // ── Inline BM25 search (no re-lock) ──────────────────────────
+        std::vector<SearchResult> kw_results;
+        {
+            auto terms = tokenize(query);
+            if (!terms.empty() && !doc_lengths_.empty()) {
+                size_t N = doc_lengths_.size();
+                double avdl = avg_dl_ > 0.0 ? avg_dl_ : 1.0;
+                std::unordered_set<std::string> uterms(terms.begin(), terms.end());
+                std::unordered_map<uint64_t, float> scores;
+                for (const auto& term : uterms) {
+                    auto it = bm25_index_.find(term);
+                    if (it == bm25_index_.end()) continue;
+                    size_t n_t = it->second.size();
+                    double idf = std::log((static_cast<double>(N)-n_t+0.5)/(n_t+0.5)+1.0);
+                    for (const auto& p : it->second) {
+                        if (filter) {
+                            auto mit = metadata_store_.find(p.doc_id);
+                            if (mit==metadata_store_.end()||!filter->matches(mit->second)) continue;
+                        }
+                        auto dl_it = doc_lengths_.find(p.doc_id);
+                        uint32_t dl = dl_it!=doc_lengths_.end() ? dl_it->second : 1;
+                        double tf_norm = (p.term_freq*(BM25_K1+1.0)) /
+                            (p.term_freq + BM25_K1*(1.0-BM25_B+BM25_B*dl/avdl));
+                        scores[p.doc_id] += static_cast<float>(idf * tf_norm);
+                    }
+                }
+                std::vector<std::pair<float,uint64_t>> ranked;
+                ranked.reserve(scores.size());
+                for (const auto& [id, sc] : scores) ranked.push_back({sc, id});
+                std::sort(ranked.begin(), ranked.end(), std::greater<std::pair<float,uint64_t>>());
+                if (ranked.size() > candidates) ranked.resize(candidates);
+                for (const auto& [sc, id] : ranked) {
+                    auto mit = metadata_store_.find(id);
+                    Metadata meta = (mit != metadata_store_.end()) ? mit->second : Metadata();
+                    kw_results.push_back({id, sc, std::move(meta)});
+                }
+            }
+        }
+
+        // ── RRF merge ────────────────────────────────────────────────
+        std::unordered_map<uint64_t, double> rrf_scores;
+        for (size_t rank = 0; rank < vec_results.size(); ++rank)
+            rrf_scores[vec_results[rank].id] += 1.0 / (static_cast<double>(rrf_k) + rank + 1);
+        for (size_t rank = 0; rank < kw_results.size(); ++rank)
+            rrf_scores[kw_results[rank].id] += 1.0 / (static_cast<double>(rrf_k) + rank + 1);
+
+        std::vector<std::pair<double, uint64_t>> ranked;
+        ranked.reserve(rrf_scores.size());
+        for (const auto& [id, sc] : rrf_scores) ranked.push_back({sc, id});
+        std::sort(ranked.begin(), ranked.end(), std::greater<std::pair<double,uint64_t>>());
+        if (ranked.size() > k) ranked.resize(k);
+
+        std::vector<SearchResult> results;
+        results.reserve(ranked.size());
+        for (const auto& [sc, id] : ranked) {
+            auto mit = metadata_store_.find(id);
+            Metadata meta = (mit != metadata_store_.end()) ? mit->second : Metadata();
+            results.push_back({id, static_cast<float>(sc), std::move(meta)});
+        }
+        return results;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Memory lifecycle: forget / purge / expire
+    // ─────────────────────────────────────────────────────────────────
+
+    // Soft-delete: mark-deleted in HNSW (exits search), blank content,
+    // set importance=0. The node shell remains so graph edges stay traversable.
+    void forget(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        wal_append(WalOp::FORGET, id, "");
+        for (auto& [name, m_idx] : modality_indices_) {
+            try { m_idx.index->markDelete(id); } catch (...) {}
+        }
+        auto it = metadata_store_.find(id);
+        if (it != metadata_store_.end()) {
+            deindex_meta(id, it->second);   // forgotten records leave candidate sets
+            it->second.content    = "";
+            it->second.source     = "_forgotten";
+            it->second.importance = 0.0f;
+            it->second.ttl        = 0;
+        }
+        maybe_auto_compact_nolock();
+    }
+
+    // Hard-delete: remove all nodes in namespace_id from indices +
+    // metadata store + reverse index. Returns count of removed nodes.
+    size_t purge(const std::string& ns_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::unordered_set<uint64_t> to_purge;
+        for (const auto& [id, meta] : metadata_store_)
+            if (meta.namespace_id == ns_id) to_purge.insert(id);
+
+        // Mark-delete in every modality
+        for (auto& [name, m_idx] : modality_indices_) {
+            for (uint64_t id : to_purge) {
+                try { m_idx.index->markDelete(id); } catch (...) {}
+            }
+        }
+        // Erase metadata (deindex first so secondary indexes stay in sync)
+        for (uint64_t id : to_purge) {
+            auto it = metadata_store_.find(id);
+            if (it != metadata_store_.end()) deindex_meta(id, it->second);
+            metadata_store_.erase(id);
+        }
+
+        // Clean reverse index: remove entries sourced from purged nodes
+        for (auto& [target, incoming] : reverse_index_) {
+            incoming.erase(
+                std::remove_if(incoming.begin(), incoming.end(),
+                    [&to_purge](const IncomingEdge& ie) {
+                        return to_purge.count(ie.source_id) > 0;
+                    }),
+                incoming.end());
+        }
+        // Remove reverse index entries for purged target keys
+        for (uint64_t id : to_purge) reverse_index_.erase(id);
+
+        // Prune edges in surviving nodes that pointed to purged targets
+        for (auto& [id, meta] : metadata_store_) {
+            meta.edges.erase(
+                std::remove_if(meta.edges.begin(), meta.edges.end(),
+                    [&to_purge](const Edge& e) {
+                        return to_purge.count(e.target_id) > 0;
+                    }),
+                meta.edges.end());
+        }
+
+        maybe_auto_compact_nolock();
+        return to_purge.size();
+    }
+
+    // Scan all nodes and soft-delete any with ttl>0 where now > timestamp+ttl.
+    // Returns count of nodes forgotten.
+    size_t forget_expired() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        int64_t now = static_cast<int64_t>(std::time(nullptr));
+        size_t  count = 0;
+        std::vector<uint64_t> expired;
+        for (const auto& [id, meta] : metadata_store_) {
+            if (meta.ttl > 0 && now > meta.timestamp + meta.ttl)
+                expired.push_back(id);
+        }
+        for (uint64_t id : expired) {
+            wal_append(WalOp::FORGET, id, "");
+            for (auto& [name, m_idx] : modality_indices_) {
+                try { m_idx.index->markDelete(id); } catch (...) {}
+            }
+            auto it = metadata_store_.find(id);
+            if (it != metadata_store_.end()) {
+                deindex_meta(id, it->second);   // drop from candidate sets
+                it->second.content    = "";
+                it->second.source     = "_forgotten";
+                it->second.importance = 0.0f;
+                it->second.ttl        = 0;
+            }
+            ++count;
+        }
+        maybe_auto_compact_nolock();
+        return count;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 7d: compact() — rebuild HNSW indices without soft-deleted records
+    // ─────────────────────────────────────────────────────────────────
+    size_t compact() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return compact_nolock();
+    }
+
+    // Configure auto-compaction. ratio in (0,1] triggers a rebuild of a modality
+    // index once its deleted/total ratio crosses `ratio` after a forget/purge/
+    // expire. 0 disables it. e.g. set_auto_compact(0.2) → rebuild at 20% dead.
+    void set_auto_compact(float ratio) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto_compact_ratio_ = ratio;
+    }
+    float get_auto_compact() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return auto_compact_ratio_;
+    }
+
+    // Persist a modality's vectors as int8 + per-vector scale (file format v7):
+    // ~4x smaller on disk, dequantized to float32 on load. Takes effect on the
+    // next save(). The in-memory index is unchanged. Opt-in; default off.
+    void set_quantized(const std::string& modality, bool on) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (on) quantized_modalities_.insert(modality);
+        else    quantized_modalities_.erase(modality);
+    }
+    bool is_quantized(const std::string& modality) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return quantized_modalities_.count(modality) > 0;
+    }
+
+    // Store this modality's vectors as int8[dim] IN MEMORY (4x less RAM) using a
+    // global scale = max_abs/127. Must be called BEFORE the first vector is added
+    // to the modality (it sets the index storage type). `max_abs` should bound
+    // the largest |component| in your vectors (values beyond it are clamped);
+    // for unit-norm embeddings a small value like 0.3–1.0 is typical.
+    void set_int8_ram(const std::string& modality, float max_abs = 1.0f) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = modality_indices_.find(modality);
+        if (it != modality_indices_.end() &&
+            it->second.index->getCurrentElementCount() > 0)
+            throw std::runtime_error(
+                "set_int8_ram('" + modality + "') must be called before any "
+                "vectors are added to that modality");
+        if (max_abs <= 0.0f) max_abs = 1.0f;
+        float scale = max_abs / 127.0f;
+        int8_ram_scale_[modality] = scale;
+        // open() pre-creates an empty "text" index; rebuild it as int8 in place.
+        if (it != modality_indices_.end()) {
+            size_t dim = it->second.dim;
+            auto space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
+            auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+                space.get(), INITIAL_MAX_ELEMENTS, 16, 200);
+            index->setEf(DEFAULT_EF);
+            it->second = {std::move(index), std::move(space), dim, true, scale};
+        }
+    }
+    bool is_int8_ram(const std::string& modality) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return int8_ram_scale_.count(modality) > 0;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Persistence & info
+    // ─────────────────────────────────────────────────────────────────
+    void save() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        save_vectors();
+    }
+    ~DB() {
+        // save() acquires mutex — call save_vectors() directly in destructor
+        // (no other threads should be using the DB at destruction time)
+        try { save_vectors(); } catch (...) {}
+    }
+
+    size_t dim(const std::string& modality = "text") const {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto it = modality_indices_.find(modality);
         if (it != modality_indices_.end()) return it->second.dim;
-        return 0;
+        return default_dim_;   // modality not created yet → report the open() default
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return metadata_store_.size();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Tuning: HNSW search beam width
+    // ─────────────────────────────────────────────────────────────────
+    // Higher ef = better recall, slower search. Default is DEFAULT_EF (50).
+    // Pass modality = "" (default) to apply to all modalities.
+    void set_ef(size_t ef, const std::string& modality = "") {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (modality.empty()) {
+            for (auto& [_name, mi] : modality_indices_) {
+                mi.index->setEf(ef);
+            }
+        } else {
+            auto it = modality_indices_.find(modality);
+            if (it == modality_indices_.end())
+                throw std::runtime_error("unknown modality: " + modality);
+            it->second.index->setEf(ef);
+        }
+    }
+
+    size_t get_ef(const std::string& modality = "text") const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = modality_indices_.find(modality);
+        if (it == modality_indices_.end())
+            throw std::runtime_error("unknown modality: " + modality);
+        return it->second.index->ef_;
     }
 };
-}  // namespace feather
+
+} // namespace feather

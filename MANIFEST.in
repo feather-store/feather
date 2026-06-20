@@ -12,14 +12,18 @@ recursive-include include *.h
 recursive-include src *.cpp
 recursive-include bindings *.cpp
 
-# Include examples
+# Include examples (cloud/brand-tenant files excluded below)
 recursive-include examples *.py *.md
+exclude examples/azure_*
 
-# Exclude build artifacts
+# Exclude build artifacts (incl. locally-compiled extensions)
 global-exclude *.pyc
 global-exclude *.pyo
 global-exclude *.o
 global-exclude *.a
+global-exclude *.so
+global-exclude *.dylib
+global-exclude *.pyd
 global-exclude __pycache__
 global-exclude *.feather
 global-exclude *.npy

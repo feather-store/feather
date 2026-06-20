@@ -1,4 +1,4 @@
-from setuptools import setup, Extension
+from setuptools import setup, Extension, find_packages
 import pybind11
 import sys
 import os
@@ -38,7 +38,10 @@ ext_modules = [
 setup(
     name="feather-db",
     version="0.16.0",
-    packages=["feather_db", "feather_db.integrations"],
+    # auto-discover all subpackages (extractors/feedback/pipelines/reason/
+    # integrations) — a hardcoded list silently shipped broken wheels missing
+    # the Phase 9.1 subpackages added after 0.8.0.
+    packages=find_packages(include=["feather_db", "feather_db.*"]),
     package_data={"feather_db": ["d3.min.js"]},
     ext_modules=ext_modules,
     python_requires=">=3.8",

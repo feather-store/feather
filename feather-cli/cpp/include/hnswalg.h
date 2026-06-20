@@ -822,6 +822,109 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // Stream variants of saveIndex/loadIndex — write/read the full HNSW graph
+    // (header + base layer, which already contains the vectors, + per-element
+    // link lists) into an arbitrary stream rather than a standalone file. This
+    // lets Feather embed the graph inside the single .feather file so load()
+    // can restore it directly instead of rebuilding the graph from vectors.
+    // The block is self-delimited by cur_element_count, so no total-filesize
+    // check is needed (it lives inside a larger stream).
+    void saveIndexStream(std::ostream &output) {
+        writeBinaryPOD(output, offsetLevel0_);
+        writeBinaryPOD(output, max_elements_);
+        writeBinaryPOD(output, cur_element_count);
+        writeBinaryPOD(output, size_data_per_element_);
+        writeBinaryPOD(output, label_offset_);
+        writeBinaryPOD(output, offsetData_);
+        writeBinaryPOD(output, maxlevel_);
+        writeBinaryPOD(output, enterpoint_node_);
+        writeBinaryPOD(output, maxM_);
+        writeBinaryPOD(output, maxM0_);
+        writeBinaryPOD(output, M_);
+        writeBinaryPOD(output, mult_);
+        writeBinaryPOD(output, ef_construction_);
+
+        output.write(data_level0_memory_, cur_element_count * size_data_per_element_);
+
+        for (size_t i = 0; i < cur_element_count; i++) {
+            unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
+            writeBinaryPOD(output, linkListSize);
+            if (linkListSize)
+                output.write(linkLists_[i], linkListSize);
+        }
+    }
+
+
+    void loadIndexStream(std::istream &input, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
+        clear();
+
+        readBinaryPOD(input, offsetLevel0_);
+        readBinaryPOD(input, max_elements_);
+        readBinaryPOD(input, cur_element_count);
+
+        size_t max_elements = max_elements_i;
+        if (max_elements < cur_element_count)
+            max_elements = max_elements_;
+        max_elements_ = max_elements;
+        readBinaryPOD(input, size_data_per_element_);
+        readBinaryPOD(input, label_offset_);
+        readBinaryPOD(input, offsetData_);
+        readBinaryPOD(input, maxlevel_);
+        readBinaryPOD(input, enterpoint_node_);
+        readBinaryPOD(input, maxM_);
+        readBinaryPOD(input, maxM0_);
+        readBinaryPOD(input, M_);
+        readBinaryPOD(input, mult_);
+        readBinaryPOD(input, ef_construction_);
+
+        data_size_ = s->get_data_size();
+        fstdistfunc_ = s->get_dist_func();
+        dist_func_param_ = s->get_dist_func_param();
+
+        data_level0_memory_ = (char *) malloc(max_elements * size_data_per_element_);
+        if (data_level0_memory_ == nullptr)
+            throw std::runtime_error("Not enough memory: loadIndexStream failed to allocate level0");
+        input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
+
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+
+        std::vector<std::mutex>(max_elements).swap(link_list_locks_);
+        std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
+
+        visited_list_pool_.reset(new VisitedListPool(1, max_elements));
+
+        linkLists_ = (char **) malloc(sizeof(void *) * max_elements);
+        if (linkLists_ == nullptr)
+            throw std::runtime_error("Not enough memory: loadIndexStream failed to allocate linklists");
+        element_levels_ = std::vector<int>(max_elements);
+        revSize_ = 1.0 / mult_;
+        ef_ = 10;
+        for (size_t i = 0; i < cur_element_count; i++) {
+            label_lookup_[getExternalLabel(i)] = i;
+            unsigned int linkListSize;
+            readBinaryPOD(input, linkListSize);
+            if (linkListSize == 0) {
+                element_levels_[i] = 0;
+                linkLists_[i] = nullptr;
+            } else {
+                element_levels_[i] = linkListSize / size_links_per_element_;
+                linkLists_[i] = (char *) malloc(linkListSize);
+                if (linkLists_[i] == nullptr)
+                    throw std::runtime_error("Not enough memory: loadIndexStream failed to allocate linklist");
+                input.read(linkLists_[i], linkListSize);
+            }
+        }
+
+        for (size_t i = 0; i < cur_element_count; i++) {
+            if (isMarkedDeleted(i)) {
+                num_deleted_ += 1;
+                if (allow_replace_deleted_) deleted_elements.insert(i);
+            }
+        }
+    }
+
+
     template<typename data_t>
     std::vector<data_t> getDataByLabel(labeltype label) const {
         // lock all operations with element by label

@@ -81,11 +81,14 @@ Issues = "https://github.com/feather-store/feather/issues"
 Changelog = "https://github.com/feather-store/feather/blob/main/CHANGELOG.md"
 "Hawky.ai" = "https://hawky.ai"
 
-[tool.setuptools]
-packages = [
-    "feather_db",
-    "feather_db.integrations",
-]
+# Auto-discover every subpackage (extractors/feedback/pipelines/reason/
+# integrations). The previous hardcoded list silently dropped the Phase 9.1
+# subpackages added after 0.8.0 from the wheel/sdist.
+[tool.setuptools.packages.find]
+include = ["feather_db*"]
 
+# Only ship real data files. The compiled extension (feather_db.core) is added
+# to the wheel automatically via ext_modules; listing *.so as package-data also
+# dragged a host-specific binary into the sdist.
 [tool.setuptools.package-data]
-"feather_db" = ["*.so", "*.pyd", "*.dll", "d3.min.js"]
+"feather_db" = ["d3.min.js"]

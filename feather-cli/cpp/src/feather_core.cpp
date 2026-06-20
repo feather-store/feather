@@ -88,4 +88,23 @@ extern "C" {
     void feather_close(void* db_ptr) {
         if (db_ptr) delete static_cast<std::unique_ptr<feather::DB>*>(db_ptr);
     }
+
+    // Phase 6: memory lifecycle
+    void feather_forget(void* db_ptr, uint64_t id) {
+        if (!db_ptr) return;
+        auto& db = *static_cast<std::unique_ptr<feather::DB>*>(db_ptr);
+        db->forget(id);
+    }
+
+    size_t feather_purge(void* db_ptr, const char* namespace_id) {
+        if (!db_ptr || !namespace_id) return 0;
+        auto& db = *static_cast<std::unique_ptr<feather::DB>*>(db_ptr);
+        return db->purge(namespace_id);
+    }
+
+    size_t feather_forget_expired(void* db_ptr) {
+        if (!db_ptr) return 0;
+        auto& db = *static_cast<std::unique_ptr<feather::DB>*>(db_ptr);
+        return db->forget_expired();
+    }
 }
