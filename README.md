@@ -4,8 +4,10 @@
 
 *Part of [Hawky.ai](https://hawky.ai) — AI-Native Development Tools*
 
+[![Tests](https://github.com/feather-store/feather/actions/workflows/test.yml/badge.svg)](https://github.com/feather-store/feather/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/feather-db)](https://pypi.org/project/feather-db/)
 [![Crates.io](https://img.shields.io/crates/v/feather-db-cli)](https://crates.io/crates/feather-db-cli)
+[![Python](https://img.shields.io/pypi/pyversions/feather-db)](https://pypi.org/project/feather-db/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Website](https://img.shields.io/badge/website-getfeather.store-blue)](https://www.getfeather.store/)
 [![HuggingFace Space](https://img.shields.io/badge/demo-HuggingFace-yellow)](https://huggingface.co/spaces/Hawky-ai/feather-db)

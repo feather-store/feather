@@ -50,7 +50,7 @@ jobs:
     - name: Run feature test suite
       run: |
         set -e
-        for t in test_secondary_index test_prefiltered_search test_auto_compact test_quantization; do
+        for t in test_secondary_index test_prefiltered_search test_auto_compact test_quantization test_batch_ingest test_persist_graph; do
           echo "::group::$t"
           python "$t.py"
           echo "::endgroup::"
