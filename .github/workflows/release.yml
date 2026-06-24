@@ -1,100 +1,77 @@
 name: Release
 
+# On a version tag: build the Rust CLI binaries for Linux/macOS and publish a
+# GitHub Release with them attached + notes from CHANGELOG.md. The PyPI wheels
+# (wheels.yml) and crate (publish-rust.yml) publish off the SAME tag push, so
+# all three run independently — no cross-workflow trigger needed.
+
 on:
   push:
-    tags:
-      - 'v*'  # Trigger on version tags like v0.1.0
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create the GitHub Release + upload assets
 
 jobs:
-  create-release:
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
-        body: |
-          ## What's New
-          
-          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
-          
-          ## Installation
-          
-          ```bash
-          pip install feather-db
-          ```
-          
-          ## Quick Start
-          
-          ```python
-          import feather_py
-          import numpy as np
-          
-          db = feather_py.DB.open("vectors.feather", dim=768)
-          vector = np.random.random(768).astype(np.float32)
-          db.add(1, vector)
-          
-          query = np.random.random(768).astype(np.float32)
-          ids, distances = db.search(query, k=5)
-          db.save()
-          ```
-        draft: false
-        prerelease: false
-  
-  build-rust-cli:
-    needs: create-release
+  build-cli:
+    name: CLI ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: feather-cli
             asset_name: feather-cli-linux-x86_64
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
-            artifact_name: feather-cli
             asset_name: feather-cli-macos-x86_64
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
-            artifact_name: feather-cli
             asset_name: feather-cli-macos-aarch64
-    
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        target: ${{ matrix.target }}
-        override: true
-    
-    - name: Build C++ core
-      run: |
-        g++ -O3 -std=c++17 -fPIC -c src/feather_core.cpp -o feather_core.o
-        ar rcs libfeather.a feather_core.o
-    
-    - name: Build Rust CLI
-      run: |
-        cd feather-cli
-        cargo build --release --target ${{ matrix.target }}
-    
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ needs.create-release.outputs.upload_url }}
-        asset_path: ./feather-cli/target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-        asset_name: ${{ matrix.asset_name }}
-        asset_content_type: application/octet-stream
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build CLI (vendored C++ via build.rs)
+        working-directory: feather-cli
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: |
+          cp "feather-cli/target/${{ matrix.target }}/release/feather" "${{ matrix.asset_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    needs: build-cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download CLI binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/master/CHANGELOG.md) for the full changelog.
+
+            ## Install
+            ```bash
+            pip install feather-db          # Python
+            cargo install feather-db-cli    # Rust CLI
+            ```
