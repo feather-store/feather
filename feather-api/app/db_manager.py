@@ -14,6 +14,7 @@ Thread safety: reads are safe; writes use a per-namespace lock.
 """
 
 import os
+import sys
 import struct
 import threading
 from typing import Dict, Optional
@@ -27,6 +28,13 @@ DEFAULT_DIM = int(os.getenv("FEATHER_DB_DIM", "768"))
 # on-disk format this build can load (v3–v9; load() is backward-compatible).
 FEATHER_MAGIC = 0x46454154   # "FEAT"
 MAX_FORMAT_VERSION = 9
+
+
+def _safe_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _validate_feather_header(path: str) -> int:
@@ -62,11 +70,18 @@ class DBManager:
         self._load_existing()
 
     def _load_existing(self):
-        """Load all .feather files found in data_dir on startup."""
-        for fname in os.listdir(self._data_dir):
+        """Load all .feather files found in data_dir on startup. A single
+        corrupt file must not take down the whole server — skip + log it."""
+        for fname in sorted(os.listdir(self._data_dir)):
             if fname.endswith(".feather"):
                 ns = fname[:-len(".feather")]
-                self._open_namespace(ns)
+                try:
+                    self._open_namespace(ns)
+                except Exception as e:  # noqa: BLE001 — never crash startup on one bad file
+                    self._dbs.pop(ns, None)
+                    self._locks.pop(ns, None)
+                    print(f"[db_manager] skipping unloadable namespace '{ns}': {e}",
+                          file=sys.stderr)
 
     def data_dir(self) -> str:
         return self._data_dir
@@ -106,20 +121,18 @@ class DBManager:
 
         Raises ValueError (bad file) or FileExistsError (exists, no overwrite).
         """
-        # Validate before we touch anything live. Cleans up the temp on failure.
+        # Cheap structural check (magic + version) before we touch anything live.
         try:
             _validate_feather_header(staged_path)
         except ValueError:
-            try: os.remove(staged_path)
-            except OSError: pass
+            _safe_remove(staged_path)
             raise
 
         with self._global_lock:
             dest = self._namespace_path(namespace)
             already = namespace in self._dbs or os.path.exists(dest)
             if already and not overwrite:
-                try: os.remove(staged_path)
-                except OSError: pass
+                _safe_remove(staged_path)
                 raise FileExistsError(namespace)
 
             # Drop any live handle first. DB is bound py::nodelete, so dropping
@@ -128,15 +141,41 @@ class DBManager:
             self._dbs.pop(namespace, None)
             self._locks.pop(namespace, None)
 
+            # Back up the existing file so a bad upload (or a regretted overwrite)
+            # is recoverable. One rolling backup per namespace.
+            backup = None
+            if os.path.exists(dest):
+                backup = dest + ".bak"
+                _safe_remove(backup)
+                try:
+                    os.replace(dest, backup)
+                except OSError:
+                    backup = None
+
             # The uploaded file is authoritative; a stale WAL would replay old
             # ops on top of it, so remove it.
             for stale in (dest + ".wal", dest + ".tmp"):
-                if os.path.exists(stale):
-                    try: os.remove(stale)
-                    except OSError: pass
+                _safe_remove(stale)
 
             os.replace(staged_path, dest)   # atomic within the same filesystem
-            return self._open_namespace(namespace)
+
+            # Open exactly once — the C++ loader's guards reject corrupt/oversized
+            # headers here. On failure, roll back to the backup so the namespace
+            # is never left broken.
+            try:
+                return self._open_namespace(namespace)
+            except Exception as e:  # noqa: BLE001
+                self._dbs.pop(namespace, None)
+                self._locks.pop(namespace, None)
+                _safe_remove(dest)
+                _safe_remove(dest + ".wal")
+                if backup and os.path.exists(backup):
+                    try:
+                        os.replace(backup, dest)
+                        self._open_namespace(namespace)
+                    except Exception:  # noqa: BLE001
+                        pass
+                raise ValueError(f"could not load uploaded .feather: {e}")
 
     def lock(self, namespace: str) -> threading.Lock:
         """Return the write lock for this namespace."""

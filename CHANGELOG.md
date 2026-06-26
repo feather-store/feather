@@ -36,6 +36,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-provider / empty-item / wrong-dim cases now return clear per-item errors
   instead of a silent skip.
 
+### Hardened the upload + import path
+- **Allocation guards on load (`feather.h` / `hnswalg.h`):** a corrupt or forged
+  `.feather` header (absurd `dim`, an `element_count`/`max_elements` far larger
+  than the file can back) no longer triggers a multi-gigabyte allocation — load
+  validates the declared sizes against the actual remaining bytes and rejects
+  with a clear error. `loadIndexStream` now fits index capacity to the real data
+  instead of trusting the on-disk `max_elements`. Protects every load path, not
+  just uploads.
+- **Upload size cap** lowered to 256 MB (`FEATHER_MAX_UPLOAD_MB`) — bounds peak
+  RAM since the file is loaded into the in-RAM index on adopt.
+- **Backup + rollback on adopt:** replacing a namespace first moves the old file
+  aside to `<ns>.feather.bak`; the new file is opened exactly once, and if it
+  fails to load the namespace is **rolled back to the backup** (never left
+  broken). A single unloadable file on disk no longer crashes server startup —
+  it's skipped and logged.
+- **Concurrent auto-embed:** bulk import now embeds vectorless records through a
+  bounded thread pool (`FEATHER_EMBED_CONCURRENCY`, default 8) instead of one
+  blocking provider call at a time, so large text imports don't crawl or time
+  out.
+- **Dim coherence:** `ingest_text` and bulk auto-embed fit the embedding to the
+  namespace's actual dim (so a 512-dim uploaded DB, or a provider whose native
+  dim differs, still ingests); `add_vector` returns a clean `400` on a dim
+  mismatch instead of letting the C++ index throw.
+
 ## [0.16.0] — 2026-06-18
 
 ### Persisted HNSW graph — file format v9 (much faster cold load)

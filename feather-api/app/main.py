@@ -26,8 +26,9 @@ import time
 import logging
 import pathlib
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -236,6 +237,41 @@ def _check_query_dim(db, vector, modality: str):
             f"for modality '{modality}'",
         )
 
+
+def _fit_dim(vec, dim: int):
+    """Pad/truncate an embedding into the namespace's dim so a provider whose
+    native dim differs from the namespace still imports/ingests cleanly."""
+    v = list(vec)
+    if dim and len(v) != dim:
+        v = (v + [0.0] * dim)[:dim]
+    return v
+
+
+# Bounded thread pool so a large auto-embed import fires provider calls
+# concurrently instead of one-at-a-time (each EMBEDDING.embed is a blocking HTTP
+# call; the config lock is only held briefly, so concurrent calls are safe).
+_EMBED_WORKERS = max(1, int(os.getenv("FEATHER_EMBED_CONCURRENCY", "8")))
+
+
+def _embed_many(texts: List[str]) -> List[Tuple[Optional[list], Optional[str]]]:
+    """Embed many strings concurrently, preserving order. Returns one
+    (vector, error) tuple per input — never raises for a single bad item."""
+    if not texts:
+        return []
+    out: List[Tuple[Optional[list], Optional[str]]] = [(None, None)] * len(texts)
+
+    def work(i: int):
+        try:
+            return i, EMBEDDING.embed(texts[i]), None
+        except Exception as e:  # noqa: BLE001
+            return i, None, str(e)
+
+    workers = min(_EMBED_WORKERS, len(texts))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for i, vec, err in ex.map(work, range(len(texts))):
+            out[i] = (vec, err)
+    return out
+
 # ─────────────────────────────────────────────
 # Routes — health & meta
 # ─────────────────────────────────────────────
@@ -390,9 +426,11 @@ def admin_overview():
     )
 
 
-# Max size for an uploaded .feather (default 512 MB). Streamed to disk in 1 MiB
-# chunks so we never hold the whole file in RAM.
-MAX_UPLOAD_BYTES = int(os.getenv("FEATHER_MAX_UPLOAD_MB", "512")) * 1024 * 1024
+# Max size for an uploaded .feather. Streamed to disk in 1 MiB chunks so we never
+# hold the whole file in RAM — but the file IS loaded into the in-RAM HNSW index
+# on adopt, so the cap also bounds peak memory on the (small) prod VM. Tune with
+# FEATHER_MAX_UPLOAD_MB.
+MAX_UPLOAD_BYTES = int(os.getenv("FEATHER_MAX_UPLOAD_MB", "256")) * 1024 * 1024
 
 
 @app.post("/v1/admin/upload", tags=["meta"], dependencies=[Depends(verify_api_key)])
@@ -463,6 +501,19 @@ async def upload_feather(
 def add_vector(namespace: str, req: AddVectorRequest):
     db = manager.get(namespace)
     meta = _meta_from_model(req.metadata) if req.metadata else Metadata()
+
+    # Reject a dim mismatch with a clean 400 instead of letting the C++ index
+    # throw (or read out of bounds) on a vector that doesn't match the namespace.
+    try:
+        ns_dim = db.dim(req.modality)
+    except Exception:
+        ns_dim = 0
+    if ns_dim and len(req.vector) != ns_dim:
+        raise HTTPException(
+            400,
+            f"vector dim {len(req.vector)} != index dim {ns_dim} "
+            f"for modality '{req.modality}'",
+        )
 
     # Always stamp namespace_id from the URL namespace if not set in body
     if not meta.namespace_id:
@@ -1065,6 +1116,14 @@ def ingest_text(namespace: str, req: IngestTextRequest):
         raise HTTPException(400, str(e))
 
     db = manager.get(namespace)
+    # Fit the embedding to the namespace's existing dim — e.g. a 512-dim DB that
+    # was uploaded, or a provider whose native dim differs from the default — so
+    # ingest doesn't fail with a dim mismatch against the existing index.
+    try:
+        ns_dim = db.dim(req.modality)
+    except Exception:
+        ns_dim = 0
+    vec = _fit_dim(vec, ns_dim or len(vec))
     rec_id = int(np.random.default_rng().integers(1, 2**53))   # JS-safe id
     meta = _meta_from_model(req.metadata) if req.metadata else Metadata()
     if not meta.namespace_id:
@@ -1093,60 +1152,78 @@ def bulk_import(namespace: str, req: ImportRequest):
     skipped = 0
     embedded = 0
     errors: List[str] = []
-    # Validate + build everything first, then insert the whole batch in parallel
-    # via add_batch (HNSW graph built across threads) instead of one-at-a-time.
-    ids: List[int] = []
-    vecs: List[np.ndarray] = []
-    metas: List[Metadata] = []
+
+    def _err(i, msg):
+        nonlocal skipped
+        skipped += 1
+        if len(errors) < 20:
+            errors.append(f"item {i}: {msg}")
+
+    # ── Pass 1: parse every item; collect the ones that need server-side
+    # embedding so we can embed them all concurrently (not one HTTP call at a
+    # time, which timed out / crawled on large text imports).
+    parsed: List[dict] = []          # validated entries, in order
+    embed_texts: List[str] = []      # texts to embed
+    embed_back: List[int] = []       # embed_texts[k] → parsed index
     for i, item in enumerate(req.items):
         try:
             rec_id = int(item["id"])
             meta_data = item.get("metadata") or {}
             content = str(meta_data.get("content", ""))
-
             vec = item.get("vector")
-            auto = False
+            entry = {"i": i, "id": rec_id, "md": meta_data, "content": content,
+                     "vec": None, "auto": False}
             if vec is None or (isinstance(vec, (list, tuple)) and len(vec) == 0):
-                # No precomputed vector — embed the content server-side.
                 if not content.strip():
                     raise ValueError("no 'vector' and no 'metadata.content' to embed")
-                try:
-                    vec = EMBEDDING.embed(content)
-                except RuntimeError as e:
-                    raise ValueError(
-                        f"no 'vector' supplied and auto-embed failed: {e} "
-                        f"— configure an embedding provider in Settings, or include vectors"
-                    )
-                auto = True
-
-            if len(vec) != expected_dim:
-                if auto:
-                    # A model with a slightly different dim still imports — pad
-                    # /truncate into the namespace's space.
-                    vec = (list(vec) + [0.0] * expected_dim)[:expected_dim]
-                else:
+                entry["auto"] = True
+                embed_back.append(len(parsed))
+                embed_texts.append(content)
+            else:
+                if len(vec) != expected_dim:
                     raise ValueError(f"dim mismatch: got {len(vec)}, expected {expected_dim}")
-
-            meta = Metadata()
-            meta.timestamp    = int(meta_data.get("timestamp") or time.time())
-            meta.importance   = float(meta_data.get("importance", 1.0))
-            meta.type         = ContextType(int(meta_data.get("type", 0)))
-            meta.source       = str(meta_data.get("source", ""))
-            meta.content      = content
-            meta.tags_json    = str(meta_data.get("tags_json", ""))
-            meta.namespace_id = str(meta_data.get("namespace_id", namespace))
-            meta.entity_id    = str(meta_data.get("entity_id", ""))
-            for k, v in (meta_data.get("attributes") or {}).items():
-                meta.set_attribute(str(k), str(v))
-            ids.append(rec_id)
-            vecs.append(np.asarray(vec, dtype=np.float32))
-            metas.append(meta)
-            if auto:
-                embedded += 1
+                entry["vec"] = list(vec)
+            parsed.append(entry)
         except Exception as e:
-            skipped += 1
-            if len(errors) < 20:
-                errors.append(f"item {i}: {e}")
+            _err(i, e)
+
+    # ── Pass 2: embed the collected texts concurrently.
+    for k, (vec, err) in enumerate(_embed_many(embed_texts)):
+        entry = parsed[embed_back[k]]
+        if err is not None:
+            entry["error"] = (f"no 'vector' supplied and auto-embed failed: {err} "
+                              f"— configure an embedding provider in Settings, or include vectors")
+        else:
+            entry["vec"] = _fit_dim(vec, expected_dim)
+
+    # ── Pass 3: assemble the batch.
+    ids: List[int] = []
+    vecs: List[np.ndarray] = []
+    metas: List[Metadata] = []
+    for entry in parsed:
+        if entry.get("error"):
+            _err(entry["i"], entry["error"])
+            continue
+        if entry["vec"] is None:
+            continue
+        md = entry["md"]
+        meta = Metadata()
+        meta.timestamp    = int(md.get("timestamp") or time.time())
+        meta.importance   = float(md.get("importance", 1.0))
+        meta.type         = ContextType(int(md.get("type", 0)))
+        meta.source       = str(md.get("source", ""))
+        meta.content      = entry["content"]
+        meta.tags_json    = str(md.get("tags_json", ""))
+        meta.namespace_id = str(md.get("namespace_id", namespace))
+        meta.entity_id    = str(md.get("entity_id", ""))
+        for k, v in (md.get("attributes") or {}).items():
+            meta.set_attribute(str(k), str(v))
+        ids.append(entry["id"])
+        vecs.append(np.asarray(entry["vec"], dtype=np.float32))
+        metas.append(meta)
+        if entry["auto"]:
+            embedded += 1
+
     with manager.lock(namespace):
         if ids:
             db.add_batch(ids, np.asarray(vecs, dtype=np.float32), metas, modality=req.modality)

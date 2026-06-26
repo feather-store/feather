@@ -744,6 +744,12 @@ private:
                 f.read(&name[0], name_len);
                 uint32_t dim32, element_count;
                 f.read((char*)&dim32, 4);
+                // Guard: a corrupt/forged header with an absurd dim would make
+                // index creation (and per-vector buffers) allocate gigabytes.
+                // No real embedding approaches 2^20 dims.
+                if (dim32 == 0 || dim32 > (1u << 20))
+                    throw std::runtime_error("corrupt .feather: implausible vector dim "
+                                             + std::to_string(dim32));
                 uint8_t quant = 0;
                 if (version >= 7) f.read((char*)&quant, 1);
                 uint8_t int8ram = 0;
@@ -772,6 +778,20 @@ private:
                 // Read all vectors serially (sequential I/O), then build the
                 // HNSW graph in parallel — graph construction dominates load.
                 f.read((char*)&element_count, 4);
+                // Guard: reject an element_count the file is too small to back,
+                // BEFORE reserving/allocating for it. Each on-disk element is at
+                // least id(8B) + (quant ? scale(4B)+dim : dim*4) bytes.
+                {
+                    std::streampos cur = f.tellg();
+                    f.seekg(0, std::ios::end);
+                    std::streamoff remaining = (f.tellg() >= cur) ? (f.tellg() - cur) : -1;
+                    f.seekg(cur);
+                    size_t min_elem = 8 + (quant ? ((size_t)dim32 + 4) : ((size_t)dim32 * 4));
+                    if (remaining >= 0 &&
+                        (uint64_t)element_count > (uint64_t)remaining / std::max<size_t>(min_elem, 1))
+                        throw std::runtime_error("corrupt .feather: element_count "
+                            + std::to_string(element_count) + " exceeds file size");
+                }
                 std::vector<std::pair<uint64_t, std::vector<float>>> items;
                 items.reserve(element_count);
                 std::vector<int8_t> qbuf(quant ? dim32 : 0);
