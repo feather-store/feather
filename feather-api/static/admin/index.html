@@ -357,6 +357,13 @@
             <div class="flex items-center gap-2">
               <input x-model="nsFilter" type="text" placeholder="Filter…"
                 class="text-sm px-3 py-1.5 border border-slate-300 rounded-md w-56 focus-ring">
+              <input type="file" x-ref="featherFile" accept=".feather" class="hidden"
+                @change="onFeatherPicked($event)">
+              <button @click="$refs.featherFile.click()" :disabled="upload.busy"
+                class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 transition flex items-center gap-1.5 disabled:opacity-40">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" class="w-3.5 h-3.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 20h16"/></svg>
+                <span x-text="upload.busy ? 'Uploading…' : 'Import .feather'"></span>
+              </button>
               <button @click="newNsModal.open=true; newNsModal.name=''"
                 class="btn-primary flex items-center gap-1.5">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="w-3.5 h-3.5"><path d="M12 5v14M5 12h14"/></svg>
@@ -1196,7 +1203,7 @@
   <div x-show="importModal.open" x-trap.noscroll="importModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="importModal.open=false">
     <div class="bg-white rounded-lg w-[640px] p-6 shadow-xl border border-slate-200">
       <h3 class="text-lg font-semibold">Bulk import</h3>
-      <p class="text-[12px] mt-1" style="color:var(--ink-mid)">Paste a JSON array of <span class="mono">{id, vector, metadata}</span> records, or upload a .json file.</p>
+      <p class="text-[12px] mt-1" style="color:var(--ink-mid)">Paste a JSON array of <span class="mono">{id, vector?, metadata}</span> records, or upload a .json file. <span class="text-slate-400">Omit <span class="mono">vector</span> to auto-embed <span class="mono">metadata.content</span> with the configured provider.</span></p>
       <div class="mt-3">
         <input type="file" accept=".json" @change="loadImportFile($event)" class="text-[12px]">
       </div>
@@ -1205,7 +1212,7 @@
   { "id": 1, "vector": [0.1, 0.2, ...], "metadata": { "content": "first", "namespace_id": "brand_a", "attributes": { "channel": "instagram" } } }
 ]'
         class="mono mt-3 w-full text-[12px] px-3 py-2 border border-slate-300 rounded-md focus-ring nice-scroll"></textarea>
-      <div class="mt-1.5 text-[10px] text-slate-400">vectors must match this namespace's dim (<span class="mono" x-text="ns.dim || '768'"></span>)</div>
+      <div class="mt-1.5 text-[10px] text-slate-400">supplied vectors must match this namespace's dim (<span class="mono" x-text="ns.dim || '768'"></span>); records without a vector are embedded server-side</div>
       <div class="mt-5 flex justify-end gap-2">
         <button @click="importModal.open=false" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
         <button @click="submitImport()" :disabled="!importModal.json_text" class="btn-primary disabled:opacity-40">Import</button>
@@ -1287,6 +1294,7 @@
                         editMode: false, edit: { content: '', importance: 1.0, attrs: '' } },
         confirmDlg: { open: false, title: '', body: '', cta: '', requireText: '', input: '', execute() {} },
         newNsModal: { open: false, name: '' },
+        upload: { busy: false },
         addRecModal: { open: false, ns_id: '', content: '', entity_id: '' },
         seedModal: { open: false, count: 100, ns_id: '', template: 'seed record {i}' },
         ingestModal: { open: false, text: '', ns_id: '', entity_id: '' },
@@ -1455,7 +1463,8 @@
               items, modality: 'text',
             });
             this.importModal.open = false;
-            this.toast(`Imported ${d.inserted}, skipped ${d.skipped}.`, d.skipped ? 'error' : 'success');
+            const emb = d.embedded ? ` (${d.embedded} auto-embedded)` : '';
+            this.toast(`Imported ${d.inserted}${emb}, skipped ${d.skipped}.`, d.skipped ? 'error' : 'success');
             if (d.errors?.length) console.warn('import errors:', d.errors);
             await this.loadRecords(true); await this.loadOverview();
           } catch (e) { this.toast(`Import failed: ${e.message}`, 'error'); }
@@ -1559,6 +1568,44 @@
             await this.loadNamespaces(); await this.loadOverview();
             this.openNamespace(name);
           } catch (e) { this.toast(`Create failed: ${e.message}`, 'error'); }
+        },
+
+        // ── import a local .feather file straight into the cloud
+        onFeatherPicked(ev) {
+          const f = ev.target.files && ev.target.files[0];
+          ev.target.value = '';   // allow re-picking the same file later
+          if (f) this.uploadFeather(f);
+        },
+        async uploadFeather(file, overwrite = false) {
+          // Default namespace = filename without the .feather extension.
+          let ns = file.name.replace(/\.feather$/i, '').replace(/[^A-Za-z0-9_\-]/g, '_');
+          ns = (prompt('Import as namespace:', ns) || '').trim();
+          if (!ns) return;
+          const fd = new FormData();
+          fd.append('file', file);
+          fd.append('namespace', ns);
+          fd.append('overwrite', overwrite ? 'true' : 'false');
+          this.upload.busy = true;
+          try {
+            const res = await fetch('/v1/admin/upload', {
+              method: 'POST', headers: { 'X-API-Key': this.apiKey }, body: fd,
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.status === 409) {
+              this.upload.busy = false;
+              if (confirm(`Namespace '${ns}' already exists. Replace it with this upload?`))
+                return this.uploadFeather(file, true);
+              return;
+            }
+            if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+            this.toast(`Imported '${data.namespace}' — ${(data.records ?? 0).toLocaleString()} records.`);
+            await this.loadNamespaces(); await this.loadOverview();
+            this.openNamespace(data.namespace);
+          } catch (e) {
+            this.toast(`Upload failed: ${e.message}`, 'error');
+          } finally {
+            this.upload.busy = false;
+          }
         },
 
         // ── namespace detail

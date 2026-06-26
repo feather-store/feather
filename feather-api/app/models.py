@@ -195,8 +195,10 @@ class EmbeddingConfigUpdate(BaseModel):
 
 
 class ImportRequest(BaseModel):
-    """Inline-bulk import.  Each item must have id + vector (dim must match)."""
-    items: List[Dict[str, Any]]        # [{ id, vector, metadata: {...} }, ...]
+    """Inline-bulk import. Each item has an id and EITHER a precomputed `vector`
+    (dim must match the namespace) OR `metadata.content`, which is embedded
+    server-side using the configured embedding provider."""
+    items: List[Dict[str, Any]]        # [{ id, vector?, metadata: {...} }, ...]
     modality: str = "text"
 
 
@@ -204,6 +206,7 @@ class ImportResponse(BaseModel):
     namespace: str
     inserted: int
     skipped: int
+    embedded: int = 0                  # of the inserted, how many were auto-embedded
     errors: List[str] = []
 
 

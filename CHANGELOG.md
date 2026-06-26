@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Cloud — import a local `.feather` straight into the dashboard
+- **`POST /v1/admin/upload`** (feather-api): upload a locally-built `.feather`
+  file and adopt it as a cloud namespace. The upload is streamed to disk in
+  1 MiB chunks (no whole-file buffering), its magic + format version are
+  validated (v1–v9), then it's atomically moved into the data dir and served —
+  so it appears in the dashboard immediately. The graph, attributes and
+  persisted HNSW index come over intact: no re-embedding, no per-record calls.
+  Returns `409` if the namespace exists (unless `overwrite=true`), `400` on a
+  non-`.feather` payload, `413` over the size cap (`FEATHER_MAX_UPLOAD_MB`,
+  default 512).
+- **Admin SPA:** an "Import .feather" button on the Namespaces screen picks a
+  local file, prompts for a namespace, uploads it, and opens it — the
+  "push my local DB to the cloud" flow, end to end.
+- `DBManager.adopt()` performs the validated, atomic file adoption (safe even
+  when replacing a live namespace, since `DB` is bound `py::nodelete`).
+
+### Fixed — JSON bulk import silently producing empty namespaces
+- `POST /v1/{namespace}/import` previously **required** a precomputed `vector`
+  of the exact namespace dim on every item; records pasted as plain text (no
+  vector) or with a mismatched dim were silently skipped, so the import
+  "succeeded" but the namespace stayed empty.
+- Items without a `vector` are now **embedded server-side** from
+  `metadata.content` using the configured provider (auto-padded/truncated to
+  the namespace dim). The response reports how many were `embedded`, and the
+  no-provider / empty-item / wrong-dim cases now return clear per-item errors
+  instead of a silent skip.
+
 ## [0.16.0] — 2026-06-18
 
 ### Persisted HNSW graph — file format v9 (much faster cold load)

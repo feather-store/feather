@@ -25,10 +25,11 @@ import os
 import time
 import logging
 import pathlib
+import tempfile
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -387,6 +388,71 @@ def admin_overview():
         totalRecords  = total,
         topNamespaces = items[:10],
     )
+
+
+# Max size for an uploaded .feather (default 512 MB). Streamed to disk in 1 MiB
+# chunks so we never hold the whole file in RAM.
+MAX_UPLOAD_BYTES = int(os.getenv("FEATHER_MAX_UPLOAD_MB", "512")) * 1024 * 1024
+
+
+@app.post("/v1/admin/upload", tags=["meta"], dependencies=[Depends(verify_api_key)])
+async def upload_feather(
+    file: UploadFile = File(...),
+    namespace: str = Form(...),
+    overwrite: bool = Form(False),
+):
+    """Adopt a locally-built `.feather` file as a cloud namespace.
+
+    Stream the upload straight into the data dir, validate its magic+version,
+    atomically move it into place, and serve it — so it shows up in the
+    dashboard immediately. This is the "push my local DB to the cloud" path:
+    the graph, attributes and persisted HNSW index come over intact (no
+    re-embedding, no per-record API calls).
+    """
+    namespace = (namespace or "").strip()
+    if not namespace:
+        raise HTTPException(400, "namespace is required")
+
+    # Stream to a temp file inside the data dir so the final move is an atomic
+    # same-filesystem rename (and so a huge upload never lands in RAM).
+    fd, staged = tempfile.mkstemp(suffix=".upload", dir=manager.data_dir())
+    size = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        413,
+                        f"file exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        try: os.remove(staged)
+        except OSError: pass
+        raise
+
+    try:
+        db = manager.adopt(namespace, staged, overwrite=overwrite)
+    except FileExistsError:
+        raise HTTPException(
+            409,
+            f"Namespace '{namespace}' already exists. "
+            f"Re-send with overwrite=true to replace it.",
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return {
+        "namespace": namespace,
+        "records": _live_record_count(db),
+        "dim": db.dim(),
+        "bytes": size,
+        "imported": True,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -1017,10 +1083,15 @@ def ingest_text(namespace: str, req: IngestTextRequest):
 @app.post("/v1/{namespace}/import", response_model=ImportResponse, tags=["records"],
           dependencies=[Depends(verify_api_key)])
 def bulk_import(namespace: str, req: ImportRequest):
-    """Bulk insert N records {id, vector, metadata}. Vectors must match namespace dim."""
+    """Bulk insert N records. Each item has an id and EITHER a precomputed
+    `vector` (must match the namespace dim) OR `metadata.content`, which is
+    embedded server-side via the configured provider. Without this, records
+    pasted as plain text (no vector) were silently skipped and the namespace
+    stayed empty."""
     db = manager.get(namespace)
     expected_dim = db.dim()
     skipped = 0
+    embedded = 0
     errors: List[str] = []
     # Validate + build everything first, then insert the whole batch in parallel
     # via add_batch (HNSW graph built across threads) instead of one-at-a-time.
@@ -1030,16 +1101,38 @@ def bulk_import(namespace: str, req: ImportRequest):
     for i, item in enumerate(req.items):
         try:
             rec_id = int(item["id"])
-            vec = item["vector"]
-            if len(vec) != expected_dim:
-                raise ValueError(f"dim mismatch: got {len(vec)}, expected {expected_dim}")
             meta_data = item.get("metadata") or {}
+            content = str(meta_data.get("content", ""))
+
+            vec = item.get("vector")
+            auto = False
+            if vec is None or (isinstance(vec, (list, tuple)) and len(vec) == 0):
+                # No precomputed vector — embed the content server-side.
+                if not content.strip():
+                    raise ValueError("no 'vector' and no 'metadata.content' to embed")
+                try:
+                    vec = EMBEDDING.embed(content)
+                except RuntimeError as e:
+                    raise ValueError(
+                        f"no 'vector' supplied and auto-embed failed: {e} "
+                        f"— configure an embedding provider in Settings, or include vectors"
+                    )
+                auto = True
+
+            if len(vec) != expected_dim:
+                if auto:
+                    # A model with a slightly different dim still imports — pad
+                    # /truncate into the namespace's space.
+                    vec = (list(vec) + [0.0] * expected_dim)[:expected_dim]
+                else:
+                    raise ValueError(f"dim mismatch: got {len(vec)}, expected {expected_dim}")
+
             meta = Metadata()
             meta.timestamp    = int(meta_data.get("timestamp") or time.time())
             meta.importance   = float(meta_data.get("importance", 1.0))
             meta.type         = ContextType(int(meta_data.get("type", 0)))
             meta.source       = str(meta_data.get("source", ""))
-            meta.content      = str(meta_data.get("content", ""))
+            meta.content      = content
             meta.tags_json    = str(meta_data.get("tags_json", ""))
             meta.namespace_id = str(meta_data.get("namespace_id", namespace))
             meta.entity_id    = str(meta_data.get("entity_id", ""))
@@ -1048,6 +1141,8 @@ def bulk_import(namespace: str, req: ImportRequest):
             ids.append(rec_id)
             vecs.append(np.asarray(vec, dtype=np.float32))
             metas.append(meta)
+            if auto:
+                embedded += 1
         except Exception as e:
             skipped += 1
             if len(errors) < 20:
@@ -1057,7 +1152,7 @@ def bulk_import(namespace: str, req: ImportRequest):
             db.add_batch(ids, np.asarray(vecs, dtype=np.float32), metas, modality=req.modality)
         db.save()
     return ImportResponse(namespace=namespace, inserted=len(ids),
-                          skipped=skipped, errors=errors)
+                          skipped=skipped, embedded=embedded, errors=errors)
 
 
 @app.get("/v1/{namespace}/hierarchy", response_model=HierarchyResponse,

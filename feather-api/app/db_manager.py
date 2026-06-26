@@ -14,6 +14,7 @@ Thread safety: reads are safe; writes use a per-namespace lock.
 """
 
 import os
+import struct
 import threading
 from typing import Dict, Optional
 from feather_db import DB
@@ -21,6 +22,32 @@ from feather_db import DB
 
 DATA_DIR = os.getenv("FEATHER_DATA_DIR", "/data")
 DEFAULT_DIM = int(os.getenv("FEATHER_DB_DIM", "768"))
+
+# .feather binary format: [magic 4B = "FEAT"] [version 4B]. We accept any
+# on-disk format this build can load (v3–v9; load() is backward-compatible).
+FEATHER_MAGIC = 0x46454154   # "FEAT"
+MAX_FORMAT_VERSION = 9
+
+
+def _validate_feather_header(path: str) -> int:
+    """Read & validate the .feather magic + version. Returns the format version.
+    Raises ValueError if the file isn't a loadable .feather."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+    except OSError as e:
+        raise ValueError(f"could not read uploaded file: {e}")
+    if len(head) < 8:
+        raise ValueError("not a .feather file (too small / truncated)")
+    magic, version = struct.unpack("<II", head)
+    if magic != FEATHER_MAGIC:
+        raise ValueError("bad magic bytes — this is not a .feather file")
+    if version < 1 or version > MAX_FORMAT_VERSION:
+        raise ValueError(
+            f"unsupported .feather format v{version} "
+            f"(this server loads up to v{MAX_FORMAT_VERSION})"
+        )
+    return version
 
 
 class DBManager:
@@ -40,6 +67,9 @@ class DBManager:
             if fname.endswith(".feather"):
                 ns = fname[:-len(".feather")]
                 self._open_namespace(ns)
+
+    def data_dir(self) -> str:
+        return self._data_dir
 
     def _namespace_path(self, namespace: str) -> str:
         # Sanitize: only allow alphanumeric, dash, underscore
@@ -64,6 +94,48 @@ class DBManager:
                 return self._dbs[namespace]
             if not create:
                 raise KeyError(f"Namespace '{namespace}' not found")
+            return self._open_namespace(namespace)
+
+    def adopt(self, namespace: str, staged_path: str, overwrite: bool = False) -> DB:
+        """Adopt an uploaded .feather file as `namespace`.
+
+        `staged_path` is a fully-written temp file (ideally already inside
+        data_dir so the final move is an atomic rename). On success the temp
+        file is moved into place and the namespace is opened/served. The temp
+        file is always cleaned up on validation failure.
+
+        Raises ValueError (bad file) or FileExistsError (exists, no overwrite).
+        """
+        # Validate before we touch anything live. Cleans up the temp on failure.
+        try:
+            _validate_feather_header(staged_path)
+        except ValueError:
+            try: os.remove(staged_path)
+            except OSError: pass
+            raise
+
+        with self._global_lock:
+            dest = self._namespace_path(namespace)
+            already = namespace in self._dbs or os.path.exists(dest)
+            if already and not overwrite:
+                try: os.remove(staged_path)
+                except OSError: pass
+                raise FileExistsError(namespace)
+
+            # Drop any live handle first. DB is bound py::nodelete, so dropping
+            # the Python reference does NOT call ~DB()/save() — the in-memory
+            # state can't clobber the file we're about to move into place.
+            self._dbs.pop(namespace, None)
+            self._locks.pop(namespace, None)
+
+            # The uploaded file is authoritative; a stale WAL would replay old
+            # ops on top of it, so remove it.
+            for stale in (dest + ".wal", dest + ".tmp"):
+                if os.path.exists(stale):
+                    try: os.remove(stale)
+                    except OSError: pass
+
+            os.replace(staged_path, dest)   # atomic within the same filesystem
             return self._open_namespace(namespace)
 
     def lock(self, namespace: str) -> threading.Lock:
