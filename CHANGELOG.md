@@ -60,6 +60,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dim differs, still ingests); `add_vector` returns a clean `400` on a dim
   mismatch instead of letting the C++ index throw.
 
+### Fixed — uploaded DB shows "N records" in Maintenance but a blank Records list
+- A `.feather` whose vectors live under a **modality other than `"text"`** (e.g.
+  an external embedding pipeline names it `"embeddings"`) uploaded fine and
+  `db.size()` reported the right count, but the dashboard hardcoded `"text"`
+  everywhere — so the Records list, header count, and stats all read an empty
+  `"text"` index and showed **0 / blank** while Maintenance showed the real count.
+- New core accessors `all_ids()` (every id with metadata, across modalities) and
+  `modality_names()`. The dashboard now lists/counts records by metadata id and
+  reports the **actual** modalities + primary dim — records show regardless of
+  modality name.
+- Also fixed a cursor off-by-one that hid the record with **id 0** on the first
+  page (`after` now defaults to -1).
+
 ## [0.16.0] — 2026-06-18
 
 ### Persisted HNSW graph — file format v9 (much faster cold load)

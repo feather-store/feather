@@ -368,10 +368,44 @@ def _prune_dead_edges(db) -> int:
     return removed
 
 
+def _all_record_ids(db) -> list:
+    """Every id that has metadata, regardless of which modality holds its
+    vector. Falls back to the "text" index on older cores without all_ids()."""
+    try:
+        return db.all_ids()
+    except AttributeError:
+        return db.get_all_ids(modality="text")
+
+
+def _modalities(db) -> list:
+    """Actual modality names present (e.g. a pipeline may name them
+    "embeddings"); falls back to ["text"] on older cores or empty DBs."""
+    try:
+        names = list(db.modality_names())
+    except AttributeError:
+        names = []
+    return names or ["text"]
+
+
+def _primary_modality(db) -> str:
+    mods = _modalities(db)
+    return "text" if "text" in mods else mods[0]
+
+
+def _primary_dim(db) -> int:
+    try:
+        return db.dim(_primary_modality(db))
+    except Exception:
+        try:
+            return db.dim()
+        except Exception:
+            return 0
+
+
 def _live_record_count(db) -> int:
     """Walk metadata, skipping soft-deleted ones."""
     n = 0
-    for record_id in db.get_all_ids(modality="text"):
+    for record_id in _all_record_ids(db):
         meta = db.get_metadata(record_id)
         if meta is None:
             continue
@@ -393,8 +427,8 @@ def namespace_stats(namespace: str):
     return NamespaceStats(
         namespace  = namespace,
         db_path    = f"{namespace}.feather",
-        dim        = db.dim(),
-        modalities = ["text"],
+        dim        = _primary_dim(db),
+        modalities = _modalities(db),
         records    = _live_record_count(db),
     )
 
@@ -410,8 +444,8 @@ def admin_overview():
             db = manager.get(name, create=False)
             n = _live_record_count(db)
             total += n
-            items.append({"name": name, "dim": db.dim(),
-                          "modalities": ["text"], "records": n})
+            items.append({"name": name, "dim": _primary_dim(db),
+                          "modalities": _modalities(db), "records": n})
         except Exception:
             continue
     items.sort(key=lambda x: x["records"], reverse=True)
@@ -701,11 +735,16 @@ def index_stats(namespace: str):
         raise HTTPException(404, f"Namespace '{namespace}' not found")
     mns = [{"id": n, "size": db.namespace_size(n)} for n in db.list_namespaces()]
     mns.sort(key=lambda x: -x["size"])
+    pm = _primary_modality(db)
+    try:
+        pquant = db.is_quantized(pm)
+    except Exception:
+        pquant = False
     return IndexStatsResponse(
         namespace=namespace,
         record_count=db.size(),
-        dim=db.dim(),
-        text_quantized=db.is_quantized("text"),
+        dim=_primary_dim(db),
+        text_quantized=pquant,
         auto_compact_ratio=db.get_auto_compact(),
         metadata_namespaces=mns[:50],
     )
@@ -743,14 +782,17 @@ def set_quantize(namespace: str, req: QuantizeRequest):
 
 @app.get("/v1/{namespace}/records", tags=["records"],
          dependencies=[Depends(verify_api_key)])
-def list_records(namespace: str, limit: int = 50, after: int = 0, modality: str = "text"):
-    """Cursor-based record listing. Returns up to `limit` records with id > `after`."""
+def list_records(namespace: str, limit: int = 50, after: int = -1, modality: str = "text"):
+    """Cursor-based record listing. Returns up to `limit` records with id > `after`.
+    Default after=-1 so a record with id 0 appears on the first page."""
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
-    all_ids = sorted(db.get_all_ids(modality=modality))
+    # List by metadata id (not a single modality index) so records whose
+    # vectors live under a non-"text" modality still show up.
+    all_ids = sorted(_all_record_ids(db))
     page_ids = [i for i in all_ids if i > after][:limit]
 
     results = []

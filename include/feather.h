@@ -1281,6 +1281,27 @@ public:
         return ids;
     }
 
+    // Every id that has metadata, regardless of which modality holds its
+    // vector(s). Records browsing/counting should use this so a DB whose
+    // vectors live under a non-"text" modality still lists its records.
+    std::vector<uint64_t> all_ids() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<uint64_t> ids;
+        ids.reserve(metadata_store_.size());
+        for (const auto& [id, _] : metadata_store_) ids.push_back(id);
+        return ids;
+    }
+
+    // The actual modality index names present in this DB (e.g. "text",
+    // "visual", or whatever an external pipeline named them).
+    std::vector<std::string> modality_names() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> names;
+        names.reserve(modality_indices_.size());
+        for (const auto& [name, _] : modality_indices_) names.push_back(name);
+        return names;
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Secondary-index queries — O(matches), LIVE records only.
     // Back the API's namespace/entity/attribute scans and feed feature A's

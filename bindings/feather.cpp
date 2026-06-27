@@ -228,6 +228,10 @@ PYBIND11_MODULE(core, m) {
             return py::array_t<float>(vec.size(), vec.data());
         }, py::arg("id"), py::arg("modality") = "text")
         .def("get_all_ids", &feather::DB::get_all_ids, py::arg("modality") = "text")
+        .def("all_ids", &feather::DB::all_ids,
+             "Every id that has metadata, across all modalities.")
+        .def("modality_names", &feather::DB::modality_names,
+             "Names of the modality indices present in this DB.")
 
         // -- Secondary metadata indexes (O(matches) lookups) --
         .def("ids_in_namespace", &feather::DB::ids_in_namespace, py::arg("namespace_id"),
