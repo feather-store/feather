@@ -89,16 +89,22 @@ engine for downstream consumers (e.g. brand teams, agents, internal tools).
 | **Atlas-style admin SPA** | `/admin/` route on the FastAPI server | Custom HTML + Tailwind + Alpine.js, brand-aligned, zero build step |
 | **Pluggable embeddings** | Settings → Embedding service | OpenAI · Azure OpenAI · Gemini · Voyage · Cohere · Ollama with curated model dropdowns |
 | **Ingest text** | `POST /v1/{ns}/ingest_text` | Server embeds via the configured provider, then stores — single call |
-| **Bulk import** | `POST /v1/{ns}/import` | Paste a JSON array of `{id, vector, metadata}` |
+| **Bulk import** | `POST /v1/{ns}/import` | JSON array of `{id, vector?, metadata}`; WAL-backed throttled saves for fast large loads, `flush` to compact — see [bulk ops](docs/bulk-operations.md) |
+| **Bulk delete** | `POST /v1/{ns}/records/batch_delete` | Delete many ids and/or a whole `entity_id` in one call (one save) — use instead of looping single DELETE |
+| **Upload `.feather`** | `POST /v1/admin/upload` · Namespaces → Import | Adopt a locally-built DB as a cloud namespace (graph + index intact) |
+| **Any-dimension namespaces** | first vector or `dim` at create | Each namespace adopts its own dim (384/768/1024/1536…), no silent padding — see [dimensions](docs/dimensions.md) |
+| **Filtered search** | `POST /v1/{ns}/search` · Search tab | Vector / keyword / hybrid, filtered by `namespace_id`, `entity_id`, and attributes |
 | **Hierarchy navigator** | Namespace detail → Hierarchy tab | Brand → Channel → Campaign → AdSet → Ad → Creative tree from `metadata.attributes` |
 | **Marketing profile card** | Record drawer | Auto-renders KPIs (CTR, ROAS, channel) when present |
 | **Cmd-K palette** | Press ⌘K / Ctrl+K | Fuzzy search namespaces · `id:123` to open a record · `/seed`, `/import` actions |
 | **Live observability** | Overview screen | p50 / p95 / p99 latency, ops-per-minute sparkline, recent activity feed |
-| **Delete + purge + compact** | Namespace header buttons | Per-record DELETE, bulk PURGE by `namespace_id`, COMPACT to reclaim |
+| **Delete + purge + compact** | Namespace header buttons | Bulk delete by ids/entity, PURGE by `namespace_id`, COMPACT to reclaim |
 | **Schema discovery** | Namespace detail → Schema tab | Distinct attribute keys + type inference + sample values |
 | **Connection panel** | Settings → Connection | Copy-paste cURL / Python / JS snippets pre-filled with your URL |
 
 See [docs/quickstart.md](docs/quickstart.md) for a self-hosted setup walkthrough.
+
+**Guides:** [Vector dimensions](docs/dimensions.md) · [Bulk operations](docs/bulk-operations.md) (import / delete / upload) · [Integrations](docs/integrations.md)
 
 > **Deployment note**: `feather-api/` runs single-tenant with one shared
 > `FEATHER_API_KEY`. Multi-tenant key isolation + HTTPS are on the roadmap.
