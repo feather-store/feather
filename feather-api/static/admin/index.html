@@ -547,6 +547,11 @@
                 </div>
 
                 <div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Filter — entity_id</label>
+                  <input x-model="search.filter_entity" type="text" placeholder="(any)" class="mt-1.5 mono w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+                </div>
+
+                <div>
                   <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Attribute filters</label>
                   <div class="mt-1.5 space-y-1">
                     <template x-for="(f, idx) in search.attrFilters" :key="idx">
@@ -1282,7 +1287,7 @@
         activeNs: '',
         nsTab: 'records',
         records: [], recordsAfter: 0, recordsHasMore: false, loadingRecords: false, vScroll: 0,
-        search: { mode: 'vector', query: '', seed: 42, k: 20, filter_ns: '', results: [], running: false,
+        search: { mode: 'vector', query: '', seed: 42, k: 20, filter_ns: '', filter_entity: '', results: [], running: false,
                   attrFilters: [], newAttrKey: '', newAttrVal: '' },
         context: { seed: 42, k: 5, hops: 2, result: null },
         maint: { stats: null, ratio: 0, loading: false, busy: '' },
@@ -1634,6 +1639,7 @@
             this.records = []; this.recordsAfter = 0; this.recordsHasMore = false;
             this.search.results = []; this.context.result = null;
             this.search.attrFilters = []; this.search.newAttrKey = ''; this.search.newAttrVal = '';
+            this.search.filter_ns = ''; this.search.filter_entity = '';
             this.console.response = '';
             this.console.method = 'GET';
             this.console.path = `/v1/${name}/records?limit=5`;
@@ -1909,9 +1915,17 @@
           const ns = encodeURIComponent(this.activeNs);
           const body = { k: this.search.k };
           if (this.search.filter_ns) body.namespace_id = this.search.filter_ns;
+          if (this.search.filter_entity) body.entity_id = this.search.filter_entity;
           if (this.search.attrFilters.length) {
-            body.attributes_match = {};
-            for (const f of this.search.attrFilters) body.attributes_match[f.key] = f.value;
+            for (const f of this.search.attrFilters) {
+              // namespace_id and entity_id are top-level metadata fields, NOT
+              // entries in the attributes map — route them to the dedicated
+              // filter so they actually match (otherwise they silently hit the
+              // empty attributes map and return nothing).
+              if (f.key === 'entity_id') { body.entity_id = f.value; }
+              else if (f.key === 'namespace_id') { body.namespace_id = f.value; }
+              else { if (!body.attributes_match) body.attributes_match = {}; body.attributes_match[f.key] = f.value; }
+            }
           }
           let path;
           if (this.search.mode === 'keyword') {
