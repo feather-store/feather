@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cloud — per-namespace dimension (support any embedding dim)
+- **A namespace's dimension is now defined by its data, never the server
+  default.** The engine already adopted the first inserted vector's length, but
+  the API layer compared every vector/query against the server-wide
+  `FEATHER_DB_DIM` (768) — so a fresh namespace silently rejected or
+  **padded/truncated** non-768 embeddings (1024, 1536, 384, …), quietly
+  corrupting them. Now the dim is enforced only once a modality index actually
+  exists (`_established_dim`); on an empty namespace the first vector is free to
+  define any dimension (1…2²⁰).
+- **No more silent padding.** `import` and `ingest_text` no longer pad/truncate
+  to 768. A vector whose length disagrees with the namespace's established dim
+  is rejected with a clear per-item error; a server-side embedding whose model
+  dim doesn't match the namespace is rejected honestly instead of reshaped.
+- **`POST /v1/namespaces`** accepts an optional `dim` to pin a new namespace's
+  dimension up front (so the dashboard reports it before the first insert and
+  clients get an early 400 on mismatch). Without it, the first vector decides.
+- Client-supplied vectors are first-class at any dimension; server-side
+  embedding stays tied to the configured model's fixed output dim (inherent).
+
+### Cloud — graph endpoint no longer 500s on large/dirty namespaces
+- **`GET /v1/{ns}/graph`** guarded: an unfiltered graph over
+  `FEATHER_GRAPH_NODE_LIMIT` (4000) returns a friendly "too large — filter by
+  namespace_id/entity" payload instead of trying to serialize hundreds of
+  thousands of nodes; and a `UnicodeDecodeError`/`ValueError` from
+  `export_graph_json` (one record with non-UTF-8 bytes anywhere in the
+  namespace) degrades to an empty graph with a "dirty data" note rather than a
+  500.
+
 ### Cloud — import a local `.feather` straight into the dashboard
 - **`POST /v1/admin/upload`** (feather-api): upload a locally-built `.feather`
   file and adopt it as a cloud namespace. The upload is streamed to disk in

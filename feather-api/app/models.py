@@ -125,6 +125,11 @@ class PurgeRequest(BaseModel):
 
 class CreateNamespaceRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_\-]+$")
+    dim: Optional[int] = Field(
+        None, ge=1, le=1_048_576,
+        description="Optional fixed dimension for this namespace. If omitted, the "
+                    "first inserted vector defines it (any dimension is allowed).",
+    )
 
 
 class SchemaAttribute(BaseModel):

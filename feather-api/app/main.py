@@ -223,28 +223,33 @@ def _build_scoring(req: SearchRequest) -> Optional[ScoringConfig]:
     )
 
 
-def _check_query_dim(db, vector, modality: str):
-    """Reject a query vector whose length doesn't match the index dim, with a
-    clean 400 instead of letting the C++ HNSW read out of bounds."""
+def _established_dim(db, modality: str = "text"):
+    """The dim of `modality`'s index IF it already exists, else None.
+
+    A namespace has no fixed dimension until its first vector lands — the engine
+    adopts that vector's length (vec.size()). An empty namespace's db.dim() only
+    reports the server default (768); treating that as the real dim is exactly
+    what silently forced every non-768 embedding to be padded or rejected. So we
+    enforce a dim ONLY once the index actually exists; otherwise the first
+    inserted vector is free to define any dimension."""
     try:
-        expected = db.dim(modality)
+        if modality in set(db.modality_names()):
+            return db.dim(modality)
     except Exception:
-        return  # modality not present yet; let downstream raise its own error
+        pass
+    return None
+
+
+def _check_query_dim(db, vector, modality: str):
+    """Reject a query whose length doesn't match an *established* index dim,
+    with a clean 400 instead of letting the C++ HNSW read out of bounds."""
+    expected = _established_dim(db, modality)
     if expected and len(vector) != expected:
         raise HTTPException(
             400,
             f"Query vector dim {len(vector)} != index dim {expected} "
             f"for modality '{modality}'",
         )
-
-
-def _fit_dim(vec, dim: int):
-    """Pad/truncate an embedding into the namespace's dim so a provider whose
-    native dim differs from the namespace still imports/ingests cleanly."""
-    v = list(vec)
-    if dim and len(v) != dim:
-        v = (v + [0.0] * dim)[:dim]
-    return v
 
 
 # Bounded thread pool so a large auto-embed import fires provider calls
@@ -291,8 +296,13 @@ def list_namespaces():
 @app.post("/v1/namespaces", status_code=201, tags=["meta"],
           dependencies=[Depends(verify_api_key)])
 def create_namespace(req: CreateNamespaceRequest):
-    """Create an empty namespace (a new .feather file on disk)."""
-    db = manager.get(req.name)
+    """Create an empty namespace (a new .feather file on disk).
+
+    A namespace has no fixed dimension until its first vector — pass an optional
+    `dim` to pin it up front (so the dashboard shows the right dimension and
+    clients get an early 400 on mismatch). With no data yet this is only a
+    reported default; the first inserted vector is what truly fixes the dim."""
+    db = manager.get(req.name, dim=req.dim)
     db.save()
     return {"name": req.name, "dim": db.dim(), "created": True}
 
@@ -536,12 +546,10 @@ def add_vector(namespace: str, req: AddVectorRequest):
     db = manager.get(namespace)
     meta = _meta_from_model(req.metadata) if req.metadata else Metadata()
 
-    # Reject a dim mismatch with a clean 400 instead of letting the C++ index
-    # throw (or read out of bounds) on a vector that doesn't match the namespace.
-    try:
-        ns_dim = db.dim(req.modality)
-    except Exception:
-        ns_dim = 0
+    # Reject a mismatch only against an *established* dim. On an empty namespace
+    # the first vector defines the dim (any dimension allowed), so we never
+    # coerce it to the server default.
+    ns_dim = _established_dim(db, req.modality)
     if ns_dim and len(req.vector) != ns_dim:
         raise HTTPException(
             400,
@@ -1191,14 +1199,17 @@ def ingest_text(namespace: str, req: IngestTextRequest):
         raise HTTPException(400, str(e))
 
     db = manager.get(namespace)
-    # Fit the embedding to the namespace's existing dim — e.g. a 512-dim DB that
-    # was uploaded, or a provider whose native dim differs from the default — so
-    # ingest doesn't fail with a dim mismatch against the existing index.
-    try:
-        ns_dim = db.dim(req.modality)
-    except Exception:
-        ns_dim = 0
-    vec = _fit_dim(vec, ns_dim or len(vec))
+    # The embedding model's output dim is fixed. If this namespace already has an
+    # established dim and the model doesn't match it, reject honestly rather than
+    # padding/truncating (which silently corrupts the vector). On an empty
+    # namespace the embedding defines the dim.
+    ns_dim = _established_dim(db, req.modality)
+    if ns_dim and len(vec) != ns_dim:
+        raise HTTPException(
+            400,
+            f"embedding dim {len(vec)} != namespace dim {ns_dim} for modality "
+            f"'{req.modality}'; the configured model doesn't match this namespace",
+        )
     rec_id = int(np.random.default_rng().integers(1, 2**53))   # JS-safe id
     meta = _meta_from_model(req.metadata) if req.metadata else Metadata()
     if not meta.namespace_id:
@@ -1223,7 +1234,9 @@ def bulk_import(namespace: str, req: ImportRequest):
     pasted as plain text (no vector) were silently skipped and the namespace
     stayed empty."""
     db = manager.get(namespace)
-    expected_dim = db.dim()
+    # No padding: an established dim is authoritative; otherwise the first
+    # supplied (or embedded) vector defines it — any dimension is allowed.
+    locked_dim = _established_dim(db, req.modality)
     skipped = 0
     embedded = 0
     errors: List[str] = []
@@ -1255,8 +1268,11 @@ def bulk_import(namespace: str, req: ImportRequest):
                 embed_back.append(len(parsed))
                 embed_texts.append(content)
             else:
-                if len(vec) != expected_dim:
-                    raise ValueError(f"dim mismatch: got {len(vec)}, expected {expected_dim}")
+                vlen = len(vec)
+                if locked_dim is None:
+                    locked_dim = vlen            # first vector defines the dim
+                elif vlen != locked_dim:
+                    raise ValueError(f"dim mismatch: got {vlen}, expected {locked_dim}")
                 entry["vec"] = list(vec)
             parsed.append(entry)
         except Exception as e:
@@ -1268,8 +1284,15 @@ def bulk_import(namespace: str, req: ImportRequest):
         if err is not None:
             entry["error"] = (f"no 'vector' supplied and auto-embed failed: {err} "
                               f"— configure an embedding provider in Settings, or include vectors")
+            continue
+        vlen = len(vec)
+        if locked_dim is None:
+            locked_dim = vlen                # all-text import: model defines dim
+        if vlen != locked_dim:
+            entry["error"] = (f"auto-embedded dim {vlen} != namespace dim {locked_dim}; "
+                              f"the configured model doesn't match this namespace")
         else:
-            entry["vec"] = _fit_dim(vec, expected_dim)
+            entry["vec"] = list(vec)         # no padding
 
     # ── Pass 3: assemble the batch.
     ids: List[int] = []

@@ -93,14 +93,18 @@ class DBManager:
             raise ValueError(f"Invalid namespace: {namespace!r}")
         return os.path.join(self._data_dir, f"{safe}.feather")
 
-    def _open_namespace(self, namespace: str) -> DB:
+    def _open_namespace(self, namespace: str, dim: Optional[int] = None) -> DB:
         path = self._namespace_path(namespace)
-        db = DB.open(path, dim=self._default_dim)
+        # `dim` only sets the reported default for a brand-new empty namespace;
+        # an existing file keeps its own dim, and the first inserted vector is
+        # what truly fixes it. So passing dim here never overrides real data.
+        db = DB.open(path, dim=dim or self._default_dim)
         self._dbs[namespace] = db
         self._locks[namespace] = threading.Lock()
         return db
 
-    def get(self, namespace: str, create: bool = True) -> DB:
+    def get(self, namespace: str, create: bool = True,
+            dim: Optional[int] = None) -> DB:
         """Return the DB for this namespace, creating it if needed."""
         if namespace in self._dbs:
             return self._dbs[namespace]
@@ -109,7 +113,7 @@ class DBManager:
                 return self._dbs[namespace]
             if not create:
                 raise KeyError(f"Namespace '{namespace}' not found")
-            return self._open_namespace(namespace)
+            return self._open_namespace(namespace, dim=dim)
 
     def adopt(self, namespace: str, staged_path: str, overwrite: bool = False) -> DB:
         """Adopt an uploaded .feather file as `namespace`.
