@@ -947,6 +947,9 @@ def context_chain(namespace: str, req: ContextChainRequest):
 # ─────────────────────────────────────────────
 # Graph export — D3-friendly nodes + links JSON
 # ─────────────────────────────────────────────
+GRAPH_NODE_LIMIT = int(os.getenv("FEATHER_GRAPH_NODE_LIMIT", "4000"))
+
+
 @app.get("/v1/{namespace}/graph", tags=["graph"],
          dependencies=[Depends(verify_api_key)])
 def export_graph(namespace: str, ns_filter: str = "", entity_filter: str = ""):
@@ -954,7 +957,37 @@ def export_graph(namespace: str, ns_filter: str = "", entity_filter: str = ""):
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
-    raw = db.export_graph_json(ns_filter, entity_filter)
+
+    # A browser force-graph can't render hundreds of thousands of nodes, and
+    # serializing them all is pointless. If the namespace is large and the
+    # caller didn't narrow it down, return a friendly guard instead of trying
+    # (and either freezing the tab or crashing on dirty bytes — see below).
+    if not ns_filter and not entity_filter:
+        try:
+            total = db.size()
+        except Exception:
+            total = 0
+        if total > GRAPH_NODE_LIMIT:
+            return {
+                "nodes": [], "links": [], "truncated": True, "total": total,
+                "note": (f"{total:,} records — too large to render as a graph. "
+                         f"Filter by namespace_id or entity to view a subgraph "
+                         f"(limit {GRAPH_NODE_LIMIT:,})."),
+            }
+
+    # export_graph_json builds one big JSON string in C++; pybind11 decodes it
+    # as strict UTF-8. A single record with non-UTF-8 bytes (latin-1, truncated
+    # multibyte) anywhere in the namespace makes that decode throw. Never let
+    # that 500 the endpoint — degrade to an empty graph with a clear note.
+    try:
+        raw = db.export_graph_json(ns_filter, entity_filter)
+    except (UnicodeDecodeError, ValueError) as e:
+        return {
+            "nodes": [], "links": [], "dirty": True,
+            "note": ("graph contains non-UTF-8 text in at least one record and "
+                     "can't be rendered; filter to a clean subset. "
+                     f"({type(e).__name__})"),
+        }
     try:
         return json.loads(raw)
     except Exception:
