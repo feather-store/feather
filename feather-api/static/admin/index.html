@@ -845,6 +845,18 @@
                   <div class="text-xs text-slate-500 mb-3">Reclaim space from forgotten/deleted vectors and prune dead edges.</div>
                   <button @click="compactNs()" :disabled="maint.busy" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-40">Run compaction</button>
                 </div>
+                <div class="border border-slate-200 rounded-lg p-4">
+                  <div class="text-sm font-medium mb-1">Bulk delete</div>
+                  <div class="text-xs text-slate-500 mb-3">Delete many records in one call (one save). By record ids and/or a whole entity_id. Use this instead of deleting records one by one.</div>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">ids (comma / space / newline separated)</label>
+                  <textarea x-model="bulkDel.ids" rows="2" placeholder="e.g. 1, 2, 3" class="mono mt-1 mb-2 w-full text-[12px] px-2 py-1.5 border border-slate-300 rounded focus-ring"></textarea>
+                  <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">or entity_id</label>
+                  <input x-model="bulkDel.entity_id" placeholder="(optional)" class="mono mt-1 mb-2 w-full text-[12px] px-2 py-1.5 border border-slate-300 rounded focus-ring">
+                  <label class="flex items-center gap-1.5 text-xs text-slate-600 mb-3"><input type="checkbox" x-model="bulkDel.cascade"> prune graph edges (slower)</label>
+                  <button @click="runBulkDelete()" :disabled="bulkDel.busy" class="text-sm px-3 py-1.5 border border-red-300 text-red-600 rounded-md hover:bg-red-50 disabled:opacity-40">Delete</button>
+                  <span class="text-xs text-slate-400 ml-2" x-show="bulkDel.busy">deleting…</span>
+                  <div x-show="bulkDel.last" class="mt-2 text-xs mono text-slate-500" x-text="bulkDel.last"></div>
+                </div>
               </div>
             </div>
           </div>
@@ -1291,6 +1303,7 @@
                   attrFilters: [], newAttrKey: '', newAttrVal: '' },
         context: { seed: 42, k: 5, hops: 2, result: null },
         maint: { stats: null, ratio: 0, loading: false, busy: '' },
+        bulkDel: { ids: '', entity_id: '', cascade: false, busy: false, last: '' },
         graph: { nsFilter: '', nodes: [], links: [] },
         schema: { loading: false, loaded: false, data: null },
         console: { method: 'POST', path: '', body: '', response: '' },
@@ -1858,6 +1871,25 @@
           };
         },
         async compactNs() { try { const d = await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/compact`); this.toast(`Compacted. Reclaimed ${d.reclaimed}.`); } catch (e) { this.toast(`Compact failed: ${e.message}`, 'error'); } },
+        async runBulkDelete() {
+          const ids = (this.bulkDel.ids || '').split(/[\s,]+/).map(s => parseInt(s, 10)).filter(n => Number.isFinite(n));
+          const ent = (this.bulkDel.entity_id || '').trim();
+          if (!ids.length && !ent) { this.toast('Enter ids or an entity_id.', 'error'); return; }
+          const n = ids.length + (ent ? ' + entity ' + ent : '');
+          if (!confirm(`Delete ${ids.length} id(s)${ent ? ' and all records for entity '+ent : ''} in "${this.activeNs}"? This cannot be undone.`)) return;
+          this.bulkDel.busy = true; this.bulkDel.last = '';
+          try {
+            const body = { cascade: !!this.bulkDel.cascade };
+            if (ids.length) body.ids = ids;
+            if (ent) body.entity_id = ent;
+            const d = await this.api('POST', `/v1/${encodeURIComponent(this.activeNs)}/records/batch_delete`, body);
+            this.bulkDel.last = `deleted ${d.deleted}, not found ${d.not_found}, edges pruned ${d.edges_pruned}`;
+            this.toast(`Deleted ${d.deleted} record(s).`);
+            this.bulkDel.ids = ''; this.bulkDel.entity_id = '';
+            this.loadIndexStats && this.loadIndexStats();
+          } catch (e) { this.toast(`Bulk delete failed: ${e.message}`, 'error'); }
+          finally { this.bulkDel.busy = false; }
+        },
 
         // ── add record
         async submitAddRecord() {

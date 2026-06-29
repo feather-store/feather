@@ -123,6 +123,18 @@ class PurgeRequest(BaseModel):
     namespace_id: str = Field(..., description="metadata.namespace_id to hard-delete (e.g. brand_id)")
 
 
+class BatchDeleteRequest(BaseModel):
+    ids: List[int] = Field(default_factory=list,
+                           description="Record ids to delete (forget). Up to 100k per call.")
+    entity_id: Optional[str] = Field(
+        None, description="Also delete every record with this metadata.entity_id.")
+    cascade: bool = Field(
+        False,
+        description="If true, sweep all records once and prune graph edges pointing "
+                    "at the deleted ids. Off by default for speed on large/edge-less "
+                    "namespaces; run compact() afterwards to clean up either way.")
+
+
 class CreateNamespaceRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_\-]+$")
     dim: Optional[int] = Field(

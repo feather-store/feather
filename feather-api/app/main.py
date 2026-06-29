@@ -45,6 +45,7 @@ from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
     KeywordSearchRequest, HybridSearchRequest,
     LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest, PurgeRequest,
+    BatchDeleteRequest,
     MetadataOut, NamespaceStats, HealthResponse, AdminOverview,
     SeedRequest, ContextChainRequest, EdgesResponse, EdgeOut, IncomingEdgeOut,
     ContextChainNode, ContextChainEdge, ContextChainResponse,
@@ -343,6 +344,29 @@ def _prune_edges_to(db, dead_id: int) -> int:
             continue
         current = list(meta.edges)
         kept    = [e for e in current if e.target_id != dead_id]
+        if len(kept) != len(current):
+            meta.edges = kept
+            db.update_metadata(rec_id, meta)
+            removed += len(current) - len(kept)
+    return removed
+
+
+def _prune_edges_to_set(db, dead_ids) -> int:
+    """One-pass cascade for a *batch* delete: remove every edge pointing at any
+    id in `dead_ids`. Unlike calling _prune_edges_to per id (O(deleted × records)),
+    this sweeps all records exactly once."""
+    dead = set(dead_ids)
+    removed = 0
+    for rec_id in db.all_ids():
+        if rec_id in dead:
+            continue
+        meta = db.get_metadata(rec_id)
+        if meta is None:
+            continue
+        current = list(meta.edges)
+        if not current:
+            continue
+        kept = [e for e in current if e.target_id not in dead]
         if len(kept) != len(current):
             meta.edges = kept
             db.update_metadata(rec_id, meta)
@@ -666,6 +690,55 @@ def delete_record(namespace: str, record_id: int):
         edges_pruned = _prune_edges_to(db, record_id)
         db.save()
     return {"id": record_id, "deleted": True, "edges_pruned": edges_pruned}
+
+
+@app.post("/v1/{namespace}/records/batch_delete", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+def batch_delete(namespace: str, req: BatchDeleteRequest):
+    """Delete many records in ONE pass: take the namespace lock once, forget
+    every id, then save once.
+
+    The single-record DELETE saves the whole namespace per call — a per-record
+    delete loop over a large namespace re-serializes it N times and can wedge
+    the server. Use this instead for any bulk delete.
+
+    Targets = `ids` ∪ (all records with `entity_id`). `cascade` (default off)
+    prunes graph edges to the deleted ids in a single sweep.
+    """
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+    ids = set(int(i) for i in (req.ids or []))
+    if req.entity_id:
+        try:
+            ids |= set(db.ids_for_entity(req.entity_id))
+        except Exception:
+            pass
+    if not ids:
+        raise HTTPException(400, "provide 'ids' and/or 'entity_id' to delete")
+    if len(ids) > 100_000:
+        raise HTTPException(413, f"too many ids ({len(ids)}); cap is 100000 per call")
+
+    deleted = 0
+    not_found = 0
+    with manager.lock(namespace):
+        for rid in ids:
+            meta = db.get_metadata(rid)
+            if (meta is None or meta.source == "_forgotten"
+                    or meta.get_attribute("_deleted") == "true"):
+                not_found += 1
+                continue
+            db.forget(rid)
+            deleted += 1
+        edges_pruned = 0
+        if req.cascade and deleted:
+            edges_pruned = _prune_edges_to_set(db, ids)
+        db.save()   # ← single save for the whole batch
+    return {"namespace": namespace, "requested": len(ids), "deleted": deleted,
+            "not_found": not_found, "edges_pruned": edges_pruned,
+            "hint": "run POST /compact to reclaim space" if deleted else None}
 
 
 @app.delete("/v1/{namespace}/records/{from_id}/link/{to_id}", tags=["records"],

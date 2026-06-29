@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cloud — bulk delete (one save, not N)
+- **`POST /v1/{ns}/records/batch_delete`** `{ids?, entity_id?, cascade?}`: delete
+  many records under a single namespace lock with **one** `save()`. The
+  single-record `DELETE` re-serializes the whole namespace per call, so a
+  per-record delete loop over a large namespace saved it N times and could wedge
+  the server. Targets are `ids` ∪ (all records with `entity_id`); `cascade`
+  (default off) prunes graph edges to the deleted ids in a single sweep. Caps at
+  100k ids/call; reports `deleted` / `not_found` / `edges_pruned`.
+- Dashboard **Maintenance → Bulk delete** card (ids and/or entity_id, optional
+  cascade) wired to the new endpoint.
+- (Bulk *insert* / *upload* already exist: `POST /v1/{ns}/import` and
+  `POST /v1/admin/upload`.)
+
+### Cloud — dashboard entity_id search filter
+- Added a dedicated **Filter — entity_id** input to the search panel, and
+  `runSearch` now routes `entity_id`/`namespace_id` attribute-filter keys to the
+  top-level filter fields. Filtering search by `entity_id` returned nothing
+  before because those are top-level metadata fields, not entries in the
+  attributes map — the dashboard had only a `namespace_id` input.
+
 ### Cloud — per-namespace dimension (support any embedding dim)
 - **A namespace's dimension is now defined by its data, never the server
   default.** The engine already adopted the first inserted vector's length, but
