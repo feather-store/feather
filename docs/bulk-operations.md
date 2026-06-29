@@ -99,6 +99,28 @@ mismatch is reported per item, not silently reshaped.
   "errors": ["item 4: dim mismatch: got 900, expected 1024"] }
 ```
 
+### Importing many batches (large datasets)
+
+Import is **fast and constant-time per batch** regardless of how big the
+namespace gets: it appends to a write-ahead log instead of re-writing the whole
+`.feather` on every call. A full save happens automatically at most once every
+~30s per namespace (and on shutdown), so your data is always durable.
+
+When you finish a bulk-load session, force one final full save so the file is
+fully compacted — either set `"flush": true` on your last batch, or call:
+
+```bash
+curl -X POST "$BASE/v1/{ns}/flush" -H "X-API-Key: $KEY"
+```
+
+```python
+# stream a large dataset in batches; flush once at the end
+for i, chunk in enumerate(batches):
+    last = (i == len(batches) - 1)
+    requests.post(f"{BASE}/v1/{ns}/import", headers=H,
+                  json={"items": chunk, "flush": last})
+```
+
 ## Bulk upload (whole `.feather`)
 
 ```
