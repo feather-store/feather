@@ -28,7 +28,7 @@ import pathlib
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -277,6 +277,26 @@ def _embed_many(texts: List[str]) -> List[Tuple[Optional[list], Optional[str]]]:
         for i, vec, err in ex.map(work, range(len(texts))):
             out[i] = (vec, err)
     return out
+
+
+# Throttled save. A single db.save() rewrites the WHOLE namespace file (and the
+# persisted HNSW graph). Calling it on every import batch makes incremental bulk
+# loading O(batches × filesize) — the file is re-serialized in full each call, so
+# it gets slower as the namespace grows. add_batch is WAL-logged, so data is
+# durable WITHOUT a full save (the WAL is replayed on load; save() clears it).
+# We therefore save at most once per FEATHER_IMPORT_SAVE_INTERVAL_S per namespace,
+# plus an explicit flush and the shutdown save_all().
+_IMPORT_SAVE_INTERVAL_S = float(os.getenv("FEATHER_IMPORT_SAVE_INTERVAL_S", "30"))
+_last_save: Dict[str, float] = {}
+
+
+def _throttled_save(namespace: str, db, force: bool = False) -> bool:
+    now = time.time()
+    if force or (now - _last_save.get(namespace, 0.0)) >= _IMPORT_SAVE_INTERVAL_S:
+        db.save()
+        _last_save[namespace] = now
+        return True
+    return False
 
 # ─────────────────────────────────────────────
 # Routes — health & meta
@@ -1294,7 +1314,7 @@ def ingest_text(namespace: str, req: IngestTextRequest):
     with manager.lock(namespace):
         db.add(id=rec_id, vec=np.asarray(vec, dtype=np.float32),
                meta=meta, modality=req.modality)
-        db.save()
+        _throttled_save(namespace, db)   # WAL-durable; throttled full save
     return {"id": rec_id, "namespace": namespace, "embedded": True, "dim": len(vec)}
 
 
@@ -1398,9 +1418,28 @@ def bulk_import(namespace: str, req: ImportRequest):
     with manager.lock(namespace):
         if ids:
             db.add_batch(ids, np.asarray(vecs, dtype=np.float32), metas, modality=req.modality)
-        db.save()
+        # Throttled save instead of a full file rewrite per batch (WAL keeps the
+        # data durable in between). Pass flush=true on the final batch to force it.
+        _throttled_save(namespace, db, force=req.flush)
     return ImportResponse(namespace=namespace, inserted=len(ids),
                           skipped=skipped, embedded=embedded, errors=errors)
+
+
+@app.post("/v1/{namespace}/flush", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+def flush_namespace(namespace: str):
+    """Force a full save of the namespace now. Call this once after a bulk-import
+    session (which uses throttled saves) to guarantee the .feather is fully
+    written. Data is durable via the WAL even without it, but this compacts the
+    WAL into the file and persists the HNSW graph."""
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    with manager.lock(namespace):
+        db.save()
+        _last_save[namespace] = time.time()
+    return {"namespace": namespace, "saved": True}
 
 
 @app.get("/v1/{namespace}/hierarchy", response_model=HierarchyResponse,

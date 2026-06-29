@@ -217,6 +217,12 @@ class ImportRequest(BaseModel):
     server-side using the configured embedding provider."""
     items: List[Dict[str, Any]]        # [{ id, vector?, metadata: {...} }, ...]
     modality: str = "text"
+    flush: bool = Field(
+        False,
+        description="Force a full save of the namespace at the end of THIS call. "
+                    "Leave false for fast incremental bulk loading (data is durable "
+                    "via the WAL and saved on a throttle / on shutdown); set true on "
+                    "your final batch to guarantee the .feather is fully written.")
 
 
 class ImportResponse(BaseModel):

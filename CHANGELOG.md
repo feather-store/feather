@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cloud — fast bulk import (throttled saves instead of one full save per call)
+- **`POST /v1/{ns}/import` was O(batches × filesize):** it called `db.save()` on
+  every call, and each save re-serializes the *entire* namespace file (plus the
+  persisted HNSW graph). Loading 300k+ records as many batches re-wrote the whole
+  growing file every batch — so import got slower and slower. `add_batch` is
+  WAL-logged, so data is durable without a full save (the WAL is replayed on
+  load; `save()` clears it). Import now saves at most once per
+  `FEATHER_IMPORT_SAVE_INTERVAL_S` (default 30s) per namespace; `ingest_text` too.
+- **`flush`**: pass `"flush": true` on your final import batch — or call
+  **`POST /v1/{ns}/flush`** — to force a full save and compact the WAL into the
+  `.feather`. (Shutdown still saves everything.)
+
 ### Cloud — bulk delete (one save, not N)
 - **`POST /v1/{ns}/records/batch_delete`** `{ids?, entity_id?, cascade?}`: delete
   many records under a single namespace lock with **one** `save()`. The
