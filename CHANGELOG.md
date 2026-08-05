@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Engine — concurrent search (readers-writer lock + GIL release)
+- **Queries were serialised twice over:** every `search`/`keyword_search`/
+  `hybrid_search` took the DB's single `std::mutex` **exclusively**, and only
+  `add_batch` released the GIL — so no matter how many workers the Cloud API
+  ran, the whole process searched on one core.
+- `mutex_` is now a **`std::shared_mutex`**. Retrieval and every const accessor
+  take it in **shared** mode; only mutations take it exclusively. hnswlib's
+  `searchKnn` is `const` and its visited-list pool is internally mutex-guarded,
+  so concurrent traversal is safe.
+- The one thing a query mutated was the salience touch. `Metadata::recall_count`
+  / `last_recalled_at` are now **`mutable std::atomic`** with a `note_recall()`
+  helper, so a query records its hit under the shared lock — no deferral, and
+  the increment stays immediately visible. Metadata gains explicit copy/move
+  (atomics aren't copyable); **the on-disk layout is byte-identical**.
+- The binding layer now **releases the GIL** around `search`, `keyword_search`,
+  `hybrid_search`, `context_chain`, `add`, `link`, `update_metadata`,
+  `update_importance`, `save`, `compact`, `auto_link`, `forget`, `purge`,
+  `forget_expired`, `export_graph_json` and `get_all_ids`.
+- `save()` no longer blocks queries: `save_vectors()` only reads, so it takes
+  the data lock **shared** and serialises saver-against-saver on a dedicated
+  `save_mutex_` (they share one `.tmp` path and rename).
+- **Measured** (40k×128, 8 threads, M-series): search **5,691 → 28,092 qps**,
+  scaling **1.00x → 4.94x** where it was previously flat at ~1.0x.
+
+### Engine — BM25 indexing was O(n²) (cold load of text-bearing DBs)
+- `add_to_bm25_index` re-summed **all** of `doc_lengths_` to recompute `avg_dl`
+  on **every** document inserted, and `rebuild_bm25_index` calls it once per
+  document — so building the index was quadratic, and it is rebuilt on every
+  `load()`. Synthetic benchmarks never caught it because their records have no
+  `content`. `avg_dl` is now maintained as a running total (`total_dl_`).
+- Re-indexing an existing document scanned the **entire vocabulary** to retire
+  its old postings. Callers now pass the previously indexed content, so removal
+  touches only that document's terms.
+- **Measured** (16k records with content): cold load **0.177s → 0.029s** (6.1x),
+  and growth is linear (~1.9x per doubling) instead of quadratic (~3.2x).
+  Extrapolated to 300k records this is ~60s of per-open rebuild removed.
+
+### Engine — forgotten/purged records leaked into keyword search (bug)
+- `forget()`, `forget_expired()` and `purge()` updated the vector index and the
+  secondary indexes but **never touched the BM25 index**. A forgotten record
+  stayed fully retrievable via `keyword_search`/`hybrid_search`, and a purged
+  one came back as a hit with **empty metadata** (its posting outlived its
+  metadata). All three now de-index, `rebuild_bm25_index()` skips dead records,
+  and both BM25 scorers defensively skip postings with no live metadata.
+
+### Build — header changes no longer produce stale objects
+- Practically the whole engine lives in `include/*.h`, but `setup.py` listed
+  only the `.cpp` sources, so an incremental `build_ext` silently reused stale
+  objects after a header edit — a build that looked fresh but contained none of
+  the changes. The extension now declares `depends=glob("include/*.h")`.
+
 ### Cloud — fast bulk import (throttled saves instead of one full save per call)
 - **`POST /v1/{ns}/import` was O(batches × filesize):** it called `db.save()` on
   every call, and each save re-serializes the *entire* namespace file (plus the

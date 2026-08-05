@@ -480,6 +480,23 @@ Every `search()` increments `recall_count` for all returned records. Call `touch
 ### Import cache when recompiling C++ `.so`
 `importlib.reload()` does NOT reload compiled `.so` files. Start a fresh Python process to pick up recompiled bindings.
 
+### Locking model — which lock does your new method need?
+`mutex_` is a `std::shared_mutex`. Take `std::shared_lock` if the method only
+reads (all const accessors, `search`, `keyword_search`, `hybrid_search`,
+`context_chain`, `save`); take `std::unique_lock` if it mutates
+`metadata_store_`, any derived index, or the HNSW graph — including anything
+that can trigger `resizeIndex`, which is not thread-safe. The one exception is
+salience: `Metadata::recall_count` / `last_recalled_at` are `mutable
+std::atomic`, so `touch_nolock()` is `const` and legal under a shared lock.
+Don't mutate anything else from a shared section.
+
+### Editing headers? The build may not notice (fixed, but know why)
+Nearly the whole engine is in `include/*.h`. setuptools only stat-checks the
+listed `.cpp` sources, so before `depends=glob("include/*.h")` was added to
+`setup.py`, an incremental `build_ext` after a header edit reused stale objects
+and produced a build that looked fresh but contained none of the changes. If you
+ever see a change "not take effect", `rm -rf build` and rebuild.
+
 ### Max elements per index (adaptive since v0.15.3)
 Each modality index starts at `INITIAL_MAX_ELEMENTS = 4096` and grows on demand: `reserve()` calls `resizeIndex()` (doubling) before any insert exceeds capacity. There is no hard ceiling — indices grow to fit whatever you store. `resizeIndex` is **not thread-safe**, so `reserve()` runs before `parallel_add` for the full batch size, never from inside it.
 
@@ -511,7 +528,7 @@ When adding a new feature to Feather DB, touch these files **in order**:
 
 | Issue | Details |
 |-------|---------|
-| No concurrent writes | HNSW is not thread-safe for simultaneous `addPoint` calls |
+| Writes are serialized (reads are not) | `mutex_` is a `std::shared_mutex`: retrieval + const accessors take it **shared** (concurrent), mutations take it **exclusively** (one writer at a time, and no reader runs alongside). Salience (`recall_count`/`last_recalled_at`) is `mutable std::atomic` so a query can record its hit under the shared lock. |
 | Soft deletes reclaimed on compaction | `forget()`/`purge()` mark vectors deleted; space is reclaimed by `compact()` or `set_auto_compact(ratio)` (Phase 7) |
 | int8 quantization (two modes) | `set_quantized()` shrinks the file; `set_int8_ram()` shrinks RAM (~1.7×, opt-in, lossy) via `Int8L2Space` |
 | `tags_json` is a raw string | Tag filtering uses substring search, not JSON parsing |

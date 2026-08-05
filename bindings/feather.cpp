@@ -50,8 +50,16 @@ PYBIND11_MODULE(core, m) {
         .def_readwrite("source",          &feather::Metadata::source)
         .def_readwrite("content",         &feather::Metadata::content)
         .def_readwrite("tags_json",       &feather::Metadata::tags_json)
-        .def_readwrite("recall_count",    &feather::Metadata::recall_count)
-        .def_readwrite("last_recalled_at",&feather::Metadata::last_recalled_at)
+        // Atomic members: expose as properties (def_readwrite cannot bind an
+        // std::atomic, which is neither copyable nor assignable from Python).
+        .def_property("recall_count",
+            [](const feather::Metadata& m) { return m.recalls(); },
+            [](feather::Metadata& m, uint32_t v) {
+                m.recall_count.store(v, std::memory_order_relaxed); })
+        .def_property("last_recalled_at",
+            [](const feather::Metadata& m) { return m.recalled_at(); },
+            [](feather::Metadata& m, uint64_t v) {
+                m.last_recalled_at.store(v, std::memory_order_relaxed); })
         .def_readwrite("namespace_id",    &feather::Metadata::namespace_id)
         .def_readwrite("entity_id",       &feather::Metadata::entity_id)
         .def_readwrite("attributes",      &feather::Metadata::attributes)
@@ -142,6 +150,7 @@ PYBIND11_MODULE(core, m) {
             auto buf = vec.request();
             const float* ptr = static_cast<const float*>(buf.ptr);
             std::vector<float> v(ptr, ptr + buf.size);
+            py::gil_scoped_release rel;   // C++ insert runs without the GIL
             db.add(id, v, meta ? *meta : feather::Metadata(), modality);
         }, py::arg("id"), py::arg("vec"),
            py::arg("meta") = std::nullopt,
@@ -182,6 +191,10 @@ PYBIND11_MODULE(core, m) {
             auto buf = q.request();
             const float* ptr = static_cast<const float*>(buf.ptr);
             std::vector<float> query(ptr, ptr + buf.size);
+            // Drop the GIL for the C++ query. DB::search takes the data lock in
+            // shared mode, so N server threads genuinely search in parallel;
+            // holding the GIL here capped the whole process at one core.
+            py::gil_scoped_release rel;
             return db.search(query, k, filter, scoring, modality);
         }, py::arg("q"), py::arg("k") = 5,
            py::arg("filter") = nullptr, py::arg("scoring") = nullptr,
@@ -191,7 +204,7 @@ PYBIND11_MODULE(core, m) {
         .def("link", &feather::DB::link,
              py::arg("from_id"), py::arg("to_id"),
              py::arg("rel_type") = "related_to",
-             py::arg("weight") = 1.0f)
+             py::arg("weight") = 1.0f, py::call_guard<py::gil_scoped_release>())
 
         .def("get_edges",    &feather::DB::get_edges,    py::arg("id"))
         .def("get_incoming", &feather::DB::get_incoming, py::arg("id"))
@@ -201,13 +214,15 @@ PYBIND11_MODULE(core, m) {
              py::arg("threshold")  = 0.80f,
              py::arg("rel_type")   = "related_to",
              py::arg("candidates") = 15,
-             "Auto-create edges between records whose vector similarity exceeds threshold.")
+             "Auto-create edges between records whose vector similarity exceeds threshold.",
+             py::call_guard<py::gil_scoped_release>())
 
         .def("context_chain", [](feather::DB& db, py::array_t<float> q,
                                   size_t k, int hops, const std::string& modality) {
             auto buf = q.request();
             const float* ptr = static_cast<const float*>(buf.ptr);
             std::vector<float> query(ptr, ptr + buf.size);
+            py::gil_scoped_release rel;
             return db.context_chain(query, k, hops, modality);
         }, py::arg("q"), py::arg("k") = 5, py::arg("hops") = 2,
            py::arg("modality") = "text",
@@ -216,18 +231,19 @@ PYBIND11_MODULE(core, m) {
         .def("export_graph_json", &feather::DB::export_graph_json,
              py::arg("namespace_filter") = "",
              py::arg("entity_filter")    = "",
-             "Export graph as D3/Cytoscape-compatible JSON string.")
+             "Export graph as D3/Cytoscape-compatible JSON string.",
+             py::call_guard<py::gil_scoped_release>())
 
         // -- Metadata --
         .def("touch",             &feather::DB::touch,             py::arg("id"))
         .def("get_metadata",      &feather::DB::get_metadata,      py::arg("id"))
-        .def("update_metadata",   &feather::DB::update_metadata,   py::arg("id"), py::arg("meta"))
-        .def("update_importance", &feather::DB::update_importance, py::arg("id"), py::arg("importance"))
+        .def("update_metadata",   &feather::DB::update_metadata,   py::arg("id"), py::arg("meta"), py::call_guard<py::gil_scoped_release>())
+        .def("update_importance", &feather::DB::update_importance, py::arg("id"), py::arg("importance"), py::call_guard<py::gil_scoped_release>())
         .def("get_vector", [](feather::DB& db, uint64_t id, const std::string& modality) {
             auto vec = db.get_vector(id, modality);
             return py::array_t<float>(vec.size(), vec.data());
         }, py::arg("id"), py::arg("modality") = "text")
-        .def("get_all_ids", &feather::DB::get_all_ids, py::arg("modality") = "text")
+        .def("get_all_ids", &feather::DB::get_all_ids, py::arg("modality") = "text", py::call_guard<py::gil_scoped_release>())
         .def("all_ids", &feather::DB::all_ids,
              "Every id that has metadata, across all modalities.")
         .def("modality_names", &feather::DB::modality_names,
@@ -249,6 +265,7 @@ PYBIND11_MODULE(core, m) {
         // -- BM25 keyword search --
         .def("keyword_search", [](feather::DB& db, const std::string& query, size_t k,
                                    feather::SearchFilter* filter) {
+            py::gil_scoped_release rel;
             return db.keyword_search(query, k, filter);
         }, py::arg("query"), py::arg("k") = 10, py::arg("filter") = nullptr,
            "BM25 keyword search over content field. Returns list of SearchResult.")
@@ -263,6 +280,7 @@ PYBIND11_MODULE(core, m) {
             py::buffer_info buf = q.request();
             std::vector<float> query_vec(static_cast<float*>(buf.ptr),
                                          static_cast<float*>(buf.ptr) + buf.size);
+            py::gil_scoped_release rel;
             return db.hybrid_search(query_vec, query, k, rrf_k, filter, scoring, modality);
         }, py::arg("vec"), py::arg("query"), py::arg("k") = 10,
            py::arg("rrf_k") = 60, py::arg("filter") = nullptr,
@@ -272,7 +290,8 @@ PYBIND11_MODULE(core, m) {
         // -- Compact (rebuild HNSW without dead records) --
         .def("compact", &feather::DB::compact,
              "Rebuild HNSW indices removing dead (forgotten/_deleted) records and "
-             "orphaned vectors. Returns count of records removed.")
+             "orphaned vectors. Returns count of records removed.",
+             py::call_guard<py::gil_scoped_release>())
         .def("set_auto_compact", &feather::DB::set_auto_compact, py::arg("ratio"),
              "Auto-rebuild a modality index when its deleted/total ratio crosses "
              "`ratio` after forget/purge/expire. 0 disables (default).")
@@ -298,14 +317,17 @@ PYBIND11_MODULE(core, m) {
 
         // -- Memory lifecycle --
         .def("forget",         &feather::DB::forget,         py::arg("id"),
-             "Soft-delete: remove from search + blank content. Graph shell preserved.")
+             "Soft-delete: remove from search + blank content. Graph shell preserved.",
+             py::call_guard<py::gil_scoped_release>())
         .def("purge",          &feather::DB::purge,          py::arg("namespace_id"),
-             "Hard-delete all nodes in namespace_id. Returns count of removed nodes.")
+             "Hard-delete all nodes in namespace_id. Returns count of removed nodes.",
+             py::call_guard<py::gil_scoped_release>())
         .def("forget_expired", &feather::DB::forget_expired,
-             "Soft-delete all nodes where ttl>0 and now > timestamp+ttl. Returns count.")
+             "Soft-delete all nodes where ttl>0 and now > timestamp+ttl. Returns count.",
+             py::call_guard<py::gil_scoped_release>())
 
         // -- Persistence & info --
-        .def("save", &feather::DB::save)
+        .def("save", &feather::DB::save, py::call_guard<py::gil_scoped_release>())
         .def("size", &feather::DB::size)
         .def("dim",  &feather::DB::dim, py::arg("modality") = "text")
 
