@@ -25,8 +25,12 @@ void Metadata::serialize(std::ostream& os) const {
     // We write links_count=0 so v3/v4 readers see no plain links and don't crash.
     uint16_t links_count = 0;
     os.write(reinterpret_cast<const char*>(&links_count), 2);
-    os.write(reinterpret_cast<const char*>(&recall_count), 4);
-    os.write(reinterpret_cast<const char*>(&last_recalled_at), 8);
+    // Salience counters are atomic — snapshot them into plain values so the
+    // on-disk layout is byte-identical to previous versions.
+    uint32_t rc = recalls();
+    uint64_t lr = recalled_at();
+    os.write(reinterpret_cast<const char*>(&rc), 4);
+    os.write(reinterpret_cast<const char*>(&lr), 8);
 
     // Phase 4: namespace_id, entity_id, attributes
     uint16_t ns_len = static_cast<uint16_t>(namespace_id.size());
@@ -98,8 +102,12 @@ Metadata Metadata::deserialize(std::istream& is) {
             m.edges.push_back({target, "related_to", 1.0f});
         }
     }
-    is.read(reinterpret_cast<char*>(&m.recall_count), 4);
-    is.read(reinterpret_cast<char*>(&m.last_recalled_at), 8);
+    uint32_t rc = 0;
+    is.read(reinterpret_cast<char*>(&rc), 4);
+    m.recall_count.store(rc, std::memory_order_relaxed);
+    uint64_t lr = 0;
+    is.read(reinterpret_cast<char*>(&lr), 8);
+    m.last_recalled_at.store(lr, std::memory_order_relaxed);
 
     // Phase 4: namespace_id, entity_id, attributes
     uint16_t ns_len = 0;

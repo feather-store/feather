@@ -26,7 +26,7 @@ jobs:
     - name: Install build dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install setuptools wheel pybind11 numpy
+        pip install setuptools wheel pybind11 numpy pytest
 
     - name: Build C++ extension
       run: python setup.py build_ext --inplace
@@ -46,6 +46,13 @@ jobs:
         import os, glob
         for f in glob.glob("smoke.feather*"): os.remove(f)
         EOF
+
+    # The tests/ suite (250+ cases: core, graph, filters, BM25/hybrid,
+    # extractors, pipelines, concurrency) was never run in CI — only the
+    # root-level feature scripts below were. Optional LLM-provider deps are not
+    # installed here, so the few tests needing them are deselected.
+    - name: Run pytest suite
+      run: pytest tests -q --deselect tests/test_engine.py::TestProviderInterface::test_provider_str
 
     - name: Run feature test suite
       run: |

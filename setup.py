@@ -1,5 +1,6 @@
 from setuptools import setup, Extension, find_packages
 import pybind11
+import glob
 import sys
 import os
 import platform
@@ -24,6 +25,12 @@ if _machine in ("x86_64", "amd64"):
         if _mode == "avx512":
             _simd_args += ["-DUSE_AVX512", "-mavx512f", "-mavx512dq"]
 
+# Nearly all of the engine lives in headers (include/feather.h alone is the DB).
+# setuptools only stat-checks the listed sources, so without `depends` an
+# incremental `build_ext` silently reuses stale objects after a header edit —
+# you get a build that looks fresh but contains none of your changes.
+_headers = sorted(glob.glob("include/*.h"))
+
 ext_modules = [
     Extension(
         "feather_db.core",
@@ -32,6 +39,7 @@ ext_modules = [
         language="c++",
         extra_compile_args=["-O3", "-std=c++17"] + _simd_args,
         extra_link_args=extra_link_args,
+        depends=_headers,
     ),
 ]
 

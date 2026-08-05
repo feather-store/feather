@@ -96,3 +96,6 @@ real_data/
 # Claude Code session data
 .claude/
 eeee.txt
+
+# local dev venv
+.venv/
