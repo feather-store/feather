@@ -546,20 +546,37 @@ private:
     }
 
     // ── WAL helpers ──────────────────────────────────────────────────
+    // A single WAL record's payload can't plausibly exceed this. The bound is
+    // what stops a corrupt/torn length field from being taken at face value —
+    // see the guard in replay_wal().
+    static constexpr uint32_t MAX_WAL_PAYLOAD = 256u * 1024 * 1024;
+
+    // The WAL handle is held open for the life of the DB. Reopening the file for
+    // every single append cost an open+close syscall pair per record, which is
+    // paid once per item inside add_batch — i.e. on the bulk-ingest hot path.
+    // Each append is still flushed, so the durability characteristics are
+    // unchanged: the bytes reach the OS before the call returns.
+    mutable std::ofstream wal_stream_;
+
     void wal_append(WalOp op, uint64_t id, const std::string& payload) {
         if (wal_path_.empty()) return;
-        std::ofstream wf(wal_path_, std::ios::binary | std::ios::app);
-        if (!wf) return;
+        if (!wal_stream_.is_open()) {
+            wal_stream_.open(wal_path_, std::ios::binary | std::ios::app);
+            if (!wal_stream_) return;
+        }
         auto op_b = static_cast<uint8_t>(op);
         uint32_t plen = static_cast<uint32_t>(payload.size());
-        wf.write(reinterpret_cast<const char*>(&op_b), 1);
-        wf.write(reinterpret_cast<const char*>(&id),   8);
-        wf.write(reinterpret_cast<const char*>(&plen), 4);
-        if (plen > 0) wf.write(payload.data(), plen);
+        wal_stream_.write(reinterpret_cast<const char*>(&op_b), 1);
+        wal_stream_.write(reinterpret_cast<const char*>(&id),   8);
+        wal_stream_.write(reinterpret_cast<const char*>(&plen), 4);
+        if (plen > 0) wal_stream_.write(payload.data(), plen);
+        wal_stream_.flush();   // hand the record to the OS, as close-per-append did
     }
 
     void wal_clear() const {
-        if (!wal_path_.empty()) std::remove(wal_path_.c_str());
+        if (wal_path_.empty()) return;
+        if (wal_stream_.is_open()) wal_stream_.close();
+        std::remove(wal_path_.c_str());
     }
 
     void replay_wal() {
@@ -567,11 +584,27 @@ private:
         std::ifstream wf(wal_path_, std::ios::binary);
         if (!wf) return;
 
+        // Size the file once so each record's declared length can be sanity
+        // checked against what's actually left to read.
+        wf.seekg(0, std::ios::end);
+        const std::streamoff wal_size = wf.tellg();
+        wf.seekg(0, std::ios::beg);
+
         while (true) {
             uint8_t op_b; uint64_t id; uint32_t plen;
             if (!wf.read(reinterpret_cast<char*>(&op_b), 1)) break;
             if (!wf.read(reinterpret_cast<char*>(&id),   8)) break;
             if (!wf.read(reinterpret_cast<char*>(&plen), 4)) break;
+            // Guard BEFORE allocating. A torn or corrupt length field otherwise
+            // becomes a multi-GB std::string: a 13-byte truncated WAL declaring
+            // a 4.29 GB payload drove peak RSS to 1.5 GB and would OOM a
+            // memory-capped container on startup. The base-file loader already
+            // guards dim/element_count exactly this way; the WAL did not.
+            // A bad length means the tail is garbage, so stop replaying here and
+            // keep everything recovered so far.
+            const std::streamoff remaining = wal_size - wf.tellg();
+            if (plen > MAX_WAL_PAYLOAD || static_cast<std::streamoff>(plen) > remaining)
+                break;
             std::string payload(plen, '\0');
             if (plen > 0 && !wf.read(&payload[0], plen)) break;
 
@@ -636,9 +669,8 @@ private:
                 }
             }
         }
-        build_reverse_index();
-        build_secondary_indexes();
-        rebuild_bm25_index();
+        // Derived indexes are built once by load_vectors() after this returns —
+        // rebuilding them here too would do the expensive BM25 pass twice.
     }
 
     static std::string escape_json(const std::string& s) {
@@ -761,7 +793,24 @@ private:
         wal_clear();
     }
 
+    // Open a namespace: read the base .feather (if any), then replay the WAL on
+    // top, then build the derived indexes once over the combined result.
+    //
+    // The base file being absent or unreadable is NOT a reason to skip WAL
+    // replay. A namespace that has never been save()d has no base file at all,
+    // yet its WAL may hold every write it has ever received — which is exactly
+    // the state the throttled-import path leaves a fresh namespace in for up to
+    // FEATHER_IMPORT_SAVE_INTERVAL_S. Returning early there silently discarded
+    // a complete, on-disk WAL and lost every record in it.
     void load_vectors() {
+        read_base_file();
+        replay_wal();          // crash recovery — runs even with no base file
+        build_reverse_index();
+        build_secondary_indexes();
+        rebuild_bm25_index();
+    }
+
+    void read_base_file() {
         std::ifstream f(path_, std::ios::binary);
         if (!f) return;
 
@@ -872,11 +921,6 @@ private:
             }
         }
 
-        build_reverse_index();
-        build_secondary_indexes();
-        rebuild_bm25_index();
-        // Replay any uncommitted WAL entries (crash recovery)
-        replay_wal();
     }
 
 public:
@@ -1346,13 +1390,21 @@ public:
         std::shared_lock<std::shared_mutex> lock(mutex_);
         auto it = modality_indices_.find(modality);
         if (it == modality_indices_.end()) return {};
+        const auto& m_idx = it->second;
         std::vector<uint64_t> ids;
-        ids.reserve(it->second.index->getCurrentElementCount());
+        ids.reserve(std::min(metadata_store_.size(),
+                             m_idx.index->getCurrentElementCount()));
+        // Membership test straight against the label table. This used to call
+        // read_vector_label() in a try/catch — so every record NOT in this
+        // modality cost a thrown-and-caught C++ exception, and every record that
+        // WAS in it cost a full dim-length vector copy that was immediately
+        // discarded. Same result set (getDataByLabel throws on exactly these two
+        // conditions), without the exceptions or the copies.
         for (const auto& [id, _] : metadata_store_) {
-            try {
-                read_vector_label(it->second, id);   // throws if not in this modality
-                ids.push_back(id);
-            } catch (...) {}
+            auto lit = m_idx.index->label_lookup_.find(id);
+            if (lit == m_idx.index->label_lookup_.end())    continue;
+            if (m_idx.index->isMarkedDeleted(lit->second))  continue;
+            ids.push_back(id);
         }
         return ids;
     }

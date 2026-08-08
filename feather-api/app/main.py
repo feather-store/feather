@@ -338,9 +338,19 @@ def delete_namespace(namespace: str):
     return {"namespace": namespace, "deleted": bool(removed)}
 
 
-def _is_dead_record(db, rec_id: int) -> bool:
-    """True if a record is missing, forgotten, or soft-deleted."""
-    meta = db.get_metadata(rec_id)
+def _is_dead_meta(meta) -> bool:
+    """THE definition of "this record no longer exists". Use it everywhere.
+
+    A record can be dead in two different ways and both must always be checked:
+      * `db.forget()` (what DELETE /records/{id} calls) blanks the content and
+        sets source="_forgotten" — it does NOT touch attributes.
+      * The API's soft-delete path sets the "_deleted" attribute.
+
+    Endpoints previously repeated these conditions inline, and one of them
+    (list_records) checked only "_deleted". Deleted records kept appearing in
+    listings forever while every other endpoint 404'd on them. Keep this as the
+    single definition so the endpoints cannot drift apart again.
+    """
     if meta is None:
         return True
     if meta.source == "_forgotten":
@@ -348,6 +358,11 @@ def _is_dead_record(db, rec_id: int) -> bool:
     if meta.get_attribute("_deleted") == "true":
         return True
     return False
+
+
+def _is_dead_record(db, rec_id: int) -> bool:
+    """True if a record is missing, forgotten, or soft-deleted."""
+    return _is_dead_meta(db.get_metadata(rec_id))
 
 
 def _prune_edges_to(db, dead_id: int) -> int:
@@ -461,11 +476,7 @@ def _live_record_count(db) -> int:
     n = 0
     for record_id in _all_record_ids(db):
         meta = db.get_metadata(record_id)
-        if meta is None:
-            continue
-        if meta.source == "_forgotten":
-            continue
-        if meta.get_attribute("_deleted") == "true":
+        if _is_dead_meta(meta):
             continue
         n += 1
     return n
@@ -641,9 +652,7 @@ def get_record(namespace: str, record_id: int):
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
     meta = db.get_metadata(record_id)
-    if meta is None:
-        raise HTTPException(404, f"Record {record_id} not found in namespace '{namespace}'")
-    if meta.source == "_forgotten" or meta.get_attribute("_deleted") == "true":
+    if _is_dead_meta(meta):
         raise HTTPException(404, f"Record {record_id} not found in namespace '{namespace}'")
     return _meta_to_model(meta)
 
@@ -697,9 +706,7 @@ def delete_record(namespace: str, record_id: int):
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
     meta = db.get_metadata(record_id)
-    if meta is None:
-        raise HTTPException(404, f"Record {record_id} not found")
-    if meta.source == "_forgotten" or meta.get_attribute("_deleted") == "true":
+    if _is_dead_meta(meta):
         raise HTTPException(404, f"Record {record_id} not found")
 
     with manager.lock(namespace):
@@ -746,8 +753,7 @@ def batch_delete(namespace: str, req: BatchDeleteRequest):
     with manager.lock(namespace):
         for rid in ids:
             meta = db.get_metadata(rid)
-            if (meta is None or meta.source == "_forgotten"
-                    or meta.get_attribute("_deleted") == "true"):
+            if _is_dead_meta(meta):
                 not_found += 1
                 continue
             db.forget(rid)
@@ -901,7 +907,15 @@ def list_records(namespace: str, limit: int = 50, after: int = -1, modality: str
         meta = db.get_metadata(record_id)
         if meta is None:
             continue
-        if meta.get_attribute("_deleted") == "true":
+        # Must match _is_dead_record() exactly. This listing used to check only
+        # the "_deleted" attribute, but DELETE /records/{id} calls db.forget(),
+        # which marks a record by setting source="_forgotten" and never sets
+        # that attribute. Deleted records therefore kept appearing here forever
+        # while every other endpoint (get/put/delete/stats/schema/graph) treated
+        # them as gone — so a caller would list an id, get a correct 404 on it,
+        # and conclude deletion was broken. The record count never dropped
+        # because the listing was counting tombstones.
+        if _is_dead_meta(meta):
             continue
         results.append(SearchResultItem(
             id=record_id, score=float(meta.importance),
@@ -1119,11 +1133,7 @@ def namespace_schema(namespace: str, sample_limit: int = 8):
     n = 0
     for record_id in db.get_all_ids(modality="text"):
         meta = db.get_metadata(record_id)
-        if meta is None:
-            continue
-        if meta.source == "_forgotten":
-            continue
-        if meta.get_attribute("_deleted") == "true":
+        if _is_dead_meta(meta):
             continue
         n += 1
         if meta.namespace_id:
@@ -1207,9 +1217,7 @@ def top_recalled(namespace: str, limit: int = 10):
     rows = []
     for record_id in db.get_all_ids(modality="text"):
         meta = db.get_metadata(record_id)
-        if meta is None or meta.source == "_forgotten":
-            continue
-        if meta.get_attribute("_deleted") == "true":
+        if _is_dead_meta(meta):
             continue
         rows.append(TopRecalledItem(
             id=record_id,
@@ -1457,9 +1465,7 @@ def namespace_hierarchy(namespace: str):
     counts: dict = {}    # tuple of values -> record_count
     for record_id in db.get_all_ids(modality="text"):
         meta = db.get_metadata(record_id)
-        if meta is None or meta.source == "_forgotten":
-            continue
-        if meta.get_attribute("_deleted") == "true":
+        if _is_dead_meta(meta):
             continue
         path = []
         for lvl in LEVELS:
