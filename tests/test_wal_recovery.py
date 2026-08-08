@@ -100,22 +100,43 @@ def test_corrupt_wal_length_does_not_allocate_wildly(tmp_path):
         fh.write(struct.pack("<Q", 9))            # id
         fh.write(struct.pack("<I", 0xFFFFFF00))   # ~4.29 GB payload (corrupt)
 
-    src = f'''
+    def _load_peak_rss(db_path):
+        """Peak RSS of a child that opens `db_path`, in MB.
+
+        Compared as a DELTA against an identical load with no WAL. Absolute RSS
+        is useless here: baseline (interpreter + numpy + the extension) differs
+        by an order of magnitude across platforms — ~33 MB on macOS vs ~600 MB
+        on the Linux CI runners — so a fixed ceiling just encodes one platform's
+        baseline. The delta isolates what the corrupt record actually cost.
+        """
+        src = f'''
 import sys, resource
 sys.path.insert(0, {REPO!r})
 import feather_db
-db = feather_db.DB.open({path!r}, dim=16)
+db = feather_db.DB.open({db_path!r}, dim=16)
 rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 print(db.size(), rss)
 '''
-    proc = subprocess.run([sys.executable, "-c", src], capture_output=True,
-                          text=True, timeout=180)
-    assert proc.returncode == 0, f"load crashed on corrupt WAL: {proc.stderr[-400:]}"
-    size, rss = proc.stdout.split()
-    assert int(size) == 1, "the valid base record should still load"
-    # ru_maxrss is bytes on macOS, KiB on Linux — normalise to MB and allow slack
-    rss_mb = int(rss) / (1e6 if sys.platform == "darwin" else 1e3)
-    assert rss_mb < 600, f"corrupt length still drove a huge allocation: {rss_mb:.0f} MB"
+        proc = subprocess.run([sys.executable, "-c", src], capture_output=True,
+                              text=True, timeout=180)
+        assert proc.returncode == 0, f"load failed: {proc.stderr[-400:]}"
+        size, rss = proc.stdout.split()
+        # ru_maxrss is bytes on macOS, KiB on Linux
+        return int(size), int(rss) / (1e6 if sys.platform == "darwin" else 1e3)
+
+    size, with_corrupt = _load_peak_rss(path)
+    assert size == 1, "the valid base record should still load"
+
+    os.remove(path + ".wal")                      # same load, nothing to replay
+    _, baseline = _load_peak_rss(path)
+
+    overhead = with_corrupt - baseline
+    # Trusting the 4.29 GB length would show up as GBs of overhead here; the
+    # guard should keep it to noise. Generous bound so this can't flake on a
+    # loaded CI box.
+    assert overhead < 250, (
+        f"corrupt length drove a large allocation: {overhead:.0f} MB over "
+        f"baseline ({with_corrupt:.0f} vs {baseline:.0f} MB)")
 
 
 def test_truncated_wal_keeps_records_written_before_the_tear(tmp_path):
