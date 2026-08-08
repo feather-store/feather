@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cloud — deleted records kept appearing in `GET /v1/{ns}/records` (data bug)
+- **Reported from production:** the listing returned ids that
+  `GET`/`DELETE /v1/{ns}/records/{id}` answered **404** for, and the record
+  count never dropped after a delete. Root cause: `list_records` filtered on
+  **only** the `_deleted` attribute, while `DELETE` calls `db.forget()`, which
+  marks a record by setting `source="_forgotten"` and never touches attributes.
+  Every *other* endpoint (get / put / delete / batch_delete / stats / schema /
+  top_recalled / hierarchy) checked **both** conditions. So deletes genuinely
+  succeeded, the listing kept showing the tombstones forever, and callers
+  retrying against those ids got a correct 404 and concluded deletion was
+  broken. Downstream, pools built from the listing served records for files
+  that no longer existed.
+- **Fixed** and made structural: there is now exactly one definition of "this
+  record is gone" (`_is_dead_meta`), and all **nine** call sites go through it,
+  so the endpoints cannot drift apart again.
+- `tests/test_api_records.py` (new) pins the invariant that every endpoint
+  agrees on which records exist — listing vs. stats vs. per-id fetch vs. all
+  three search paths. Verified to have teeth: 4 of 9 fail against the old code.
+  CI now installs the Cloud API deps so these actually run.
+
+### Engine — the WAL was discarded for namespaces that had never been saved (data loss)
+- **`load_vectors()` returned at `if (!f) return;` — before `replay_wal()`.** A
+  namespace with no base `.feather` therefore threw away a complete, on-disk
+  WAL. That is exactly the state throttled bulk import leaves a *fresh*
+  namespace in for up to `FEATHER_IMPORT_SAVE_INTERVAL_S` (30s default), so a
+  crash in that window silently lost every imported record — while the
+  changelog promised "durable without a full save".
+  **Measured: 0/300 records recovered before, 300/300 after.**
+- **A corrupt WAL length field is no longer taken at face value.** A 13-byte
+  truncated WAL declaring a 4.29 GB payload drove peak RSS to ~1.5 GB building
+  the `std::string` before the read failed — enough to OOM a memory-capped
+  container on startup and make the namespace unloadable. Replay now bounds the
+  length against `MAX_WAL_PAYLOAD` and the bytes actually remaining, and stops
+  at a bad record while keeping everything recovered up to that point.
+  **Measured: peak RSS 1,509 MB → 33 MB.** (The base-file loader already
+  guarded `dim`/`element_count` this way; the WAL never got the same treatment.)
+- **The WAL handle stays open** instead of being reopened for every append —
+  that open+close syscall pair was paid once per item inside `add_batch`, i.e.
+  on the bulk-ingest hot path. Each record is still flushed, so durability is
+  unchanged.
+- Derived indexes are now built once after replay rather than twice.
+
+### Engine — `get_all_ids()` no longer uses exceptions for flow control
+- It called `read_vector_label()` in a `try`/`catch` per record: every record
+  *not* in the queried modality cost a thrown-and-caught C++ exception, and
+  every record that *was* cost a full dim-length vector copy that was
+  immediately discarded. Now a direct lookup against the label table with the
+  same two conditions `getDataByLabel` throws on — identical result set.
+
 ### Engine — concurrent search (readers-writer lock + GIL release)
 - **Queries were serialised twice over:** every `search`/`keyword_search`/
   `hybrid_search` took the DB's single `std::mutex` **exclusively**, and only
