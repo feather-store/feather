@@ -2,10 +2,16 @@ version: "3.9"
 
 services:
   feather-api:
-    build:
-      context: ..            # repo root (so Dockerfile can copy feather source)
-      dockerfile: feather-api/Dockerfile
-    image: feather-db-api:0.9.0
+    # Official multi-arch image (linux/amd64 + linux/arm64), published by
+    # .github/workflows/docker.yml on every version tag.
+    # Pin to a release in production, e.g.
+    #   ghcr.io/feather-store/feather-api:0.16.0
+    #
+    # To build locally from source instead of pulling, uncomment:
+    # build:
+    #   context: ..            # repo root (so Dockerfile can copy feather source)
+    #   dockerfile: feather-api/Dockerfile
+    image: ghcr.io/feather-store/feather-api:latest
     ports:
       - "8000:8000"
     volumes:
