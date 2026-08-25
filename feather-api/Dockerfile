@@ -46,7 +46,12 @@ VOLUME ["/data"]
 # Environment defaults
 ENV FEATHER_DATA_DIR=/data
 ENV FEATHER_DB_DIM=768
-ENV FEATHER_API_KEY=""
+
+# FEATHER_API_KEY is deliberately NOT defaulted here. The app refuses to start
+# without it, so a missing key fails loudly at `docker run` instead of quietly
+# serving an unauthenticated database on the published port:
+#   docker run -e FEATHER_API_KEY="$(openssl rand -hex 32)" ...
+# For a local, unreachable run only: -e FEATHER_DEV_MODE=1
 
 # Health-check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
