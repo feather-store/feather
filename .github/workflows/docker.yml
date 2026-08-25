@@ -1,0 +1,91 @@
+name: Build & Publish Docker Image
+
+# Builds the multi-arch feather-api image (linux/amd64 + linux/arm64) and pushes
+# it to GitHub Container Registry on a version tag:
+#
+#   ghcr.io/<owner>/feather-api:0.16.0   (full version)
+#   ghcr.io/<owner>/feather-api:0.16     (major.minor, moves with patches)
+#   ghcr.io/<owner>/feather-api:0        (major, moves with minors)
+#   ghcr.io/<owner>/feather-api:latest   (most recent tag)
+#
+# workflow_dispatch builds the current default branch as :edge for testing —
+# it never touches :latest or any semver tag.
+#
+# No registry secrets required — uses the built-in GITHUB_TOKEN.
+#
+# One-time manual step after the first publish (GHCR packages are private by
+# default): GitHub → Packages → feather-api → Package settings → Change
+# visibility → Public. Public repos also inherit free OCI storage.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # metadata-action normalizes this to lowercase for GHCR
+  IMAGE_NAME: ${{ github.repository_owner }}/feather-api
+
+jobs:
+  build-and-push:
+    name: build & push multi-arch image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=edge,enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=Feather DB API
+            org.opencontainers.image.description=Feather DB — embedded vector database and living context engine (FastAPI cloud wrapper)
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: feather-api/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify published manifest
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
+          echo "Published manifests for ${IMAGE}:"
+          docker buildx imagetools inspect "${IMAGE}:latest" || \
+            docker buildx imagetools inspect "${IMAGE}:edge"

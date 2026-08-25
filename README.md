@@ -143,6 +143,22 @@ CLI (Rust):
 cargo install feather-db-cli
 ```
 
+Docker (official multi-arch image — amd64 + arm64):
+
+```bash
+docker run -d --name feather \
+  -p 8000:8000 \
+  -e FEATHER_API_KEY="feather-$(openssl rand -hex 16)" \
+  ghcr.io/feather-store/feather-api:latest
+
+curl http://localhost:8000/health   # → {"status":"ok"}
+# Admin SPA: http://localhost:8000/admin/ · Swagger: http://localhost:8000/docs
+```
+
+> Images are published to GHCR on every version tag by
+> `.github/workflows/docker.yml`. Pin a release in production
+> (`ghcr.io/feather-store/feather-api:<version>`).
+
 Build from source:
 
 ```bash
@@ -589,14 +605,24 @@ Standard ANN benchmark. Full sweep results in [`bench/results/`](./bench/results
 
 Feather DB ships with a production-ready FastAPI wrapper and the **Atlas-style
 admin SPA** (custom HTML + Tailwind + Alpine.js — no build step) you can deploy
-on any Linux VM.
+on any Linux VM. No clone needed — pull the official image:
 
 ```bash
-git clone https://github.com/feather-store/feather.git
-cd feather
-FEATHER_API_KEY="feather-$(openssl rand -hex 16)" \
-  docker compose -f feather-api/docker-compose.yml up -d --build
+curl -fsSLO https://raw.githubusercontent.com/feather-store/feather/master/feather-api/docker-compose.yml
+FEATHER_API_KEY="feather-$(openssl rand -hex 16)" docker compose up -d
 ```
+
+Or plain `docker run`:
+
+```bash
+docker run -d --name feather \
+  -p 8000:8000 \
+  -v feather-data:/data \
+  -e FEATHER_API_KEY="feather-$(openssl rand -hex 16)" \
+  ghcr.io/feather-store/feather-api:latest
+```
+
+(Contributors building from source: `docker compose -f feather-api/docker-compose.yml up -d --build`.)
 
 | URL | Description |
 |-----|-------------|
