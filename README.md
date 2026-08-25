@@ -107,7 +107,10 @@ See [docs/quickstart.md](docs/quickstart.md) for a self-hosted setup walkthrough
 **Guides:** [Vector dimensions](docs/dimensions.md) · [Bulk operations](docs/bulk-operations.md) (import / delete / upload) · [Integrations](docs/integrations.md)
 
 > **Deployment note**: `feather-api/` runs single-tenant with one shared
-> `FEATHER_API_KEY`. Multi-tenant key isolation + HTTPS are on the roadmap.
+> `FEATHER_API_KEY`, and **refuses to start without it** — an unset key would
+> leave every namespace readable and deletable by anyone who can reach the
+> port. For a local no-auth run, set `FEATHER_DEV_MODE=1` explicitly.
+> Multi-tenant key isolation + HTTPS are on the roadmap.
 
 ---
 

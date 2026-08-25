@@ -18,7 +18,8 @@ Endpoints:
   POST /v1/{namespace}/save             — flush to disk
 
 Authentication: X-API-Key header (set FEATHER_API_KEY env var).
-If FEATHER_API_KEY is unset, auth is disabled (dev mode).
+Startup fails if FEATHER_API_KEY is unset. To run without auth locally, set
+FEATHER_DEV_MODE=1 explicitly — never on a reachable host.
 """
 
 import os
@@ -149,11 +150,36 @@ def _root():
 # ─────────────────────────────────────────────
 # Auth middleware
 # ─────────────────────────────────────────────
-API_KEY = os.getenv("FEATHER_API_KEY", "")
+API_KEY  = os.getenv("FEATHER_API_KEY", "")
+DEV_MODE = os.getenv("FEATHER_DEV_MODE", "").lower() in ("1", "true", "yes")
+
+# Fail closed. Running without a key leaves every namespace readable AND
+# deletable by anyone who can reach the port — so an unset key is a startup
+# error, not a silent downgrade to open access. Opting out has to be explicit
+# and has to be visible in the process environment, which is why it's a
+# separate variable rather than an empty-key sentinel: the official container
+# image ships FEATHER_API_KEY="" by default, and that default must not be
+# the thing that decides whether auth is on.
+if not API_KEY and not DEV_MODE:
+    raise RuntimeError(
+        "FEATHER_API_KEY is not set — refusing to start with authentication "
+        "disabled.\n"
+        "  Production:  set FEATHER_API_KEY=<a strong random key>\n"
+        "  Local dev:   set FEATHER_DEV_MODE=1 to run without auth "
+        "(never do this on a reachable host)."
+    )
+
+if DEV_MODE and not API_KEY:
+    logger.warning(
+        "FEATHER_DEV_MODE=1 and no FEATHER_API_KEY: authentication is DISABLED. "
+        "Every endpoint, including delete and purge, is open to anyone who can "
+        "reach this port."
+    )
+
 
 def verify_api_key(x_api_key: str = Header(default="")):
     if not API_KEY:
-        return   # dev mode — no key required
+        return   # dev mode — explicitly opted in via FEATHER_DEV_MODE
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 

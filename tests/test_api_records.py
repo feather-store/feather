@@ -36,6 +36,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("FEATHER_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("FEATHER_DB_DIM", str(DIM))
     monkeypatch.delenv("FEATHER_API_KEY", raising=False)
+    monkeypatch.setenv("FEATHER_DEV_MODE", "1")   # no-auth now has to be explicit
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
     # Drop cached modules so the patched env is picked up per test.

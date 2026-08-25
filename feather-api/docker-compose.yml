@@ -19,9 +19,13 @@ services:
     environment:
       FEATHER_DATA_DIR: /data
       FEATHER_DB_DIM: "768"
-      # REQUIRED — set FEATHER_API_KEY in your environment or a .env file.
-      # If unset the API starts in dev mode (no auth). Never commit a real key.
-      FEATHER_API_KEY: "${FEATHER_API_KEY:-}"
+      # REQUIRED. The container refuses to start without it — an unset key
+      # would otherwise mean an open vector store on a published port. `?err`
+      # (not `:-`) fails the compose run here rather than at container start,
+      # so the error names the missing variable. Never commit a real key.
+      FEATHER_API_KEY: "${FEATHER_API_KEY:?set FEATHER_API_KEY (e.g. `openssl rand -hex 32`), or set FEATHER_DEV_MODE=1 for a local no-auth run}"
+      # Local, unreachable hosts only — skips auth entirely.
+      FEATHER_DEV_MODE: "${FEATHER_DEV_MODE:-}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",

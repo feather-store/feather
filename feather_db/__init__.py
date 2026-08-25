@@ -47,4 +47,4 @@ __all__ = [
     "OllamaProvider", "GeminiProvider",
     "ContextEngine",
 ]
-__version__ = "0.16.0"
+__version__ = "0.17.0"

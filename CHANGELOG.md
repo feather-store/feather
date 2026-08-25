@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.17.0] — 2026-08-25
+
+### Cloud — the API refuses to start without `FEATHER_API_KEY` (security)
+- **Why now:** `v0.17.0` is the first release to publish an *official* container
+  image (`ghcr.io/feather-store/feather-api`). That image sets
+  `ENV FEATHER_API_KEY=""`, and `verify_api_key()` read an empty key as "dev
+  mode — let everyone in". Anyone following the one-command deploy in the
+  README would have got a vector database on a public port with read **and
+  delete** access to every namespace, with nothing anywhere saying so. Shipping
+  that as the official image would have turned a deployment mistake into a
+  distributed default.
+- **Fixed:** an unset key is now a startup error, not a silent downgrade to open
+  access. Running without auth requires setting `FEATHER_DEV_MODE=1`
+  explicitly — a separate variable on purpose, so the image's empty-string
+  default can never be the thing that decides whether auth is on. A configured
+  key always wins over `FEATHER_DEV_MODE`, so a stray env var in a deploy can't
+  open a production host.
+- `feather-api/docker-compose.yml` uses `${FEATHER_API_KEY:?…}` so the failure
+  surfaces at compose time, naming the missing variable, rather than as a
+  container that won't boot.
+- `tests/test_api_auth.py` (new, 6 tests) pins it: unset and empty keys both
+  refuse to start, dev mode still works, a real key is enforced and outranks dev
+  mode, and every destructive route (`POST /vectors`, `DELETE /records/{id}`,
+  `batch_delete`, `DELETE /namespaces/{ns}`) 401s unauthenticated with the data
+  intact afterwards. Verified to have teeth: 2 fail against the old code.
+
+### CI — official multi-arch Docker image on GHCR
+- New `.github/workflows/docker.yml` builds `linux/amd64` + `linux/arm64` and
+  publishes to GHCR on every `v*` tag (`<version>`, `<major.minor>`, `<major>`,
+  `latest`). `workflow_dispatch` builds `:edge` from the default branch without
+  touching stable tags. Auth via the built-in `GITHUB_TOKEN` — no registry
+  secrets to configure or leak. Thanks to **@Ajinkgupta** ([#3]).
+- `feather-api/docker-compose.yml` pulls the published image by default,
+  replacing a stale local `feather-db-api:0.9.0` pin; building from source is
+  kept as a commented option for contributors.
+- Removed the stale root `Dockerfile` (a v0.1.0 placeholder superseded by the
+  multi-stage `feather-api/Dockerfile`).
+
 ### Cloud — deleted records kept appearing in `GET /v1/{ns}/records` (data bug)
 - **Reported from production:** the listing returned ids that
   `GET`/`DELETE /v1/{ns}/records/{id}` answered **404** for, and the record

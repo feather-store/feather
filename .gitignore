@@ -99,3 +99,4 @@ eeee.txt
 
 # local dev venv
 .venv/
+.venv311/
