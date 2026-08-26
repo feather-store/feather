@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### WAL durability — fsync + per-record checksums (foundation)
+- **The gap:** `wal_append()` only `flush()`ed. That hands bytes to the kernel,
+  which survives the *process* dying but **not the machine or container dying** —
+  which is most of what a write-ahead log is for. Every existing recovery test
+  SIGKILLs the process, so the suite passed against the weaker guarantee and
+  structurally could not have caught this.
+- **The other gap:** there was no checksum. The `MAX_WAL_PAYLOAD` length guard
+  catches a *short* tail, but it cannot see a record whose bytes were mangled in
+  place — right size, wrong contents. Such a record replayed as plausible
+  garbage and was then written into the next checkpoint as if it were real:
+  silent corruption promoted to durable corruption.
+- **WAL format v2**: an 8-byte header (`FWAL` + version) and a CRC32 on every
+  record, covering `op + id + plen + payload`. Replay verifies before applying
+  and stops at the last record that still checks out.
+- **v1 WALs still recover.** Replay sniffs the header — `'F'` (0x46) can never be
+  a v1 opcode, so the discrimination is exact, not heuristic. A WAL that a crash
+  already left on disk must not be stranded by the upgrade that fixes crashes.
+- **fsync policy**: one `fsync` per single-record mutation, and **one per batch**
+  for `add_batch()`/`forget_expired()` rather than one per record — the batch
+  either lands or its tail is lost, and the per-record CRC is what lets replay
+  find that boundary. `FEATHER_WAL_SYNC=0` opts out.
+- Measured cost: **`add()` +19%** (0.298s → 0.356s for 2,000 records),
+  **`add_batch()` ~0%** (0.071s → 0.072s for 2,000).
+- Switched the WAL handle from `std::ofstream` to `std::FILE*`: durability needs
+  the underlying descriptor and there is no portable way to reach `fileno()`
+  through an `ofstream`.
+- `tests/test_wal_durability.py` (new, 8 tests): header/version, record framing
+  incl. CRC, a flipped byte caught rather than replayed, intact WAL still
+  replaying in full, torn tail, v1 back-compat, and both fsync modes. Verified
+  to have teeth — **4 of 8 fail against the pre-fix code**.
+
+
 ---
 
 ## [0.17.0] — 2026-08-25

@@ -16,6 +16,13 @@
 #include <thread>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <array>
+#if defined(_WIN32)
+#  include <io.h>          // _commit / _fileno for the WAL fsync
+#else
+#  include <unistd.h>      // fsync
+#endif
 #include "hnswlib.h"
 #include "metadata.h"
 #include "filter.h"
@@ -551,31 +558,119 @@ private:
     // see the guard in replay_wal().
     static constexpr uint32_t MAX_WAL_PAYLOAD = 256u * 1024 * 1024;
 
+    // WAL on-disk format. v1 (<=0.17.0) was a bare record stream with no header
+    // and no checksum; v2 prefixes WAL_MAGIC + version and appends a CRC32 to
+    // every record. replay_wal() sniffs the header so a WAL left behind by an
+    // older build still recovers — the crash it exists for must not be made
+    // worse by the upgrade that fixes it.
+    //   v2 record: [op:1][id:8][plen:4][payload:plen][crc32:4]
+    //   crc32 covers op + id + plen + payload.
+    static constexpr uint32_t WAL_MAGIC   = 0x4C415746u; // "FWAL" little-endian
+    static constexpr uint32_t WAL_VERSION = 2u;
+
+    // CRC-32 (IEEE 802.3, reflected). A length guard only catches a *short*
+    // tail; it cannot see a record whose bytes were mangled in place. Without a
+    // checksum such a record replays as plausible garbage — a corrupt vector or
+    // a metadata blob that deserializes into nonsense — and is then written
+    // into the next checkpoint as if it were real. The checksum turns silent
+    // corruption into a clean stop at the last known-good record.
+    static uint32_t crc32_of(const void* data, size_t len, uint32_t crc = 0xFFFFFFFFu) {
+        static const auto table = [] {
+            std::array<uint32_t, 256> t{};
+            for (uint32_t i = 0; i < 256; ++i) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; ++k)
+                    c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                t[i] = c;
+            }
+            return t;
+        }();
+        const auto* p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < len; ++i)
+            crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+        return crc;
+    }
+
     // The WAL handle is held open for the life of the DB. Reopening the file for
     // every single append cost an open+close syscall pair per record, which is
     // paid once per item inside add_batch — i.e. on the bulk-ingest hot path.
-    // Each append is still flushed, so the durability characteristics are
-    // unchanged: the bytes reach the OS before the call returns.
-    mutable std::ofstream wal_stream_;
+    // A C stdio handle rather than std::ofstream because durability needs the
+    // underlying descriptor: fflush() only pushes into the kernel, and there is
+    // no portable way to reach fileno() through a std::ofstream.
+    mutable std::FILE* wal_file_ = nullptr;
+
+    // fsync policy. Default on: a WAL whose writes are only flush()ed survives
+    // the process dying but NOT the machine or container dying, which is most
+    // of what a write-ahead log is for. FEATHER_WAL_SYNC=0 trades that back for
+    // throughput on hosts where the caller accepts the risk.
+    static bool wal_sync_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("FEATHER_WAL_SYNC");
+            return !(e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N'));
+        }();
+        return on;
+    }
+
+    bool wal_open_for_append() const {
+        if (wal_file_) return true;
+        bool fresh = true;
+        {   // a zero-length or missing file needs the v2 header written first
+            std::ifstream probe(wal_path_, std::ios::binary | std::ios::ate);
+            if (probe && probe.tellg() > 0) fresh = false;
+        }
+        wal_file_ = std::fopen(wal_path_.c_str(), "ab");
+        if (!wal_file_) return false;
+        if (fresh) {
+            uint32_t magic = WAL_MAGIC, ver = WAL_VERSION;
+            std::fwrite(&magic, 4, 1, wal_file_);
+            std::fwrite(&ver,   4, 1, wal_file_);
+        }
+        return true;
+    }
 
     void wal_append(WalOp op, uint64_t id, const std::string& payload) {
         if (wal_path_.empty()) return;
-        if (!wal_stream_.is_open()) {
-            wal_stream_.open(wal_path_, std::ios::binary | std::ios::app);
-            if (!wal_stream_) return;
-        }
+        if (!wal_open_for_append()) return;
+
         auto op_b = static_cast<uint8_t>(op);
         uint32_t plen = static_cast<uint32_t>(payload.size());
-        wal_stream_.write(reinterpret_cast<const char*>(&op_b), 1);
-        wal_stream_.write(reinterpret_cast<const char*>(&id),   8);
-        wal_stream_.write(reinterpret_cast<const char*>(&plen), 4);
-        if (plen > 0) wal_stream_.write(payload.data(), plen);
-        wal_stream_.flush();   // hand the record to the OS, as close-per-append did
+
+        uint32_t crc = 0xFFFFFFFFu;
+        crc = crc32_of(&op_b, 1, crc);
+        crc = crc32_of(&id,   8, crc);
+        crc = crc32_of(&plen, 4, crc);
+        if (plen > 0) crc = crc32_of(payload.data(), plen, crc);
+        crc ^= 0xFFFFFFFFu;
+
+        std::fwrite(&op_b, 1, 1, wal_file_);
+        std::fwrite(&id,   8, 1, wal_file_);
+        std::fwrite(&plen, 4, 1, wal_file_);
+        if (plen > 0) std::fwrite(payload.data(), 1, plen, wal_file_);
+        std::fwrite(&crc,  4, 1, wal_file_);
+        std::fflush(wal_file_);
+    }
+
+    // Push the WAL all the way to stable storage. Separate from wal_append so a
+    // bulk ingest pays one fsync for the whole batch instead of one per record:
+    // the batch either lands or its tail is lost, and the tail is exactly what
+    // the per-record CRC lets replay detect and discard.
+    void wal_sync() const {
+        if (!wal_file_ || !wal_sync_enabled()) return;
+        std::fflush(wal_file_);
+#if defined(_WIN32)
+        _commit(_fileno(wal_file_));
+#else
+        ::fsync(fileno(wal_file_));
+#endif
+    }
+
+    void wal_close() const {
+        if (wal_file_) { std::fclose(wal_file_); wal_file_ = nullptr; }
     }
 
     void wal_clear() const {
         if (wal_path_.empty()) return;
-        if (wal_stream_.is_open()) wal_stream_.close();
+        wal_close();
         std::remove(wal_path_.c_str());
     }
 
@@ -590,6 +685,26 @@ private:
         const std::streamoff wal_size = wf.tellg();
         wf.seekg(0, std::ios::beg);
 
+        // Sniff the format. v2 opens with WAL_MAGIC + version and carries a
+        // CRC32 per record; anything else is a v1 WAL from <=0.17.0, which is
+        // read exactly as before. Upgrading must not strand a WAL that a crash
+        // already left on disk. 'F' (0x46) can never be a v1 opcode, so the
+        // discrimination is unambiguous rather than heuristic.
+        bool has_crc = false;
+        {
+            uint32_t magic = 0;
+            if (wal_size >= 8 && wf.read(reinterpret_cast<char*>(&magic), 4) &&
+                magic == WAL_MAGIC) {
+                uint32_t ver = 0;
+                wf.read(reinterpret_cast<char*>(&ver), 4);
+                if (ver > WAL_VERSION) return;   // written by a newer build
+                has_crc = true;
+            } else {
+                wf.clear();
+                wf.seekg(0, std::ios::beg);      // v1: no header, rewind
+            }
+        }
+
         while (true) {
             uint8_t op_b; uint64_t id; uint32_t plen;
             if (!wf.read(reinterpret_cast<char*>(&op_b), 1)) break;
@@ -603,10 +718,26 @@ private:
             // A bad length means the tail is garbage, so stop replaying here and
             // keep everything recovered so far.
             const std::streamoff remaining = wal_size - wf.tellg();
-            if (plen > MAX_WAL_PAYLOAD || static_cast<std::streamoff>(plen) > remaining)
+            const std::streamoff need = static_cast<std::streamoff>(plen) + (has_crc ? 4 : 0);
+            if (plen > MAX_WAL_PAYLOAD || need > remaining)
                 break;
             std::string payload(plen, '\0');
             if (plen > 0 && !wf.read(&payload[0], plen)) break;
+
+            // Verify before applying. A mangled record must not be replayed and
+            // then persisted into the next checkpoint as though it were real —
+            // stop at the last record that still checks out.
+            if (has_crc) {
+                uint32_t stored = 0;
+                if (!wf.read(reinterpret_cast<char*>(&stored), 4)) break;
+                uint32_t crc = 0xFFFFFFFFu;
+                crc = crc32_of(&op_b, 1, crc);
+                crc = crc32_of(&id,   8, crc);
+                crc = crc32_of(&plen, 4, crc);
+                if (plen > 0) crc = crc32_of(payload.data(), plen, crc);
+                crc ^= 0xFFFFFFFFu;
+                if (crc != stored) break;
+            }
 
             std::istringstream ss(payload);
             auto op = static_cast<WalOp>(op_b);
@@ -960,6 +1091,7 @@ public:
             ws.write(reinterpret_cast<const char*>(vec.data()), vec.size() * 4);
             meta.serialize(ws);
             wal_append(WalOp::ADD, id, ws.str());
+            wal_sync();
         }
 
         auto& m_idx = get_or_create_index(modality, vec.size());
@@ -1040,6 +1172,7 @@ public:
             add_to_bm25_index(ids[i], meta.content, had_prev ? &prev_content : nullptr);
             items.emplace_back(ids[i], vecs[i]);
         }
+        wal_sync();   // one fsync per batch, not per record
         reserve(m_idx, m_idx.index->getCurrentElementCount() + items.size());
         parallel_add(m_idx, items);   // concurrent graph construction
     }
@@ -1074,6 +1207,7 @@ public:
             ws.write(rel_type.data(), rel_len);
             ws.write(reinterpret_cast<const char*>(&weight), 4);
             wal_append(WalOp::LINK, from_id, ws.str());
+            wal_sync();
         }
 
         it->second.edges.push_back({to_id, rel_type, weight});
@@ -1337,6 +1471,7 @@ public:
             std::ostringstream ws;
             meta.serialize(ws);
             wal_append(WalOp::UPDATE, id, ws.str());
+            wal_sync();
         }
         std::string prev_content;
         bool had_prev = false;
@@ -1368,6 +1503,7 @@ public:
             std::ostringstream ws;
             ws.write(reinterpret_cast<const char*>(&importance), 4);
             wal_append(WalOp::UIMP, id, ws.str());
+            wal_sync();
         }
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end()) it->second.importance = importance;
@@ -1753,6 +1889,7 @@ public:
     void forget(uint64_t id) {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         wal_append(WalOp::FORGET, id, "");
+        wal_sync();
         for (auto& [name, m_idx] : modality_indices_) {
             try { m_idx.index->markDelete(id); } catch (...) {}
         }
@@ -1849,6 +1986,7 @@ public:
             }
             ++count;
         }
+        wal_sync();   // one fsync for the whole sweep
         maybe_auto_compact_nolock();
         return count;
     }
@@ -1934,6 +2072,8 @@ public:
         // save() acquires mutex — call save_vectors() directly in destructor
         // (no other threads should be using the DB at destruction time)
         try { save_vectors(); } catch (...) {}
+        wal_close();   // save_vectors() clears the WAL on success; on failure
+                       // the handle still has to be released
     }
 
     size_t dim(const std::string& modality = "text") const {
