@@ -51,6 +51,10 @@ private:
     std::unordered_map<std::string, ModalityIndex> modality_indices_;
     std::string path_;
     std::string wal_path_;
+
+    // Set as the very last act of load_vectors(). Guards the destructor and
+    // save_vectors() so a partially-read file is never written back. See ~DB().
+    bool load_complete_ = false;
     size_t default_dim_ = 768;   // dim reported before any modality index exists
     std::unordered_map<uint64_t, Metadata> metadata_store_;
 
@@ -830,6 +834,14 @@ private:
     // ── Persistence ─────────────────────────────────────────────────
 
     void save_vectors() const {
+        // A DB whose load threw holds a fragment of the file, not its contents.
+        // Writing that back is data loss, so refuse loudly rather than silently
+        // truncating. The destructor checks the same flag before calling in.
+        if (!load_complete_)
+            throw std::logic_error(
+                "refusing to save a DB whose load did not complete — "
+                "this would overwrite " + path_ + " with a partial read");
+
         // Atomic save: write to .tmp, then rename — prevents corruption on crash
         std::string tmp_path = path_ + ".tmp";
         std::ofstream f(tmp_path, std::ios::binary);
@@ -939,6 +951,8 @@ private:
         build_reverse_index();
         build_secondary_indexes();
         rebuild_bm25_index();
+        load_complete_ = true; // last statement: a throw anywhere above leaves
+                               // this false and the destructor won't checkpoint
     }
 
     void read_base_file() {
@@ -968,9 +982,27 @@ private:
             // v3/v4/v5: separate metadata section then modality indices
             uint32_t meta_count;
             f.read((char*)&meta_count, 4);
+            // A corrupt count is a loop trip count, so an absurd value means
+            // meta_count iterations of deserialize() against a stream that ran
+            // out — each one allocating from garbage lengths. Observed: a forged
+            // count of 0xFFFFFF00 left the process spinning for >10 minutes
+            // instead of failing. The smallest possible record is id(8) plus a
+            // minimal Metadata, so anything claiming more records than there are
+            // bytes left is corrupt by arithmetic, not by heuristic.
+            {
+                const std::streamoff here = f.tellg();
+                f.seekg(0, std::ios::end);
+                const std::streamoff end = f.tellg();
+                f.seekg(here, std::ios::beg);
+                if (static_cast<std::streamoff>(meta_count) > (end - here) / 8)
+                    throw std::runtime_error(
+                        "corrupt .feather: metadata count " + std::to_string(meta_count) +
+                        " exceeds remaining file size");
+            }
             for (uint32_t i = 0; i < meta_count; ++i) {
                 uint64_t id;
-                f.read((char*)&id, 8);
+                if (!f.read((char*)&id, 8))
+                    throw std::runtime_error("corrupt .feather: truncated metadata section");
                 metadata_store_[id] = Metadata::deserialize(f);
             }
             uint32_t modal_count;
@@ -2069,9 +2101,21 @@ public:
         save_vectors();
     }
     ~DB() {
-        // save() acquires mutex — call save_vectors() directly in destructor
-        // (no other threads should be using the DB at destruction time)
-        try { save_vectors(); } catch (...) {}
+        // Only checkpoint a DB whose load actually completed. If load_vectors()
+        // threw, `this` holds a HALF-PARSED view of the file — some records
+        // read, the rest never reached — and save_vectors() would serialise
+        // that fragment over the very file it failed to read, then wal_clear()
+        // the log that could have rebuilt it. DB::open() builds a unique_ptr,
+        // so a throw inside load unwinds straight into this destructor: the
+        // failure path and the destroy-the-evidence path were the same path.
+        //
+        // Reproduced: a .feather truncated to 60% left a 16 KB
+        // `<path>.tmp` behind — the destructor had begun rewriting the file
+        // from the fragment and only crashed before reaching std::rename.
+        // Whether the original survived was down to where the crash landed.
+        if (load_complete_) {
+            try { save_vectors(); } catch (...) {}
+        }
         wal_close();   // save_vectors() clears the WAL on success; on failure
                        // the handle still has to be released
     }

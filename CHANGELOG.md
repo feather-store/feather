@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### A failed `open()` destroyed the file it failed to read (data loss)
+- `DB::open()` builds a `unique_ptr<DB>`. When `load_vectors()` threw, the
+  pointer unwound straight into `~DB()`, which ran `save_vectors()`
+  unconditionally — serialising a **half-parsed** view of the file back over the
+  file, then `wal_clear()`ing the log that could have rebuilt it. The failure
+  path and the destroy-the-evidence path were the same path.
+- **Reproduced**: a `.feather` truncated to 60% left a 16 KB `<path>.tmp`
+  behind and then SIGSEGV'd. The original survived only because the crash landed
+  *before* `std::rename` — a corruption that failed cleanly would have completed
+  the rename and taken the data with it.
+- **Fixed** with a `load_complete_` flag set as the last statement of
+  `load_vectors()`. The destructor checks it, and `save_vectors()` now throws
+  `std::logic_error` rather than silently truncating. Truncated-file opens went
+  from **SIGSEGV (rc=139)** to a clean `RuntimeError` with the input
+  **byte-identical** and no `.tmp` left behind.
+- Only reachable from the `open()` unwind: `bindings/feather.cpp:141` binds `DB`
+  with `py::nodelete`, so `~DB()` never runs from Python.
+
+### An absurd metadata count spun instead of failing
+- `meta_count` (`feather.h:969`) is a loop trip count and was unbounded — the
+  v7+ loader guards `dim` and `element_count` this way, the v3–v5 metadata
+  section did not. A forged `0xFFFFFF00` left the process spinning for **over
+  ten minutes**, allocating from garbage lengths on a stream that had already
+  run out.
+- **Fixed** by rejecting any count larger than the remaining bytes can hold —
+  arithmetic, not heuristic — plus a read check per record. Now **0 seconds**.
+- Found while independently verifying a multi-agent audit; the agents did not
+  catch this one.
+
+### `tests/test_open_failure_safety.py` (new, 7 tests)
+Truncation at 30/60/90%, no `.tmp` residue, the WAL surviving a failed load,
+the absurd-count timeout, and the healthy open/save path still working.
+Verified to have teeth: **5 of 7 fail against the pre-fix code**.
+
+
 ### WAL durability — fsync + per-record checksums (foundation)
 - **The gap:** `wal_append()` only `flush()`ed. That hands bytes to the kernel,
   which survives the *process* dying but **not the machine or container dying** —

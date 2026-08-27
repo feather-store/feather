@@ -480,6 +480,21 @@ Every `search()` increments `recall_count` for all returned records. Call `touch
 ### Import cache when recompiling C++ `.so`
 `importlib.reload()` does NOT reload compiled `.so` files. Start a fresh Python process to pick up recompiled bindings.
 
+### `load_complete_` — why the destructor is guarded
+`~DB()` only checkpoints when `load_complete_` is true, and `save_vectors()`
+throws `std::logic_error` otherwise. `DB::open()` holds a `unique_ptr`, so a
+throw inside `load_vectors()` unwinds directly into the destructor — without the
+flag, a file that failed to parse got a half-parsed fragment written back over
+it and its WAL cleared. If you add an early return or a new throw site in the
+load path, `load_complete_ = true` must stay the **last** statement of
+`load_vectors()`; anything after it is code that ran on a DB already declared
+loaded.
+
+Corollary for new format-reading code: every count read off disk is a loop trip
+count. Bound it against the bytes actually remaining before looping (see
+`meta_count` at `feather.h:969` and the `dim`/`element_count` guards below it),
+or a corrupt file becomes a hang rather than an error.
+
 ### WAL durability — what the guarantee actually is
 The WAL is format **v2**: an 8-byte header (`FWAL` + version) then records of
 `[op:1][id:8][plen:4][payload][crc32:4]`. Two rules if you touch it:
