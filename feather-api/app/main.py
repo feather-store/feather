@@ -915,9 +915,15 @@ def set_quantize(namespace: str, req: QuantizeRequest):
 
 @app.get("/v1/{namespace}/records", tags=["records"],
          dependencies=[Depends(verify_api_key)])
-def list_records(namespace: str, limit: int = 50, after: int = -1, modality: str = "text"):
-    """Cursor-based record listing. Returns up to `limit` records with id > `after`.
-    Default after=-1 so a record with id 0 appears on the first page."""
+def list_records(namespace: str, limit: int = 50, after: int = -1,
+                 modality: str = "text", include_deleted: bool = False):
+    """Cursor-based record listing. Returns up to `limit` LIVE records with
+    id > `after`. Default after=-1 so a record with id 0 appears on the first page.
+
+    Pass include_deleted=true to see tombstones as well; they carry
+    `"deleted": true` in the response so callers never have to recognise the
+    internal sentinel.
+    """
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
@@ -926,34 +932,53 @@ def list_records(namespace: str, limit: int = 50, after: int = -1, modality: str
     # List by metadata id (not a single modality index) so records whose
     # vectors live under a non-"text" modality still show up.
     all_ids = sorted(_all_record_ids(db))
-    page_ids = [i for i in all_ids if i > after][:limit]
 
+    # Filter BEFORE truncating, never after. Slicing to `limit` first and then
+    # dropping the dead rows means a page that happens to be all tombstones
+    # comes back EMPTY — the caller reads zero rows and concludes the namespace
+    # is empty. Measured on 47 live records behind 127 tombstones: limit=10, 50
+    # and 100 each returned 0 rows, and only limit=174 (a full over-fetch)
+    # returned all 47. Tombstones must cost the caller neither page slots nor
+    # whole pages, so the scan walks past them and keeps going until it has
+    # `limit` live records or runs out of ids.
     results = []
-    for record_id in page_ids:
+    last_seen = after
+    for record_id in all_ids:
+        if record_id <= after:
+            continue
+        last_seen = record_id
         meta = db.get_metadata(record_id)
         if meta is None:
             continue
-        # Must match _is_dead_record() exactly. This listing used to check only
-        # the "_deleted" attribute, but DELETE /records/{id} calls db.forget(),
-        # which marks a record by setting source="_forgotten" and never sets
-        # that attribute. Deleted records therefore kept appearing here forever
-        # while every other endpoint (get/put/delete/stats/schema/graph) treated
-        # them as gone — so a caller would list an id, get a correct 404 on it,
-        # and conclude deletion was broken. The record count never dropped
-        # because the listing was counting tombstones.
-        if _is_dead_meta(meta):
+        # Must match _is_dead_record() exactly. DELETE /records/{id} calls
+        # db.forget(), which marks a record by setting source="_forgotten";
+        # a listing that checked only the "_deleted" attribute kept showing
+        # tombstones forever while every other endpoint 404'd them.
+        dead = _is_dead_meta(meta)
+        if dead and not include_deleted:
             continue
-        results.append(SearchResultItem(
+        item = SearchResultItem(
             id=record_id, score=float(meta.importance),
             metadata=_meta_to_model(meta)
-        ))
+        )
+        results.append((item, dead))
+        if len(results) >= limit:
+            break
 
-    next_cursor = page_ids[-1] if page_ids else after
+    has_more = bool(all_ids) and all_ids[-1] > last_seen
+    payload = []
+    for item, dead in results:
+        row = item.model_dump() if hasattr(item, "model_dump") else item.dict()
+        # An explicit boolean, so no client has to know the "_forgotten" string.
+        if include_deleted:
+            row["deleted"] = dead
+        payload.append(row)
+
     return {
-        "results": results,
-        "count": len(results),
-        "next_cursor": next_cursor,
-        "has_more": len(page_ids) == limit,
+        "results": payload,
+        "count": len(payload),
+        "next_cursor": last_seen,
+        "has_more": has_more,
     }
 
 

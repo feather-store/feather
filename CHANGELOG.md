@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tombstones spent the caller's page budget — and the first fix made it worse
+- Filed by the dev team against 0.16.0. `GET /records` counted deleted records
+  against `limit`, so a paging client received mostly ghosts: on a namespace of
+  47 live records behind 127 tombstones, `limit=10` returned 2 live rows and
+  `limit=100` returned 25. Correctness required over-fetching the entire
+  history.
+- v0.17.0 excluded tombstones from the listing — but filtered them **after**
+  slicing to `limit`. A page whose ids happened to all be tombstones therefore
+  came back **empty**: measured, `limit=10/50/100` each returned **0 rows**,
+  and only `limit=174` returned the 47 live records. That is worse than the
+  original bug, because a caller reads zero rows and concludes the namespace is
+  empty rather than under-filled.
+- **Fixed** by filtering before truncating: the scan walks past tombstones and
+  keeps going until it has `limit` live records or runs out of ids. `has_more`
+  and `next_cursor` now come from the scan rather than the raw slice, so a
+  trailing run of tombstones no longer advertises a page that isn't there.
+- **`include_deleted=true`** added as an explicit opt-in; those rows carry
+  `"deleted": true` so no client has to recognise the internal `"_forgotten"`
+  sentinel — the team asked for exactly this, and the sentinel is due to be
+  replaced by a real flag byte in format v10 anyway.
+- Verified end-to-end against a running uvicorn server over real HTTP, not just
+  the test client: their exact reproduction, all four documented findings, and
+  a full paged walk returning each of 47 live records exactly once across 7
+  pages — before and after a server restart.
+- Two findings needed no code: `POST /v1/{ns}/compact` already exists, and the
+  stats route is `/v1/namespaces/{ns}/stats`, not `/v1/{ns}/stats`.
+- 5 new tests in `tests/test_api_records.py`; **3 of 5 fail against the
+  pre-fix code**. Suite 287 -> 292.
+
+
 ### A failed `open()` destroyed the file it failed to read (data loss)
 - `DB::open()` builds a `unique_ptr<DB>`. When `load_vectors()` threw, the
   pointer unwound straight into `~DB()`, which ran `save_vectors()`

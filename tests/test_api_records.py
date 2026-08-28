@@ -183,3 +183,75 @@ def test_deleted_records_do_not_come_back_in_any_search_path(client):
         assert r.status_code == 200, f"{path}: {r.text}"
         ids = [item["id"] for item in r.json()["results"]]
         assert 2 not in ids, f"deleted record resurfaced via {path}"
+
+
+# ── Pagination must not be spent on tombstones ────────────────────────────
+# Filed by the dev team against 0.16.0: tombstones were interleaved with live
+# records and counted against `limit`, so a paging client received mostly
+# ghosts. The first fix excluded them from the listing — but excluded them
+# AFTER slicing to `limit`, which turned "your page is full of ghosts" into
+# "your page is empty". Measured on 47 live records behind 127 tombstones:
+# limit=10/50/100 each returned 0 rows. Filtering has to happen before the cut.
+
+def _seed_churned(client, live=8, deleted=12):
+    """Deleted ids sort BEFORE live ones, so a naive slice sees only tombstones."""
+    for rid in range(deleted + live):
+        _add(client, rid, content=f"record {rid}")
+    for rid in range(deleted):
+        assert client.delete(f"/v1/{NS}/records/{rid}").status_code == 200
+    return deleted, live
+
+
+def test_a_small_page_returns_live_records_not_an_empty_page(client):
+    """The regression: every early id is a tombstone, so slicing first yields 0."""
+    _seed_churned(client, live=8, deleted=12)
+    rows = _list_ids(client, limit=5)
+    assert len(rows) == 5, f"page of 5 returned {len(rows)} rows — tombstones ate the page"
+    assert all(r >= 12 for r in rows), f"a tombstone was returned: {rows}"
+
+
+def test_every_page_size_sees_all_live_records(client):
+    """Correctness must not depend on over-fetching. Before the fix only a
+    limit >= total-ever-written returned the full live set."""
+    deleted, live = _seed_churned(client, live=8, deleted=12)
+    for limit in (1, 3, 5, 8, 20, 100):
+        rows = _list_ids(client, limit=limit)
+        assert len(rows) == min(limit, live), (
+            f"limit={limit} returned {len(rows)} rows, expected {min(limit, live)}")
+
+
+def test_paging_through_a_churned_namespace_yields_each_live_record_once(client):
+    deleted, live = _seed_churned(client, live=8, deleted=12)
+    seen, cursor, guard = [], -1, 0
+    while guard < 50:
+        guard += 1
+        r = client.get(f"/v1/{NS}/records", params={"limit": 3, "after": cursor})
+        body = r.json()
+        seen += [x["id"] for x in body["results"]]
+        if not body["has_more"]:
+            break
+        cursor = body["next_cursor"]
+    assert sorted(seen) == list(range(12, 20)), f"paging lost or duplicated records: {seen}"
+    assert len(seen) == len(set(seen)), "a record was returned on two pages"
+
+
+def test_include_deleted_is_opt_in_and_flags_rows_explicitly(client):
+    """The team asked not to have to recognise an undocumented sentinel."""
+    _seed_churned(client, live=3, deleted=2)
+    r = client.get(f"/v1/{NS}/records", params={"limit": 100, "include_deleted": "true"})
+    rows = r.json()["results"]
+    assert len(rows) == 5, "include_deleted=true should surface tombstones too"
+    flags = {row["id"]: row.get("deleted") for row in rows}
+    assert flags[0] is True and flags[1] is True, "tombstones not flagged deleted=true"
+    assert flags[2] is False, "live record wrongly flagged deleted"
+
+
+def test_has_more_is_false_once_the_live_records_run_out(client):
+    """A trailing run of tombstones must not advertise another page."""
+    for rid in range(10):
+        _add(client, rid)
+    for rid in range(5, 10):
+        client.delete(f"/v1/{NS}/records/{rid}")
+    body = client.get(f"/v1/{NS}/records", params={"limit": 50}).json()
+    assert [x["id"] for x in body["results"]] == [0, 1, 2, 3, 4]
+    assert body["has_more"] is False, "claimed another page when only tombstones remain"
