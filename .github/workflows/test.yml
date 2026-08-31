@@ -55,6 +55,21 @@ jobs:
     # extractors, pipelines, concurrency) was never run in CI — only the
     # root-level feature scripts below were. Optional LLM-provider deps are not
     # installed here, so the few tests needing them are deselected.
+    # The Rust CLI compiles a VENDORED copy of the engine (cargo package cannot
+    # follow paths outside the package root). Left unchecked it drifts: at
+    # v0.17.0 it was 764 lines behind and had none of the WAL recovery, fsync,
+    # checksum or failed-open fixes, so a published CLI would still lose a bulk
+    # import on crash under a version claiming otherwise. Fail the build rather
+    # than ship that.
+    - name: Vendored C++ is in sync with include/
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+      run: |
+        ./scripts/sync-cpp.sh
+        git diff --exit-code feather-cli/cpp/ || {
+          echo "::error::feather-cli/cpp/ is out of sync — run ./scripts/sync-cpp.sh and commit"
+          exit 1
+        }
+
     - name: Run pytest suite
       run: pytest tests -q --deselect tests/test_engine.py::TestProviderInterface::test_provider_str
 

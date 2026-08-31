@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.18.0] — 2026-08-31
+
+Six data-correctness fixes, four of which could lose or corrupt data, plus the
+integration feedback from two teams running Feather in anger. Everything below
+was reproduced before it was fixed and verified by reverting the fix and
+watching the new tests fail.
+
+### Also in this release
+- **The Rust CLI's vendored engine is now generated, not drifted.**
+  `feather-cli/cpp/` had fallen 764 lines behind `include/` and contained none of
+  the WAL recovery, fsync, checksum, failed-open or salience fixes — a published
+  CLI would still have lost a bulk import on crash under a version whose notes
+  said otherwise. `scripts/sync-cpp.sh` regenerates it and CI now fails on any
+  diff. (The copy exists because `cargo package` will not follow paths outside
+  the package root, so `build.rs` cannot compile against `../../include`.)
+
+
 ### Search no longer mutates what it returns, and the real cosine is available
 Two further findings from the same integration report, benchmarked against
 Qdrant 1.19.0 holding identical L2-normalised vectors with numpy as the

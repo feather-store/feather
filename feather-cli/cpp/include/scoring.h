@@ -31,7 +31,7 @@ public:
         // e.g., recall=0 -> factor=1.0
         //       recall=10 -> factor=3.4
         //       recall=100 -> factor=5.6
-        float stickiness = 1.0f + std::log(1.0f + meta.recall_count);
+        float stickiness = 1.0f + std::log(1.0f + static_cast<float>(meta.recalls()));
         
         double age_days = age_seconds / 86400.0;
         

@@ -862,11 +862,28 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         readBinaryPOD(input, max_elements_);
         readBinaryPOD(input, cur_element_count);
 
+        // Fit capacity to the actual data and ignore any (possibly corrupt or
+        // inflated) on-disk max_elements, so a forged header can't trigger a
+        // giant allocation. Growth after load is handled by resizeIndex() on
+        // the next insert.
         size_t max_elements = max_elements_i;
         if (max_elements < cur_element_count)
-            max_elements = max_elements_;
+            max_elements = cur_element_count;
+        if (max_elements < 1) max_elements = 1;
         max_elements_ = max_elements;
         readBinaryPOD(input, size_data_per_element_);
+
+        // The persisted base layer (cur_element_count elements) must actually be
+        // present in the stream; reject truncated/forged headers up front.
+        {
+            std::streampos _cur = input.tellg();
+            input.seekg(0, std::ios::end);
+            std::streamoff _rem = (input.tellg() >= _cur) ? (input.tellg() - _cur) : -1;
+            input.seekg(_cur);
+            if (_rem >= 0 &&
+                (uint64_t)cur_element_count * (uint64_t)size_data_per_element_ > (uint64_t)_rem)
+                throw std::runtime_error("corrupt index stream: base layer exceeds remaining bytes");
+        }
         readBinaryPOD(input, label_offset_);
         readBinaryPOD(input, offsetData_);
         readBinaryPOD(input, maxlevel_);
