@@ -347,3 +347,75 @@ def test_repeated_identical_import_errors_are_collapsed(client):
     errs = r.json().get("detail", r.json()).get("errors", [])
     assert len(errs) == 1, f"expected the repeats collapsed, got {len(errs)}"
     assert "5 more" in errs[0], f"collapsed message should say how many: {errs[0]}"
+
+
+# ── Findings 6 and 7: the score is not a similarity, and reads mutate ─────
+
+def test_raw_score_returns_exact_cosine(client):
+    """The default score is 1/(1+L2sq) — correct for ranking, but not a
+    similarity. A team benchmarking against Qdrant measured it off by
+    0.046-0.077 with no scoring knob able to recover the true value, and the
+    error changing sign so it could not be calibrated away downstream."""
+    rng = np.random.default_rng(11)
+    vecs = {}
+    for rid in range(12):
+        v = rng.normal(0, 1, DIM).astype(np.float32); v /= np.linalg.norm(v)
+        vecs[rid] = v
+        client.post(f"/v1/{NS}/vectors",
+                    json={"id": rid, "vector": v.tolist(), "metadata": {"content": f"d{rid}"}})
+    q = rng.normal(0, 1, DIM).astype(np.float32); q /= np.linalg.norm(q)
+
+    r = client.post(f"/v1/{NS}/search",
+                    json={"vector": q.tolist(), "k": 3, "raw_score": True, "track": False})
+    assert r.status_code == 200, r.text
+    for item in r.json()["results"]:
+        exact = float(np.dot(q, vecs[item["id"]]))
+        assert item["cosine"] == pytest.approx(exact, abs=1e-5), (
+            f"cosine {item['cosine']} != exact {exact}")
+        # And the default score is demonstrably NOT that number.
+        assert abs(item["score"] - exact) > 1e-3, (
+            "score now equals cosine — this test no longer proves anything")
+
+
+def test_cosine_is_absent_unless_requested(client):
+    _add(client, 1)
+    r = client.post(f"/v1/{NS}/search",
+                    json={"vector": np.random.rand(DIM).tolist(), "k": 1, "track": False})
+    assert r.json()["results"][0]["cosine"] is None
+
+
+def test_track_false_does_not_mutate_recall_count(client):
+    """A read that writes makes evaluation perturb the state it measures, and
+    the inflation is unrecoverable — only the inflated counter is persisted."""
+    for rid in range(6):
+        _add(client, rid)
+    q = np.random.rand(DIM).astype(np.float32).tolist()
+    top = client.post(f"/v1/{NS}/search",
+                      json={"vector": q, "k": 2, "track": False}).json()["results"][0]["id"]
+
+    def rc(i):
+        return client.get(f"/v1/{NS}/records/{i}").json()["recall_count"]
+
+    assert rc(top) == 0
+    for _ in range(3):
+        client.post(f"/v1/{NS}/search", json={"vector": q, "k": 2, "track": False})
+    assert rc(top) == 0, "track=false still recorded a recall"
+
+    for _ in range(2):
+        client.post(f"/v1/{NS}/search", json={"vector": q, "k": 2})
+    assert rc(top) == 2, "default should still track"
+
+
+def test_only_returned_records_are_touched(client):
+    """Salience must mean 'this record was returned', not 'this record was
+    examined'. The filtered path scans the whole indexed candidate set, so a
+    k=5 query over 400 candidates used to increment all 400 — which makes
+    stickiness a constant and collapses adaptive decay."""
+    for rid in range(30):
+        _add(client, rid, content=f"doc {rid}")
+    q = np.random.rand(DIM).astype(np.float32).tolist()
+    client.post(f"/v1/{NS}/search", json={"vector": q, "k": 3})
+
+    touched = [i for i in range(30)
+               if client.get(f"/v1/{NS}/records/{i}").json()["recall_count"] > 0]
+    assert len(touched) == 3, f"k=3 touched {len(touched)} records"

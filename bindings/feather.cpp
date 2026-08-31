@@ -187,7 +187,8 @@ PYBIND11_MODULE(core, m) {
         .def("search", [](feather::DB& db, py::array_t<float> q, size_t k,
                            const feather::SearchFilter* filter,
                            const feather::ScoringConfig* scoring,
-                           const std::string& modality) {
+                           const std::string& modality,
+                           bool record_salience) {
             auto buf = q.request();
             const float* ptr = static_cast<const float*>(buf.ptr);
             std::vector<float> query(ptr, ptr + buf.size);
@@ -195,10 +196,10 @@ PYBIND11_MODULE(core, m) {
             // shared mode, so N server threads genuinely search in parallel;
             // holding the GIL here capped the whole process at one core.
             py::gil_scoped_release rel;
-            return db.search(query, k, filter, scoring, modality);
+            return db.search(query, k, filter, scoring, modality, record_salience);
         }, py::arg("q"), py::arg("k") = 5,
            py::arg("filter") = nullptr, py::arg("scoring") = nullptr,
-           py::arg("modality") = "text")
+           py::arg("modality") = "text", py::arg("record_salience") = true)
 
         // -- Graph --
         .def("link", &feather::DB::link,

@@ -684,10 +684,31 @@ def search_vectors(namespace: str, req: SearchRequest):
     sc = _build_scoring(req)
     _check_query_dim(db, req.vector, req.modality)
 
-    raw = db.search(req.vector, k=req.k, filter=sf, scoring=sc, modality=req.modality)
+    # track=false keeps evaluation and monitoring traffic from mutating the
+    # salience counters it is measuring.
+    raw = db.search(req.vector, k=req.k, filter=sf, scoring=sc,
+                    modality=req.modality, record_salience=req.track)
+
+    cosines = {}
+    if req.raw_score:
+        # The default score is a ranking number, not a similarity: it is
+        # 1/(1+L2_squared), so on unit vectors it compresses cosine into a narrow
+        # band and no scoring knob recovers the original — the error is not even a
+        # constant offset, it changes sign. Compute the real thing from the stored
+        # vector so a caller can threshold something meaningful.
+        q = np.asarray(req.vector, dtype=np.float32)
+        qn = float(np.linalg.norm(q))
+        for r in raw:
+            try:
+                v = np.asarray(db.get_vector(r.id, req.modality), dtype=np.float32)
+                vn = float(np.linalg.norm(v))
+                cosines[r.id] = (float(np.dot(q, v)) / (qn * vn)) if qn and vn else None
+            except Exception:
+                cosines[r.id] = None
 
     items = [
-        SearchResultItem(id=r.id, score=r.score, metadata=_meta_to_model(r.metadata))
+        SearchResultItem(id=r.id, score=r.score, cosine=cosines.get(r.id),
+                         metadata=_meta_to_model(r.metadata))
         for r in raw
     ]
     return SearchResponse(results=items, count=len(items))

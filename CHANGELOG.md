@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Search no longer mutates what it returns, and the real cosine is available
+Two further findings from the same integration report, benchmarked against
+Qdrant 1.19.0 holding identical L2-normalised vectors with numpy as the
+reference.
+
+- **Reads performed writes.** `recall_count` incremented on every record a search
+  *touched*, not the ones it returned. The pre-filtered path scans the whole
+  indexed candidate set, so a `k=5` query over a 400-record namespace credited
+  **all 400** (measured); with scoring enabled the HNSW path fetched `k*3` and
+  credited 15 for 5 returned. Since `stickiness = 1 + ln(1 + recall_count)` is the
+  entire basis of adaptive decay, uniform inflation makes stickiness a constant
+  and collapses decay to recency x importance — **irreversibly**, because only the
+  inflated counter is persisted.
+  Salience now applies **after** truncation, so a recall means "this record was
+  returned". Measured: filtered `k=5` went 400 -> 5 touched, unfiltered with
+  scoring 15 -> 5.
+- **`track=false`** added to search (`record_salience` on the C++ `search()` and
+  the Python binding). Evaluation, benchmarking and monitoring traffic can now
+  read without perturbing the state it measures. Default stays true.
+- **`raw_score=true`** returns `cosine`: the exact cosine similarity, computed
+  from the stored vector. The default `score` is `1/(1+L2_squared)` optionally
+  blended with time decay — correct for ranking (the reporting team measured
+  **100% top-10 agreement with exact cosine on every query**) but it is not a
+  similarity, is off by 0.046-0.077 against one, and cannot be calibrated away
+  because the error changes sign. Verified exact to 3e-9.
+  Both `score` and `cosine` now carry docstrings saying which is which.
+
+4 new tests; suite 299 -> 303.
+
+
 ### Cloud API — stop failing silently (integration feedback)
 Seven issues reported by a team integrating Feather as the vector store for
 creative analysis (~1,260 records at 768d). Every one shared a shape: the server

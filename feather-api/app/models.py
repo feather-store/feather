@@ -57,6 +57,21 @@ class SearchRequest(BaseModel):
                     "first or list records and re-rank client-side.",
     )
     modality: str = "text"
+    track: bool = Field(
+        True,
+        description="Whether this query counts as a recall for the records it "
+                    "returns (feeds adaptive decay). Set false for evaluation, "
+                    "benchmarking and monitoring traffic so a read does not "
+                    "mutate the state it is measuring.",
+    )
+    raw_score: bool = Field(
+        False,
+        description="Also return `cosine`: the true cosine similarity between the "
+                    "query and each stored vector, computed exactly. The default "
+                    "`score` is 1/(1+L2_squared), optionally blended with time "
+                    "decay — useful for ranking, but NOT a similarity, and it "
+                    "must not be thresholded.",
+    )
     # Filters
     namespace_id: Optional[str] = None
     entity_id: Optional[str] = None
@@ -75,7 +90,11 @@ class SearchRequest(BaseModel):
 
 class SearchResultItem(BaseModel):
     id: int
+    # Ranking score: 1/(1+L2_squared), optionally blended with time decay.
+    # Correct for ordering, NOT a similarity — do not threshold it.
     score: float
+    # True cosine similarity, present only when raw_score=true was requested.
+    cosine: Optional[float] = None
     metadata: MetadataOut
 
 

@@ -1648,10 +1648,17 @@ public:
         Metadata metadata;
     };
 
+    // `record_salience` controls whether this query counts as a recall for the
+    // records it touches. Default true (a real user query is evidence of value),
+    // but evaluation, monitoring and the engine's own internal self-queries must
+    // pass false: a read that mutates the state it measures makes benchmarking
+    // meaningless and, worse, permanently corrupts the decay signal — only the
+    // inflated counter is persisted, so the original is unrecoverable.
     std::vector<SearchResult> search(const std::vector<float>& q, size_t k = 5,
                                      const SearchFilter*   filter  = nullptr,
                                      const ScoringConfig*  scoring = nullptr,
-                                     const std::string&    modality = "text") {
+                                     const std::string&    modality = "text",
+                                     bool record_salience = true) {
         // SHARED lock: queries run concurrently with each other. The only
         // mutation here is the salience touch, which goes through Metadata's
         // atomic counters.
@@ -1687,7 +1694,6 @@ public:
                         float diff = q[d] - vec[d];
                         dist += diff * diff;
                     }
-                    touch_nolock(id);
                     float score = scoring
                         ? Scorer::calculate_score(dist, it->second, *scoring, now_ts)
                         : 1.0f / (1.0f + dist);
@@ -1696,6 +1702,15 @@ public:
                 std::sort(results.begin(), results.end(),
                     [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
                 if (results.size() > k) results.resize(k);
+                // Touch AFTER truncation: a recall means "this record was
+                // returned", not "this record was examined". This path scans the
+                // whole indexed candidate set, so touching inside the loop
+                // credited every record in the namespace on every query —
+                // measured, a k=5 search over 400 candidates incremented all 400.
+                // Uniform inflation makes stickiness a constant, which collapses
+                // adaptive decay to recency x importance.
+                if (record_salience)
+                    for (const auto& r : results) touch_nolock(r.id);
                 return results;
             }
         }
@@ -1726,7 +1741,6 @@ public:
 
         while (!res.empty()) {
             auto [dist, id] = res.top(); res.pop();
-            touch_nolock(id);
             auto it = metadata_store_.find(id);
             Metadata meta = (it != metadata_store_.end()) ? it->second : Metadata();
             float score = scoring
@@ -1738,6 +1752,11 @@ public:
         std::sort(results.begin(), results.end(),
             [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
         if (results.size() > k) results.resize(k);
+        // Same rule as the pre-filtered path. With scoring enabled the HNSW walk
+        // fetches k*3 candidates, so touching during the walk credited three
+        // times as many records as were ever returned.
+        if (record_salience)
+            for (const auto& r : results) touch_nolock(r.id);
         return results;
     }
 
