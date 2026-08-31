@@ -255,3 +255,95 @@ def test_has_more_is_false_once_the_live_records_run_out(client):
     body = client.get(f"/v1/{NS}/records", params={"limit": 50}).json()
     assert [x["id"] for x in body["results"]] == [0, 1, 2, 3, 4]
     assert body["has_more"] is False, "claimed another page when only tombstones remain"
+
+
+# ── Integration feedback: the API must not fail silently ──────────────────
+# All five reproduced against v0.17.0 by a team integrating Feather as the
+# vector store for creative analysis. The common thread is silence: the server
+# returned 200 and the caller found out much later, or never.
+
+def test_import_that_stores_nothing_is_not_a_200(client):
+    """A backfill that wrote zero vectors answered a flat 200, so a caller
+    checking the status recorded a successful import of nothing."""
+    _add(client, 1)                                   # establishes dim
+    r = client.post(f"/v1/{NS}/import",
+                    json={"items": [{"id": 99, "vector": [0.1] * 4}]})
+    assert r.status_code == 400, f"stored nothing but returned {r.status_code}"
+    detail = r.json()["detail"]
+    assert detail["inserted"] == 0 and detail["skipped"] == 1
+    assert "dim mismatch" in " ".join(detail["errors"]).lower()
+
+
+def test_partial_import_reports_207_not_200(client):
+    _add(client, 1)
+    good = np.random.rand(DIM).astype(np.float32).tolist()
+    r = client.post(f"/v1/{NS}/import", json={"items": [
+        {"id": 10, "vector": good},
+        {"id": 11, "vector": [0.1] * 4},          # wrong dim
+    ]})
+    assert r.status_code == 207, f"partial import returned {r.status_code}"
+    body = r.json()
+    assert body["inserted"] == 1 and body["skipped"] == 1
+    assert body["partial"] is True
+
+
+def test_unknown_metadata_keys_are_rejected_by_name(client):
+    """They were accepted, reported inserted, and absent on read back. The team
+    only noticed after building a UI and seeing every media URL come back empty."""
+    _add(client, 1)
+    vec = np.random.rand(DIM).astype(np.float32).tolist()
+    r = client.post(f"/v1/{NS}/import", json={"items": [
+        {"id": 2, "vector": vec,
+         "metadata": {"content": "x", "creative_hash": "abc", "creative_url": "https://e/x.jpg"}},
+    ]})
+    assert r.status_code == 400
+    errs = " ".join(r.json()["detail"]["errors"])
+    assert "creative_hash" in errs and "creative_url" in errs, "offending keys not named"
+    assert "attributes" in errs, "error should point at the supported alternative"
+
+    # The same guard on the single-add route.
+    r2 = client.post(f"/v1/{NS}/vectors", json={
+        "id": 3, "vector": vec, "metadata": {"content": "x", "creative_hash": "abc"}})
+    assert r2.status_code == 422, "unknown key accepted on /vectors"
+
+
+def test_a_zero_vector_query_is_rejected(client):
+    """An empty string embeds to exactly this. The engine ranks by L2 and
+    returned confident-looking rows for a query with no direction."""
+    for rid in (1, 2, 3):
+        _add(client, rid)
+    r = client.post(f"/v1/{NS}/search", json={"vector": [0.0] * DIM, "k": 3})
+    assert r.status_code == 400, f"zero-norm query returned {r.status_code}"
+    assert "zero" in r.json()["detail"].lower()
+
+
+def test_stored_vectors_can_be_read_back(client):
+    """Without this, 'find records like this one' had to re-embed text that had
+    already been embedded — an API call and a cost per lookup."""
+    _add(client, 1)
+    plain = client.get(f"/v1/{NS}/records/1").json()
+    assert "vector" not in plain, "vector returned without being asked for"
+
+    withvec = client.get(f"/v1/{NS}/records/1", params={"include_vector": "true"}).json()
+    assert len(withvec["vector"]) == DIM
+
+
+def test_single_get_can_be_read_like_every_other_route(client):
+    """Client code reading record["metadata"]["content"] worked for search hits
+    and silently returned nothing for a single get."""
+    _add(client, 1, content="hello")
+    got = client.get(f"/v1/{NS}/records/1").json()
+    assert got["id"] == 1
+    assert got["metadata"]["content"] == "hello"     # nested, like search
+    assert got["content"] == "hello"                 # flat, as before — non-breaking
+
+
+def test_repeated_identical_import_errors_are_collapsed(client):
+    """A misconfigured provider produced one copy of the same message per item;
+    a 1,000-item import returned 1,000 identical strings."""
+    _add(client, 1)
+    items = [{"id": 900 + i, "metadata": {"content": f"n{i}"}} for i in range(6)]
+    r = client.post(f"/v1/{NS}/import", json={"items": items})
+    errs = r.json().get("detail", r.json()).get("errors", [])
+    assert len(errs) == 1, f"expected the repeats collapsed, got {len(errs)}"
+    assert "5 more" in errs[0], f"collapsed message should say how many: {errs[0]}"

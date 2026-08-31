@@ -186,6 +186,16 @@ def verify_api_key(x_api_key: str = Header(default="")):
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
+# The accepted top-level metadata schema. Anything else is rejected rather than
+# silently discarded — see the import path and MetadataIn.model_config.
+_METADATA_KEYS = {
+    "timestamp", "importance", "type", "source", "content", "tags_json",
+    "namespace_id", "entity_id", "attributes",
+    # accepted on input and ignored (server-owned), but not an error to send back
+    "recall_count", "last_recalled_at", "links",
+}
+
+
 def _meta_from_model(m_in) -> Metadata:
     meta = Metadata()
     meta.timestamp       = m_in.timestamp if m_in.timestamp else int(time.time())
@@ -277,6 +287,20 @@ def _check_query_dim(db, vector, modality: str):
             f"Query vector dim {len(vector)} != index dim {expected} "
             f"for modality '{modality}'",
         )
+    # A zero vector has no direction, so its similarity to anything is undefined
+    # — but the engine ranks by L2 and will happily return confident-looking
+    # rows (measured: top score 0.500 against an all-zero query). An empty
+    # string embeds to exactly this, so it is a plausible client bug rather than
+    # a hypothetical, and a UI will present the result as genuine matches.
+    if vector is not None and len(vector):
+        arr = np.asarray(vector, dtype=np.float32)
+        if not np.any(arr):
+            raise HTTPException(
+                400,
+                "Query vector is all zeros: a zero-norm vector has no direction, "
+                "so similarity against it is undefined. This usually means an "
+                "empty string was embedded.",
+            )
 
 
 # Bounded thread pool so a large auto-embed import fires provider calls
@@ -669,9 +693,26 @@ def search_vectors(namespace: str, req: SearchRequest):
     return SearchResponse(results=items, count=len(items))
 
 
-@app.get("/v1/{namespace}/records/{record_id}", response_model=MetadataOut,
+# No response_model: the route returns the flat metadata fields (unchanged, so
+# existing callers keep working) PLUS `id`, a `metadata` mirror and an optional
+# `vector`. A MetadataOut model would strip exactly those additions.
+@app.get("/v1/{namespace}/records/{record_id}",
          tags=["records"], dependencies=[Depends(verify_api_key)])
-def get_record(namespace: str, record_id: int):
+def get_record(namespace: str, record_id: int, include_vector: bool = False,
+               modality: str = "text"):
+    """Fetch one record.
+
+    `include_vector=true` returns the stored vector. Without it there was no way
+    to get a vector back out, so "find records like this one" and any offline
+    clustering had to RE-EMBED text that had already been embedded — an API call
+    and a cost per lookup, and only correct if the exact embedded text happened
+    to be kept in `content`.
+
+    The response also carries `id` and a `metadata` mirror so it can be read the
+    same way as a search hit or a listing row; those nest under `metadata` while
+    this route returned the metadata object bare, and client code written for one
+    shape silently returned nothing on the other.
+    """
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
@@ -680,7 +721,21 @@ def get_record(namespace: str, record_id: int):
     meta = db.get_metadata(record_id)
     if _is_dead_meta(meta):
         raise HTTPException(404, f"Record {record_id} not found in namespace '{namespace}'")
-    return _meta_to_model(meta)
+
+    model = _meta_to_model(meta)
+    body = model.model_dump() if hasattr(model, "model_dump") else model.dict()
+    # Additive, not a replacement: the flat fields stay so existing callers keep
+    # working, and `metadata` is added so the shape matches every other route.
+    out = dict(body)
+    out["id"] = record_id
+    out["metadata"] = body
+    if include_vector:
+        try:
+            vec = db.get_vector(record_id, modality)
+            out["vector"] = [float(x) for x in vec] if vec is not None and len(vec) else None
+        except Exception:
+            out["vector"] = None
+    return out
 
 
 @app.put("/v1/{namespace}/records/{record_id}", tags=["records"],
@@ -1409,6 +1464,19 @@ def bulk_import(namespace: str, req: ImportRequest):
         try:
             rec_id = int(item["id"])
             meta_data = item.get("metadata") or {}
+            # Reject unknown metadata keys instead of dropping them. Import takes
+            # raw dicts rather than MetadataIn, so nothing validated them: keys
+            # like creative_hash / creative_url were accepted, reported inserted,
+            # and were simply absent on read back. One integration only found out
+            # after building a UI on top and seeing every media URL come back
+            # empty. Custom fields belong in `attributes`, which does persist.
+            unknown = set(meta_data) - _METADATA_KEYS
+            if unknown:
+                raise ValueError(
+                    "unknown metadata key(s): " + ", ".join(sorted(unknown)) +
+                    " — top-level metadata is a fixed schema; put custom fields "
+                    "inside 'attributes' (they are stored as strings)"
+                )
             content = str(meta_data.get("content", ""))
             vec = item.get("vector")
             entry = {"i": i, "id": rec_id, "md": meta_data, "content": content,
@@ -1480,8 +1548,37 @@ def bulk_import(namespace: str, req: ImportRequest):
         # Throttled save instead of a full file rewrite per batch (WAL keeps the
         # data durable in between). Pass flush=true on the final batch to force it.
         _throttled_save(namespace, db, force=req.flush)
-    return ImportResponse(namespace=namespace, inserted=len(ids),
-                          skipped=skipped, embedded=embedded, errors=errors)
+    # Collapse repeated identical errors. A misconfigured provider produced one
+    # copy of the same message per item — a 1,000-item import returned 1,000
+    # identical strings, burying anything item-specific.
+    if errors:
+        seen, deduped = {}, []
+        for e in errors:
+            key = e.split(":", 1)[-1].strip()
+            if key in seen:
+                seen[key] += 1
+            else:
+                seen[key] = 1
+                deduped.append((key, e))
+        errors = [e if seen[k] == 1 else f"{e}  (and {seen[k]-1} more items with the same error)"
+                  for k, e in deduped]
+
+    body = ImportResponse(namespace=namespace, inserted=len(ids), skipped=skipped,
+                          embedded=embedded, errors=errors,
+                          partial=bool(skipped))
+    # The status code has to carry the outcome. A caller that checks the HTTP
+    # status is doing the normal thing, and a flat 200 on a backfill that stored
+    # nothing reads as success — one integration recorded a completed backfill
+    # that wrote zero vectors. 400 when nothing landed, 207 when only some did.
+    if req.items and not ids:
+        raise HTTPException(
+            400,
+            {"message": f"import stored nothing: {skipped} of {len(req.items)} items were skipped",
+             "namespace": namespace, "inserted": 0, "skipped": skipped, "errors": errors},
+        )
+    if skipped:
+        return JSONResponse(status_code=207, content=body.model_dump())
+    return body
 
 
 @app.post("/v1/{namespace}/flush", tags=["records"],

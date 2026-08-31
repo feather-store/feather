@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Cloud API — stop failing silently (integration feedback)
+Seven issues reported by a team integrating Feather as the vector store for
+creative analysis (~1,260 records at 768d). Every one shared a shape: the server
+answered 200 and the caller found out much later, or never.
+
+- **`import` reported success when it stored nothing** *(data loss)*. A backfill
+  that wrote zero vectors returned a flat `200 OK` with `inserted: 0`. Now
+  **400** when nothing landed and **207 Multi-Status** when only some items did,
+  with a `partial` flag on the body. A caller checking the HTTP status is doing
+  the normal thing; the status has to carry the outcome.
+- **Unknown metadata keys were dropped silently** *(data loss)*. Top-level
+  metadata is a fixed schema, and anything else — `creative_hash`,
+  `creative_url` — was accepted, counted as inserted, and simply absent on read
+  back. The reporting team only noticed after building a UI and seeing every
+  media URL come back empty. Unknown keys are now **rejected by name**, on both
+  `/import` (400) and `/vectors` (422), with the error pointing at `attributes`
+  as the supported place for custom fields.
+- **Stored vectors could not be read back** *(functional gap)*. No route exposed
+  them, so "find records like this one" and any offline clustering had to
+  **re-embed text that had already been embedded** — an API call and a cost per
+  lookup. Added `?include_vector=true` to `GET /records/{id}`.
+- **A zero vector returned ranked results** *(correctness)*. An empty string
+  embeds to exactly this, so it is a plausible client bug rather than a
+  hypothetical. A zero-norm vector has no direction, but the engine ranks by L2
+  and returned confident-looking rows (measured: top score 0.500). Now a 400.
+- **Single-record GET had a different shape from every other route.** It
+  returned the metadata object bare while list and search nest it under
+  `metadata`, so client code written for one silently returned nothing on the
+  other. `id` and a `metadata` mirror are now included **additively** — the flat
+  fields stay, so existing callers are unaffected.
+- **Repeated import errors are collapsed.** A misconfigured provider produced one
+  copy of the same message per item; a 1,000-item import returned 1,000
+  identical strings. Duplicates now fold into one line with a count.
+- **The `k` cap is documented** on the field rather than only surfacing as a bare
+  422 from pydantic.
+
+`tests/test_api_records.py` gains 7 tests for these; **all 7 fail against the
+pre-fix code**. Suite 292 -> 299.
+
+
 ### Tombstones spent the caller's page budget — and the first fix made it worse
 - Filed by the dev team against 0.16.0. `GET /records` counted deleted records
   against `limit`, so a paging client received mostly ghosts: on a namespace of

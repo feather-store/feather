@@ -2,7 +2,7 @@
 Pydantic request / response models for Feather DB Cloud API.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any
 from enum import IntEnum
 
@@ -15,6 +15,15 @@ class ContextTypeEnum(IntEnum):
 
 
 class MetadataIn(BaseModel):
+    # Reject unknown top-level keys rather than dropping them. Pydantic's default
+    # ("ignore") accepted e.g. creative_hash / creative_url, returned 200, stored
+    # nothing, and gave the caller no way to find out — one integration only
+    # noticed after building a UI and seeing every media URL come back empty.
+    # Silently discarding user data behind a success response is the worst of the
+    # available options; a 400 naming the offending keys is the cheapest to act on.
+    # Custom fields belong in `attributes`, and the error says so.
+    model_config = ConfigDict(extra="forbid")
+
     timestamp: Optional[int] = None          # defaults to now
     importance: float = 1.0
     type: ContextTypeEnum = ContextTypeEnum.FACT
@@ -41,7 +50,12 @@ class AddVectorRequest(BaseModel):
 
 class SearchRequest(BaseModel):
     vector: List[float]
-    k: int = Field(10, ge=1, le=1000)
+    k: int = Field(
+        10, ge=1, le=1000,
+        description="How many results. Capped at 1000; /search has no paging, so "
+                    "to score a whole namespace larger than that, filter it down "
+                    "first or list records and re-rank client-side.",
+    )
     modality: str = "text"
     # Filters
     namespace_id: Optional[str] = None
@@ -72,7 +86,12 @@ class SearchResponse(BaseModel):
 
 class KeywordSearchRequest(BaseModel):
     query: str
-    k: int = Field(10, ge=1, le=1000)
+    k: int = Field(
+        10, ge=1, le=1000,
+        description="How many results. Capped at 1000; /search has no paging, so "
+                    "to score a whole namespace larger than that, filter it down "
+                    "first or list records and re-rank client-side.",
+    )
     # Filters (same as SearchRequest)
     namespace_id: Optional[str] = None
     entity_id: Optional[str] = None
@@ -88,7 +107,12 @@ class KeywordSearchRequest(BaseModel):
 class HybridSearchRequest(BaseModel):
     vector: List[float]
     query: str
-    k: int = Field(10, ge=1, le=1000)
+    k: int = Field(
+        10, ge=1, le=1000,
+        description="How many results. Capped at 1000; /search has no paging, so "
+                    "to score a whole namespace larger than that, filter it down "
+                    "first or list records and re-rank client-side.",
+    )
     rrf_k: int = Field(60, ge=1, le=10000)
     modality: str = "text"
     # Filters
@@ -231,6 +255,11 @@ class ImportResponse(BaseModel):
     skipped: int
     embedded: int = 0                  # of the inserted, how many were auto-embedded
     errors: List[str] = []
+    # A caller that checks the HTTP status is doing the normal thing, so the
+    # status has to carry the outcome: 200 only when everything landed,
+    # 207 when some items were skipped, 400 when nothing was written at all.
+    # Previously a backfill that stored zero vectors answered a flat 200.
+    partial: bool = False
 
 
 # ── Maintenance / index admin (Phase 7–8 capabilities) ──────────────
