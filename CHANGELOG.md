@@ -11,6 +11,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.18.1] — 2026-09-01
+
+Release plumbing only — no engine changes. Fixes the reason PyPI has never
+received a binary wheel.
+
+- **`macos-13` runners were retired by GitHub on 2025-12-04.** `wheels.yml` and
+  `release.yml` still requested that label, and a job asking for a retired runner
+  **queues forever rather than failing** — one sat pending 21 hours before being
+  cancelled. Both now target `macos-15-intel` for x86_64.
+- **`cibuildwheel` bumped v2.21 → v2.23.** The pinned version referenced a
+  manylinux image that has since been removed from quay.io, failing the Linux leg
+  independently of the macOS one.
+- **The SIMD gate read the host architecture, not the target.** `setup.py` keyed
+  x86 intrinsics off `platform.machine()`, so a cross-compiled build pulled
+  `immintrin.h` into an arm64 wheel (*"This header is only meant to be used on
+  x86 and x64 architecture"*). It now prefers `ARCHFLAGS` / `_PYTHON_HOST_PLATFORM`
+  and treats a universal2 build as arch-neutral. `CIBW_ENVIRONMENT` is scoped
+  per-leg as a second line of defence.
+- **`publish-rust.yml` reported success when it published nothing.** The step was
+  `cargo publish || echo "publish skipped (already published?)"`, which swallowed
+  every failure — including an unset `CARGO_REGISTRY_TOKEN`, which is what
+  actually happened on v0.18.0: the job went green and the crate was never
+  published. It now fails loudly on a missing token and only tolerates a genuine
+  "already uploaded" response. (Same silent-success failure mode the Cloud API was
+  fixed for in 0.18.0, in our own release plumbing.)
+
+**Still required before the crate can publish:** add a `CARGO_REGISTRY_TOKEN`
+repository secret.
+
+
+---
+
 ## [0.18.0] — 2026-08-31
 
 Six data-correctness fixes, four of which could lose or corrupt data, plus the

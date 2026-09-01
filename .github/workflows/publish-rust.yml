@@ -31,5 +31,24 @@ jobs:
         working-directory: feather-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # don't fail the run if this exact version is already published
-        run: cargo publish --no-verify || echo "publish skipped (already published?)"
+        # Re-publishing an existing version is fine and must not fail the run.
+        # ANY other failure must. The blanket `|| echo "already published?"` this
+        # replaces reported success when CARGO_REGISTRY_TOKEN was simply unset —
+        # the job went green and the crate was never published, which is the same
+        # silent-success failure mode the API was just fixed for.
+        run: |
+          set -o pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set — add it under"                  "Settings > Secrets and variables > Actions. Get a token from"                  "crates.io > Account Settings > API Tokens."
+            exit 1
+          fi
+          out=$(cargo publish --no-verify 2>&1) && rc=0 || rc=$?
+          echo "$out"
+          if [ $rc -ne 0 ]; then
+            if echo "$out" | grep -qiE "already (been )?uploaded|already exists"; then
+              echo "::notice::this version is already on crates.io — nothing to do"
+              exit 0
+            fi
+            echo "::error::cargo publish failed"
+            exit $rc
+          fi
