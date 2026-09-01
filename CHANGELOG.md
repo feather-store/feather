@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.18.2] — 2026-09-01
+
+Release plumbing. In 0.18.1 the macOS wheel legs and the CLI binaries built for
+the first time; this fixes the remaining Linux leg.
+
+- **manylinux2014 can no longer install a modern numpy.** The Linux wheel *built*
+  and passed `auditwheel repair`; the cibuildwheel **test** step then failed,
+  because there is no manylinux2014 numpy wheel for cp312+, so pip fell back to
+  the sdist and hit `NumPy requires GCC >= 10.3` against manylinux2014's GCC 9.
+  Linux wheels now build on **`manylinux_2_28`** (glibc 2.28 — Debian 10,
+  Ubuntu 18.10, CentOS 8 and later; GCC 12), which is where numpy itself moved.
+  Pinning an old numpy instead would only defer the same failure.
+- Created the `pypi` GitHub environment the publish job declares. Publishing uses
+  **Trusted Publishing (OIDC)**, so no token is stored — but the environment has
+  to exist and a matching trusted publisher must be registered on PyPI.
+
+
+---
+
 ## [0.18.1] — 2026-09-01
 
 Release plumbing only — no engine changes. Fixes the reason PyPI has never

@@ -41,6 +41,13 @@ jobs:
         env:
           CIBW_BUILD: "cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*"
           CIBW_SKIP: "*-musllinux_* *_i686 *-win32"
+          # manylinux2014 (glibc 2.17, GCC 9) can no longer install a modern
+          # numpy: there is no manylinux2014 wheel for cp312+, so pip falls back
+          # to the sdist and the build dies on "NumPy requires GCC >= 10.3".
+          # The wheel itself built and repaired fine — only the test venv failed.
+          # manylinux_2_28 (glibc 2.28 = Debian 10 / Ubuntu 18.10 / CentOS 8,
+          # 2018 and later) ships GCC 12 and is where the ecosystem has moved.
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_ARCHS_LINUX: "x86_64"
           # setup.py gates x86 SIMD on platform.machine(), which reports the HOST
           # architecture, not the one cibuildwheel is building FOR. Setting this
