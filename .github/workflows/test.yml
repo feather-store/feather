@@ -34,7 +34,9 @@ jobs:
         # langgraph so tests/test_langgraph_store.py runs instead of skipping —
         # it is the adapter that puts Feather inside an agent, so it must not rot.
         # 3.9 is excluded: langgraph requires >=3.10.
-        if [ "${{ matrix.python-version }}" != "3.9" ]; then pip install langgraph; fi
+        # langgraph + mcp on 3.10+: both require >=3.10, and both adapters must
+        # not rot — the previous MCP server broke silently against SDK 2.0.
+        if [ "${{ matrix.python-version }}" != "3.9" ]; then pip install langgraph "mcp>=2.0.0"; fi
 
     - name: Build C++ extension
       run: python setup.py build_ext --inplace
