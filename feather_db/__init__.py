@@ -30,6 +30,7 @@ from .providers import (
 from .engine import ContextEngine
 
 __all__ = [
+    "Pocket", "PocketItem", "pocket",
     "DB", "ContextType", "Metadata", "ScoringConfig",
     "Edge", "IncomingEdge",
     "ContextNode", "ContextEdge", "ContextChainResult",
@@ -47,4 +48,6 @@ __all__ = [
     "OllamaProvider", "GeminiProvider",
     "ContextEngine",
 ]
+from .pocket import Pocket, PocketItem, pocket  # noqa: E402
+
 __version__ = "0.19.0"

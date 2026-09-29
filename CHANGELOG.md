@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Agent pocket memory — hot / warm / cache tiering per agent
+An agent does not want "the top k for a query". It wants the things it should be
+carrying right now, sized to the context budget it has left. Answering that by
+hand is what every agent codebase ends up doing badly.
+
+- **Feather already measured the signal and nobody read it as a tier.** Every
+  search hit increments `recall_count`, and `stickiness = 1 + ln(1+recall_count)`
+  already slows decay for what an agent keeps returning to. `Pocket` interprets
+  those counters instead of leaving them to re-rank search.
+- **Three tiers, one file.** HOT is the working set — fits a token budget,
+  ordered by heat, and costs no query, no embedding and no model call. WARM is
+  everything else in scope, reachable by `recall()`, and a hit **promotes** it so
+  the working set follows real usage. CACHE is keyed results with a TTL, in the
+  same store with the same expiry.
+- **Scopes are hierarchical and agents inherit.** A pocket at
+  `("hawky","brand_a","creative")` reads its own memory plus `("hawky","brand_a")`
+  and `("hawky",)` — its notes AND the brand rules AND the org policy, in one
+  budget, ranked together. Writes always land in the pocket's own scope, so no
+  agent can mutate a sibling's memory; the agent's own key shadows an inherited
+  one. Inherited memory is discounted 30% per level, because fleet-wide recall
+  counts say little about whether *this* agent needs it now.
+- **Sessions separate learning from thinking.** `with p.session() as s:` gives
+  scratch its own scope — real memory during the run, dropped at the end unless
+  `s.keep()` promotes it. Scratch is capped at 40% of budget, because everything
+  written this run has age ~0 and would otherwise evict the rules it is supposed
+  to follow. `__exit__` cleans up on the exception path, and `maintain()` reaps
+  scratch from processes that were killed outright.
+- **`hot()` is memoised against a write generation.** It is O(namespace) —
+  measured 171 ms at 10,000 memories, far too slow for a per-turn call. Repeat
+  calls are now **0.001 ms**, recomputed on any write through any pocket on the
+  same DB. `recall()` invalidates too: it looks like a read but increments
+  `recall_count`, and without that the cache served a view predating the
+  promotion it had just performed.
+
+Measured: 50 agents × 40 memories → per-agent `hot()` 0.2 ms median; 16
+concurrent agents × 30 ops → no errors; 200 sessions × 5 scratch notes → 0
+leaked scopes, flat RSS; 2,000 cache lookups over 50 keys → 170 µs each,
+computed exactly 50 times.
+
+**Known limitation:** single-process only. Two processes writing one `.feather`
+still destroy each other's writes silently (measured: 0/20 records survived from
+one of two agent processes). Since agents are usually separate processes, file
+locking is the prerequisite for a fleet sharing one file — tracked separately.
+
+55 tests in `tests/test_pocket.py`. Suite 318 → 373.
+
+
 ---
 
 ## [0.19.0] — 2026-09-29
