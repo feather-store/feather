@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Feather over MCP, rebuilt for SDK 2.0 — and shaped like agent memory
+The existing `feather-serve` is **broken against the current SDK**: `Server.list_tools`
+was removed in MCP 2.0, so `create_server()` raises before it can start. It also
+exposed 16 low-level database verbs — a model handed `feather_add_intel`,
+`feather_mmr_search` and `feather_consolidate` has to work out which one means
+"remember this", and it usually decides not to.
+
+`feather-agent` replaces it with a surface shaped like what an agent does, using
+each MCP capability for what it is actually good at:
+
+- **Tools** (`remember`, `recall`, `context`, `forget`, `memory_stats`) — the
+  model calls these when it decides to. Good for recall, weak for capture.
+- **Prompts** (`/remember`, `/what-do-you-know`, `/catch-up`) — **user-invoked**,
+  which is the reliable capture path precisely because it does not depend on the
+  model choosing to act. This is the capability the old server never implemented.
+- **Resources** (`feather://context`, `feather://stats`) — attachable, so the
+  working set costs no tool call and no round trip.
+
+Backed by `Pocket`, so an agent reached over MCP gets the same hot/warm/cache
+tiering and scope inheritance: `--scope hawky.brand_a.creative` reads its own
+memory plus `hawky.brand_a` and `hawky`, and sibling agents cannot see each
+other. Memory survives a server restart because it is one file.
+
+    feather-agent --db agent.feather --scope hawky.brand_a.creative
+
+The `mcp` extra is pinned to **>=2.0.0** (0.9.0 predates both the stateless
+protocol core and the `MCPServer` API), and CI installs it on 3.10+ so this
+adapter cannot break silently again. 17 tests, including one that asserts the
+legacy server is still broken — if it ever passes, something changed and the
+replacement should be revisited.
+
+### Concurrency test no longer flakes on a loaded machine
+`test_concurrent_search_scales` took a single timing sample, which failed once
+in three runs on an otherwise-passing build. Scheduler noise and CPU contention
+can only make a timing run *slower*, so it now takes the best of three rounds —
+the fastest round is the honest estimate of what the lock permits.
+
+
 ### Agent pocket memory — hot / warm / cache tiering per agent
 An agent does not want "the top k for a query". It wants the things it should be
 carrying right now, sized to the context budget it has left. Answering that by
