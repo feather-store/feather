@@ -44,9 +44,24 @@ NS_SEP = "."
 _VALUE_ATTR   = "_lg_value"       # the JSON payload
 _CREATED_ATTR = "_lg_created_at"  # Feather has ONE timestamp; created_at lives here
                                   # until format v10 adds recorded_at/valid_from.
+_UNINDEXED    = "_lg_unindexed"   # index=False: stored, but not semantically findable
 
 
-def _is_dead(meta) -> bool:
+def _expired(meta, now: Optional[float] = None) -> bool:
+    """Feather's own rule: ttl seconds from timestamp, 0 meaning never.
+
+    Checked on every read because nothing sweeps automatically — `forget_expired()`
+    exists but has to be called. Without this an expired item stayed readable
+    until someone happened to run the sweep, which for an agent memory means a
+    fact the caller asked to be temporary outliving the reason it was temporary.
+    """
+    ttl = getattr(meta, "ttl", 0) or 0
+    if ttl <= 0:
+        return False
+    return (now if now is not None else time.time()) > meta.timestamp + ttl
+
+
+def _is_dead(meta, now: Optional[float] = None) -> bool:
     """Mirror the Cloud API's `_is_dead_meta` exactly.
 
     `db.forget()` marks a record by setting source="_forgotten"; an earlier
@@ -57,7 +72,9 @@ def _is_dead(meta) -> bool:
         return True
     if meta.source == "_forgotten":
         return True
-    return meta.get_attribute("_deleted") == "true"
+    if meta.get_attribute("_deleted") == "true":
+        return True
+    return _expired(meta, now)
 
 
 def _require_langgraph() -> None:
@@ -129,6 +146,12 @@ class FeatherStore(BaseStore):
     the agent.
     """
 
+    # BaseStore.put() refuses a ttl unless the subclass declares support, and
+    # raises before reaching batch() — so without this, Feather's own `ttl` and
+    # forget_expired() were unreachable through the LangGraph API even though
+    # both already worked.
+    supports_ttl: bool = True
+
     def __init__(
         self,
         path: str = "agent_memory.feather",
@@ -199,10 +222,23 @@ class FeatherStore(BaseStore):
         meta.set_attribute(_VALUE_ATTR, json.dumps(dict(op.value)))
         meta.set_attribute(_CREATED_ATTR, created)
         if op.ttl is not None:
-            meta.ttl = int(op.ttl * 60)            # LangGraph ttl is in minutes
+            # LangGraph ttl is in MINUTES; Feather stores whole SECONDS, where 0
+            # means "never expires". Truncating would turn any ttl under one
+            # second into permanent — the worst possible direction for a field
+            # whose entire purpose is to make something temporary. Round, and
+            # floor at one second so a positive ttl can never mean forever.
+            meta.ttl = max(1, int(round(op.ttl * 60)))
 
         # Only embed when indexing is on for this item AND an embedder exists.
         # op.index is False to opt out, a list to pick fields, None for default.
+        # index=False means "store it, do not make it semantically findable".
+        # The placeholder vector below is IDENTICAL for every unindexed record,
+        # so without a marker they all match each other perfectly and an
+        # index=False item came back as a top semantic hit — the opposite of
+        # what was asked for.
+        if op.index is False:
+            meta.set_attribute(_UNINDEXED, "true")
+
         vec = None
         if op.index is not False and self._embed is not None:
             text = _indexed_text(dict(op.value),
@@ -253,8 +289,13 @@ class FeatherStore(BaseStore):
                     cand.append((i, None, m))
 
         results = []
+        semantic = bool(op.query and self._embed is not None)
         for rid, score, meta in cand:
             if _is_dead(meta):
+                continue
+            # Unindexed records are still returned by a filter-only search —
+            # they exist, they are just not semantically retrievable.
+            if semantic and meta.get_attribute(_UNINDEXED) == "true":
                 continue
             ns = tuple(meta.namespace_id.split(NS_SEP)) if meta.namespace_id else ()
             if op.namespace_prefix and ns[:len(op.namespace_prefix)] != op.namespace_prefix:
@@ -266,16 +307,32 @@ class FeatherStore(BaseStore):
 
         return results[op.offset: op.offset + op.limit]
 
+    @staticmethod
+    def _matches_condition(ns: tuple[str, ...], cond: Any) -> bool:
+        """LangGraph prefix/suffix matching, with `*` as a single-element wildcard."""
+        path = tuple(cond.path)
+        seg = ns[: len(path)] if cond.match_type == "prefix" else ns[-len(path):]
+        if len(seg) != len(path):
+            return False
+        return all(p == "*" or p == s for p, s in zip(path, seg))
+
     def _list_namespaces(self, op: Any) -> list[tuple[str, ...]]:
-        out = []
+        out: list[tuple[str, ...]] = []
         for flat in self.db.list_namespaces():
             if not flat:
                 continue
             ns = tuple(flat.split(NS_SEP))
+            # Filter on the FULL namespace, then truncate. Truncating first would
+            # make ("a","b","c") match a suffix condition on ("b",) at max_depth=2,
+            # which is a match against a path the caller never stored.
+            if op.match_conditions:
+                if not all(self._matches_condition(ns, c) for c in op.match_conditions):
+                    continue
             if op.max_depth is not None:
                 ns = ns[: op.max_depth]
             if ns not in out:
                 out.append(ns)
+        out.sort()
         return out[op.offset: op.offset + op.limit]
 
     # ── helpers ──────────────────────────────────────────────────────────

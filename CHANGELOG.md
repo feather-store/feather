@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### FeatherStore now honours the whole `BaseStore` contract
+Four behaviours the LangGraph interface specifies that the first implementation
+either silently ignored or actively inverted. Each was found by exercising the
+contract rather than re-reading the code.
+
+- **TTL was unreachable.** `BaseStore.put()` refuses a `ttl` unless the subclass
+  sets `supports_ttl`, and raises *before* reaching `batch()` — so Feather's own
+  `ttl` field and `forget_expired()` could not be used through the LangGraph API
+  even though both already worked. Declared, and enforced on read.
+- **A sub-second TTL became permanent.** LangGraph's `ttl` is in *minutes*,
+  Feather stores whole *seconds*, and `0` means "never expires" — so
+  `int(0.001 * 60)` silently turned an expiring memory into a permanent one.
+  Now rounded and floored at one second: a positive TTL can never mean forever.
+- **`index=False` was ignored.** The placeholder vector is identical for every
+  unindexed record, so without a marker they matched each other perfectly and an
+  `index=False` item came back as the *top* semantic hit — the opposite of what
+  was asked. Unindexed records are now excluded from semantic results while
+  remaining stored and listable.
+- **`list_namespaces` ignored its match conditions.** Prefix, suffix and `*`
+  wildcards are now applied — and applied to the *full* namespace before
+  `max_depth` truncation, because truncating first lets `("a","b","c")` match a
+  suffix condition on `("b",)` at depth 2, a path the caller never stored.
+
+10 tests; **7 fail against the previous implementation.**
+
+
 ### Feather over MCP, rebuilt for SDK 2.0 — and shaped like agent memory
 The existing `feather-serve` is **broken against the current SDK**: `Server.list_tools`
 was removed in MCP 2.0, so `create_server()` raises before it can start. It also
