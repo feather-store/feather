@@ -11,7 +11,9 @@ delete used a sentinel that `db.forget()` does not set, and namespace-PREFIX
 search returned nothing on both the semantic and the filter-only path because
 Feather's namespace index is exact-match.
 """
+import asyncio
 import hashlib
+import time
 
 import numpy as np
 import pytest
@@ -170,3 +172,114 @@ def test_works_without_an_embedder(tmp_path):
     assert s.get(NS, "a").value["text"] == "x"
     assert len(s.search(NS, filter={"kind": "preference"}, limit=9)) == 1
     s.close()
+
+
+# ── the LangGraph contract, beyond the happy path ─────────────────────────
+# Four behaviours the interface specifies that the first implementation either
+# silently ignored or actively inverted. Each was found by exercising the
+# contract rather than the code.
+
+def test_ttl_is_declared_and_enforced(store):
+    """BaseStore.put() refuses a ttl unless the subclass sets supports_ttl, and
+    raises before reaching batch() — so Feather's own ttl and forget_expired()
+    were unreachable through the LangGraph API even though both already worked.
+    """
+    assert store.supports_ttl is True
+
+    store.put(NS, "short", {"text": "expires"}, ttl=0.001)   # sub-second
+    store.put(NS, "long", {"text": "stays"}, ttl=60)
+    store.put(NS, "never", {"text": "no ttl"})
+    assert store.get(NS, "short") is not None
+
+    time.sleep(1.4)
+    assert store.get(NS, "short") is None, "expired item still readable"
+    assert store.get(NS, "long") is not None
+    assert store.get(NS, "never") is not None
+
+
+def test_a_sub_second_ttl_does_not_become_permanent(store):
+    """LangGraph ttl is in MINUTES, Feather stores whole SECONDS, and 0 means
+    'never expires'. Truncating turned any ttl under a second into permanent —
+    the worst possible direction for a field whose purpose is impermanence."""
+    store.put(NS, "tiny", {"text": "x"}, ttl=0.0001)         # 6 ms
+    rid = store.db.get_metadata(
+        __import__("feather_db.integrations.langgraph_store", fromlist=["_ns_key"])
+        ._ns_key(NS, "tiny"))
+    assert rid.ttl >= 1, "a positive ttl was floored to 0, which means forever"
+
+
+def test_expired_items_are_excluded_from_search(store):
+    store.put(NS, "gone", {"text": "alpha expiring"}, ttl=0.001)
+    store.put(NS, "kept", {"text": "alpha staying"})
+    time.sleep(1.4)
+    keys = {i.key for i in store.search(NS, limit=10)}
+    assert keys == {"kept"}
+
+
+def test_index_false_stores_but_does_not_make_it_findable(store):
+    """The placeholder vector is IDENTICAL for every unindexed record, so
+    without a marker they match each other perfectly and an index=False item
+    came back as a TOP semantic hit — the opposite of what was asked."""
+    store.put(NS, "hidden", {"text": "secret internal note"}, index=False)
+    store.put(NS, "visible", {"text": "a normal memory"})
+
+    assert store.get(NS, "hidden") is not None, "index=False must still store it"
+    semantic = {i.key for i in store.search(NS, query="secret internal note", limit=5)}
+    assert "hidden" not in semantic
+
+    # but it is still there for a filter-only listing
+    assert "hidden" in {i.key for i in store.search(NS, limit=10)}
+
+
+def test_list_namespaces_honours_prefix(store):
+    store.put(("acme", "u1", "prefs"), "a", {"x": 1})
+    store.put(("acme", "u2", "prefs"), "b", {"x": 1})
+    store.put(("other", "u3", "prefs"), "c", {"x": 1})
+
+    got = store.list_namespaces(prefix=("acme",))
+    assert got and all(ns[0] == "acme" for ns in got)
+    assert ("other", "u3", "prefs") not in got
+
+
+def test_list_namespaces_honours_suffix(store):
+    store.put(("acme", "u1", "prefs"), "a", {"x": 1})
+    store.put(("acme", "u1", "episodes"), "b", {"x": 1})
+
+    got = store.list_namespaces(suffix=("prefs",))
+    assert ("acme", "u1", "prefs") in got
+    assert ("acme", "u1", "episodes") not in got
+
+
+def test_list_namespaces_wildcard(store):
+    store.put(("acme", "u1", "prefs"), "a", {"x": 1})
+    store.put(("acme", "u2", "prefs"), "b", {"x": 1})
+    got = store.list_namespaces(prefix=("acme", "*", "prefs"))
+    assert len(got) == 2
+
+
+def test_list_namespaces_filters_before_truncating(store):
+    """Truncating first would let ("a","b","c") match a suffix on ("b",) at
+    max_depth=2 — a match against a path the caller never stored."""
+    store.put(("a", "b", "c"), "k", {"x": 1})
+    assert store.list_namespaces(suffix=("b",), max_depth=2) == []
+
+
+def test_the_async_path_works(store):
+    async def go():
+        await store.aput(NS, "async_key", {"text": "written via aput"})
+        got = await store.aget(NS, "async_key")
+        hits = await store.asearch(NS, query="written via", limit=3)
+        return got, hits
+
+    got, hits = asyncio.run(go())
+    assert got is not None and got.value["text"] == "written via aput"
+    assert any(h.key == "async_key" for h in hits)
+
+
+def test_batch_applies_every_op_in_order(store):
+    from langgraph.store.base import GetOp, PutOp
+    ops = [PutOp(NS, f"b{i}", {"n": i}, None, None) for i in range(5)]
+    ops.append(GetOp(NS, "b2"))
+    results = store.batch(ops)
+    assert results[-1] is not None and results[-1].value["n"] == 2
+    assert len(store.search(NS, limit=20)) == 5
