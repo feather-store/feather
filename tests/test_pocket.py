@@ -602,3 +602,42 @@ def test_different_budgets_are_cached_separately(fleet):
     large = p.hot(6000)
     assert len(small) < len(large)
     assert len(p.hot(60)) == len(small)        # still correct after the other call
+
+
+# ── recall ranks by relevance, not heat ───────────────────────────────────
+
+def test_recall_ranks_by_relevance_not_heat(fleet):
+    """Found by simulating a marketing workload: every query returned the same
+    pinned org policy, because recall() sorted by heat alone and a pinned record
+    has heat 1.0 by definition. Heat answers "what should I be carrying";
+    relevance answers "what did you ask for"."""
+    pocket(fleet, ("org",)).remember("policy", "pinned unrelated policy", pinned=True)
+    p = pocket(fleet, ("org", "agent"))
+    for i in range(10):
+        p.remember(f"row{i}", f"week {i} tiktok performance numbers")
+
+    hits = p.recall("week 7 tiktok performance", k=3)
+    assert hits
+    assert hits[0].key != "policy", "a pinned record outranked the actual match"
+    assert hits[0].relevance >= hits[-1].relevance
+
+
+def test_recall_still_prefers_the_hot_one_among_equals(fleet):
+    """Heat must remain a tiebreaker — two equally relevant memories should be
+    separated by which one the agent actually uses."""
+    p = pocket(fleet, ("org", "agent"))
+    p.remember("cold", "identical wording here")
+    p.remember("warm", "identical wording here")
+    for _ in range(10):
+        p.recall("identical wording")
+
+    hits = {i.key: i for i in p.recall("identical wording", k=2)}
+    if abs(hits["warm"].relevance - hits["cold"].relevance) < 1e-6:
+        assert hits["warm"].heat >= hits["cold"].heat
+
+
+def test_relevance_is_zero_outside_recall(fleet):
+    """hot() is not a search; a relevance score there would be meaningless."""
+    p = pocket(fleet, ("org", "agent"))
+    p.remember("a", "something")
+    assert p.hot()[0].relevance == 0.0

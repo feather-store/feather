@@ -54,6 +54,12 @@ UNUSED_FLOOR = 0.4
 # heat 0.0001 costs few tokens but spends the model's attention, and an agent
 # reasoning from stale context is worse off than one reasoning from none.
 MIN_HEAT = 0.01
+# How much heat may influence recall() ranking. Small on purpose: recall answers
+# an explicit question, so a memory being frequently used is weak evidence next
+# to it actually matching the query. At 0.15 a pinned record (heat 1.0 by
+# definition) outranked a row scoring 0.04 higher on relevance — heat should
+# separate near-ties, not overturn the search.
+RECALL_HEAT_WEIGHT = 0.05
 
 # `hot()` is O(namespace): it reads every record in scope, scores it, and sorts.
 # Measured, that is 171 ms at 10,000 memories in one agent's scope — far too slow
@@ -112,6 +118,7 @@ class PocketItem:
     pinned: bool
     scope: tuple[str, ...] = ()      # which layer it came from
     inherited: bool = False          # True when it came from an ancestor scope
+    relevance: float = 0.0           # normalised search score; 0 outside recall()
 
     def __repr__(self) -> str:          # readable in a debugger / log line
         p = "*" if self.pinned else " "
@@ -358,6 +365,9 @@ class Pocket:
             else:
                 hits += [(h, depth) for h in self.db.keyword_search(query, k=k * 3)
                          if h.metadata.namespace_id == flat]
+        # Each scope is searched separately, so raw scores are only comparable
+        # within one. Normalise before ranking across them.
+        top = max((h.score for h, _ in hits), default=1.0) or 1.0
 
         out, seen = [], set()
         for h, depth in hits:
@@ -376,8 +386,16 @@ class Pocket:
                 pinned=m.get_attribute(_PINNED) == "true",
                 scope=tuple(m.namespace_id.split(SCOPE_SEP)) if m.namespace_id else (),
                 inherited=depth > 0,
+                relevance=float(h.score) / top,
             ))
-        out.sort(key=lambda x: -x.heat)
+        # Rank by RELEVANCE, with heat as a modest tiebreaker.
+        #
+        # Sorting by heat alone made recall() ignore the query: a pinned record
+        # has heat 1.0 by definition, so an org policy was returned first for
+        # "which tiktok creative performed best" as readily as for "what should
+        # I not claim". Heat answers "what should I be carrying"; relevance
+        # answers "what did you ask for". Only hot() may confuse the two.
+        out.sort(key=lambda x: -(x.relevance + RECALL_HEAT_WEIGHT * x.heat))
         # recall() looks like a read but IS a write: search() increments
         # recall_count on every hit, which changes heat and therefore the
         # working set. Without this the memoised hot() would keep serving a view
