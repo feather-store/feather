@@ -79,6 +79,20 @@ jobs:
     - name: Run pytest suite
       run: pytest tests -q --deselect tests/test_engine.py::TestProviderInterface::test_provider_str
 
+    - name: MCP suite must run, not skip
+      if: matrix.python-version != '3.9'
+      # `importorskip` turns a missing/broken SDK into a green skip. That is
+      # precisely how the previous MCP server shipped broken against SDK 2.0
+      # with CI passing, so on every version that supports it, assert the
+      # protocol tests actually executed.
+      run: |
+        out=$(pytest tests/test_mcp_protocol.py tests/test_mcp_personas.py -q 2>&1 | tail -3)
+        echo "$out"
+        echo "$out" | grep -qE '[0-9]+ passed' || {
+          echo "::error::MCP suite did not run on Python ${{ matrix.python-version }}"
+          exit 1
+        }
+
     - name: Run feature test suite
       run: |
         set -e

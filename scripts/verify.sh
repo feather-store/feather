@@ -42,12 +42,25 @@ for t in tests/test_wal_recovery.py tests/test_wal_durability.py \
   [ -n "$n" ] && ok "$(basename $t): $n" || bad "$(basename $t) failed"
 done
 
-hdr "5. Vendored Rust engine is in sync"
+hdr "5. MCP surface (real protocol, not direct calls)"
+# These must RUN, not skip. A skipped MCP suite is how the previous server
+# shipped broken against SDK 2.0 while CI stayed green.
+mcp_out=$($PY -m pytest tests/test_mcp_protocol.py tests/test_mcp_personas.py -q 2>&1 | tail -3)
+mcp_n=$(printf '%s' "$mcp_out" | grep -oE '[0-9]+ passed' | head -1)
+if printf '%s' "$mcp_out" | grep -q "failed\|error"; then
+  bad "MCP suite failed"; printf '%s\n' "$mcp_out"
+elif [ -z "$mcp_n" ]; then
+  bad "MCP suite did not run (skipped — is the SDK installed on $PY?)"
+else
+  ok "client<->server over MCP: $mcp_n"
+fi
+
+hdr "6. Vendored Rust engine is in sync"
 ./scripts/sync-cpp.sh >/dev/null 2>&1
 if git diff --quiet feather-cli/cpp/ 2>/dev/null; then ok "feather-cli/cpp matches include/"
 else bad "vendored C++ has drifted — commit the sync"; git diff --stat feather-cli/cpp/ | tail -3; fi
 
-hdr "6. Version consistency"
+hdr "7. Version consistency"
 v_py=$(grep -oE '^version = "[^"]+"' pyproject.toml | head -1 | cut -d'"' -f2)
 v_st=$(grep -oE 'version="[^"]+"' setup.py | head -1 | cut -d'"' -f2)
 v_in=$(grep -oE '__version__ = "[^"]+"' feather_db/__init__.py | cut -d'"' -f2)
@@ -56,7 +69,7 @@ if [ "$v_py" = "$v_st" ] && [ "$v_py" = "$v_in" ] && [ "$v_py" = "$v_cg" ]; then
   ok "all four declare $v_py"
 else bad "version drift: pyproject=$v_py setup=$v_st __init__=$v_in Cargo=$v_cg"; fi
 
-hdr "7. Release prerequisites"
+hdr "8. Release prerequisites"
 command -v gh >/dev/null 2>&1 && {
   gh secret list 2>/dev/null | grep -q CARGO_REGISTRY_TOKEN \
     && ok "CARGO_REGISTRY_TOKEN is set" \
@@ -71,7 +84,7 @@ command -v gh >/dev/null 2>&1 && {
   else ok "no retired runner labels in any job target"; fi
 } || skp "gh not installed — skipping release checks"
 
-hdr "8. Live API behaviour (the two integration reports)"
+hdr "9. Live API behaviour (the two integration reports)"
 if [ "$QUICK" != "quick" ]; then
   $PY - 2>/dev/null <<'PY' && ok "API contract checks passed" || bad "API contract checks failed"
 import os, sys, shutil, logging, numpy as np

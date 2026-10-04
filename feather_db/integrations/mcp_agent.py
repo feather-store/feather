@@ -60,11 +60,21 @@ def build(
     dim: int = 768,
     budget_tokens: int = 4000,
     embed=None,
+    db: "DB | None" = None,
 ) -> "MCPServer":
-    """Build the server. Kept separate from main() so tests can drive it."""
+    """Build the server. Kept separate from main() so tests can drive it.
+
+    `db` runs this scope against an already-open database instead of opening
+    `db_path`. A host serving several agents must use it: two `DB.open` calls on
+    one path are two independent instances with independent in-memory state, and
+    whichever saves last overwrites the other's records. One DB, many scopes is
+    safe — the scopes isolate the agents, the single instance keeps the file
+    consistent. When `db` is given, `db_path` is ignored.
+    """
     _require_mcp()
 
-    db = DB.open(db_path, dim=dim)
+    if db is None:
+        db = DB.open(db_path, dim=dim)
     pkt = Pocket(db, _scope(scope), budget_tokens=budget_tokens, embed=embed)
 
     server = MCPServer(
