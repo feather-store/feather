@@ -5,8 +5,11 @@ name: Build & Publish Wheels
 # version tag. Replaces the old publish-pypi.yml, which produced non-manylinux
 # Linux wheels that PyPI rejects.
 #
-# Wheels are built with FEATHER_SIMD=sse: SSE2 is universal on x86-64, so the
-# wheels run on any machine (local source builds still default to AVX).
+# Wheels are built with FEATHER_SIMD=auto (the default): the AVX2+FMA / AVX-512
+# distance kernels carry per-function target attributes and are picked at
+# RUNTIME from CPUID, so one wheel runs on any x86-64 CPU and still uses AVX2 or
+# AVX-512 where available; arm64 wheels use NEON. (Before 0.19 wheels were
+# SSE-only: pip users never got the AVX kernels.)
 #
 # Publishing uses PyPI Trusted Publishing (OIDC) — no API token stored. One-time
 # setup on PyPI: project feather-db → Publishing → add a GitHub publisher with
@@ -56,13 +59,12 @@ jobs:
           # 2018 and later) ships GCC 12 and is where the ecosystem has moved.
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_ARCHS_LINUX: "x86_64"
-          # setup.py gates x86 SIMD on platform.machine(), which reports the HOST
-          # architecture, not the one cibuildwheel is building FOR. Setting this
-          # globally pulled x86 intrinsics into the arm64 build:
-          #   immintrin.h:14: "This header is only meant to be used on x86 and x64"
-          # Scope it to the x86_64 legs; arm64 relies on -O3 NEON auto-vectorisation.
-          CIBW_ENVIRONMENT_LINUX: "FEATHER_SIMD=sse"
-          CIBW_ENVIRONMENT_MACOS: "FEATHER_SIMD=${{ matrix.os == 'macos-14' && 'none' || 'sse' }}"
+          # FEATHER_SIMD=auto: no global -m flags. The x86 kernels are gated on the
+          # compiler's TARGET macros (__x86_64__), not the build host, so an arm64
+          # leg never sees immintrin.h and gets NEON instead. Never use `native`
+          # here: it bakes the runner's CPU into the wheel.
+          CIBW_ENVIRONMENT_LINUX: "FEATHER_SIMD=auto"
+          CIBW_ENVIRONMENT_MACOS: "FEATHER_SIMD=auto"
           CIBW_TEST_REQUIRES: "numpy"
           CIBW_TEST_COMMAND: >-
             python -c "import feather_db, numpy as np;

@@ -158,6 +158,7 @@ class IngestPipeline:
         self._entity_seq = 0
         # Canonical-id -> entity feather row id, for reuse across records.
         self._entity_index: dict[str, int] = {}
+        self._resume_from_db()
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -326,7 +327,8 @@ class IngestPipeline:
                    .build())
             results = self._db.search(qvec, k=self._candidate_k,
                                        modality=self._modality,
-                                       filter=flt)
+                                       filter=flt,
+                                       record_salience=False)   # internal lookup
         except Exception:
             return []
 
@@ -412,6 +414,32 @@ class IngestPipeline:
         return row
 
     # ── ID allocation ──────────────────────────────────────────────────
+
+    def _resume_from_db(self) -> None:
+        """Continue id sequences after the highest id already stored, and
+        re-learn canonical entity rows. Without this every new pipeline on an
+        existing DB restarted at base+1 and silently overwrote earlier records
+        (add() upserts), and re-created entities it had already stored."""
+        try:
+            ids = self._db.all_ids()
+        except Exception:        # test doubles / DB-like objects without it
+            return
+        span = FACT_ID_BASE - SOURCE_ID_BASE
+        for rid in ids:
+            if SOURCE_ID_BASE < rid < SOURCE_ID_BASE + span:
+                self._source_seq = max(self._source_seq, rid - SOURCE_ID_BASE)
+            elif FACT_ID_BASE < rid < FACT_ID_BASE + span:
+                self._fact_seq = max(self._fact_seq, rid - FACT_ID_BASE)
+            elif ENTITY_ID_BASE < rid < ENTITY_ID_BASE + span:
+                self._entity_seq = max(self._entity_seq, rid - ENTITY_ID_BASE)
+        try:
+            for rid in self._db.ids_with_attribute("kind", "entity"):
+                meta = self._db.get_metadata(rid)
+                cid = meta.get_attribute("canonical_id") if meta is not None else ""
+                if cid:
+                    self._entity_index.setdefault(cid, rid)
+        except Exception:
+            pass
 
     def _next_source_id(self) -> int:
         self._source_seq += 1

@@ -67,8 +67,11 @@ for i in range(12): db.add(id=i, vec=vec(), meta=Metadata())
 db.forget(0); db.forget(1)
 check("below threshold: shells remain", db.get_metadata(0) is not None and db.size() == 12,
       f"size {db.size()}")
-# forget a 3rd -> 3/12 = 0.25 >= 0.25 -> auto-compact fires, dead erased
+# forget a 3rd -> 3/12 = 0.25 >= 0.25 -> auto-compact fires, dead erased.
+# Since 0.19 it runs on a background thread (forget() no longer blocks for the
+# rebuild), so wait for it before checking.
 db.forget(2)
+db.wait_for_compaction()
 check("at threshold: auto-compacted (dead erased)",
       db.get_metadata(0) is None and db.get_metadata(2) is None)
 check("size dropped to 9", db.size() == 9, f"got {db.size()}")
@@ -79,7 +82,7 @@ print("4) persistence: compacted state round-trips")
 db, p = fresh()
 for i in range(5): db.add(id=i, vec=vec(), meta=Metadata())
 db.forget(2); db.compact(); db.save()
-del db
+db.close(save=False)
 db2 = fc.DB.open(p, dim=DIM)
 check("reload size 4", db2.size() == 4, f"got {db2.size()}")
 check("reload forgotten gone", db2.get_metadata(2) is None)

@@ -420,3 +420,8 @@ class FeatherStore(BaseStore):
 
     def close(self) -> None:
         self.db.save()
+        # Release the single-owner file lock so the path can be reopened in
+        # this process; save() alone keeps the handle (and the lock) alive.
+        close = getattr(self.db, "close", None)
+        if close is not None:
+            close()

@@ -93,7 +93,7 @@ relerr = float(np.max(np.abs(rec - orig)) / (np.max(np.abs(orig)) + 1e-9))
 check("get_vector rel error < 5%", relerr < 0.05, f"{relerr:.4f}")
 
 print("3) round-trip: save + reload keeps int8 + recall")
-dbi.save(); del dbi
+dbi.save(); dbi.close(save=False)
 dbi2 = fc.DB.open(pi, dim=DIM)
 check("reload is_int8_ram", dbi2.is_int8_ram("text") is True)
 check("reload size", dbi2.size() == N, f"got {dbi2.size()}")

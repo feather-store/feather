@@ -1,0 +1,54 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "oracle",
+  "n": 500,
+  "dim": 128,
+  "feather_version": "0.18.2",
+  "python_version": "3.12.3",
+  "platform": "Linux x86_64",
+  "commit": "88e7ca4",
+  "started_at": 1790238102.6137903,
+  "wall_seconds": 2.3118371963500977,
+  "metrics": {
+    "overall": 0.432,
+    "by_axis": {
+      "temporal-reasoning": 0.24812030075187969,
+      "multi-session-reasoning": 0.3458646616541353,
+      "knowledge-updates": 0.6410256410256411,
+      "information-extraction": 0.5576923076923077
+    },
+    "by_question_type": {
+      "temporal-reasoning": 0.24812030075187969,
+      "multi-session": 0.3458646616541353,
+      "knowledge-update": 0.6410256410256411,
+      "single-session-preference": 0.0,
+      "single-session-assistant": 0.5357142857142857,
+      "single-session-user": 0.8142857142857143
+    },
+    "per_q_seconds_p50": 0.004142738499922416,
+    "per_q_seconds_mean": 0.004519283218003693,
+    "n_questions": 500,
+    "n_scored": 500,
+    "n_failures": 0,
+    "failures_sample": [],
+    "history_turns_total": 10960,
+    "embeddings_emitted": 11460,
+    "embedder": "deterministic_d128",
+    "judge": "substring",
+    "top_k": 10,
+    "decay_engaged": false,
+    "decay_half_life_days": null,
+    "decay_time_weight": null,
+    "peak_rss_mb": 1492.29296875
+  },
+  "params": {
+    "k": 10,
+    "ef": null,
+    "embedder": "deterministic_d128",
+    "judge": "substring",
+    "variant": "oracle",
+    "decay_half_life": null,
+    "decay_time_weight": null
+  },
+  "notes": ""
+}

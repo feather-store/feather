@@ -21,7 +21,7 @@ def build(path, quantize):
     db = fc.DB.open(path, dim=DIM)
     if quantize: db.set_quantized("text", True)
     for i, v in VECS.items(): db.add(id=i, vec=v, meta=Metadata())
-    db.save()
+    db.close()   # checkpoint + release the file lock before it is reopened
     return db
 
 def cleanup(p):

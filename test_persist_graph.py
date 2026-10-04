@@ -40,7 +40,7 @@ db.add_batch(ids=list(range(N)), vecs=vecs, metas=metas)
 before = [topk(db, q) for q in queries]
 db.save()
 fsz = os.path.getsize(p) / 1e6
-del db
+db.close(save=False)
 
 # ── reload (should restore graph, NOT rebuild) ──────────────────────────
 t = time.time()
@@ -61,7 +61,7 @@ check(ver == 9, "file format v9", f"got v{ver}")
 print("2) fallback path: forgotten record disables graph-persist")
 db2.forget(id=0)
 db2.save()
-del db2
+db2.close(save=False)
 db3 = fc.DB.open(p, dim=DIM)
 # id 0 must be gone, others searchable
 res_ids = set()
@@ -70,7 +70,7 @@ for q in queries[:10]:
 check(0 not in [r.id for r in db3.search(vecs[0], k=K)],
       "forgotten id 0 absent after reload")
 check(db3.size() == N - 1, "size N-1 after forget+reload", f"got {db3.size()}")
-del db3
+db3.close(save=False)
 os.remove(p)
 
 # ── on-disk quantized modality still round-trips ────────────────────────
@@ -84,12 +84,12 @@ for i in range(5000):
 dbq.add_batch(ids=list(range(5000)), vecs=vecs[:5000], metas=mq)
 q_before = [topk(dbq, q) for q in queries[:20]]
 dbq.save()
-del dbq
+dbq.close(save=False)
 dbq2 = fc.DB.open(pq, dim=DIM)
 q_after = [topk(dbq2, q) for q in queries[:20]]
 ov = np.mean([len(set(a) & set(b)) / K for a, b in zip(q_before, q_after)])
 check(ov >= 0.9, "quantized recall preserved across save/load", f"overlap={ov:.3f}")
-del dbq2
+dbq2.close(save=False)
 os.remove(pq)
 
 print("\n" + ("ALL PASS" if fails == 0 else f"{fails} FAILED"))

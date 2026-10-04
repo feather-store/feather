@@ -1,0 +1,299 @@
+{
+  "setup": {
+    "n": 50000,
+    "dim": 768,
+    "build_s": 34.01
+  },
+  "readers_only_r1": {
+    "read": {
+      "ops": 18077,
+      "ops_per_s": 2259.5,
+      "p50_ms": 0.423,
+      "p90_ms": 0.525,
+      "p99_ms": 0.723,
+      "p999_ms": 0.937,
+      "max_ms": 5.58,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "window_s": 8.0
+  },
+  "readers_only_r4": {
+    "read": {
+      "ops": 72182,
+      "ops_per_s": 9019.8,
+      "p50_ms": 0.42,
+      "p90_ms": 0.543,
+      "p99_ms": 0.776,
+      "p999_ms": 0.992,
+      "max_ms": 3.54,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "window_s": 8.0
+  },
+  "readers_only_r8": {
+    "read": {
+      "ops": 106892,
+      "ops_per_s": 13355.8,
+      "p50_ms": 0.541,
+      "p90_ms": 0.836,
+      "p99_ms": 1.287,
+      "p999_ms": 1.7,
+      "max_ms": 3.46,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "window_s": 8.0
+  },
+  "writers_only_add_w1": {
+    "write": {
+      "ops": 4458,
+      "ops_per_s": 557.2,
+      "p50_ms": 1.767,
+      "p90_ms": 2.249,
+      "p99_ms": 3.003,
+      "p999_ms": 3.612,
+      "max_ms": 12.56,
+      "over_10ms": 1,
+      "over_50ms": 0
+    },
+    "window_s": 8.0
+  },
+  "writers_only_add_w4": {
+    "write": {
+      "ops": 4335,
+      "ops_per_s": 541.5,
+      "p50_ms": 2.002,
+      "p90_ms": 20.655,
+      "p99_ms": 66.272,
+      "p999_ms": 113.274,
+      "max_ms": 287.19,
+      "over_10ms": 812,
+      "over_50ms": 93
+    },
+    "window_s": 8.01
+  },
+  "writers_only_add_w16": {
+    "write": {
+      "ops": 4261,
+      "ops_per_s": 530.4,
+      "p50_ms": 1.977,
+      "p90_ms": 103.655,
+      "p99_ms": 366.659,
+      "p999_ms": 582.051,
+      "max_ms": 964.61,
+      "over_10ms": 1038,
+      "over_50ms": 765
+    },
+    "window_s": 8.03
+  },
+  "r8_plus_add_w1": {
+    "read": {
+      "ops": 106628,
+      "ops_per_s": 13321.6,
+      "p50_ms": 0.551,
+      "p90_ms": 0.842,
+      "p99_ms": 1.317,
+      "p999_ms": 1.81,
+      "max_ms": 3.33,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "write": {
+      "ops": 10,
+      "ops_per_s": 1.2,
+      "p50_ms": 552.747,
+      "p90_ms": 1790.8,
+      "p99_ms": 1811.292,
+      "p999_ms": 1813.341,
+      "max_ms": 1813.57,
+      "over_10ms": 10,
+      "over_50ms": 10
+    },
+    "window_s": 8.0
+  },
+  "r8_plus_add_w4": {
+    "read": {
+      "ops": 106140,
+      "ops_per_s": 13255.3,
+      "p50_ms": 0.549,
+      "p90_ms": 0.849,
+      "p99_ms": 1.377,
+      "p999_ms": 2.288,
+      "max_ms": 5.77,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "write": {
+      "ops": 24,
+      "ops_per_s": 3.0,
+      "p50_ms": 272.628,
+      "p90_ms": 3711.673,
+      "p99_ms": 7305.423,
+      "p999_ms": 7937.294,
+      "max_ms": 8007.5,
+      "over_10ms": 19,
+      "over_50ms": 16
+    },
+    "window_s": 8.01
+  },
+  "r8_plus_add_w16": {
+    "read": {
+      "ops": 98406,
+      "ops_per_s": 12252.0,
+      "p50_ms": 0.584,
+      "p90_ms": 0.947,
+      "p99_ms": 1.557,
+      "p999_ms": 2.813,
+      "max_ms": 5.59,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "write": {
+      "ops": 47,
+      "ops_per_s": 5.9,
+      "p50_ms": 1026.096,
+      "p90_ms": 8020.893,
+      "p99_ms": 8030.402,
+      "p999_ms": 8031.702,
+      "max_ms": 8031.85,
+      "over_10ms": 44,
+      "over_50ms": 41
+    },
+    "window_s": 8.03
+  },
+  "r8_plus_link_w4": {
+    "read": {
+      "ops": 107018,
+      "ops_per_s": 13371.3,
+      "p50_ms": 0.54,
+      "p90_ms": 0.866,
+      "p99_ms": 1.409,
+      "p999_ms": 1.922,
+      "max_ms": 3.87,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "write": {
+      "ops": 41,
+      "ops_per_s": 5.1,
+      "p50_ms": 769.341,
+      "p90_ms": 1397.991,
+      "p99_ms": 1818.654,
+      "p999_ms": 1840.248,
+      "max_ms": 1842.65,
+      "over_10ms": 37,
+      "over_50ms": 37
+    },
+    "window_s": 8.0
+  },
+  "r8_plus_add_batch1000_w1": {
+    "write": {
+      "ops": 37,
+      "ops_per_s": 4.6,
+      "p50_ms": 205.839,
+      "p90_ms": 254.733,
+      "p99_ms": 472.811,
+      "p999_ms": 564.324,
+      "max_ms": 574.49,
+      "over_10ms": 37,
+      "over_50ms": 37
+    },
+    "read": {
+      "ops": 2773,
+      "ops_per_s": 341.8,
+      "p50_ms": 0.935,
+      "p90_ms": 168.659,
+      "p99_ms": 254.887,
+      "p999_ms": 291.857,
+      "max_ms": 292.27,
+      "over_10ms": 296,
+      "over_50ms": 296
+    },
+    "window_s": 8.11
+  },
+  "hybrid_r8_only": {
+    "read": {
+      "ops": 67554,
+      "ops_per_s": 8441.6,
+      "p50_ms": 0.909,
+      "p90_ms": 1.225,
+      "p99_ms": 1.815,
+      "p999_ms": 2.335,
+      "max_ms": 3.36,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "window_s": 8.0
+  },
+  "hybrid_r8_plus_add_w4": {
+    "read": {
+      "ops": 61826,
+      "ops_per_s": 7720.3,
+      "p50_ms": 0.973,
+      "p90_ms": 1.407,
+      "p99_ms": 2.131,
+      "p999_ms": 2.825,
+      "max_ms": 3.84,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "write": {
+      "ops": 4,
+      "ops_per_s": 0.5,
+      "p50_ms": 8005.903,
+      "p90_ms": 8007.338,
+      "p99_ms": 8007.836,
+      "p999_ms": 8007.886,
+      "max_ms": 8007.89,
+      "over_10ms": 4,
+      "over_50ms": 4
+    },
+    "window_s": 8.01
+  },
+  "r8_plus_add_w2_during_save_loop": {
+    "read": {
+      "ops": 88376,
+      "ops_per_s": 11041.0,
+      "p50_ms": 0.661,
+      "p90_ms": 1.144,
+      "p99_ms": 1.855,
+      "p999_ms": 2.527,
+      "max_ms": 4.48,
+      "over_10ms": 0,
+      "over_50ms": 0
+    },
+    "write": {
+      "ops": 3,
+      "ops_per_s": 0.4,
+      "p50_ms": 8003.422,
+      "p90_ms": 8003.9,
+      "p99_ms": 8004.008,
+      "p999_ms": 8004.019,
+      "max_ms": 8004.02,
+      "over_10ms": 2,
+      "over_50ms": 2
+    },
+    "window_s": 8.0,
+    "foreground": {
+      "saves": 20,
+      "save_ms_mean": 390.5,
+      "save_ms_max": 643.4
+    }
+  },
+  "final_size": 100142,
+  "file_bytes": {
+    "ather": 337891330
+  },
+  "_meta": {
+    "suite": "contention",
+    "wal_sync": "0",
+    "n": 50000,
+    "dim": 768,
+    "seconds": 8.0,
+    "cpus": 32,
+    "wall_s": 157.7,
+    "version": "0.18.2"
+  }
+}
