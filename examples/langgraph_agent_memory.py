@@ -1,114 +1,122 @@
-"""A LangGraph agent with long-term memory in one Feather file.
+"""Feather as long-term memory for a LangGraph agent.
 
-Run:
-    pip install feather-db langgraph
+Runs offline: no API key, no model download. The "LLM" is a stub so the thing
+being demonstrated is the memory, not the generation.
+
+The point of this file is the one line that adds memory to an existing graph:
+
+    graph = builder.compile(store=FeatherStore("agent_memory.feather", ...))
+
+Everything else here is an ordinary LangGraph agent. Run it twice — the second
+run starts with a brand new thread, and the agent still knows who you are,
+because `BaseStore` is cross-thread by definition and Feather persists it to one
+file on disk.
+
     python examples/langgraph_agent_memory.py
-
-No API key, no server, no container. The agent's memory is `agent_memory.feather`
-sitting next to this script — which is the whole point: every other agent-memory
-system in this category needs a database or a service running beside your agent.
-
-The one line that matters is passing `store=` to `compile()`. Everything else is
-an ordinary LangGraph graph.
 """
-import hashlib
 import os
+import shutil
 import tempfile
 
 import numpy as np
 from langgraph.graph import StateGraph, START, END
-from langgraph.store.base import BaseStore
 from typing_extensions import TypedDict
 
+from feather_db.integrations import AgentMemory
 from feather_db.integrations.langgraph_store import FeatherStore
 
+ORG, USER = "hawky", "user_842"
 
-def embed(text: str) -> np.ndarray:
-    """Stand-in embedder so the example runs offline.
 
-    Swap for a real one in production — Feather ships providers for OpenAI,
-    Gemini, Voyage, Cohere and Ollama in feather_db.integrations.embedders.
-    """
-    seed = int(hashlib.sha1(text.encode()).hexdigest()[:8], 16)
-    v = np.random.default_rng(seed).normal(0, 1, 256).astype(np.float32)
-    return v / np.linalg.norm(v)
+def embedder(dim=64):
+    """A bag-of-words stand-in so the demo needs no API key. In production pass
+    a real embedder — `feather_db.integrations.embedders.make_embedder`."""
+    def embed(text: str):
+        v = np.zeros(dim, dtype=np.float32)
+        for tok in str(text).lower().split():
+            v[hash(tok) % dim] += 1.0
+        n = np.linalg.norm(v)
+        return v / n if n else v
+    return embed
 
 
 class State(TypedDict):
-    user_id: str
     message: str
     reply: str
 
 
-def remember(state: State, *, store: BaseStore) -> dict:
-    """Write what this turn taught us.
+# ── the agent ─────────────────────────────────────────────────────────────
 
-    The namespace tree is the memory model: (tenant, subject, kind). Because
-    search takes a PREFIX, ("acme", user) later reaches preferences and episodes
-    together, while ("acme", user, "preferences") narrows to one kind.
-    """
-    ns = ("acme", state["user_id"], "preferences")
+def remember(state: State, *, store) -> dict:
+    """Capture anything durable the user just said."""
+    mem = AgentMemory(store, org=ORG, user=USER)
     text = state["message"]
-    if "prefer" in text.lower() or "rather" in text.lower():
-        # A deterministic key means re-learning the same thing updates in place
-        # instead of accumulating near-duplicates.
-        key = hashlib.sha1(text.lower().encode()).hexdigest()[:12]
-        store.put(ns, key, {"kind": "preference", "text": text, "confidence": 0.8})
+
+    if "prefer" in text.lower():
+        mem.preferences.set("comms", text)
+    mem.episodes.record(text)
     return {}
 
 
-def recall_and_reply(state: State, *, store: BaseStore) -> dict:
-    """Read everything known about this user, then answer."""
-    hits = store.search(("acme", state["user_id"]), query=state["message"], limit=3)
-    if hits:
-        known = "; ".join(h.value["text"] for h in hits)
-        reply = f"(recalled: {known}) → answering '{state['message']}'"
+def respond(state: State, *, store) -> dict:
+    """Answer using what is already known. A real agent puts this in the prompt."""
+    mem = AgentMemory(store, org=ORG, user=USER)
+
+    known = mem.preferences.get("comms")
+    history = mem.episodes.recent(3)
+
+    if known:
+        reply = (f"I remember: {known['text']!r}. "
+                 f"We have spoken {len(history)} time(s) recently.")
     else:
-        reply = f"(nothing remembered yet) → answering '{state['message']}'"
+        reply = "I do not know anything about you yet."
     return {"reply": reply}
 
 
-def build(store: BaseStore):
-    g = StateGraph(State)
-    g.add_node("remember", remember)
-    g.add_node("reply", recall_and_reply)
-    g.add_edge(START, "remember")
-    g.add_edge("remember", "reply")
-    g.add_edge("reply", END)
-    return g.compile(store=store)          # ← the whole integration
+def build_graph(store):
+    builder = StateGraph(State)
+    builder.add_node("remember", remember)
+    builder.add_node("respond", respond)
+    builder.add_edge(START, "remember")
+    builder.add_edge("remember", "respond")
+    builder.add_edge("respond", END)
+    #                        ↓ the only line that adds memory
+    return builder.compile(store=store)
 
 
 def main() -> None:
-    path = os.path.join(tempfile.mkdtemp(), "agent_memory.feather")
-    store = FeatherStore(path, dim=256, embed=embed)
-    agent = build(store)
+    workdir = tempfile.mkdtemp()
+    path = os.path.join(workdir, "agent_memory.feather")
+    try:
+        store = FeatherStore(path, dim=64, embed=embedder())
+        graph = build_graph(store)
 
-    print("── session 1 ───────────────────────────────────────────")
-    for msg in [
-        "I prefer async written updates over calls",
-        "I'd rather see numbers than adjectives",
-    ]:
-        out = agent.invoke({"user_id": "u_842", "message": msg, "reply": ""})
-        print(f"  {msg}\n    {out['reply']}\n")
+        print("── session 1 " + "─" * 50)
+        out = graph.invoke({"message": "I prefer written async updates, not calls"},
+                           config={"configurable": {"thread_id": "conv-1"}})
+        print("  user  : I prefer written async updates, not calls")
+        print("  agent :", out["reply"])
 
-    # The agent process ends. The file remains.
-    store.close()
+        # A completely separate conversation. A checkpointer would remember
+        # nothing here — thread state does not cross threads. The store does.
+        print("\n── session 2, new thread " + "─" * 37)
+        out = graph.invoke({"message": "what do you know about me?"},
+                           config={"configurable": {"thread_id": "conv-2"}})
+        print("  user  : what do you know about me?")
+        print("  agent :", out["reply"])
 
-    print("── session 2, a brand new process would start here ──────")
-    store2 = FeatherStore(path, dim=256, embed=embed)
-    agent2 = build(store2)
-    out = agent2.invoke(
-        {"user_id": "u_842", "message": "how should I send you the report?", "reply": ""}
-    )
-    print(f"  how should I send you the report?\n    {out['reply']}\n")
+        # And a new process entirely: the file is the memory.
+        store.close()
+        print("\n── after restart, new store object " + "─" * 27)
+        reopened = FeatherStore(path, dim=64, embed=embedder())
+        mem = AgentMemory(reopened, org=ORG, user=USER)
+        print("  held  :", mem.summary())
+        print("  recall:", [v["text"] for v in mem.recall("how to contact", limit=1)])
+        reopened.close()
 
-    print("── what is stored ──────────────────────────────────────")
-    for ns in store2.list_namespaces():
-        for item in store2.search(ns, limit=10):
-            print(f"  {'/'.join(item.namespace)}  {item.key}")
-            print(f"      {item.value['text']}")
-    print(f"\n  one file, {os.path.getsize(path) // 1024} KB, no server")
-    store2.close()
+        print(f"\n  one file, {os.path.getsize(path):,} bytes: {os.path.basename(path)}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

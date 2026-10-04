@@ -48,6 +48,9 @@ from .base          import FeatherTools, TOOL_SPECS
 from .claude        import ClaudeConnector
 from .openai_compat import OpenAIConnector
 from .gemini        import GeminiConnector, GeminiEmbedder
+# Typed agent memory. Pure Python, no optional deps of its own — it needs a
+# store instance, not a store library, so it imports eagerly.
+from .agent_memory  import AgentMemory, KINDS
 
 # LangChain / LlamaIndex adapters — optional deps, import gracefully
 try:
@@ -74,6 +77,8 @@ __all__ = [
     "FeatherRetriever",
     "FeatherVectorStoreIndex",
     "FeatherReader",
+    "AgentMemory",
+    "KINDS",
 ]
 
 
