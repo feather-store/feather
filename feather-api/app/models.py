@@ -2,9 +2,49 @@
 Pydantic request / response models for Feather DB Cloud API.
 """
 
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict, Any
+import base64
+import binascii
+
+import numpy as np
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+from typing import Any, ClassVar, Dict, List, Optional
 from enum import IntEnum
+
+
+class VectorInput(BaseModel):
+    """A query/record vector, as a JSON float list (`vector`) or as base64 of
+    little-endian float32 bytes (`vector_b64`). The binary form skips parsing
+    and validating thousands of JSON floats per request, which dominated the
+    cost of a search at 768-3072 dims."""
+    vector: Optional[List[float]] = None
+    vector_b64: Optional[str] = Field(
+        None, description="base64(little-endian float32 bytes); alternative to `vector`.")
+
+    VECTOR_REQUIRED: ClassVar[bool] = True
+
+    @model_validator(mode="after")
+    def _one_vector(self):
+        both = self.vector is not None and self.vector_b64 is not None
+        neither = self.vector is None and self.vector_b64 is None
+        if both or (neither and self.VECTOR_REQUIRED):
+            raise ValueError("provide exactly one of `vector` or `vector_b64`")
+        if self.vector_b64 is not None:
+            try:
+                raw = base64.b64decode(self.vector_b64, validate=True)
+            except (binascii.Error, ValueError):
+                raise ValueError("`vector_b64` is not valid base64")
+            if len(raw) == 0 or len(raw) % 4:
+                raise ValueError("`vector_b64` must decode to a whole number of float32 values")
+        return self
+
+    def has_vector(self) -> bool:
+        return self.vector is not None or self.vector_b64 is not None
+
+    def vector_array(self) -> np.ndarray:
+        """The vector as a contiguous float32 numpy array (no copy for b64)."""
+        if self.vector_b64 is not None:
+            return np.frombuffer(base64.b64decode(self.vector_b64), dtype="<f4")
+        return np.asarray(self.vector, dtype=np.float32)
 
 
 class ContextTypeEnum(IntEnum):
@@ -41,15 +81,13 @@ class MetadataOut(MetadataIn):
     links: List[int] = Field(default_factory=list)
 
 
-class AddVectorRequest(BaseModel):
+class AddVectorRequest(VectorInput):
     id: int
-    vector: List[float]
     metadata: Optional[MetadataIn] = None
     modality: str = "text"
 
 
-class SearchRequest(BaseModel):
-    vector: List[float]
+class SearchRequest(VectorInput):
     k: int = Field(
         10, ge=1, le=1000,
         description="How many results. Capped at 1000; /search has no paging, so "
@@ -72,6 +110,9 @@ class SearchRequest(BaseModel):
                     "decay — useful for ranking, but NOT a similarity, and it "
                     "must not be thresholded.",
     )
+    include_metadata: bool = Field(
+        True, description="Set false to return only id/score(/cosine): skips copying "
+                          "and serialising every hit's metadata.")
     # Filters
     namespace_id: Optional[str] = None
     entity_id: Optional[str] = None
@@ -95,7 +136,7 @@ class SearchResultItem(BaseModel):
     score: float
     # True cosine similarity, present only when raw_score=true was requested.
     cosine: Optional[float] = None
-    metadata: MetadataOut
+    metadata: Optional[MetadataOut] = None   # omitted when include_metadata=false
 
 
 class SearchResponse(BaseModel):
@@ -111,6 +152,7 @@ class KeywordSearchRequest(BaseModel):
                     "to score a whole namespace larger than that, filter it down "
                     "first or list records and re-rank client-side.",
     )
+    include_metadata: bool = True
     # Filters (same as SearchRequest)
     namespace_id: Optional[str] = None
     entity_id: Optional[str] = None
@@ -123,8 +165,7 @@ class KeywordSearchRequest(BaseModel):
     timestamp_before: Optional[int] = None
 
 
-class HybridSearchRequest(BaseModel):
-    vector: List[float]
+class HybridSearchRequest(VectorInput):
     query: str
     k: int = Field(
         10, ge=1, le=1000,
@@ -134,6 +175,7 @@ class HybridSearchRequest(BaseModel):
     )
     rrf_k: int = Field(60, ge=1, le=10000)
     modality: str = "text"
+    include_metadata: bool = True
     # Filters
     namespace_id: Optional[str] = None
     entity_id: Optional[str] = None
@@ -352,8 +394,9 @@ class SeedRequest(BaseModel):
     seed: int = Field(42, description="RNG seed for reproducibility")
 
 
-class ContextChainRequest(BaseModel):
-    vector: Optional[List[float]] = None     # if omitted, server generates random with `seed`
+class ContextChainRequest(VectorInput):
+    # vector / vector_b64 optional here: if omitted, server generates random with `seed`
+    VECTOR_REQUIRED: ClassVar[bool] = False
     seed: int = 42
     k: int = Field(5, ge=1, le=1000)
     hops: int = Field(2, ge=0, le=10)

@@ -17,19 +17,24 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <array>
-#ifndef _WIN32
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/file.h>      // flock
-#else
-#include <io.h>
-#include <windows.h>
-#endif
+#include <condition_variable>
+#include <filesystem>
+#include <limits>
 #if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX       // feather.h uses std::min / std::max
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>     // LockFileEx, FlushFileBuffers, MoveFileEx
 #  include <io.h>          // _commit / _fileno for the WAL fsync
 #else
 #  include <unistd.h>      // fsync
+#  include <fcntl.h>       // open
+#  include <sys/file.h>    // flock
 #endif
 #include "hnswlib.h"
 #include "metadata.h"
@@ -38,6 +43,197 @@
 #include <optional>
 
 namespace feather {
+
+// ── Phase-fair readers-writer lock ─────────────────────────────────────
+// libstdc++'s std::shared_mutex is glibc's pthread_rwlock with default
+// attributes, which PREFER READERS: a writer waits until no reader holds the
+// lock at all. Under a steady read load that moment never comes — measured,
+// 8 readers at 768-d cut a single writer from 191 to 0.6 writes/s, and
+// hybrid-search readers blocked writes for the whole measurement window
+// (CONCURRENCY_BASELINE.md §2.3–2.4).
+//
+// This lock is phase-fair: once a writer is waiting, newly arriving readers
+// queue behind it; when that writer releases, every reader that queued during
+// its turn is admitted before the next writer. Neither side can starve the
+// other. Same interface as std::shared_mutex, so std::shared_lock /
+// std::unique_lock work unchanged. NOT recursive: a thread holding the lock
+// shared must never take it again (a waiting writer would deadlock it).
+class FairSharedMutex {
+    // state_: [W_ACTIVE | W_WAITING | reader count (30 bits)].
+    // Readers take a lock-free fast path whenever no writer is waiting or
+    // active: lock_shared/unlock_shared are one CAS / one fetch_sub on this
+    // word. The mutex + condition variables are only used once a writer is
+    // involved. (The first version took the mutex twice per read.)
+    static constexpr uint32_t W_ACTIVE  = 1u << 31;
+    static constexpr uint32_t W_WAITING = 1u << 30;
+    static constexpr uint32_t READERS   = W_WAITING - 1u;
+    std::atomic<uint32_t> state_{0};
+
+    std::mutex m_;                          // guards the fields below
+    std::condition_variable readers_cv_, writers_cv_;
+    size_t waiting_readers_ = 0;
+    size_t waiting_writers_ = 0;
+    size_t reader_pass_     = 0;            // readers admitted ahead of waiting writers
+    size_t long_readers_    = 0;            // active snapshot-style readers (save, auto_link)
+
+    // Slow path, caller holds m_: may a reader enter now?
+    bool reader_may_enter(uint32_t s) const {
+        return !(s & W_ACTIVE) &&
+               (!(s & W_WAITING) || reader_pass_ > 0 || long_readers_ > 0);
+    }
+public:
+    void lock_shared() {
+        uint32_t s = state_.load(std::memory_order_relaxed);
+        while (!(s & (W_ACTIVE | W_WAITING))) {           // fast path: no writer around
+            if (state_.compare_exchange_weak(s, s + 1, std::memory_order_acquire,
+                                             std::memory_order_relaxed))
+                return;
+        }
+        std::unique_lock<std::mutex> l(m_);                // a writer is waiting or active
+        ++waiting_readers_;
+        readers_cv_.wait(l, [&] { return reader_may_enter(state_.load(std::memory_order_acquire)); });
+        --waiting_readers_;
+        if (reader_pass_ > 0) --reader_pass_;
+        state_.fetch_add(1, std::memory_order_acquire);
+    }
+    void unlock_shared() {
+        const uint32_t s = state_.fetch_sub(1, std::memory_order_release) - 1;
+        if ((s & READERS) == 0 && (s & W_WAITING)) {
+            // Last reader out while a writer waits. Taking m_ before notifying
+            // closes the gap between the writer's predicate check and its wait.
+            std::lock_guard<std::mutex> l(m_);
+            writers_cv_.notify_one();
+        }
+    }
+    // Shared lock for long, read-only sections. Readers keep being admitted
+    // while it is held; writers wait for it (and for regular readers) as usual.
+    void lock_shared_long() {
+        lock_shared();
+        std::lock_guard<std::mutex> l(m_);
+        ++long_readers_;
+        readers_cv_.notify_all();          // release readers queued behind a writer
+    }
+    void unlock_shared_long() {
+        {
+            std::lock_guard<std::mutex> l(m_);
+            --long_readers_;
+        }
+        unlock_shared();
+    }
+    void lock() {
+        std::unique_lock<std::mutex> l(m_);
+        ++waiting_writers_;
+        state_.fetch_or(W_WAITING, std::memory_order_relaxed);   // closes the reader fast path
+        writers_cv_.wait(l, [&] {
+            const uint32_t s = state_.load(std::memory_order_acquire);
+            return !(s & W_ACTIVE) && (s & READERS) == 0 && reader_pass_ == 0;
+        });
+        --waiting_writers_;
+        // No reader can enter meanwhile: the fast path is closed by W_WAITING,
+        // and the slow path needs m_, which we hold.
+        state_.store(W_ACTIVE | (waiting_writers_ ? W_WAITING : 0u), std::memory_order_relaxed);
+    }
+    void unlock() {
+        std::lock_guard<std::mutex> l(m_);
+        state_.store(waiting_writers_ ? W_WAITING : 0u, std::memory_order_release);
+        if (waiting_readers_ > 0) {        // readers' turn (phase-fair)
+            if (waiting_writers_) reader_pass_ = waiting_readers_;
+            readers_cv_.notify_all();
+        } else if (waiting_writers_ > 0) {
+            writers_cv_.notify_one();
+        }
+    }
+};
+
+// Build with -DFEATHER_STD_SHARED_MUTEX to fall back to std::shared_mutex
+// (reader-preferring on Linux) — kept for A/B benchmarking only.
+#ifdef FEATHER_STD_SHARED_MUTEX
+using RWMutex = std::shared_mutex;
+#else
+using RWMutex = FairSharedMutex;
+#endif
+
+// RAII shared lock for long read-only sections (checkpoint snapshots, the
+// auto_link kNN pass): other readers keep flowing while it is held.
+class LongSharedLock {
+    RWMutex& m_;
+public:
+    explicit LongSharedLock(RWMutex& m) : m_(m) {
+#ifdef FEATHER_STD_SHARED_MUTEX
+        m_.lock_shared();
+#else
+        m_.lock_shared_long();
+#endif
+    }
+    ~LongSharedLock() {
+#ifdef FEATHER_STD_SHARED_MUTEX
+        m_.unlock_shared();
+#else
+        m_.unlock_shared_long();
+#endif
+    }
+    LongSharedLock(const LongSharedLock&) = delete;
+    LongSharedLock& operator=(const LongSharedLock&) = delete;
+};
+
+// ── Platform file helpers (durable checkpoints, single-owner lock) ─────
+namespace fsio {
+inline void fsync_path(const std::string& p) {
+#if defined(_WIN32)
+    HANDLE h = CreateFileA(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("fsync: cannot open " + p);
+    BOOL ok = FlushFileBuffers(h);
+    CloseHandle(h);
+    if (!ok) throw std::runtime_error("fsync: FlushFileBuffers failed for " + p);
+#else
+    int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("fsync: cannot open " + p);
+    int rc = ::fsync(fd);
+    ::close(fd);
+    if (rc != 0) throw std::runtime_error("fsync failed for " + p);
+#endif
+}
+// Make a rename durable: on POSIX the directory entry must be synced too.
+inline void fsync_parent_dir(const std::string& p) {
+#if !defined(_WIN32)
+    auto dir = std::filesystem::path(p).parent_path();
+    std::string d = dir.empty() ? std::string(".") : dir.string();
+    int fd = ::open(d.c_str(), O_RDONLY);
+    if (fd >= 0) { ::fsync(fd); ::close(fd); }
+#else
+    (void)p;   // MOVEFILE_WRITE_THROUGH already flushed the rename
+#endif
+}
+// Atomically replace `to` with `from`. std::rename fails on Windows when the
+// target exists, and doesn't wait for the metadata write — MoveFileEx does both.
+inline void atomic_replace(const std::string& from, const std::string& to) {
+#if defined(_WIN32)
+    if (!MoveFileExA(from.c_str(), to.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        throw std::runtime_error("atomic replace failed: " + from + " -> " + to);
+#else
+    if (std::rename(from.c_str(), to.c_str()) != 0)
+        throw std::runtime_error("atomic rename failed: " + from + " -> " + to);
+#endif
+}
+inline void fsync_file(std::FILE* f) {
+#if defined(_WIN32)
+    _commit(_fileno(f));
+#else
+    ::fsync(fileno(f));
+#endif
+}
+inline bool exists(const std::string& p) {
+    std::error_code ec;
+    return std::filesystem::exists(p, ec);
+}
+inline uint64_t size_or_zero(const std::string& p) {
+    std::error_code ec;
+    auto s = std::filesystem::file_size(p, ec);
+    return ec ? 0 : static_cast<uint64_t>(s);
+}
+} // namespace fsio
 
 // ── Reverse-index entry: who points to a given node ──────────────
 struct IncomingEdge {
@@ -98,7 +294,7 @@ private:
     // derived indexes, or the HNSW graph (including resizeIndex) takes it
     // EXCLUSIVELY. Retrieval's only mutation is the salience touch, which goes
     // through Metadata's mutable atomic counters — see touch_nolock().
-    mutable std::shared_mutex mutex_;
+    mutable RWMutex mutex_;
     // Serialises save() against save(): concurrent savers would collide on the
     // shared ".tmp" path and the atomic rename. Always taken BEFORE mutex_.
     mutable std::mutex save_mutex_;
@@ -134,7 +330,10 @@ private:
     std::unordered_map<std::string, float> int8_ram_scale_;
 
     // ── BM25 Inverted Index ──────────────────────────────────────────
-    struct PostingEntry { uint64_t doc_id; uint32_t term_freq; };
+    // doc_len rides in the padding after term_freq (still 16 bytes). A doc's
+    // postings are always written and retired together with its length, so
+    // the copy never goes stale, and scoring needs no doc_lengths_ lookup.
+    struct PostingEntry { uint64_t doc_id; uint32_t term_freq; uint32_t doc_len; };
     std::unordered_map<std::string, std::vector<PostingEntry>> bm25_index_;
     std::unordered_map<uint64_t, uint32_t> doc_lengths_;
     // Running sum of doc_lengths_ so avg_dl_ is an O(1) update per document.
@@ -147,13 +346,51 @@ private:
     static constexpr float BM25_B  = 0.75f;
 
     // ── WAL op codes ─────────────────────────────────────────────────
+    // PURGE (0.19) is new; a pre-0.19 build replaying a WAL that contains it
+    // skips the record (unknown ops fall through replay's if/else chain).
     enum class WalOp : uint8_t {
         ADD    = 0x01,
         UPDATE = 0x02,
         UIMP   = 0x03,
         LINK   = 0x04,
         FORGET = 0x05,
+        PURGE  = 0x06,
     };
+
+    // ── WAL group commit ─────────────────────────────────────────────
+    // Records are appended (fwrite+fflush) inside the exclusive data lock, so
+    // WAL order == apply order. The fsync happens AFTER the data lock is
+    // released: a writer waits until the WAL is durable past its own record's
+    // LSN, and one fsync by a "leader" covers every record appended before it
+    // started. Readers are no longer blocked for the duration of an fsync, and
+    // concurrent writers share fsyncs instead of queueing one each.
+    // wal_mutex_ is always taken AFTER mutex_ (never the reverse).
+    mutable std::mutex              wal_mutex_;
+    mutable std::condition_variable wal_cv_;
+    mutable uint64_t wal_written_lsn_ = 0;   // appended + flushed to the OS
+    mutable uint64_t wal_synced_lsn_  = 0;   // on stable storage (or checkpointed)
+    mutable bool     wal_syncing_     = false;
+    mutable uint64_t wal_fsyncs_      = 0;   // stat: number of WAL fsyncs issued
+
+    // ── Background compaction ────────────────────────────────────────
+    // While a compaction builds its new indexes (without holding mutex_),
+    // writers append their vector-level changes here so they can be replayed
+    // onto the new indexes at the swap. Guarded by mutex_.
+    struct CompactionOp {
+        bool remove;                 // false = add/upsert, true = markDelete
+        std::string modality;        // add only
+        uint64_t id;
+        std::vector<float> vec;      // add only
+    };
+    bool compacting_ = false;
+    std::vector<CompactionOp> compaction_log_;
+    std::mutex compact_run_mx_;      // one compaction at a time
+    std::thread compactor_;          // started lazily by auto-compaction
+    std::mutex compactor_mx_;
+    std::condition_variable compactor_cv_;
+    bool compaction_requested_ = false;
+    bool compactor_busy_       = false;
+    bool stop_compactor_       = false;
 
     // ── Helpers ─────────────────────────────────────────────────────
 
@@ -178,6 +415,18 @@ private:
             m_idx.index->resizeIndex(std::max(target, cap * 2));
     }
 
+    // Every index is created with allow_replace_deleted: a new insert reuses the
+    // slot of a vector that forget()/purge() marked deleted instead of growing
+    // the index, so tombstones stop accumulating and compaction is needed far
+    // less often.
+    static std::unique_ptr<hnswlib::HierarchicalNSW<float>>
+    make_hnsw(hnswlib::SpaceInterface<float>* space, size_t capacity) {
+        auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+            space, capacity, 16, 200, /*random_seed=*/100, /*allow_replace_deleted=*/true);
+        index->setEf(DEFAULT_EF);
+        return index;
+    }
+
     ModalityIndex& get_or_create_index(const std::string& modality, size_t dim) {
         auto it = modality_indices_.find(modality);
         if (it == modality_indices_.end()) {
@@ -187,9 +436,7 @@ private:
             std::unique_ptr<hnswlib::SpaceInterface<float>> space;
             if (int8) space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
             else      space = std::make_unique<hnswlib::L2Space>(dim);
-            auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-                space.get(), INITIAL_MAX_ELEMENTS, 16, 200);
-            index->setEf(DEFAULT_EF);
+            auto index = make_hnsw(space.get(), INITIAL_MAX_ELEMENTS);
             modality_indices_[modality] = {std::move(index), std::move(space), dim, int8, scale};
             return modality_indices_[modality];
         }
@@ -207,18 +454,32 @@ private:
         }
     }
 
+    // Insert raw storage-format bytes. `reuse_slot` lets a NEW label take over a
+    // deleted slot. It is only ever passed from single-threaded paths under the
+    // exclusive lock: hnswlib's replace path assumes no concurrent operation on
+    // the slot being reused, so parallel_add never reuses. An existing label is
+    // always updated in place (reusing a slot for it would orphan its old node
+    // and return it twice from search).
+    static void insert_raw(ModalityIndex& m_idx, uint64_t id, const void* data, bool reuse_slot) {
+        auto& idx = *m_idx.index;
+        bool reuse = reuse_slot && idx.getDeletedCount() > 0 &&
+                     idx.label_lookup_.find(id) == idx.label_lookup_.end();
+        idx.addPoint(data, id, reuse);
+    }
+
     // Insert a float vector into a modality index, quantizing to int8 first if
     // the modality is in-RAM int8. Centralises the float-vs-int8 store decision.
-    static void add_point(ModalityIndex& m_idx, uint64_t id, const float* vec) {
+    static void add_point(ModalityIndex& m_idx, uint64_t id, const float* vec,
+                          bool reuse_slot = false) {
         if (m_idx.int8) {
             // Reusable per-thread buffer — a fresh std::vector per call across the
             // parallel insert pool churns the allocator and inflates RSS by ~MBs.
             static thread_local std::vector<int8_t> q;
             q.resize(m_idx.dim);
             quantize_global(vec, m_idx.dim, m_idx.scale, q.data());
-            m_idx.index->addPoint(q.data(), id);
+            insert_raw(m_idx, id, q.data(), reuse_slot);
         } else {
-            m_idx.index->addPoint(vec, id);
+            insert_raw(m_idx, id, vec, reuse_slot);
         }
     }
 
@@ -296,31 +557,67 @@ private:
     // so the graph is built concurrently. Caller must guarantee exclusive
     // structural access (no concurrent resize) — true at load and batch-ingest,
     // and we never exceed max_elements here so no resize is triggered.
-    static void parallel_add(ModalityIndex& m_idx,
-                             std::vector<std::pair<uint64_t, std::vector<float>>>& items) {
-        const size_t n = items.size();
-        if (n == 0) return;
+    // Thread count for a parallel build of n items: every core, but at least two
+    // items per thread. Chunked add_batch relies on the full width to keep each
+    // exclusive section short.
+    static size_t build_threads(size_t n) {
         unsigned hw = std::thread::hardware_concurrency();
-        size_t nthreads = std::min<size_t>(hw ? hw : 4, n);
+        size_t nthreads = std::min<size_t>(hw ? hw : 4, std::max<size_t>(1, n / 2));
         if (const char* env = std::getenv("FEATHER_LOAD_THREADS")) {
             long v = std::atol(env);                // override / cap thread count
-            if (v >= 1) nthreads = std::min<size_t>(static_cast<size_t>(v), n);
+            if (v >= 1) nthreads = std::min<size_t>(static_cast<size_t>(v), nthreads);
         }
-        if (nthreads <= 1 || n < 256) {           // small sets: serial is faster
-            for (auto& [id, v] : items) add_point(m_idx, id, v.data());
-            return;
-        }
+        return nthreads;
+    }
+
+    template <class Fn>
+    static void run_parallel(size_t n, Fn&& fn, size_t max_threads = 0) {
+        size_t nthreads = build_threads(n);
+        if (max_threads > 0) nthreads = std::min(nthreads, max_threads);
+        if (nthreads <= 1) { for (size_t i = 0; i < n; ++i) fn(i); return; }
         std::atomic<size_t> next{0};
         std::vector<std::thread> pool;
         pool.reserve(nthreads);
         for (size_t t = 0; t < nthreads; ++t) {
             pool.emplace_back([&]() {
                 size_t i;
-                while ((i = next.fetch_add(1)) < n)
-                    add_point(m_idx, items[i].first, items[i].second.data());
+                while ((i = next.fetch_add(1)) < n) fn(i);
             });
         }
         for (auto& th : pool) th.join();
+    }
+
+    static void parallel_add(ModalityIndex& m_idx,
+                             std::vector<std::pair<uint64_t, std::vector<float>>>& items) {
+        run_parallel(items.size(), [&](size_t i) {
+            add_point(m_idx, items[i].first, items[i].second.data());
+        });
+    }
+
+    // Same, from vectors already in the index's storage format (float or int8
+    // bytes, `stride` bytes each) — used by compaction to rebuild without a
+    // dequantize/requantize round trip.
+    static void parallel_add_raw(ModalityIndex& m_idx, const std::vector<uint64_t>& ids,
+                                 const std::vector<char>& data, size_t stride,
+                                 size_t max_threads = 0) {
+        run_parallel(ids.size(), [&](size_t i) {
+            m_idx.index->addPoint(data.data() + i * stride, ids[i], false);
+        }, max_threads);
+    }
+
+    // Background compaction builds on at most half the cores by default
+    // (FEATHER_COMPACT_THREADS): with every core busy rebuilding, concurrent
+    // queries were measured at p50 12 ms instead of 0.5 ms at 768-d.
+    static size_t compact_threads() {
+        static const size_t c = [] {
+            if (const char* e = std::getenv("FEATHER_COMPACT_THREADS")) {
+                long v = std::atol(e);
+                if (v >= 1) return static_cast<size_t>(v);
+            }
+            unsigned hw = std::thread::hardware_concurrency();
+            return std::max<size_t>(1, (hw ? hw : 4) / 2);
+        }();
+        return c;
     }
 
     // ── Secondary index helpers ──────────────────────────────────────
@@ -371,7 +668,10 @@ private:
     // (so the caller knows the result is an authoritative candidate set rather
     // than "no constraint"). An empty return with indexed=true means the filter
     // genuinely matches nothing.
-    std::unordered_set<uint64_t>
+    // Returns a plain vector: a single-set filter (e.g. one namespace) is a
+    // linear copy instead of re-hashing every id into a new unordered_set, and
+    // a multi-set filter probes the larger sets for each id of the smallest.
+    std::vector<uint64_t>
     candidates_for_filter(const SearchFilter& f, bool& indexed) const {
         indexed = false;
         std::vector<const std::unordered_set<uint64_t>*> sets;
@@ -394,78 +694,91 @@ private:
         // Intersect smallest-first to minimise work.
         std::sort(sets.begin(), sets.end(),
                   [](auto* a, auto* b) { return a->size() < b->size(); });
-        std::unordered_set<uint64_t> result(sets[0]->begin(), sets[0]->end());
-        for (size_t i = 1; i < sets.size() && !result.empty(); ++i) {
-            std::unordered_set<uint64_t> next;
-            for (uint64_t id : result)
-                if (sets[i]->count(id)) next.insert(id);
-            result.swap(next);
+        std::vector<uint64_t> result;
+        result.reserve(sets[0]->size());
+        for (uint64_t id : *sets[0]) {
+            bool all = true;
+            for (size_t i = 1; i < sets.size() && all; ++i) all = sets[i]->count(id) > 0;
+            if (all) result.push_back(id);
         }
         return result;
     }
 
-    // ── Compaction (lock-free core) ──────────────────────────────────
-    // Rebuild every modality index keeping only records that are present AND
-    // live in metadata_store_. This reclaims the space held by markDelete'd
-    // vectors (forget/expire) and orphaned index elements (purge erased their
-    // metadata but left the vector marked-deleted in the graph). Caller MUST
-    // hold mutex_. Returns the number of dead metadata records removed.
-    size_t compact_nolock() {
-        std::unordered_set<uint64_t> dead;
-        for (const auto& [id, meta] : metadata_store_)
-            if (is_dead_meta(meta)) dead.insert(id);
+    // ── Compaction support ───────────────────────────────────────────
+    // Caller holds mutex_ exclusively. Record a vector-level change made while a
+    // background compaction is building its new indexes, so the swap can replay
+    // it (see compact()).
+    void log_compaction_add(const std::string& modality, uint64_t id, const float* v, size_t dim) {
+        if (!compacting_) return;
+        compaction_log_.push_back({false, modality, id, std::vector<float>(v, v + dim)});
+    }
+    void log_compaction_remove(uint64_t id) {
+        if (!compacting_) return;
+        compaction_log_.push_back({true, std::string(), id, {}});
+    }
 
-        // Anything to reclaim? dead metadata, or index elements with no live
-        // metadata (purged). If neither, this is a no-op.
-        bool work = !dead.empty();
-        if (!work)
-            for (auto& [name, m_idx] : modality_indices_)
-                if (m_idx.index->getDeletedCount() > 0) { work = true; break; }
-        if (!work) return 0;
-
-        for (auto& [name, m_idx] : modality_indices_) {
-            size_t n = m_idx.index->cur_element_count;
-            std::vector<std::pair<uint64_t, std::vector<float>>> survivors;
-            survivors.reserve(n);
-            for (size_t i = 0; i < n; ++i) {
-                uint64_t id = m_idx.index->getExternalLabel(i);
-                auto mit = metadata_store_.find(id);
-                if (mit == metadata_store_.end()) continue;  // purged / orphaned
-                if (is_dead_meta(mit->second))      continue;  // forgotten / _deleted
-                survivors.push_back({id, read_vector_internal(m_idx, i)});  // float (deq if int8)
-            }
-            // Rebuild preserving the storage type (float L2 or int8).
-            std::unique_ptr<hnswlib::SpaceInterface<float>> space;
-            if (m_idx.int8) space = std::make_unique<hnswlib::Int8L2Space>(m_idx.dim, m_idx.scale);
-            else            space = std::make_unique<hnswlib::L2Space>(m_idx.dim);
-            auto new_index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-                space.get(), std::max(INITIAL_MAX_ELEMENTS, survivors.size()), 16, 200);
-            new_index->setEf(DEFAULT_EF);
-            m_idx.index = std::move(new_index);
-            m_idx.space = std::move(space);
-            for (const auto& [id, vec] : survivors)
-                add_point(m_idx, id, vec.data());
+    // Drop reverse-index entries into and out of `gone` (ids whose metadata was
+    // erased). One pass over the reverse index instead of a full rebuild.
+    void prune_reverse_index(const std::unordered_set<uint64_t>& gone) {
+        if (gone.empty()) return;
+        for (uint64_t id : gone) reverse_index_.erase(id);
+        for (auto it = reverse_index_.begin(); it != reverse_index_.end(); ) {
+            auto& v = it->second;
+            v.erase(std::remove_if(v.begin(), v.end(),
+                    [&](const IncomingEdge& ie) { return gone.count(ie.source_id) > 0; }), v.end());
+            if (v.empty()) it = reverse_index_.erase(it); else ++it;
         }
-
-        for (uint64_t id : dead) metadata_store_.erase(id);
-        build_reverse_index();
-        build_secondary_indexes();
-        rebuild_bm25_index();
-        return dead.size();
     }
 
     // Caller holds mutex_. If any modality's deleted/total ratio has crossed the
-    // configured threshold, rebuild to reclaim the dead vectors. One compaction
-    // rebuilds every modality, so a single pass suffices.
+    // configured threshold, ask the background compactor to rebuild. This used
+    // to compact INLINE, so whichever forget() crossed the threshold blocked for
+    // the whole rebuild (measured: 35 s at 100k x 128) with the DB frozen.
     void maybe_auto_compact_nolock() {
-        if (auto_compact_ratio_ <= 0.0f) return;
+        if (auto_compact_ratio_ <= 0.0f || compacting_ || closed_) return;
         for (const auto& [name, m_idx] : modality_indices_) {
             size_t total = m_idx.index->getCurrentElementCount();
             if (total == 0) continue;
             float ratio = static_cast<float>(m_idx.index->getDeletedCount())
                         / static_cast<float>(total);
-            if (ratio >= auto_compact_ratio_) { compact_nolock(); return; }
+            if (ratio >= auto_compact_ratio_) { request_compaction(); return; }
         }
+    }
+
+    void request_compaction() {
+        std::lock_guard<std::mutex> g(compactor_mx_);
+        if (stop_compactor_) return;
+        compaction_requested_ = true;
+        if (!compactor_.joinable())
+            compactor_ = std::thread([this] { compactor_loop(); });
+        compactor_cv_.notify_one();
+    }
+
+    void compactor_loop() {
+        std::unique_lock<std::mutex> g(compactor_mx_);
+        for (;;) {
+            compactor_cv_.wait(g, [&] { return compaction_requested_ || stop_compactor_; });
+            if (stop_compactor_) return;
+            compaction_requested_ = false;
+            compactor_busy_ = true;
+            g.unlock();
+            try { compact(); } catch (...) {}
+            g.lock();
+            compactor_busy_ = false;
+            compactor_cv_.notify_all();   // wake wait_for_compaction()
+        }
+    }
+
+    // Stop and join the background compactor. Must be called WITHOUT mutex_
+    // held (the worker may be waiting for it inside compact()).
+    void stop_compactor() {
+        {
+            std::lock_guard<std::mutex> g(compactor_mx_);
+            stop_compactor_ = true;
+        }
+        compactor_cv_.notify_all();
+        if (compactor_.joinable() && compactor_.get_id() != std::this_thread::get_id())
+            compactor_.join();
     }
 
     static const std::unordered_set<std::string>& stop_words() {
@@ -561,7 +874,7 @@ private:
         doc_lengths_[id] = static_cast<uint32_t>(tokens.size());
         total_dl_ += static_cast<double>(tokens.size());
         for (const auto& [term, freq] : tf)
-            bm25_index_[term].push_back({id, freq});
+            bm25_index_[term].push_back({id, freq, static_cast<uint32_t>(tokens.size())});
 
         recompute_avg_dl();   // O(1) — running total, not a scan
     }
@@ -647,6 +960,21 @@ private:
         return on;
     }
 
+    // FEATHER_WAL_STRICT=1: keep the pre-0.19 visibility guarantee — a write is
+    // fsynced BEFORE the exclusive lock is released, so no reader can ever see
+    // a record that a machine crash could still lose. Concurrent writers still
+    // share fsyncs (group commit), but readers wait for the fsync again.
+    static bool wal_strict() {
+        static const bool on = [] {
+            const char* e = std::getenv("FEATHER_WAL_STRICT");
+            return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' || e[0] == 't' || e[0] == 'T');
+        }();
+        return on;
+    }
+
+    std::string wal_old_path() const { return wal_path_ + ".old"; }
+
+    // Caller holds wal_mutex_.
     bool wal_open_for_append() const {
         if (wal_file_) return true;
         bool fresh = true;
@@ -664,9 +992,14 @@ private:
         return true;
     }
 
-    void wal_append(WalOp op, uint64_t id, const std::string& payload) {
-        if (wal_path_.empty()) return;
-        if (!wal_open_for_append()) return;
+    // Append one record and flush it to the OS. Returns its LSN (0 when there
+    // is no WAL). Called with mutex_ held exclusively, so WAL order is exactly
+    // the order mutations are applied in memory. Durability is established
+    // separately by wal_wait_durable(), normally after mutex_ is released.
+    uint64_t wal_append(WalOp op, uint64_t id, const std::string& payload) {
+        if (wal_path_.empty()) return 0;
+        std::lock_guard<std::mutex> g(wal_mutex_);
+        if (!wal_open_for_append()) return 0;
 
         auto op_b = static_cast<uint8_t>(op);
         uint32_t plen = static_cast<uint32_t>(payload.size());
@@ -684,20 +1017,39 @@ private:
         if (plen > 0) std::fwrite(payload.data(), 1, plen, wal_file_);
         std::fwrite(&crc,  4, 1, wal_file_);
         std::fflush(wal_file_);
+        return ++wal_written_lsn_;
     }
 
-    // Push the WAL all the way to stable storage. Separate from wal_append so a
-    // bulk ingest pays one fsync for the whole batch instead of one per record:
-    // the batch either lands or its tail is lost, and the tail is exactly what
-    // the per-record CRC lets replay detect and discard.
-    void wal_sync() const {
-        if (!wal_file_ || !wal_sync_enabled()) return;
-        std::fflush(wal_file_);
-#if defined(_WIN32)
-        _commit(_fileno(wal_file_));
-#else
-        ::fsync(fileno(wal_file_));
-#endif
+    // Group commit. Block until every WAL record up to `lsn` is on stable
+    // storage. The first waiter becomes the leader and fsyncs everything
+    // appended so far — outside wal_mutex_, so other writers keep appending —
+    // while the rest wait on the condition variable and are released by that
+    // single fsync. N concurrent writers pay ~1 fsync instead of N serial ones.
+    void wal_wait_durable(uint64_t lsn) const {
+        if (lsn == 0 || !wal_sync_enabled()) return;
+        std::unique_lock<std::mutex> lk(wal_mutex_);
+        while (wal_synced_lsn_ < lsn) {
+            if (wal_syncing_) { wal_cv_.wait(lk); continue; }
+            if (!wal_file_) {                      // checkpointed away meanwhile
+                wal_synced_lsn_ = std::max(wal_synced_lsn_, wal_written_lsn_);
+                break;
+            }
+            wal_syncing_ = true;
+            const uint64_t target = wal_written_lsn_;
+            std::FILE* fh = wal_file_;             // stays open: close/rotate wait
+            lk.unlock();                           //   for !wal_syncing_
+            fsio::fsync_file(fh);
+            lk.lock();
+            ++wal_fsyncs_;
+            wal_syncing_    = false;
+            wal_synced_lsn_ = std::max(wal_synced_lsn_, target);
+            wal_cv_.notify_all();
+        }
+    }
+
+    // Wait until no fsync is in flight. Caller holds `lk` on wal_mutex_.
+    void wal_quiesce(std::unique_lock<std::mutex>& lk) const {
+        wal_cv_.wait(lk, [&] { return !wal_syncing_; });
     }
 
     // ── Advisory file lock ───────────────────────────────────────────────
@@ -879,22 +1231,6 @@ private:
     }
 
 public:
-    /// Checkpoint, release the WAL handle and drop the inter-process lock.
-    ///
-    /// Required rather than decorative: the Python binding holds DB with
-    /// py::nodelete, so ~DB() never runs from Python and the lock would survive
-    /// until process exit — making a file unreopenable by the very process that
-    /// opened it. Idempotent.
-    void close() {
-        if (closed_) return;
-        if (load_complete_ && !read_only_) {
-            try { save_vectors(); } catch (...) {}
-        }
-        wal_close();
-        release_lock();
-        closed_ = true;
-    }
-
     bool is_read_only() const { return read_only_; }
     bool is_closed()    const { return closed_; }
 
@@ -928,18 +1264,53 @@ private:
     }
 
     void wal_close() const {
+        std::unique_lock<std::mutex> lk(wal_mutex_);
+        wal_quiesce(lk);
         if (wal_file_) { std::fclose(wal_file_); wal_file_ = nullptr; }
     }
 
+    // Checkpoint completed: every record so far is in the (durable) base file.
+    // Caller must hold mutex_ so no append can race the removal.
     void wal_clear() const {
         if (wal_path_.empty()) return;
-        wal_close();
+        std::unique_lock<std::mutex> lk(wal_mutex_);
+        wal_quiesce(lk);
+        if (wal_file_) { std::fclose(wal_file_); wal_file_ = nullptr; }
         std::remove(wal_path_.c_str());
+        std::remove(wal_old_path().c_str());
+        wal_synced_lsn_ = wal_written_lsn_;
+        wal_cv_.notify_all();
     }
 
-    void replay_wal() {
-        if (wal_path_.empty()) return;
-        std::ifstream wf(wal_path_, std::ios::binary);
+    // Start of a non-blocking checkpoint (caller holds mutex_, so no appends
+    // race it). Make the current WAL durable, then rename it to <wal>.old so new
+    // writes go to a fresh WAL while the base file is being made durable
+    // outside the lock. Recovery replays <wal>.old then <wal> on top of
+    // whichever base file survived — replay is idempotent, so both orders of
+    // "crash before/after the base-file rename" recover correctly.
+    // Returns false if a previous checkpoint left a <wal>.old behind; the caller
+    // then does a fully synchronous checkpoint instead.
+    bool wal_rotate() const {
+        if (wal_path_.empty()) return true;
+        std::unique_lock<std::mutex> lk(wal_mutex_);
+        wal_quiesce(lk);
+        if (fsio::exists(wal_old_path())) return false;
+        if (wal_file_) {
+            std::fflush(wal_file_);
+            if (wal_sync_enabled()) { fsio::fsync_file(wal_file_); ++wal_fsyncs_; }
+            std::fclose(wal_file_);
+            wal_file_ = nullptr;
+        }
+        wal_synced_lsn_ = wal_written_lsn_;     // all records now durable
+        wal_cv_.notify_all();
+        if (fsio::exists(wal_path_))
+            fsio::atomic_replace(wal_path_, wal_old_path());
+        return true;
+    }
+
+    void replay_wal(const std::string& path) {
+        if (path.empty()) return;
+        std::ifstream wf(path, std::ios::binary);
         if (!wf) return;
 
         // Size the file once so each record's declared length can be sanity
@@ -1016,8 +1387,9 @@ private:
                 ss.read(reinterpret_cast<char*>(vec.data()), dim32 * 4);
                 Metadata meta = Metadata::deserialize(ss);
                 auto& m_idx = get_or_create_index(modality, dim32);
+                if (dim32 != m_idx.dim) continue;   // corrupt / mismatched record
                 reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
-                try { add_point(m_idx, id, vec.data()); } catch (...) {}
+                try { add_point(m_idx, id, vec.data(), /*reuse_slot=*/true); } catch (...) {}
                 metadata_store_[id] = std::move(meta);
 
             } else if (op == WalOp::UPDATE) {
@@ -1061,6 +1433,13 @@ private:
                     it->second.importance = 0.0f;
                     it->second.ttl        = 0;
                 }
+
+            } else if (op == WalOp::PURGE) {
+                uint16_t ns_len = 0;
+                ss.read(reinterpret_cast<char*>(&ns_len), 2);
+                std::string ns(ns_len, '\0');
+                if (ns_len > 0) ss.read(&ns[0], ns_len);
+                purge_core(ns, /*maintain_derived=*/false);
             }
         }
         // Derived indexes are built once by load_vectors() after this returns —
@@ -1092,8 +1471,33 @@ private:
 
     // ── Persistence ─────────────────────────────────────────────────
 
+    // Should checkpoints fsync the new base file? Shares the FEATHER_WAL_SYNC
+    // switch: with it off, the caller has already accepted flush-only writes.
+    static bool checkpoint_sync_enabled() { return wal_sync_enabled(); }
+
+    // Make a fully-written .tmp snapshot the durable base file.
+    //   1. fsync the snapshot  2. atomically replace  3. fsync the directory
+    // Before 0.19 none of these syncs happened: after a power loss the renamed
+    // file could come back empty while the WAL had already been deleted.
+    void publish_snapshot(const std::string& tmp_path) const {
+        if (checkpoint_sync_enabled()) fsio::fsync_path(tmp_path);
+        fsio::atomic_replace(tmp_path, path_);
+        if (checkpoint_sync_enabled()) fsio::fsync_parent_dir(path_);
+    }
+
+    // Fully synchronous checkpoint (caller holds mutex_, shared or exclusive):
+    // snapshot, publish, then drop both WAL files.
     void save_vectors() const {
         check_writable("save");
+        write_snapshot(path_ + ".tmp");
+        publish_snapshot(path_ + ".tmp");
+        wal_clear();
+    }
+
+    // Serialize the whole DB to `tmp_path`. Caller holds mutex_ (shared is
+    // enough). Throws on any write error — including a full disk — so a
+    // truncated snapshot can never be published.
+    void write_snapshot(const std::string& tmp_path) const {
         // A DB whose load threw holds a fragment of the file, not its contents.
         // Writing that back is data loss, so refuse loudly rather than silently
         // truncating. The destructor checks the same flag before calling in.
@@ -1103,7 +1507,6 @@ private:
                 "this would overwrite " + path_ + " with a partial read");
 
         // Atomic save: write to .tmp, then rename — prevents corruption on crash
-        std::string tmp_path = path_ + ".tmp";
         std::ofstream f(tmp_path, std::ios::binary);
         if (!f) throw std::runtime_error("Cannot save to temp file: " + tmp_path);
 
@@ -1188,12 +1591,17 @@ private:
                 }
             }
         }
+        f.flush();
+        if (!f) {
+            f.close();
+            std::remove(tmp_path.c_str());
+            throw std::runtime_error("write failed (disk full?) while saving " + tmp_path);
+        }
         f.close();
-        // Atomic rename: tmp → real path (POSIX atomic)
-        if (std::rename(tmp_path.c_str(), path_.c_str()) != 0)
-            throw std::runtime_error("Atomic rename failed: " + tmp_path + " → " + path_);
-        // Checkpoint: clear WAL now that the full state is on disk
-        wal_clear();
+        if (!f) {
+            std::remove(tmp_path.c_str());
+            throw std::runtime_error("close failed while saving " + tmp_path);
+        }
     }
 
     // Open a namespace: read the base .feather (if any), then replay the WAL on
@@ -1207,7 +1615,11 @@ private:
     // a complete, on-disk WAL and lost every record in it.
     void load_vectors() {
         read_base_file();
-        replay_wal();          // crash recovery — runs even with no base file
+        // Crash recovery — runs even with no base file. <wal>.old exists only if
+        // a checkpoint was interrupted between rotating the WAL and deleting
+        // the old one; its records are older than everything in <wal>.
+        replay_wal(wal_old_path());
+        replay_wal(wal_path_);
         build_reverse_index();
         build_secondary_indexes();
         rebuild_bm25_index();
@@ -1350,6 +1762,12 @@ public:
     // ─────────────────────────────────────────────────────────────────
     // Factory
     // ─────────────────────────────────────────────────────────────────
+private:
+    void ensure_open() const {
+        if (closed_) throw std::logic_error("DB is closed: " + path_);
+    }
+
+public:
     /// Open a database. `read_only` takes a SHARED lock, so any number of
     /// readers may hold the file at once; the default takes an EXCLUSIVE one and
     /// refuses if another process already has it. See the lock_path_ comment for
@@ -1378,32 +1796,34 @@ public:
     // ─────────────────────────────────────────────────────────────────
     // Ingestion
     // ─────────────────────────────────────────────────────────────────
-    void add(uint64_t id, const std::vector<float>& vec,
-             const Metadata& meta = Metadata(),
-             const std::string& modality = "text") {
-        check_writable("add a record");
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+private:
+    static std::string encode_add(const std::string& modality,
+                                  const std::vector<float>& vec, const Metadata& meta) {
+        std::ostringstream ws;
+        uint16_t mod_len = static_cast<uint16_t>(modality.size());
+        ws.write(reinterpret_cast<const char*>(&mod_len), 2);
+        ws.write(modality.data(), mod_len);
+        uint32_t dim32 = static_cast<uint32_t>(vec.size());
+        ws.write(reinterpret_cast<const char*>(&dim32), 4);
+        ws.write(reinterpret_cast<const char*>(vec.data()), vec.size() * 4);
+        meta.serialize(ws);
+        return ws.str();
+    }
 
-        // WAL: log before mutating in-memory state
-        {
-            std::ostringstream ws;
-            uint16_t mod_len = static_cast<uint16_t>(modality.size());
-            ws.write(reinterpret_cast<const char*>(&mod_len), 2);
-            ws.write(modality.data(), mod_len);
-            uint32_t dim32 = static_cast<uint32_t>(vec.size());
-            ws.write(reinterpret_cast<const char*>(&dim32), 4);
-            ws.write(reinterpret_cast<const char*>(vec.data()), vec.size() * 4);
-            meta.serialize(ws);
-            wal_append(WalOp::ADD, id, ws.str());
-            wal_sync();
-        }
+    // Validate a vector against its modality BEFORE anything is logged: a WAL
+    // record with the wrong dim would be replayed into the index on the next
+    // open and read past the end of its vector.
+    void check_dim_nolock(const std::string& modality, size_t dim) const {
+        if (dim == 0) throw std::runtime_error("empty vector for modality " + modality);
+        auto it = modality_indices_.find(modality);
+        if (it != modality_indices_.end() && it->second.dim != dim)
+            throw std::runtime_error("Dimension mismatch for modality " + modality +
+                                     ": got " + std::to_string(dim) + ", index has " +
+                                     std::to_string(it->second.dim));
+    }
 
-        auto& m_idx = get_or_create_index(modality, vec.size());
-        if (vec.size() != m_idx.dim)
-            throw std::runtime_error("Dimension mismatch for modality " + modality);
-        reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
-        add_point(m_idx, id, vec.data());
-
+    // Metadata half of an upsert (caller holds mutex_ exclusively).
+    void apply_meta_upsert_nolock(uint64_t id, const Metadata& meta) {
         std::string prev_content;
         bool had_prev = false;
         auto it = metadata_store_.find(id);
@@ -1412,126 +1832,186 @@ public:
             prev_content = it->second.content;   // needed to retire old BM25 postings
             had_prev     = true;
             Metadata combined = meta;
-            if (combined.edges.empty() && !it->second.edges.empty())
-                combined.edges = it->second.edges;
-            metadata_store_[id] = combined;
+            if (combined.edges.empty() && !it->second.edges.empty()) {
+                combined.edges = it->second.edges;   // edges kept: reverse index unchanged
+            } else if (!meta.edges.empty()) {
+                // Edges replaced: keep the reverse index exact (it used to go
+                // stale until the next reload, so get_incoming() missed them).
+                for (const auto& e : it->second.edges) {
+                    auto rit = reverse_index_.find(e.target_id);
+                    if (rit == reverse_index_.end()) continue;
+                    auto& v = rit->second;
+                    v.erase(std::remove_if(v.begin(), v.end(),
+                            [id](const IncomingEdge& ie) { return ie.source_id == id; }), v.end());
+                    if (v.empty()) reverse_index_.erase(rit);
+                }
+                for (const auto& e : meta.edges)
+                    reverse_index_[e.target_id].push_back({id, e.rel_type, e.weight});
+            }
+            it->second = std::move(combined);
         } else {
-            metadata_store_[id] = meta;
+            it = metadata_store_.emplace(id, meta).first;
+            for (const auto& e : meta.edges)
+                reverse_index_[e.target_id].push_back({id, e.rel_type, e.weight});
         }
-        if (!is_dead_meta(metadata_store_[id])) index_meta(id, metadata_store_[id]);
-        add_to_bm25_index(id, meta.content, had_prev ? &prev_content : nullptr);
+        const bool dead = is_dead_meta(it->second);
+        if (!dead) index_meta(id, it->second);
+        // A dead record must not be keyword-searchable either.
+        add_to_bm25_index(id, dead ? std::string() : meta.content,
+                          had_prev ? &prev_content : nullptr);
+    }
+
+    // add_batch builds the graph in chunks and releases the exclusive lock
+    // between them, so readers get a turn at least every chunk. One 1,000-vector
+    // batch used to hold the lock for the whole parallel build: measured, reads
+    // fell 99% while batches ran (CONCURRENCY_BASELINE.md section 2.3).
+    static size_t batch_chunk() {
+        static const size_t c = [] {
+            if (const char* e = std::getenv("FEATHER_BATCH_CHUNK")) {
+                long v = std::atol(e);
+                if (v >= 1) return static_cast<size_t>(v);
+            }
+            unsigned hw = std::thread::hardware_concurrency();
+            return std::max<size_t>(64, 2 * static_cast<size_t>(hw ? hw : 4));
+        }();
+        return c;
+    }
+
+public:
+    void add(uint64_t id, const std::vector<float>& vec,
+             const Metadata& meta = Metadata(),
+             const std::string& modality = "text") {
+        check_writable("add a record");
+        const std::string payload = encode_add(modality, vec, meta);   // no lock needed
+        uint64_t lsn = 0;
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            check_dim_nolock(modality, vec.size());
+            // WAL: log before mutating in-memory state
+            lsn = wal_append(WalOp::ADD, id, payload);
+
+            auto& m_idx = get_or_create_index(modality, vec.size());
+            reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
+            add_point(m_idx, id, vec.data(), /*reuse_slot=*/true);
+            log_compaction_add(modality, id, vec.data(), vec.size());
+            apply_meta_upsert_nolock(id, meta);
+            if (wal_strict()) wal_wait_durable(lsn);
+        }
+        wal_wait_durable(lsn);   // group commit: fsync outside the data lock
     }
 
     // Bulk insert. Same per-item semantics as add(), but the HNSW graph (the
-    // expensive part) is built in PARALLEL — much faster for bulk ingestion.
+    // expensive part) is built in PARALLEL, much faster for bulk ingestion.
     // `metas` may be empty (default Metadata for all) or must match ids.size().
+    // The batch is applied in chunks (FEATHER_BATCH_CHUNK, default
+    // max(64, 2 x cores)); readers may observe a partially-applied batch. The
+    // call returns once the whole batch is durable (one fsync, not one per record).
     void add_batch(const std::vector<uint64_t>& ids,
                    const std::vector<std::vector<float>>& vecs,
                    const std::vector<Metadata>& metas,
                    const std::string& modality = "text") {
         check_writable("add a batch");
-        std::unique_lock<std::shared_mutex> lock(mutex_);
         const size_t n = ids.size();
         if (n == 0) return;
         if (vecs.size() != n)
             throw std::runtime_error("add_batch: ids and vecs size mismatch");
         if (!metas.empty() && metas.size() != n)
             throw std::runtime_error("add_batch: metas size mismatch");
-
-        auto& m_idx = get_or_create_index(modality, vecs[0].size());
-        static const Metadata kDefault;
-
-        // WAL + metadata + secondary indexes serially (cheap), collect vectors.
-        std::vector<std::pair<uint64_t, std::vector<float>>> items;
-        items.reserve(n);
-        for (size_t i = 0; i < n; ++i) {
-            const Metadata& meta = metas.empty() ? kDefault : metas[i];
-            if (vecs[i].size() != m_idx.dim)
+        const size_t dim = vecs[0].size();
+        for (const auto& v : vecs)
+            if (v.size() != dim)
                 throw std::runtime_error("Dimension mismatch for modality " + modality);
-            {
-                std::ostringstream ws;
-                uint16_t mod_len = static_cast<uint16_t>(modality.size());
-                ws.write(reinterpret_cast<const char*>(&mod_len), 2);
-                ws.write(modality.data(), mod_len);
-                uint32_t dim32 = static_cast<uint32_t>(vecs[i].size());
-                ws.write(reinterpret_cast<const char*>(&dim32), 4);
-                ws.write(reinterpret_cast<const char*>(vecs[i].data()), vecs[i].size() * 4);
-                meta.serialize(ws);
-                wal_append(WalOp::ADD, ids[i], ws.str());
-            }
-            std::string prev_content;
-            bool had_prev = false;
-            auto it = metadata_store_.find(ids[i]);
-            if (it != metadata_store_.end()) {
-                deindex_meta(ids[i], it->second);
-                prev_content = it->second.content;
-                had_prev     = true;
-                Metadata combined = meta;
-                if (combined.edges.empty() && !it->second.edges.empty())
-                    combined.edges = it->second.edges;
-                metadata_store_[ids[i]] = combined;
-            } else {
-                metadata_store_[ids[i]] = meta;
-            }
-            if (!is_dead_meta(metadata_store_[ids[i]])) index_meta(ids[i], metadata_store_[ids[i]]);
-            add_to_bm25_index(ids[i], meta.content, had_prev ? &prev_content : nullptr);
-            items.emplace_back(ids[i], vecs[i]);
+        {
+            std::shared_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            check_dim_nolock(modality, dim);
         }
-        wal_sync();   // one fsync per batch, not per record
-        reserve(m_idx, m_idx.index->getCurrentElementCount() + items.size());
-        parallel_add(m_idx, items);   // concurrent graph construction
+        static const Metadata kDefault;
+        const size_t chunk = batch_chunk();
+        uint64_t last_lsn = 0;
+
+        for (size_t s = 0; s < n; s += chunk) {
+            const size_t e = std::min(n, s + chunk);
+            std::vector<std::string> payloads;
+            payloads.reserve(e - s);
+            for (size_t i = s; i < e; ++i)
+                payloads.push_back(encode_add(modality, vecs[i], metas.empty() ? kDefault : metas[i]));
+
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            check_dim_nolock(modality, dim);
+            for (size_t i = s; i < e; ++i) {
+                last_lsn = wal_append(WalOp::ADD, ids[i], payloads[i - s]);
+                apply_meta_upsert_nolock(ids[i], metas.empty() ? kDefault : metas[i]);
+                log_compaction_add(modality, ids[i], vecs[i].data(), dim);
+            }
+            auto& m_idx = get_or_create_index(modality, dim);
+            reserve(m_idx, m_idx.index->getCurrentElementCount() + (e - s));
+            run_parallel(e - s, [&](size_t k) {          // concurrent graph construction
+                add_point(m_idx, ids[s + k], vecs[s + k].data());
+            });
+            if (wal_strict()) wal_wait_durable(last_lsn);
+        }
+        wal_wait_durable(last_lsn);   // one fsync for the whole batch
     }
 
     // ─────────────────────────────────────────────────────────────────
     // Salience
     // ─────────────────────────────────────────────────────────────────
     void touch(uint64_t id) {
-        std::shared_lock<std::shared_mutex> lock(mutex_);   // atomic counters
+        std::shared_lock<RWMutex> lock(mutex_);   // atomic counters
         touch_nolock(id);
     }
 
     // ─────────────────────────────────────────────────────────────────
     // Graph: link
     // ─────────────────────────────────────────────────────────────────
+    static std::string encode_link(uint64_t to_id, const std::string& rel_type, float weight) {
+        std::ostringstream ws;
+        ws.write(reinterpret_cast<const char*>(&to_id), 8);
+        auto rel_len = static_cast<uint8_t>(std::min(rel_type.size(), size_t(255)));
+        ws.write(reinterpret_cast<const char*>(&rel_len), 1);
+        ws.write(rel_type.data(), rel_len);
+        ws.write(reinterpret_cast<const char*>(&weight), 4);
+        return ws.str();
+    }
+
     void link(uint64_t from_id, uint64_t to_id,
               const std::string& rel_type = "related_to",
               float weight = 1.0f) {
         check_writable("create an edge");
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        auto it = metadata_store_.find(from_id);
-        if (it == metadata_store_.end()) return;
-
-        for (const auto& e : it->second.edges)
-            if (e.target_id == to_id && e.rel_type == rel_type) return;
-
-        // WAL
+        const std::string payload = encode_link(to_id, rel_type, weight);
+        uint64_t lsn = 0;
         {
-            std::ostringstream ws;
-            ws.write(reinterpret_cast<const char*>(&to_id), 8);
-            auto rel_len = static_cast<uint8_t>(std::min(rel_type.size(), size_t(255)));
-            ws.write(reinterpret_cast<const char*>(&rel_len), 1);
-            ws.write(rel_type.data(), rel_len);
-            ws.write(reinterpret_cast<const char*>(&weight), 4);
-            wal_append(WalOp::LINK, from_id, ws.str());
-            wal_sync();
-        }
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            auto it = metadata_store_.find(from_id);
+            if (it == metadata_store_.end()) return;
 
-        it->second.edges.push_back({to_id, rel_type, weight});
-        reverse_index_[to_id].push_back({from_id, rel_type, weight});
+            for (const auto& e : it->second.edges)
+                if (e.target_id == to_id && e.rel_type == rel_type) return;
+
+            lsn = wal_append(WalOp::LINK, from_id, payload);
+            it->second.edges.push_back({to_id, rel_type, weight});
+            reverse_index_[to_id].push_back({from_id, rel_type, weight});
+            if (wal_strict()) wal_wait_durable(lsn);
+        }
+        wal_wait_durable(lsn);
     }
 
     // ─────────────────────────────────────────────────────────────────
     // Graph: query edges
     // ─────────────────────────────────────────────────────────────────
     std::vector<Edge> get_edges(uint64_t id) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = metadata_store_.find(id);
         if (it == metadata_store_.end()) return {};
         return it->second.edges;
     }
 
     std::vector<IncomingEdge> get_incoming(uint64_t id) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = reverse_index_.find(id);
         if (it == reverse_index_.end()) return {};
         return it->second;
@@ -1554,16 +2034,17 @@ public:
     // vectors and nothing in Feather enforces normalisation. The cost is one
     // dot product per candidate inside a loop that was already O(n*candidates)
     // under the exclusive lock.
+    //
+    // The kNN pass (the expensive part) runs under the SHARED lock, so queries
+    // continue meanwhile; only applying the new edges takes the exclusive lock.
+    // Every edge is WAL-logged (it used to be in-memory only until the next
+    // save()), with one fsync for the whole pass.
     size_t auto_link(const std::string& modality = "text",
                      float threshold = 0.80f,
                      const std::string& rel_type = "related_to",
                      size_t candidates = 15) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        auto m_it = modality_indices_.find(modality);
-        if (m_it == modality_indices_.end()) return 0;
-        auto& m_idx = m_it->second;
-        size_t n = m_idx.index->cur_element_count;
-        size_t links_created = 0;
+        struct Cand { uint64_t from, to; float sim; };
+        std::vector<Cand> found;
 
         auto cosine = [&](const std::vector<float>& a, const std::vector<float>& b) -> float {
             if (a.size() != b.size() || a.empty()) return 0.0f;
@@ -1577,32 +2058,55 @@ public:
             return static_cast<float>(dot / (std::sqrt(na) * std::sqrt(nb)));
         };
 
-        for (size_t i = 0; i < n; ++i) {
-            uint64_t from_id = m_idx.index->getExternalLabel(i);
-            // stored data is already in the index's storage format (float or
-            // int8), so it can be used directly as the query.
-            const void* qdata = m_idx.index->getDataByInternalId(i);
-            std::vector<float> from_vec;
-            try { from_vec = read_vector_label(m_idx, from_id); } catch (...) { continue; }
-            auto res = m_idx.index->searchKnn(qdata, candidates + 1);
-            while (!res.empty()) {
-                auto [dist, to_id] = res.top(); res.pop();
-                if (to_id == from_id) continue;
-                std::vector<float> to_vec;
-                try { to_vec = read_vector_label(m_idx, to_id); } catch (...) { continue; }
-                float sim = cosine(from_vec, to_vec);   // true cosine, not 1/(1+L2)
-                if (sim < threshold) continue;
-                auto& meta = metadata_store_[from_id];
-                bool exists = false;
-                for (const auto& e : meta.edges)
-                    if (e.target_id == to_id && e.rel_type == rel_type) { exists = true; break; }
-                if (!exists) {
-                    meta.edges.push_back({to_id, rel_type, sim});
-                    reverse_index_[to_id].push_back({from_id, rel_type, sim});
-                    ++links_created;
+        {
+            LongSharedLock lock(mutex_);   // long pass: queries keep flowing
+            ensure_open();
+            auto m_it = modality_indices_.find(modality);
+            if (m_it == modality_indices_.end()) return 0;
+            auto& m_idx = m_it->second;
+            size_t n = m_idx.index->cur_element_count;
+            for (size_t i = 0; i < n; ++i) {
+                if (m_idx.index->isMarkedDeleted(i)) continue;
+                uint64_t from_id = m_idx.index->getExternalLabel(i);
+                auto mit = metadata_store_.find(from_id);
+                if (mit == metadata_store_.end() || is_dead_meta(mit->second)) continue;
+                // stored data is already in the index's storage format (float or
+                // int8), so it can be used directly as the query.
+                const void* qdata = m_idx.index->getDataByInternalId(i);
+                std::vector<float> from_vec;
+                try { from_vec = read_vector_label(m_idx, from_id); } catch (...) { continue; }
+                auto res = m_idx.index->searchKnn(qdata, candidates + 1);
+                while (!res.empty()) {
+                    auto [dist, to_id] = res.top(); res.pop();
+                    if (to_id == from_id) continue;
+                    std::vector<float> to_vec;
+                    try { to_vec = read_vector_label(m_idx, to_id); } catch (...) { continue; }
+                    float sim = cosine(from_vec, to_vec);   // true cosine, not 1/(1+L2)
+                    if (sim >= threshold) found.push_back({from_id, to_id, sim});
                 }
             }
         }
+        size_t links_created = 0;
+        uint64_t last_lsn = 0;
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            for (const auto& c : found) {
+                auto mit = metadata_store_.find(c.from);   // may have changed meanwhile
+                if (mit == metadata_store_.end() || is_dead_meta(mit->second)) continue;
+                auto& meta = mit->second;
+                bool exists = false;
+                for (const auto& e : meta.edges)
+                    if (e.target_id == c.to && e.rel_type == rel_type) { exists = true; break; }
+                if (exists) continue;
+                last_lsn = wal_append(WalOp::LINK, c.from, encode_link(c.to, rel_type, c.sim));
+                meta.edges.push_back({c.to, rel_type, c.sim});
+                reverse_index_[c.to].push_back({c.from, rel_type, c.sim});
+                ++links_created;
+            }
+            if (wal_strict()) wal_wait_durable(last_lsn);
+        }
+        wal_wait_durable(last_lsn);
         return links_created;
     }
 
@@ -1635,7 +2139,7 @@ public:
                                      const std::string& modality = "text") {
         // Read-only apart from the salience touch (atomic), so chains run
         // concurrently with queries and with each other.
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto m_it = modality_indices_.find(modality);
         if (m_it == modality_indices_.end()) return {};
         auto& m_idx = m_it->second;
@@ -1736,7 +2240,7 @@ public:
     // ─────────────────────────────────────────────────────────────────
     std::string export_graph_json(const std::string& ns_filter   = "",
                                   const std::string& eid_filter  = "") const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         std::ostringstream oss;
         oss << "{\"nodes\":[";
         bool first = true;
@@ -1795,7 +2299,7 @@ public:
     // Metadata CRUD
     // ─────────────────────────────────────────────────────────────────
     std::optional<Metadata> get_metadata(uint64_t id) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end()) return it->second;
         return std::nullopt;
@@ -1803,53 +2307,68 @@ public:
 
     void update_metadata(uint64_t id, const Metadata& meta) {
         check_writable("update metadata");
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        // WAL
+        std::string payload;
         {
             std::ostringstream ws;
             meta.serialize(ws);
-            wal_append(WalOp::UPDATE, id, ws.str());
-            wal_sync();
+            payload = ws.str();
         }
-        std::string prev_content;
-        bool had_prev = false;
-        auto old = metadata_store_.find(id);
-        if (old != metadata_store_.end()) {
-            deindex_meta(id, old->second);
-            prev_content = old->second.content;
-            had_prev     = true;
+        uint64_t lsn = 0;
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            lsn = wal_append(WalOp::UPDATE, id, payload);
+            std::string prev_content;
+            bool had_prev = false;
+            auto old = metadata_store_.find(id);
+            if (old != metadata_store_.end()) {
+                deindex_meta(id, old->second);
+                prev_content = old->second.content;
+                had_prev     = true;
+                // Retire this record's reverse-index entries using its OWN old
+                // edge list: O(edges of this record). This used to sweep the
+                // whole reverse index on every update: measured 13 ms per call
+                // at 500k edges, all of it under the exclusive lock.
+                for (const auto& e : old->second.edges) {
+                    auto rit = reverse_index_.find(e.target_id);
+                    if (rit == reverse_index_.end()) continue;
+                    auto& v = rit->second;
+                    v.erase(std::remove_if(v.begin(), v.end(),
+                            [id](const IncomingEdge& ie) { return ie.source_id == id; }), v.end());
+                    if (v.empty()) reverse_index_.erase(rit);
+                }
+                old->second = meta;
+            } else {
+                metadata_store_.emplace(id, meta);
+            }
+            if (!is_dead_meta(meta)) index_meta(id, meta);
+            for (const auto& e : meta.edges)
+                reverse_index_[e.target_id].push_back({id, e.rel_type, e.weight});
+            // A record updated into a dead state must leave the keyword index too.
+            add_to_bm25_index(id, is_dead_meta(meta) ? std::string() : meta.content,
+                              had_prev ? &prev_content : nullptr);
+            if (wal_strict()) wal_wait_durable(lsn);
         }
-        metadata_store_[id] = meta;
-        if (!is_dead_meta(meta)) index_meta(id, meta);
-        for (auto& [target, incoming_list] : reverse_index_) {
-            incoming_list.erase(
-                std::remove_if(incoming_list.begin(), incoming_list.end(),
-                    [id](const IncomingEdge& ie) { return ie.source_id == id; }),
-                incoming_list.end());
-        }
-        for (const auto& e : meta.edges)
-            reverse_index_[e.target_id].push_back({id, e.rel_type, e.weight});
-        // A record updated into a dead state must leave the keyword index too.
-        add_to_bm25_index(id, is_dead_meta(meta) ? std::string() : meta.content,
-                          had_prev ? &prev_content : nullptr);
+        wal_wait_durable(lsn);
     }
 
     void update_importance(uint64_t id, float importance) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        // WAL
+        std::string payload(reinterpret_cast<const char*>(&importance), 4);
+        uint64_t lsn = 0;
         {
-            std::ostringstream ws;
-            ws.write(reinterpret_cast<const char*>(&importance), 4);
-            wal_append(WalOp::UIMP, id, ws.str());
-            wal_sync();
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            lsn = wal_append(WalOp::UIMP, id, payload);
+            auto it = metadata_store_.find(id);
+            if (it != metadata_store_.end()) it->second.importance = importance;
+            if (wal_strict()) wal_wait_durable(lsn);
         }
-        auto it = metadata_store_.find(id);
-        if (it != metadata_store_.end()) it->second.importance = importance;
+        wal_wait_durable(lsn);
     }
 
     // Get raw vector for a given id and modality (empty if not found)
     std::vector<float> get_vector(uint64_t id, const std::string& modality = "text") const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = modality_indices_.find(modality);
         if (it == modality_indices_.end()) return {};
         try {
@@ -1861,7 +2380,7 @@ public:
 
     // Get all IDs present in a modality index
     std::vector<uint64_t> get_all_ids(const std::string& modality = "text") const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = modality_indices_.find(modality);
         if (it == modality_indices_.end()) return {};
         const auto& m_idx = it->second;
@@ -1887,7 +2406,7 @@ public:
     // vector(s). Records browsing/counting should use this so a DB whose
     // vectors live under a non-"text" modality still lists its records.
     std::vector<uint64_t> all_ids() const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         std::vector<uint64_t> ids;
         ids.reserve(metadata_store_.size());
         for (const auto& [id, _] : metadata_store_) ids.push_back(id);
@@ -1897,7 +2416,7 @@ public:
     // The actual modality index names present in this DB (e.g. "text",
     // "visual", or whatever an external pipeline named them).
     std::vector<std::string> modality_names() const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         std::vector<std::string> names;
         names.reserve(modality_indices_.size());
         for (const auto& [name, _] : modality_indices_) names.push_back(name);
@@ -1910,14 +2429,14 @@ public:
     // pre-filtered search with ready-made candidate sets.
     // ─────────────────────────────────────────────────────────────────
     std::vector<uint64_t> ids_in_namespace(const std::string& ns) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = ns_index_.find(ns);
         if (it == ns_index_.end()) return {};
         return {it->second.begin(), it->second.end()};
     }
 
     std::vector<uint64_t> ids_for_entity(const std::string& eid) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = entity_index_.find(eid);
         if (it == entity_index_.end()) return {};
         return {it->second.begin(), it->second.end()};
@@ -1925,20 +2444,20 @@ public:
 
     std::vector<uint64_t> ids_with_attribute(const std::string& key,
                                              const std::string& val) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = attr_index_.find(attr_key(key, val));
         if (it == attr_index_.end()) return {};
         return {it->second.begin(), it->second.end()};
     }
 
     size_t namespace_size(const std::string& ns) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = ns_index_.find(ns);
         return it == ns_index_.end() ? 0 : it->second.size();
     }
 
     std::vector<std::string> list_namespaces() const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         std::vector<std::string> out;
         out.reserve(ns_index_.size());
         for (const auto& [ns, _] : ns_index_) out.push_back(ns);
@@ -1969,7 +2488,34 @@ public:
         uint64_t id;
         float    score;
         Metadata metadata;
+        // Exact cosine(query, stored vector) when search(..., with_cosine=true);
+        // NaN otherwise. `score` is a ranking value (1/(1+L2^2), optionally
+        // decay-weighted), not a similarity you can threshold.
+        float    cosine = std::numeric_limits<float>::quiet_NaN();
     };
+
+private:
+    // Fill SearchResult::cosine for the (already truncated) result set.
+    static void fill_cosines(const ModalityIndex& m_idx, const std::vector<float>& q,
+                             std::vector<SearchResult>& results) {
+        double qn = 0.0;
+        for (float x : q) qn += static_cast<double>(x) * x;
+        qn = std::sqrt(qn);
+        for (auto& r : results) {
+            std::vector<float> v;
+            try { v = read_vector_label(m_idx, r.id); } catch (...) { continue; }
+            if (v.size() != q.size()) continue;
+            double dot = 0.0, vn = 0.0;
+            for (size_t i = 0; i < v.size(); ++i) {
+                dot += static_cast<double>(q[i]) * v[i];
+                vn  += static_cast<double>(v[i]) * v[i];
+            }
+            vn = std::sqrt(vn);
+            if (qn > 0.0 && vn > 0.0) r.cosine = static_cast<float>(dot / (qn * vn));
+        }
+    }
+
+public:
 
     // `record_salience` controls whether this query counts as a recall for the
     // records it touches. Default true (a real user query is evidence of value),
@@ -1981,63 +2527,48 @@ public:
                                      const SearchFilter*   filter  = nullptr,
                                      const ScoringConfig*  scoring = nullptr,
                                      const std::string&    modality = "text",
-                                     bool record_salience = true) {
+                                     bool record_salience = true,
+                                     bool with_cosine = false) {
         // SHARED lock: queries run concurrently with each other. The only
         // mutation here is the salience touch, which goes through Metadata's
         // atomic counters.
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto m_it = modality_indices_.find(modality);
         if (m_it == modality_indices_.end()) return {};
         auto& m_idx = m_it->second;
         check_query_dim(m_idx, q.size(), modality);
 
-        // ── Pre-filtered exact path (feature A) ──────────────────────
-        // When the filter constrains an indexed field (namespace/entity/
-        // attribute), resolve the candidate set from the secondary indexes and
-        // rank EXACTLY over just those vectors. Unlike HNSW's ef-bounded
-        // filtered traversal — which silently returns far fewer than k when the
-        // filter is selective — this returns up to k matches whenever ≥k records
-        // match, and is O(matches) so a selective filter is also fast.
-        if (filter) {
-            bool indexed = false;
-            auto cand = candidates_for_filter(*filter, indexed);
-            if (indexed) {
-                double now_ts = static_cast<double>(std::time(nullptr));
-                std::vector<SearchResult> results;
-                results.reserve(cand.size());
-                for (uint64_t id : cand) {
-                    auto it = metadata_store_.find(id);
-                    if (it == metadata_store_.end() || is_dead_meta(it->second)) continue;
-                    if (!filter->matches(it->second)) continue;   // non-indexed predicates
-                    std::vector<float> vec;
-                    try { vec = read_vector_label(m_idx, id); }   // float (deq if int8)
-                    catch (...) { continue; }                     // not in this modality
-                    if (vec.size() != m_idx.dim) continue;
-                    float dist = 0.0f;                            // exact L2 in float space
-                    for (size_t d = 0; d < m_idx.dim; ++d) {
-                        float diff = q[d] - vec[d];
-                        dist += diff * diff;
-                    }
-                    float score = scoring
-                        ? Scorer::calculate_score(dist, it->second, *scoring, now_ts)
-                        : 1.0f / (1.0f + dist);
-                    results.push_back({id, score, it->second});
-                }
-                std::sort(results.begin(), results.end(),
-                    [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
-                if (results.size() > k) results.resize(k);
-                // Touch AFTER truncation: a recall means "this record was
-                // returned", not "this record was examined". This path scans the
-                // whole indexed candidate set, so touching inside the loop
-                // credited every record in the namespace on every query —
-                // measured, a k=5 search over 400 candidates incremented all 400.
-                // Uniform inflation makes stickiness a constant, which collapses
-                // adaptive decay to recency x importance.
-                if (record_salience)
-                    for (const auto& r : results) touch_nolock(r.id);
-                return results;
+        const double now_ts = static_cast<double>(std::time(nullptr));
+        static const Metadata kNoMeta;
+        auto score_of = [&](float dist, const Metadata& meta) {
+            return scoring ? Scorer::calculate_score(dist, meta, *scoring, now_ts)
+                           : 1.0f / (1.0f + dist);
+        };
+        // Rank on (score, id) only; copy metadata for the k winners alone. The
+        // pre-filtered path used to copy the full Metadata (content, attributes,
+        // edges) of EVERY candidate before sorting — 20k string copies to
+        // return 10.
+        auto finish = [&](std::vector<std::pair<float, uint64_t>>& scored) {
+            const size_t kk = std::min(k, scored.size());
+            std::partial_sort(scored.begin(), scored.begin() + kk, scored.end(),
+                [](const std::pair<float, uint64_t>& a, const std::pair<float, uint64_t>& b) {
+                    return a.first > b.first || (a.first == b.first && a.second < b.second);
+                });
+            std::vector<SearchResult> results;
+            results.reserve(kk);
+            for (size_t i = 0; i < kk; ++i) {
+                auto it = metadata_store_.find(scored[i].second);
+                results.push_back({scored[i].second, scored[i].first,
+                                   it != metadata_store_.end() ? it->second : kNoMeta});
             }
-        }
+            // Touch AFTER truncation: a recall means "this record was returned",
+            // not "this record was examined" (touching every scanned candidate
+            // made stickiness a constant and collapsed adaptive decay).
+            if (record_salience)
+                for (const auto& r : results) touch_nolock(r.id);
+            if (with_cosine) fill_cosines(m_idx, q, results);
+            return results;
+        };
 
         struct FilterWrapper : public hnswlib::BaseFilterFunctor {
             const SearchFilter* filter_;
@@ -2049,101 +2580,227 @@ public:
                 if (!filter_) return true;
                 auto it = store_.find(id);
                 if (it == store_.end()) return false;
+                if (is_dead_meta(it->second)) return false;   // same rule as the exact scan
                 return filter_->matches(it->second);
             }
         };
+        const size_t want = scoring ? k * 3 : k;          // scoring re-ranks a wider pool
+        auto qbytes = encode_query(m_idx, q.data());      // float bytes or int8 blob
 
-        FilterWrapper hnsw_filter(filter, metadata_store_);
-        size_t candidates = (scoring) ? k * 3 : k;
-        auto qbytes = encode_query(m_idx, q.data());   // float bytes or int8 blob
-        auto res = m_idx.index->searchKnn(qbytes.data(), candidates,
-                                          filter ? &hnsw_filter : nullptr);
+        // Graph traversal, optionally with a per-call ef. Returns (score, id).
+        auto hnsw = [&](const SearchFilter* f, size_t ef_override) {
+            FilterWrapper fw(f, metadata_store_);
+            auto res = m_idx.index->searchKnnEf(qbytes.data(), want, ef_override,
+                                                 f ? &fw : nullptr);
+            std::vector<std::pair<float, uint64_t>> scored;
+            scored.reserve(res.size());
+            while (!res.empty()) {
+                auto [dist, id] = res.top(); res.pop();
+                auto it = metadata_store_.find(id);
+                scored.push_back({score_of(dist, it != metadata_store_.end() ? it->second : kNoMeta), id});
+            }
+            return scored;
+        };
 
-        std::vector<SearchResult> results;
-        double now_ts = static_cast<double>(std::time(nullptr));
-        (void)now_ts; // used conditionally when scoring != nullptr
-
-        while (!res.empty()) {
-            auto [dist, id] = res.top(); res.pop();
-            auto it = metadata_store_.find(id);
-            Metadata meta = (it != metadata_store_.end()) ? it->second : Metadata();
-            float score = scoring
-                ? Scorer::calculate_score(dist, meta, *scoring, now_ts)
-                : 1.0f / (1.0f + dist);
-            results.push_back({id, score, std::move(meta)});
+        // ── Pre-filtered path ────────────────────────────────────────
+        // When the filter constrains an indexed field (namespace/entity/
+        // attribute), the secondary indexes give the exact candidate set.
+        //  * Small or very selective sets: exact scan over just those vectors,
+        //    with the index's own SIMD distance kernel on the stored data (no
+        //    per-candidate copy). Complete top-k whenever >= k records match,
+        //    which ef-bounded filtered HNSW cannot promise for selective filters.
+        //  * Large, unselective sets: filtered graph traversal with ef raised
+        //    to ~2k/selectivity for this call, falling back to the exact scan
+        //    if the walk comes up short.
+        //  The route is a cost comparison, not a size threshold. The scan costs
+        //  ~candidates; a filtered walk costs ~k/selectivity^2 (a wider beam AND
+        //  more visited nodes failing the filter). Measured at 100k x 768:
+        //  sel 2% -> scan 0.55 ms vs walk 45 ms; sel 20% -> scan 9.1 ms vs walk
+        //  1.1 ms. Take the walk when candidates * sel^2 > C * k (C=10,
+        //  calibrated at 128-d and 768-d; FEATHER_PREFILTER_C overrides).
+        if (filter) {
+            bool indexed = false;
+            auto cand = candidates_for_filter(*filter, indexed);
+            if (indexed) {
+                const size_t live = m_idx.index->getCurrentElementCount() -
+                                    m_idx.index->getDeletedCount();
+                const int mode = prefilter_mode();
+                if (mode != PREFILTER_EXACT && live > 0 && !cand.empty()) {
+                    const double c   = static_cast<double>(cand.size());
+                    const double sel = std::min(1.0, c / static_cast<double>(live));
+                    const double need = 2.0 * static_cast<double>(want) / sel;
+                    const bool walk = need <= static_cast<double>(PREFILTER_MAX_EF) &&
+                        (mode == PREFILTER_HNSW ||
+                         (c >= 2000.0 && c * sel * sel > prefilter_c() * static_cast<double>(want)));
+                    if (walk) {
+                        const size_t ef = std::max<size_t>(m_idx.index->ef_,
+                                                           static_cast<size_t>(need));
+                        auto scored = hnsw(filter, ef);
+                        if (scored.size() >= std::min(want, cand.size()))
+                            return finish(scored);
+                    }
+                }
+                std::vector<std::pair<float, uint64_t>> scored;
+                scored.reserve(cand.size());
+                auto& idx = *m_idx.index;
+                const auto dist_fn = m_idx.space->get_dist_func();
+                void* dist_param   = m_idx.space->get_dist_func_param();
+                const auto f32i8   = feather_simd::f32_i8_l2_fn();
+                for (uint64_t id : cand) {
+                    auto it = metadata_store_.find(id);
+                    if (it == metadata_store_.end() || is_dead_meta(it->second)) continue;
+                    if (!filter->matches(it->second)) continue;   // non-indexed predicates
+                    // label_lookup_ is only mutated under the exclusive lock, so
+                    // reading it under our shared lock needs no extra mutex.
+                    auto lit = idx.label_lookup_.find(id);
+                    if (lit == idx.label_lookup_.end()) continue; // not in this modality
+                    if (idx.isMarkedDeleted(lit->second)) continue;
+                    const char* data = idx.getDataByInternalId(lit->second);
+                    float dist;
+                    if (m_idx.int8) {
+                        // Asymmetric: float query vs int8 row dequantized inside
+                        // the (SIMD) kernel, as exact as before, without the loop.
+                        dist = f32i8(q.data(), reinterpret_cast<const int8_t*>(data),
+                                     m_idx.scale, m_idx.dim);
+                    } else {
+                        dist = dist_fn(q.data(), data, dist_param);   // SIMD kernel
+                    }
+                    scored.push_back({score_of(dist, it->second), id});
+                }
+                return finish(scored);
+            }
         }
 
-        std::sort(results.begin(), results.end(),
-            [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
-        if (results.size() > k) results.resize(k);
-        // Same rule as the pre-filtered path. With scoring enabled the HNSW walk
-        // fetches k*3 candidates, so touching during the walk credited three
-        // times as many records as were ever returned.
-        if (record_salience)
-            for (const auto& r : results) touch_nolock(r.id);
-        return results;
+        // ── Graph path (no filter, or only non-indexed predicates) ────
+        auto scored = hnsw(filter, 0);
+        return finish(scored);
     }
+
+private:
+    // Filtered-search routing (see the cost model in search()).
+    static constexpr size_t PREFILTER_MAX_EF = 4096;
+    enum { PREFILTER_AUTO = 0, PREFILTER_EXACT = 1, PREFILTER_HNSW = 2 };
+    // FEATHER_PREFILTER_MODE=auto|exact|hnsw forces a route (tests, A/B).
+    static int prefilter_mode() {
+        static const int m = [] {
+            const char* e = std::getenv("FEATHER_PREFILTER_MODE");
+            if (e && !std::strcmp(e, "exact")) return static_cast<int>(PREFILTER_EXACT);
+            if (e && !std::strcmp(e, "hnsw"))  return static_cast<int>(PREFILTER_HNSW);
+            return static_cast<int>(PREFILTER_AUTO);
+        }();
+        return m;
+    }
+    static double prefilter_c() {
+        static const double c = [] {
+            if (const char* e = std::getenv("FEATHER_PREFILTER_C")) {
+                double v = std::atof(e);
+                if (v > 0.0) return v;
+            }
+            return 10.0;
+        }();
+        return c;
+    }
+
+public:
 
     // ─────────────────────────────────────────────────────────────────
     // BM25 keyword search
     // ─────────────────────────────────────────────────────────────────
-    std::vector<SearchResult> keyword_search(const std::string& query, size_t k = 10,
-                                             const SearchFilter* filter = nullptr) {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+private:
+    using ScoredId = std::pair<float, uint64_t>;
+
+    // Best first; ties go to the smaller id (same order as search()).
+    static bool better_scored(const ScoredId& a, const ScoredId& b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+    }
+
+    // The best `limit` BM25 hits for `query` as (score, id), best first.
+    // Caller holds mutex_ (shared is enough). Returns ids and scores only, so
+    // callers copy Metadata just for the hits they actually return.
+    std::vector<ScoredId> bm25_top_nolock(const std::string& query, size_t limit,
+                                          const SearchFilter* filter) const {
+        std::vector<ScoredId> ranked;
+        if (limit == 0 || doc_lengths_.empty()) return ranked;
         auto terms = tokenize(query);
-        if (terms.empty() || doc_lengths_.empty()) return {};
+        if (terms.empty()) return ranked;
 
-        size_t N = doc_lengths_.size();
-        double avdl = avg_dl_ > 0.0 ? avg_dl_ : 1.0;
-
-        // Unique query terms
         std::unordered_set<std::string> unique_terms(terms.begin(), terms.end());
-
-        std::unordered_map<uint64_t, float> scores;
-
+        std::vector<const std::vector<PostingEntry>*> lists;
+        size_t total_postings = 0;
         for (const auto& term : unique_terms) {
             auto it = bm25_index_.find(term);
             if (it == bm25_index_.end()) continue;
-            const auto& postings = it->second;
-            size_t n_t = postings.size();
+            lists.push_back(&it->second);
+            total_postings += it->second.size();
+        }
+        if (lists.empty()) return ranked;
 
+        // Never return a posting whose record is gone or dead: it would
+        // surface as a hit with empty metadata.
+        auto eligible = [&](uint64_t id) {
+            auto mit = metadata_store_.find(id);
+            return mit != metadata_store_.end() && !is_dead_meta(mit->second) &&
+                   (!filter || filter->matches(mit->second));
+        };
+
+        // Each posting carries its document's length, so scoring needs no
+        // doc_lengths_ lookup. A filter is applied per posting: it usually
+        // rejects most documents, and keeping them out of `scores` is cheaper
+        // than scoring them. Without one, forget()/purge() already drop
+        // postings, so eligibility is only checked on the winners below.
+        const double N = static_cast<double>(doc_lengths_.size());
+        const double avdl = avg_dl_ > 0.0 ? avg_dl_ : 1.0;
+        std::unordered_map<uint64_t, float> scores;
+        if (!filter) scores.reserve(total_postings);
+        for (const auto* postings : lists) {
+            const double n_t = static_cast<double>(postings->size());
             // IDF (BM25+): log((N - n_t + 0.5) / (n_t + 0.5) + 1)
-            double idf = std::log(
-                (static_cast<double>(N) - static_cast<double>(n_t) + 0.5) /
-                (static_cast<double>(n_t) + 0.5) + 1.0);
-
-            for (const auto& p : postings) {
-                // Never score a posting whose record is gone or dead — that
-                // would surface as a hit with empty metadata.
-                auto mit = metadata_store_.find(p.doc_id);
-                if (mit == metadata_store_.end() || is_dead_meta(mit->second)) continue;
-                if (filter && !filter->matches(mit->second)) continue;
-                auto dl_it = doc_lengths_.find(p.doc_id);
-                uint32_t dl = (dl_it != doc_lengths_.end()) ? dl_it->second : 1;
-                double tf_norm =
-                    (static_cast<double>(p.term_freq) * (BM25_K1 + 1.0)) /
-                    (static_cast<double>(p.term_freq) +
-                     BM25_K1 * (1.0 - BM25_B + BM25_B * static_cast<double>(dl) / avdl));
+            const double idf = std::log((N - n_t + 0.5) / (n_t + 0.5) + 1.0);
+            for (const auto& p : *postings) {
+                if (filter && !eligible(p.doc_id)) continue;
+                const double tf = static_cast<double>(p.term_freq);
+                const double tf_norm = (tf * (BM25_K1 + 1.0)) /
+                    (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * static_cast<double>(p.doc_len) / avdl));
                 scores[p.doc_id] += static_cast<float>(idf * tf_norm);
             }
         }
 
-        // Sort by score descending
-        std::vector<std::pair<float, uint64_t>> ranked;
         ranked.reserve(scores.size());
-        for (const auto& [id, sc] : scores) ranked.push_back({sc, id});
-        std::sort(ranked.begin(), ranked.end(), std::greater<std::pair<float,uint64_t>>());
-        if (ranked.size() > k) ranked.resize(k);
+        for (const auto& [id, sc] : scores) ranked.emplace_back(sc, id);
+        // A stale posting that reaches the top is dropped and the next best
+        // takes its place. With a filter every entry is already eligible, so
+        // this loop runs once.
+        for (;;) {
+            const auto head_end = ranked.begin() + std::min(limit, ranked.size());
+            std::partial_sort(ranked.begin(), head_end, ranked.end(), better_scored);
+            const auto kept_end = std::remove_if(ranked.begin(), head_end,
+                [&](const ScoredId& e) { return !eligible(e.second); });
+            if (kept_end == head_end) {
+                ranked.erase(head_end, ranked.end());
+                return ranked;
+            }
+            ranked.erase(kept_end, head_end);
+        }
+    }
 
+    // Caller holds mutex_. Copies metadata for the final hits only.
+    std::vector<SearchResult> to_results_nolock(const std::vector<ScoredId>& ranked,
+                                                bool record_hit) const {
         std::vector<SearchResult> results;
         results.reserve(ranked.size());
         for (const auto& [sc, id] : ranked) {
-            touch_nolock(id);
+            if (record_hit) touch_nolock(id);
             auto mit = metadata_store_.find(id);
-            Metadata meta = (mit != metadata_store_.end()) ? mit->second : Metadata();
-            results.push_back({id, sc, std::move(meta)});
+            results.push_back({id, sc, mit != metadata_store_.end() ? mit->second : Metadata()});
         }
         return results;
+    }
+
+public:
+    std::vector<SearchResult> keyword_search(const std::string& query, size_t k = 10,
+                                             const SearchFilter* filter = nullptr) {
+        std::shared_lock<RWMutex> lock(mutex_);
+        return to_results_nolock(bm25_top_nolock(query, k, filter), /*record_hit=*/true);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -2157,12 +2814,13 @@ public:
                                             const ScoringConfig* scoring = nullptr,
                                             const std::string& modality = "text") {
         // Read-only end to end (RRF fusion never touches salience), so this
-        // runs fully concurrently with other queries.
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        size_t candidates = k * 3;
+        // runs fully concurrently with other queries. Both rankings and the
+        // fusion work on (score, id); metadata is copied for the final k only.
+        std::shared_lock<RWMutex> lock(mutex_);
+        const size_t candidates = k * 3;
 
         // ── Inline vector search (no re-lock) ─────────────────────────
-        std::vector<SearchResult> vec_results;
+        std::vector<ScoredId> vec_ranked;
         {
             auto m_it = modality_indices_.find(modality);
             if (m_it != modality_indices_.end()) {
@@ -2179,81 +2837,53 @@ public:
                 size_t cands = scoring ? candidates * 3 : candidates;
                 auto qbytes = encode_query(m_idx, vec.data());
                 auto res = m_idx.index->searchKnn(qbytes.data(), cands, filter ? &fw : nullptr);
-                double now_ts = static_cast<double>(std::time(nullptr));
+                const double now_ts = static_cast<double>(std::time(nullptr));
+                static const Metadata kNoMeta;
+                vec_ranked.reserve(res.size());
                 while (!res.empty()) {
                     auto [dist, id] = res.top(); res.pop();
-                    auto it = metadata_store_.find(id);
-                    Metadata meta = (it != metadata_store_.end()) ? it->second : Metadata();
-                    float score = scoring
-                        ? Scorer::calculate_score(dist, meta, *scoring, now_ts)
-                        : 1.0f / (1.0f + dist);
-                    vec_results.push_back({id, score, std::move(meta)});
+                    float score;
+                    if (scoring) {
+                        auto it = metadata_store_.find(id);
+                        score = Scorer::calculate_score(
+                            dist, it != metadata_store_.end() ? it->second : kNoMeta,
+                            *scoring, now_ts);
+                    } else {
+                        score = 1.0f / (1.0f + dist);
+                    }
+                    vec_ranked.emplace_back(score, id);
                 }
-                std::sort(vec_results.begin(), vec_results.end(),
-                    [](const SearchResult& a, const SearchResult& b){ return a.score > b.score; });
-                if (vec_results.size() > candidates) vec_results.resize(candidates);
+                const auto head_end = vec_ranked.begin() + std::min(candidates, vec_ranked.size());
+                std::partial_sort(vec_ranked.begin(), head_end, vec_ranked.end(), better_scored);
+                vec_ranked.erase(head_end, vec_ranked.end());
             }
         }
 
         // ── Inline BM25 search (no re-lock) ──────────────────────────
-        std::vector<SearchResult> kw_results;
-        {
-            auto terms = tokenize(query);
-            if (!terms.empty() && !doc_lengths_.empty()) {
-                size_t N = doc_lengths_.size();
-                double avdl = avg_dl_ > 0.0 ? avg_dl_ : 1.0;
-                std::unordered_set<std::string> uterms(terms.begin(), terms.end());
-                std::unordered_map<uint64_t, float> scores;
-                for (const auto& term : uterms) {
-                    auto it = bm25_index_.find(term);
-                    if (it == bm25_index_.end()) continue;
-                    size_t n_t = it->second.size();
-                    double idf = std::log((static_cast<double>(N)-n_t+0.5)/(n_t+0.5)+1.0);
-                    for (const auto& p : it->second) {
-                        auto mit = metadata_store_.find(p.doc_id);
-                        if (mit == metadata_store_.end() || is_dead_meta(mit->second)) continue;
-                        if (filter && !filter->matches(mit->second)) continue;
-                        auto dl_it = doc_lengths_.find(p.doc_id);
-                        uint32_t dl = dl_it!=doc_lengths_.end() ? dl_it->second : 1;
-                        double tf_norm = (p.term_freq*(BM25_K1+1.0)) /
-                            (p.term_freq + BM25_K1*(1.0-BM25_B+BM25_B*dl/avdl));
-                        scores[p.doc_id] += static_cast<float>(idf * tf_norm);
-                    }
-                }
-                std::vector<std::pair<float,uint64_t>> ranked;
-                ranked.reserve(scores.size());
-                for (const auto& [id, sc] : scores) ranked.push_back({sc, id});
-                std::sort(ranked.begin(), ranked.end(), std::greater<std::pair<float,uint64_t>>());
-                if (ranked.size() > candidates) ranked.resize(candidates);
-                for (const auto& [sc, id] : ranked) {
-                    auto mit = metadata_store_.find(id);
-                    Metadata meta = (mit != metadata_store_.end()) ? mit->second : Metadata();
-                    kw_results.push_back({id, sc, std::move(meta)});
-                }
-            }
-        }
+        const auto kw_ranked = bm25_top_nolock(query, candidates, filter);
 
         // ── RRF merge ────────────────────────────────────────────────
         std::unordered_map<uint64_t, double> rrf_scores;
-        for (size_t rank = 0; rank < vec_results.size(); ++rank)
-            rrf_scores[vec_results[rank].id] += 1.0 / (static_cast<double>(rrf_k) + rank + 1);
-        for (size_t rank = 0; rank < kw_results.size(); ++rank)
-            rrf_scores[kw_results[rank].id] += 1.0 / (static_cast<double>(rrf_k) + rank + 1);
+        rrf_scores.reserve(vec_ranked.size() + kw_ranked.size());
+        for (size_t rank = 0; rank < vec_ranked.size(); ++rank)
+            rrf_scores[vec_ranked[rank].second] += 1.0 / (static_cast<double>(rrf_k) + rank + 1);
+        for (size_t rank = 0; rank < kw_ranked.size(); ++rank)
+            rrf_scores[kw_ranked[rank].second] += 1.0 / (static_cast<double>(rrf_k) + rank + 1);
 
-        std::vector<std::pair<double, uint64_t>> ranked;
-        ranked.reserve(rrf_scores.size());
-        for (const auto& [id, sc] : rrf_scores) ranked.push_back({sc, id});
-        std::sort(ranked.begin(), ranked.end(), std::greater<std::pair<double,uint64_t>>());
-        if (ranked.size() > k) ranked.resize(k);
+        std::vector<std::pair<double, uint64_t>> fused;
+        fused.reserve(rrf_scores.size());
+        for (const auto& [id, sc] : rrf_scores) fused.emplace_back(sc, id);
+        const auto top_end = fused.begin() + std::min(k, fused.size());
+        std::partial_sort(fused.begin(), top_end, fused.end(),
+            [](const std::pair<double, uint64_t>& a, const std::pair<double, uint64_t>& b) {
+                return a.first > b.first || (a.first == b.first && a.second < b.second);
+            });
 
-        std::vector<SearchResult> results;
-        results.reserve(ranked.size());
-        for (const auto& [sc, id] : ranked) {
-            auto mit = metadata_store_.find(id);
-            Metadata meta = (mit != metadata_store_.end()) ? mit->second : Metadata();
-            results.push_back({id, static_cast<float>(sc), std::move(meta)});
-        }
-        return results;
+        std::vector<ScoredId> ranked;
+        ranked.reserve(top_end - fused.begin());
+        for (auto it = fused.begin(); it != top_end; ++it)
+            ranked.emplace_back(static_cast<float>(it->first), it->second);
+        return to_results_nolock(ranked, /*record_hit=*/false);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -2262,14 +2892,13 @@ public:
 
     // Soft-delete: mark-deleted in HNSW (exits search), blank content,
     // set importance=0. The node shell remains so graph edges stay traversable.
-    void forget(uint64_t id) {
-        check_writable("forget a record");
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        wal_append(WalOp::FORGET, id, "");
-        wal_sync();
+private:
+    // Caller holds mutex_ exclusively.
+    void forget_nolock(uint64_t id) {
         for (auto& [name, m_idx] : modality_indices_) {
             try { m_idx.index->markDelete(id); } catch (...) {}
         }
+        log_compaction_remove(id);
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end()) {
             deindex_meta(id, it->second);   // forgotten records leave candidate sets
@@ -2281,124 +2910,282 @@ public:
             it->second.importance = 0.0f;
             it->second.ttl        = 0;
         }
-        maybe_auto_compact_nolock();
     }
 
-    // Hard-delete: remove all nodes in namespace_id from indices +
-    // metadata store + reverse index. Returns count of removed nodes.
-    size_t purge(const std::string& ns_id) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+    // Hard-delete every record in a namespace. Shared by purge() and WAL
+    // replay; replay passes maintain_derived=false because load_vectors()
+    // rebuilds the derived indexes once afterwards.
+    size_t purge_core(const std::string& ns_id, bool maintain_derived) {
         std::unordered_set<uint64_t> to_purge;
         for (const auto& [id, meta] : metadata_store_)
             if (meta.namespace_id == ns_id) to_purge.insert(id);
+        if (to_purge.empty()) return 0;
 
-        // Mark-delete in every modality
-        for (auto& [name, m_idx] : modality_indices_) {
+        for (auto& [name, m_idx] : modality_indices_)
             for (uint64_t id : to_purge) {
                 try { m_idx.index->markDelete(id); } catch (...) {}
             }
-        }
-        // Erase metadata (deindex first so secondary indexes stay in sync)
         for (uint64_t id : to_purge) {
+            log_compaction_remove(id);
             auto it = metadata_store_.find(id);
-            if (it != metadata_store_.end()) {
+            if (it == metadata_store_.end()) continue;
+            if (maintain_derived) {
                 deindex_meta(id, it->second);
-                // Purged ids must leave the keyword index too — a stale posting
+                // Purged ids must leave the keyword index too: a stale posting
                 // resolves to no metadata and surfaces as an empty ghost hit.
                 remove_from_bm25_index(id, &it->second.content);
             }
-            metadata_store_.erase(id);
+            metadata_store_.erase(it);
         }
-
-        // Clean reverse index: remove entries sourced from purged nodes
-        for (auto& [target, incoming] : reverse_index_) {
-            incoming.erase(
-                std::remove_if(incoming.begin(), incoming.end(),
-                    [&to_purge](const IncomingEdge& ie) {
-                        return to_purge.count(ie.source_id) > 0;
-                    }),
-                incoming.end());
-        }
-        // Remove reverse index entries for purged target keys
-        for (uint64_t id : to_purge) reverse_index_.erase(id);
-
+        if (maintain_derived) prune_reverse_index(to_purge);
         // Prune edges in surviving nodes that pointed to purged targets
         for (auto& [id, meta] : metadata_store_) {
             meta.edges.erase(
                 std::remove_if(meta.edges.begin(), meta.edges.end(),
-                    [&to_purge](const Edge& e) {
-                        return to_purge.count(e.target_id) > 0;
-                    }),
+                    [&to_purge](const Edge& e) { return to_purge.count(e.target_id) > 0; }),
                 meta.edges.end());
         }
-
-        maybe_auto_compact_nolock();
         return to_purge.size();
+    }
+
+public:
+    void forget(uint64_t id) {
+        check_writable("forget a record");
+        uint64_t lsn = 0;
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            lsn = wal_append(WalOp::FORGET, id, "");
+            forget_nolock(id);
+            maybe_auto_compact_nolock();
+            if (wal_strict()) wal_wait_durable(lsn);
+        }
+        wal_wait_durable(lsn);
+    }
+
+    // Hard-delete: remove all nodes in namespace_id from indices +
+    // metadata store + reverse index. Returns count of removed nodes.
+    // WAL-logged since 0.19 (it used to survive a crash only via save()).
+    size_t purge(const std::string& ns_id) {
+        std::string payload;
+        {
+            uint16_t len = static_cast<uint16_t>(std::min<size_t>(ns_id.size(), 65535));
+            payload.append(reinterpret_cast<const char*>(&len), 2);
+            payload.append(ns_id.data(), len);
+        }
+        uint64_t lsn = 0;
+        size_t n = 0;
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            lsn = wal_append(WalOp::PURGE, 0, payload);
+            n = purge_core(ns_id, /*maintain_derived=*/true);
+            maybe_auto_compact_nolock();
+            if (wal_strict()) wal_wait_durable(lsn);
+        }
+        wal_wait_durable(lsn);
+        return n;
     }
 
     // Scan all nodes and soft-delete any with ttl>0 where now > timestamp+ttl.
     // Returns count of nodes forgotten.
     size_t forget_expired() {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        int64_t now = static_cast<int64_t>(std::time(nullptr));
-        size_t  count = 0;
-        std::vector<uint64_t> expired;
-        for (const auto& [id, meta] : metadata_store_) {
-            if (meta.ttl > 0 && now > meta.timestamp + meta.ttl)
-                expired.push_back(id);
-        }
-        for (uint64_t id : expired) {
-            wal_append(WalOp::FORGET, id, "");
-            for (auto& [name, m_idx] : modality_indices_) {
-                try { m_idx.index->markDelete(id); } catch (...) {}
+        uint64_t last_lsn = 0;
+        size_t count = 0;
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            int64_t now = static_cast<int64_t>(std::time(nullptr));
+            std::vector<uint64_t> expired;
+            for (const auto& [id, meta] : metadata_store_) {
+                if (meta.ttl > 0 && now > meta.timestamp + meta.ttl)
+                    expired.push_back(id);
             }
-            auto it = metadata_store_.find(id);
-            if (it != metadata_store_.end()) {
-                deindex_meta(id, it->second);   // drop from candidate sets
-                remove_from_bm25_index(id, &it->second.content);
-                it->second.content    = "";
-                it->second.source     = "_forgotten";
-                it->second.importance = 0.0f;
-                it->second.ttl        = 0;
+            for (uint64_t id : expired) {
+                last_lsn = wal_append(WalOp::FORGET, id, "");
+                forget_nolock(id);
+                ++count;
             }
-            ++count;
+            maybe_auto_compact_nolock();
+            if (wal_strict()) wal_wait_durable(last_lsn);
         }
-        wal_sync();   // one fsync for the whole sweep
-        maybe_auto_compact_nolock();
+        wal_wait_durable(last_lsn);   // one fsync for the whole sweep
         return count;
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // 7d: compact() — rebuild HNSW indices without soft-deleted records
+    // compact(): rebuild HNSW indices without soft-deleted records
     // ─────────────────────────────────────────────────────────────────
+    // Three phases, so the DB is never frozen for the rebuild itself:
+    //   1. exclusive lock (short): snapshot the live vectors of every modality
+    //      in their storage format and start logging vector-level changes;
+    //   2. NO lock: build the new indexes in parallel from the snapshot, while
+    //      readers keep using (and writers keep changing) the old ones;
+    //   3. exclusive lock (short): replay the changes logged during phase 2
+    //      onto the new indexes, swap them in, and erase dead metadata.
+    // Measured before this change: 40 s (100k x 128) to 86 s (50k x 768) with
+    // no reads or writes at all. Transient RAM: one copy of the live vectors
+    // plus the new index while phase 2 runs. Returns the number of dead records
+    // erased.
     size_t compact() {
         check_writable("compact");
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        return compact_nolock();
+        std::lock_guard<std::mutex> one_at_a_time(compact_run_mx_);
+        struct Snap {
+            std::string name;
+            size_t dim; bool int8; float scale; size_t ef; size_t stride;
+            std::vector<uint64_t> ids;
+            std::vector<char> data;
+            std::unique_ptr<hnswlib::SpaceInterface<float>> space;
+            std::unique_ptr<hnswlib::HierarchicalNSW<float>> index;
+        };
+        std::vector<Snap> snaps;
+        std::unordered_set<uint64_t> dead;
+
+        // ── Phase 1: snapshot ────────────────────────────────────────
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            for (const auto& [id, meta] : metadata_store_)
+                if (is_dead_meta(meta)) dead.insert(id);
+            bool work = !dead.empty();
+            if (!work)
+                for (auto& [name, m_idx] : modality_indices_)
+                    if (m_idx.index->getDeletedCount() > 0) { work = true; break; }
+            if (!work) return 0;
+
+            for (auto& [name, m_idx] : modality_indices_) {
+                Snap sn;
+                sn.name   = name;
+                sn.dim    = m_idx.dim;
+                sn.int8   = m_idx.int8;
+                sn.scale  = m_idx.scale;
+                sn.ef     = m_idx.index->ef_;
+                sn.stride = m_idx.space->get_data_size();
+                const size_t n = m_idx.index->cur_element_count;
+                sn.ids.reserve(n);
+                sn.data.reserve(n * sn.stride);
+                for (size_t i = 0; i < n; ++i) {
+                    if (m_idx.index->isMarkedDeleted(i)) continue;
+                    uint64_t id = m_idx.index->getExternalLabel(i);
+                    auto mit = metadata_store_.find(id);
+                    if (mit == metadata_store_.end()) continue;  // purged / orphaned
+                    if (is_dead_meta(mit->second))      continue;  // forgotten / _deleted
+                    sn.ids.push_back(id);
+                    const char* raw = m_idx.index->getDataByInternalId(i);
+                    sn.data.insert(sn.data.end(), raw, raw + sn.stride);
+                }
+                snaps.push_back(std::move(sn));
+            }
+            compacting_ = true;
+            compaction_log_.clear();
+        }
+
+        // ── Phase 2: build without holding the data lock ─────────────
+        try {
+            for (auto& sn : snaps) {
+                if (sn.int8) sn.space = std::make_unique<hnswlib::Int8L2Space>(sn.dim, sn.scale);
+                else         sn.space = std::make_unique<hnswlib::L2Space>(sn.dim);
+                sn.index = make_hnsw(sn.space.get(),
+                                     std::max(INITIAL_MAX_ELEMENTS, sn.ids.size() + sn.ids.size() / 8 + 64));
+                ModalityIndex tmp{std::move(sn.index), nullptr, sn.dim, sn.int8, sn.scale};
+                parallel_add_raw(tmp, sn.ids, sn.data, sn.stride, compact_threads());
+                sn.index = std::move(tmp.index);
+                std::vector<char>().swap(sn.data);    // release the snapshot early
+            }
+        } catch (...) {
+            std::unique_lock<RWMutex> lock(mutex_);
+            compacting_ = false;
+            compaction_log_.clear();
+            throw;
+        }
+
+        // ── Phase 3: catch up and swap ───────────────────────────────
+        std::unique_lock<RWMutex> lock(mutex_);
+        compacting_ = false;
+        if (closed_) { compaction_log_.clear(); return 0; }
+        std::unordered_map<std::string, Snap*> by_name;
+        for (auto& sn : snaps) by_name[sn.name] = &sn;
+        for (const auto& op : compaction_log_) {
+            if (op.remove) {
+                for (auto& sn : snaps) {
+                    try { sn.index->markDelete(op.id); } catch (...) {}
+                }
+                continue;
+            }
+            auto it = by_name.find(op.modality);
+            if (it == by_name.end()) continue;            // modality created meanwhile
+            Snap& sn = *it->second;
+            ModalityIndex tmp{std::move(sn.index), nullptr, sn.dim, sn.int8, sn.scale};
+            reserve(tmp, tmp.index->getCurrentElementCount() + 1);
+            add_point(tmp, op.id, op.vec.data(), /*reuse_slot=*/true);
+            sn.index = std::move(tmp.index);
+        }
+        compaction_log_.clear();
+        compaction_log_.shrink_to_fit();
+
+        for (auto& sn : snaps) {
+            auto mit = modality_indices_.find(sn.name);
+            if (mit == modality_indices_.end()) continue;
+            sn.index->setEf(sn.ef);
+            mit->second.index = std::move(sn.index);   // old index freed here
+            mit->second.space = std::move(sn.space);
+        }
+
+        // Erase metadata that is STILL dead (an id may have been re-added
+        // during phase 2). Dead records are already out of the secondary and
+        // BM25 indexes (forget/purge/update remove them), so only the reverse
+        // index needs pruning — no full rebuild.
+        std::unordered_set<uint64_t> erased;
+        for (uint64_t id : dead) {
+            auto it = metadata_store_.find(id);
+            if (it == metadata_store_.end() || !is_dead_meta(it->second)) continue;
+            remove_from_bm25_index(id, &it->second.content);   // no-op unless add() of a dead meta slipped in
+            metadata_store_.erase(it);
+            erased.insert(id);
+        }
+        prune_reverse_index(erased);
+        return erased.size();
     }
 
     // Configure auto-compaction. ratio in (0,1] triggers a rebuild of a modality
     // index once its deleted/total ratio crosses `ratio` after a forget/purge/
-    // expire. 0 disables it. e.g. set_auto_compact(0.2) → rebuild at 20% dead.
+    // expire. 0 disables it. e.g. set_auto_compact(0.2) -> rebuild at 20% dead.
+    // The rebuild runs on a background thread (it used to run inline inside the
+    // forget() that crossed the threshold).
     void set_auto_compact(float ratio) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+        std::unique_lock<RWMutex> lock(mutex_);
         auto_compact_ratio_ = ratio;
     }
     float get_auto_compact() const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         return auto_compact_ratio_;
+    }
+
+    // True while a compaction is between its snapshot and its swap.
+    bool is_compacting() const {
+        std::shared_lock<RWMutex> lock(mutex_);
+        return compacting_;
+    }
+
+    // Block until no background (auto-)compaction is requested or running.
+    // Returns false if `timeout_s` > 0 elapsed first.
+    bool wait_for_compaction(double timeout_s = 0.0) {
+        std::unique_lock<std::mutex> g(compactor_mx_);
+        auto idle = [&] { return stop_compactor_ || (!compaction_requested_ && !compactor_busy_); };
+        if (timeout_s <= 0.0) { compactor_cv_.wait(g, idle); return true; }
+        return compactor_cv_.wait_for(g, std::chrono::duration<double>(timeout_s), idle);
     }
 
     // Persist a modality's vectors as int8 + per-vector scale (file format v7):
     // ~4x smaller on disk, dequantized to float32 on load. Takes effect on the
     // next save(). The in-memory index is unchanged. Opt-in; default off.
     void set_quantized(const std::string& modality, bool on) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+        std::unique_lock<RWMutex> lock(mutex_);
         if (on) quantized_modalities_.insert(modality);
         else    quantized_modalities_.erase(modality);
     }
     bool is_quantized(const std::string& modality) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         return quantized_modalities_.count(modality) > 0;
     }
 
@@ -2406,9 +3193,9 @@ public:
     // global scale = max_abs/127. Must be called BEFORE the first vector is added
     // to the modality (it sets the index storage type). `max_abs` should bound
     // the largest |component| in your vectors (values beyond it are clamped);
-    // for unit-norm embeddings a small value like 0.3–1.0 is typical.
+    // for unit-norm embeddings a small value like 0.3-1.0 is typical.
     void set_int8_ram(const std::string& modality, float max_abs = 1.0f) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+        std::unique_lock<RWMutex> lock(mutex_);
         auto it = modality_indices_.find(modality);
         if (it != modality_indices_.end() &&
             it->second.index->getCurrentElementCount() > 0)
@@ -2418,35 +3205,70 @@ public:
         if (max_abs <= 0.0f) max_abs = 1.0f;
         float scale = max_abs / 127.0f;
         int8_ram_scale_[modality] = scale;
-        // open() pre-creates an empty "text" index; rebuild it as int8 in place.
+        // An existing (empty) index for this modality is rebuilt as int8 in place.
         if (it != modality_indices_.end()) {
             size_t dim = it->second.dim;
             auto space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
-            auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-                space.get(), INITIAL_MAX_ELEMENTS, 16, 200);
-            index->setEf(DEFAULT_EF);
+            auto index = make_hnsw(space.get(), INITIAL_MAX_ELEMENTS);
             it->second = {std::move(index), std::move(space), dim, true, scale};
         }
     }
     bool is_int8_ram(const std::string& modality) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         return int8_ram_scale_.count(modality) > 0;
     }
 
     // ─────────────────────────────────────────────────────────────────
     // Persistence & info
     // ─────────────────────────────────────────────────────────────────
+    // Checkpoint. The snapshot is written under the SHARED lock (queries keep
+    // running), and the slow part — fsyncing the new base file and the rename —
+    // happens after the lock is released: the WAL is rotated to <wal>.old at
+    // the snapshot point so writers can proceed into a fresh WAL immediately.
+    // Before 0.19, writers were blocked for the entire save (measured: writer
+    // p99 2.1 s while saves looped).
     void save() {
-        // save_vectors() only reads DB state, so a full-file write no longer
-        // blocks queries — it takes the data lock in SHARED mode (which still
-        // excludes writers, so the snapshot is consistent) and serialises
-        // savers against each other on save_mutex_, since they share one .tmp
-        // path and one atomic rename.
+        check_writable("save");
         std::lock_guard<std::mutex> save_lock(save_mutex_);
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        save_vectors();
+        const std::string tmp = path_ + ".tmp";
+        bool rotated = false;
+        {
+            LongSharedLock lock(mutex_);   // long: queries keep flowing during the snapshot
+            ensure_open();
+            write_snapshot(tmp);
+            rotated = wal_rotate();
+            if (!rotated) {
+                // A previous checkpoint left <wal>.old behind (it failed after
+                // rotating). Finish synchronously so the two WALs never need
+                // merging: publish, then drop both.
+                publish_snapshot(tmp);
+                wal_clear();
+                return;
+            }
+        }
+        publish_snapshot(tmp);                       // fsync + rename + dir fsync
+        std::remove(wal_old_path().c_str());         // its records are in the base now
     }
+
+    // Close the DB: checkpoint (unless save=false), release the WAL and the
+    // inter-process file lock. Further calls on this handle throw. Required
+    // rather than decorative: Python never runs ~DB() (the handle is held with
+    // py::nodelete), so without close() — or a `with DB.open(...) as db:`
+    // block — the lock lives until process exit. Idempotent. A read-only
+    // handle holds only a SHARED lock and never rewrites the file.
+    void close(bool do_save = true) {
+        stop_compactor();                            // never join while holding mutex_
+        std::lock_guard<std::mutex> save_lock(save_mutex_);
+        std::unique_lock<RWMutex> lock(mutex_);
+        if (closed_) return;
+        if (do_save && load_complete_ && !read_only_) save_vectors();
+        wal_close();
+        release_lock();
+        closed_ = true;
+    }
+
     ~DB() {
+        stop_compactor();
         // Only checkpoint a DB whose load actually completed. If load_vectors()
         // threw, `this` holds a HALF-PARSED view of the file — some records
         // read, the rest never reached — and save_vectors() would serialise
@@ -2462,7 +3284,7 @@ public:
         // read_only_ is the second guard: a reader holds only a SHARED lock, so
         // a checkpoint from here would rewrite the file while other readers —
         // and possibly a writer waiting on it — are using it.
-        if (load_complete_ && !read_only_ && !closed_) {
+        if (!closed_ && load_complete_ && !read_only_) {
             try { save_vectors(); } catch (...) {}
         }
         wal_close();   // save_vectors() clears the WAL on success; on failure
@@ -2470,15 +3292,28 @@ public:
         release_lock();
     }
 
+    // Bytes currently held in the WAL files (<wal> + <wal>.old). A caller-side
+    // checkpoint policy ("save once the WAL passes N MB") uses this instead of
+    // saving after every mutation.
+    uint64_t wal_size() const {
+        return fsio::size_or_zero(wal_path_) + fsio::size_or_zero(wal_old_path());
+    }
+
+    // Number of WAL fsyncs issued so far (group-commit effectiveness).
+    uint64_t wal_fsync_count() const {
+        std::lock_guard<std::mutex> g(wal_mutex_);
+        return wal_fsyncs_;
+    }
+
     size_t dim(const std::string& modality = "text") const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = modality_indices_.find(modality);
         if (it != modality_indices_.end()) return it->second.dim;
         return default_dim_;   // modality not created yet → report the open() default
     }
 
     size_t size() const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         return metadata_store_.size();
     }
 
@@ -2488,7 +3323,7 @@ public:
     // Higher ef = better recall, slower search. Default is DEFAULT_EF (50).
     // Pass modality = "" (default) to apply to all modalities.
     void set_ef(size_t ef, const std::string& modality = "") {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+        std::unique_lock<RWMutex> lock(mutex_);
         if (modality.empty()) {
             for (auto& [_name, mi] : modality_indices_) {
                 mi.index->setEf(ef);
@@ -2502,7 +3337,7 @@ public:
     }
 
     size_t get_ef(const std::string& modality = "text") const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::shared_lock<RWMutex> lock(mutex_);
         auto it = modality_indices_.find(modality);
         if (it == modality_indices_.end())
             throw std::runtime_error("unknown modality: " + modality);

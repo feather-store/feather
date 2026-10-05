@@ -42,9 +42,7 @@ def _make(path, n=200, dim=32):
         metas.append(m)
     db.add_batch(list(range(n)), np.random.rand(n, dim).astype(np.float32), metas)
     db.save()
-    del db
-
-
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
 def _open_in_child(path, dim=32, timeout=60):
     """Open in a subprocess: pre-fix failures were SIGSEGV, which pytest cannot
     catch, and an unbounded loop, which needs a timeout rather than an assert."""
@@ -101,7 +99,7 @@ def test_failed_open_does_not_clear_the_wal(tmp_path):
     for i in range(500, 505):
         m = feather_db.Metadata(); m.content = f"unsaved {i}"
         db.add(i, np.random.rand(32).astype(np.float32), m)
-    del db
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
     assert os.path.exists(path + ".wal")
 
     with open(path, "r+b") as fh:       # now damage the base file
@@ -138,5 +136,5 @@ def test_a_good_file_still_opens_and_saves(tmp_path):
     m = feather_db.Metadata(); m.content = "added after reopen"
     db.add(9999, np.random.rand(32).astype(np.float32), m)
     db.save()
-    del db
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
     assert DB.open(path, dim=32).size() == 51, "guard broke the normal save path"

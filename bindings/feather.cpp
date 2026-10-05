@@ -5,8 +5,97 @@
 
 namespace py = pybind11;
 
+// Build the API's JSON-ready dict for a Metadata straight from C++. The Cloud
+// API used to go Metadata -> pydantic model -> dict per hit; this is one pass.
+static py::dict metadata_to_dict(const feather::Metadata& m) {
+    py::dict d;
+    d["timestamp"]        = m.timestamp;
+    d["importance"]       = m.importance;
+    d["type"]             = static_cast<int>(m.type);
+    d["source"]           = m.source;
+    d["content"]          = m.content;
+    d["tags_json"]        = m.tags_json;
+    d["namespace_id"]     = m.namespace_id;
+    d["entity_id"]        = m.entity_id;
+    py::dict attrs;
+    for (const auto& [k, v] : m.attributes) attrs[py::str(k)] = v;
+    d["attributes"]       = attrs;
+    d["recall_count"]     = m.recalls();
+    d["last_recalled_at"] = m.recalled_at();
+    py::list links;
+    for (const auto& e : m.edges) links.append(e.target_id);
+    d["links"]            = links;
+    d["ttl"]              = m.ttl;
+    d["confidence"]       = m.confidence;
+    return d;
+}
+
 PYBIND11_MODULE(core, m) {
     m.doc() = "Feather: Embedded Vector Database + Living Context Engine";
+
+    // ── SIMD introspection + kernel test hooks ──────────────────────────
+    m.def("simd_info", []() {
+        py::dict d;
+        d["active"]   = feather_simd::level_name(feather_simd::level());
+        d["detected"] = feather_simd::level_name(feather_simd::detected_level());
+        return d;
+    }, "Distance-kernel ISA in use ('active', after any FEATHER_SIMD_RUNTIME cap) "
+       "and the best one this CPU supports ('detected').");
+
+    // Levels usable on this machine, lowest first (for tests / benchmarks).
+    m.def("_simd_levels", []() {
+        std::vector<std::string> out{"scalar"};
+        const int det = feather_simd::detected_level();
+        if (det == feather_simd::NEON) { out.push_back("neon"); return out; }
+        if (det >= feather_simd::SSE)    out.push_back("sse2");
+        if (det >= feather_simd::AVX2)   out.push_back("avx2+fma");
+        if (det >= feather_simd::AVX512) out.push_back("avx512f");
+        return out;
+    });
+
+    auto level_from = [](const std::string& name) -> int {
+        const int det = feather_simd::detected_level();
+        int l;
+        if      (name == "scalar")   l = feather_simd::SCALAR;
+        else if (name == "sse2")     l = feather_simd::SSE;
+        else if (name == "avx2+fma") l = feather_simd::AVX2;
+        else if (name == "avx512f")  l = feather_simd::AVX512;
+        else if (name == "neon")     l = feather_simd::NEON;
+        else throw std::invalid_argument("unknown SIMD level " + name);
+        bool ok = (l == feather_simd::SCALAR) ||
+                  (det == feather_simd::NEON ? l == feather_simd::NEON
+                                             : (l != feather_simd::NEON && l <= det));
+        if (!ok) throw std::invalid_argument("SIMD level " + name + " not supported on this CPU");
+        return l;
+    };
+
+    m.def("_l2sqr", [level_from](py::array_t<float, py::array::c_style | py::array::forcecast> a,
+                                 py::array_t<float, py::array::c_style | py::array::forcecast> b,
+                                 const std::string& level) {
+        if (a.size() != b.size()) throw std::invalid_argument("length mismatch");
+        auto fn = level.empty() ? feather_simd::l2_fn() : feather_simd::l2_fn_for(level_from(level));
+        return fn(a.data(), b.data(), static_cast<size_t>(a.size()));
+    }, py::arg("a"), py::arg("b"), py::arg("level") = "",
+       "Squared L2 with a given kernel (test hook).");
+
+    m.def("_int8_l2sqr", [level_from](py::array_t<int8_t, py::array::c_style | py::array::forcecast> a,
+                                      py::array_t<int8_t, py::array::c_style | py::array::forcecast> b,
+                                      const std::string& level) {
+        if (a.size() != b.size()) throw std::invalid_argument("length mismatch");
+        auto fn = level.empty() ? feather_simd::i8_l2_fn() : feather_simd::i8_l2_fn_for(level_from(level));
+        return static_cast<long long>(fn(a.data(), b.data(), static_cast<size_t>(a.size())));
+    }, py::arg("a"), py::arg("b"), py::arg("level") = "",
+       "Integer squared L2 of two int8 vectors with a given kernel (test hook).");
+
+    m.def("_f32_i8_l2sqr", [level_from](py::array_t<float, py::array::c_style | py::array::forcecast> q,
+                                        py::array_t<int8_t, py::array::c_style | py::array::forcecast> v,
+                                        float scale, const std::string& level) {
+        if (q.size() != v.size()) throw std::invalid_argument("length mismatch");
+        auto fn = level.empty() ? feather_simd::f32_i8_l2_fn()
+                                : feather_simd::f32_i8_l2_fn_for(level_from(level));
+        return fn(q.data(), v.data(), scale, static_cast<size_t>(q.size()));
+    }, py::arg("q"), py::arg("v"), py::arg("scale"), py::arg("level") = "",
+       "Squared L2 between a float query and an int8 row x scale (test hook).");
 
     // ── ContextType ──────────────────────────────────────────────────
     py::enum_<feather::ContextType>(m, "ContextType")
@@ -87,7 +176,9 @@ PYBIND11_MODULE(core, m) {
             auto it = m.attributes.find(key);
             return it != m.attributes.end() ? it->second : default_val;
         }, py::arg("key"), py::arg("default") = "",
-        "Get an attribute value by key, or default if absent.");
+        "Get an attribute value by key, or default if absent.")
+        .def("to_dict", &metadata_to_dict,
+             "All fields as a plain dict (links = edge target ids).");
 
     // ── ScoringConfig ────────────────────────────────────────────────
     py::class_<feather::ScoringConfig>(m, "ScoringConfig")
@@ -118,7 +209,19 @@ PYBIND11_MODULE(core, m) {
     py::class_<feather::DB::SearchResult>(m, "SearchResult")
         .def_readonly("id",       &feather::DB::SearchResult::id)
         .def_readonly("score",    &feather::DB::SearchResult::score)
-        .def_readonly("metadata", &feather::DB::SearchResult::metadata);
+        .def_readonly("metadata", &feather::DB::SearchResult::metadata)
+        .def_property_readonly("cosine", [](const feather::DB::SearchResult& r) -> py::object {
+            if (std::isnan(r.cosine)) return py::none();
+            return py::float_(r.cosine);
+        }, "Exact cosine(query, stored vector) if searched with with_cosine=True, else None.")
+        .def("to_dict", [](const feather::DB::SearchResult& r, bool include_metadata) {
+            py::dict d;
+            d["id"]    = r.id;
+            d["score"] = r.score;
+            d["cosine"] = std::isnan(r.cosine) ? py::object(py::none()) : py::object(py::float_(r.cosine));
+            if (include_metadata) d["metadata"] = metadata_to_dict(r.metadata);
+            return d;
+        }, py::arg("include_metadata") = true);
 
     // ── ContextNode / ContextEdge / ContextChainResult ───────────────
     py::class_<feather::DB::ContextNode>(m, "ContextNode")
@@ -156,7 +259,7 @@ PYBIND11_MODULE(core, m) {
 
         // -- Ingestion --
         .def("add", [](feather::DB& db, uint64_t id,
-                        py::array_t<float> vec,
+                        py::array_t<float, py::array::c_style | py::array::forcecast> vec,
                         const std::optional<feather::Metadata>& meta,
                         const std::string& modality) {
             auto buf = vec.request();
@@ -196,11 +299,14 @@ PYBIND11_MODULE(core, m) {
            "Bulk-insert N records (vecs: N x dim float32). HNSW graph built in parallel.")
 
         // -- Search --
-        .def("search", [](feather::DB& db, py::array_t<float> q, size_t k,
+        .def("search", [](feather::DB& db,
+                           py::array_t<float, py::array::c_style | py::array::forcecast> q,
+                           size_t k,
                            const feather::SearchFilter* filter,
                            const feather::ScoringConfig* scoring,
                            const std::string& modality,
-                           bool record_salience) {
+                           bool record_salience,
+                           bool with_cosine) {
             auto buf = q.request();
             const float* ptr = static_cast<const float*>(buf.ptr);
             std::vector<float> query(ptr, ptr + buf.size);
@@ -208,10 +314,11 @@ PYBIND11_MODULE(core, m) {
             // shared mode, so N server threads genuinely search in parallel;
             // holding the GIL here capped the whole process at one core.
             py::gil_scoped_release rel;
-            return db.search(query, k, filter, scoring, modality, record_salience);
+            return db.search(query, k, filter, scoring, modality, record_salience, with_cosine);
         }, py::arg("q"), py::arg("k") = 5,
            py::arg("filter") = nullptr, py::arg("scoring") = nullptr,
-           py::arg("modality") = "text", py::arg("record_salience") = true)
+           py::arg("modality") = "text", py::arg("record_salience") = true,
+           py::arg("with_cosine") = false)
 
         // -- Graph --
         .def("link", &feather::DB::link,
@@ -230,7 +337,7 @@ PYBIND11_MODULE(core, m) {
              "Auto-create edges between records whose vector similarity exceeds threshold.",
              py::call_guard<py::gil_scoped_release>())
 
-        .def("context_chain", [](feather::DB& db, py::array_t<float> q,
+        .def("context_chain", [](feather::DB& db, py::array_t<float, py::array::c_style | py::array::forcecast> q,
                                   size_t k, int hops, const std::string& modality) {
             auto buf = q.request();
             const float* ptr = static_cast<const float*>(buf.ptr);
@@ -284,7 +391,7 @@ PYBIND11_MODULE(core, m) {
            "BM25 keyword search over content field. Returns list of SearchResult.")
 
         // -- Hybrid search: BM25 + vector via RRF --
-        .def("hybrid_search", [](feather::DB& db, py::array_t<float> q,
+        .def("hybrid_search", [](feather::DB& db, py::array_t<float, py::array::c_style | py::array::forcecast> q,
                                    const std::string& query, size_t k,
                                    size_t rrf_k,
                                    feather::SearchFilter* filter,
@@ -341,17 +448,33 @@ PYBIND11_MODULE(core, m) {
 
         // -- Persistence & info --
         .def("save", &feather::DB::save, py::call_guard<py::gil_scoped_release>())
-        .def("close", &feather::DB::close,
-             "Checkpoint and release the file lock. Needed because this binding "
-             "uses py::nodelete, so the C++ destructor never runs from Python — "
-             "without close() the lock lives until the process exits and the "
-             "file cannot be reopened. Idempotent.")
+        .def("close", &feather::DB::close, py::arg("save") = true,
+             "Checkpoint (unless save=False), release the WAL and the inter-process "
+             "file lock. Needed because this binding uses py::nodelete, so the C++ "
+             "destructor never runs from Python — without close() the lock lives "
+             "until the process exits and the file cannot be reopened. Idempotent.",
+             py::call_guard<py::gil_scoped_release>())
         .def("is_read_only", &feather::DB::is_read_only)
         .def("is_closed",    &feather::DB::is_closed)
-        .def("__enter__", [](feather::DB& db) -> feather::DB& { return db; })
+        .def_property_readonly("closed", &feather::DB::is_closed)
+        .def("__enter__", [](feather::DB& db) -> feather::DB& { return db; },
+             py::return_value_policy::reference)
         .def("__exit__", [](feather::DB& db, py::object, py::object, py::object) {
-            db.close();
+            py::gil_scoped_release rel;
+            db.close(true);
         })
+        .def("wal_size", &feather::DB::wal_size,
+             "Bytes currently in the WAL (+ <wal>.old). Use it to checkpoint on "
+             "WAL size instead of saving after every mutation.")
+        .def("wal_fsync_count", &feather::DB::wal_fsync_count,
+             "WAL fsyncs issued so far (group commit shares one across writers).")
+        .def("is_compacting", &feather::DB::is_compacting,
+             "True while a compaction is building its new indexes.")
+        .def("wait_for_compaction", &feather::DB::wait_for_compaction,
+             py::arg("timeout") = 0.0,
+             "Block until background auto-compaction is idle. timeout<=0 waits "
+             "forever; returns False if the timeout elapsed first.",
+             py::call_guard<py::gil_scoped_release>())
         .def("size", &feather::DB::size)
         .def("dim",  &feather::DB::dim, py::arg("modality") = "text")
 

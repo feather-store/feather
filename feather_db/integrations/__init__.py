@@ -60,7 +60,10 @@ except Exception:
     _LANGCHAIN_LOADED = False
 
 try:
-    from .llamaindex_compat import FeatherVectorStoreIndex, FeatherReader
+    # Exported under an alias: the LangChain adapter already owns the name
+    # FeatherVectorStore. (This imported a non-existent class before, and the
+    # except below silently hid it — the LlamaIndex adapters were never exported.)
+    from .llamaindex_compat import FeatherVectorStore as FeatherVectorStoreIndex, FeatherReader
     _LLAMAINDEX_LOADED = True
 except Exception:
     _LLAMAINDEX_LOADED = False

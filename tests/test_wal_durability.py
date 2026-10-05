@@ -73,11 +73,9 @@ def test_a_flipped_byte_is_caught_instead_of_replayed(tmp_path):
     path = str(tmp_path / "flip.feather")
     db = _seed(path, 6)
     db.save()                       # checkpoint: records 0-5 are in the base file
-    del db
-
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
     db = _seed(path, 4, start=100)  # 100-103 live only in the WAL
-    del db
-
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
     raw = bytearray(open(path + ".wal", "rb").read())
     # Corrupt deep inside the first WAL record's payload — length untouched.
     target = HEADER_LEN + 13 + 40
@@ -99,10 +97,9 @@ def test_intact_wal_still_replays_completely(tmp_path):
     path = str(tmp_path / "intact.feather")
     db = _seed(path, 3)
     db.save()
-    del db
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
     db = _seed(path, 7, start=200)
-    del db
-
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
     db2 = DB.open(path, dim=16)
     assert db2.size() == 10
     for i in list(range(3)) + list(range(200, 207)):
@@ -114,8 +111,7 @@ def test_truncated_tail_still_keeps_earlier_records(tmp_path):
     before it must survive, now judged by checksum rather than length alone."""
     path = str(tmp_path / "torn.feather")
     db = _seed(path, 12)
-    del db
-
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
     wal = path + ".wal"
     full = os.path.getsize(wal)
     with open(wal, "r+b") as fh:
@@ -134,10 +130,9 @@ def test_a_v1_wal_from_an_older_build_still_recovers(tmp_path):
     path = str(tmp_path / "legacy.feather")
     db = _seed(path, 4)
     db.save()                        # base file with 0-3
-    del db
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
     db = _seed(path, 3, start=50)    # 50-52 in a v2 WAL
-    del db
-
+    db.close(save=False)   # drop the handle: no checkpoint, lock released
     # Rewrite that WAL in v1 form: drop the header, strip each record's CRC.
     raw = open(path + ".wal", "rb").read()
     assert struct.unpack("<I", raw[:4])[0] == WAL_MAGIC

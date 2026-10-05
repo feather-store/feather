@@ -18,7 +18,7 @@ FILES=(
   include/bruteforce.h include/feather.h include/space_l2.h
   include/visited_list_pool.h include/stop_condition.h include/space_ip.h
   include/hnswalg.h include/hnswlib.h include/metadata.h include/filter.h
-  include/scoring.h
+  include/scoring.h include/feather_simd.h
   src/filter.cpp src/scoring.cpp src/metadata.cpp src/feather_core.cpp
 )
 for f in "${FILES[@]}"; do

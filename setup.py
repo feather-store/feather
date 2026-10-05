@@ -8,12 +8,21 @@ import platform
 # -undefined dynamic_lookup is macOS-only; Linux doesn't need it
 extra_link_args = ["-undefined", "dynamic_lookup"] if sys.platform == "darwin" else []
 
-# SIMD: space_l2.h ships hand-written SSE/AVX/AVX-512 L2 kernels gated behind
-# USE_* macros with RUNTIME CPU dispatch. They are x86 intrinsics, so we only
-# enable them on x86_64. SSE2 is baseline on all x86-64; AVX is selected at
-# runtime via AVXCapable(). On arm64/aarch64 we rely on -O3 NEON auto-vectorization.
-# Override with FEATHER_SIMD=none|sse|avx|avx512 (avx512 only if your build AND
-# run hosts both support it).
+# SIMD: distance kernels are selected at RUNTIME (include/feather_simd.h).
+# The AVX2+FMA and AVX-512 kernels are compiled with per-function
+# __attribute__((target(...))), so the default build needs no global -mavx and
+# the same binary runs on any x86-64 CPU while still using AVX2/AVX-512 where
+# the CPU has it. arm64 uses NEON. Published wheels therefore get the fast
+# kernels too (before 0.19 they were built SSE-only).
+#
+# FEATHER_SIMD:
+#   auto    (default) portable build, runtime dispatch
+#   native  -march=native: also lets the compiler auto-vectorise the rest of the
+#           engine for THIS machine's CPU. Not portable, so never use it for wheels.
+#   none    scalar distance kernels only (debugging)
+#   sse | avx | avx512  legacy values, treated as auto (dispatch picks the ISA)
+# FEATHER_SIMD_RUNTIME=scalar|sse|avx2|avx512 caps the level at run time.
+#
 # platform.machine() is the HOST architecture. When a wheel is cross-compiled —
 # cibuildwheel building x86_64 on an arm64 runner, or universal2 — the host and
 # the TARGET differ, and gating x86 intrinsics on the host pulls immintrin.h into
@@ -45,14 +54,16 @@ def _target_machine() -> str:
 
 _machine = _target_machine()
 _simd_args = []
-if _machine in ("x86_64", "amd64"):
-    _mode = os.getenv("FEATHER_SIMD", "avx").lower()
-    if _mode != "none":
-        _simd_args += ["-DUSE_SSE"]
-        if _mode in ("avx", "avx512"):
-            _simd_args += ["-DUSE_AVX", "-mavx"]
-        if _mode == "avx512":
-            _simd_args += ["-DUSE_AVX512", "-mavx512f", "-mavx512dq"]
+_mode = os.getenv("FEATHER_SIMD", "auto").lower()
+if _mode == "none":
+    _simd_args += ["-DNO_MANUAL_VECTORIZATION"]
+elif _mode == "native":
+    if _machine == "universal":
+        print("FEATHER_SIMD=native ignored for a universal2 build", file=sys.stderr)
+    elif sys.platform != "win32":
+        _simd_args += ["-march=native"]
+elif _mode not in ("auto", "sse", "avx", "avx512", ""):
+    raise SystemExit(f"FEATHER_SIMD={_mode!r}: expected auto, native or none")
 
 # Nearly all of the engine lives in headers (include/feather.h alone is the DB).
 # setuptools only stat-checks the listed sources, so without `depends` an

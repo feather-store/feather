@@ -551,11 +551,15 @@ python setup.py sdist bdist_wheel
 - `src/filter.cpp`, `src/metadata.cpp`, `src/scoring.cpp`
 - Flags: `-O3 -std=c++17`
 
-### Enabling SIMD (Performance Optimization)
-```python
-# In setup.py extra_compile_args:
-"-DUSE_AVX", "-march=native", "-ffast-math"
-```
+### SIMD (runtime-dispatched since 0.19)
+Distance kernels live in `include/feather_simd.h` and are picked at RUNTIME from
+CPUID: AVX-512F / AVX2+FMA / SSE2 / scalar on x86-64, NEON on arm64. Wide
+kernels use per-function `FEATHER_TARGET("avx2,fma")` attributes — never add a
+global `-mavx`/`-march` to the default build (it makes wheels crash on older
+CPUs). Build modes: `FEATHER_SIMD=auto` (default) | `native` | `none`;
+`FEATHER_SIMD_RUNTIME=scalar|sse|avx2|avx512` caps the level for A/B tests;
+`feather_db.core.simd_info()` reports it. A new kernel needs a numpy
+equivalence case in `tests/test_simd.py` (it runs every level the CPU has).
 
 ### Rust CLI
 ```bash
@@ -615,20 +619,51 @@ The WAL is format **v2**: an 8-byte header (`FWAL` + version) then records of
   at the first mismatch. A length check alone only catches a short tail; it
   cannot see a record that is the right size with the wrong bytes, and replaying
   one writes garbage into the next checkpoint.
-- **Sync is per-mutation, not per-append.** `wal_append()` writes and flushes;
-  `wal_sync()` is what reaches stable storage. Single-record mutations call it
-  immediately. `add_batch()` and `forget_expired()` call it **once at the end** —
-  one fsync per batch, not per record (measured: `add()` +19%, `add_batch()` ~0%).
-  If you add a new bulk mutation, follow that pattern or you will fsync per item.
+- **Append inside the lock, wait for durability outside it (group commit, 0.19).**
+  `wal_append()` writes + flushes and returns the record's LSN; call it while
+  holding `mutex_` exclusively so WAL order == apply order. After releasing
+  `mutex_`, call `wal_wait_durable(lsn)` — a leader fsyncs everything appended
+  so far and releases every writer it covers. A new mutation follows this shape:
+
+  ```cpp
+  const std::string payload = encode_...(...);          // no lock
+  uint64_t lsn = 0;
+  {
+      std::unique_lock<RWMutex> lock(mutex_);
+      ensure_open();
+      /* validate BEFORE logging */  lsn = wal_append(WalOp::X, id, payload);
+      /* apply in memory */
+      if (wal_strict()) wal_wait_durable(lsn);           // FEATHER_WAL_STRICT=1
+  }
+  wal_wait_durable(lsn);                                // never inside mutex_ otherwise
+  ```
+
+  Bulk mutations append all records and wait once on the last LSN. Never fsync
+  (or call `wal_wait_durable`) inside the exclusive lock outside strict mode:
+  it blocks every reader for the disk flush (measured −68% reads, 1 writer).
 
 v1 WALs (≤0.17.0, no header, no CRC) still replay — the header sniff is exact
 because `'F'` cannot be a v1 opcode. Don't remove that path while any deployed
 build can still leave a v1 WAL behind. `FEATHER_WAL_SYNC=0` disables fsync.
 
+**Checkpoints (0.19).** `save()` writes the snapshot under the SHARED lock, then
+`wal_rotate()` renames `<wal>` → `<wal>.old`, and the fsync + atomic replace of
+the base file happen after the lock is released; `<wal>.old` is deleted last.
+`load_vectors()` replays `<wal>.old` then `<wal>`. Replay must stay idempotent
+(a crash after the rename replays `<wal>.old` over a base that already has it).
+Every new WalOp must be replayable twice without changing the result.
+
 ### Locking model — which lock does your new method need?
-`mutex_` is a `std::shared_mutex`. Take `std::shared_lock` if the method only
+`mutex_` is a `FairSharedMutex` (phase-fair, atomic reader fast path; alias
+`RWMutex`; any change to it must pass `tests/cpp/lock_stress.cpp`, including
+under `-fsanitize=thread`) — glibc's
+`std::shared_mutex` prefers readers and starved writers under read load. It is
+**not recursive**: never take it shared while already holding it shared (a
+waiting writer would deadlock you). Lock order is `save_mutex_` → `mutex_` →
+`wal_mutex_`; never join the compactor thread while holding `mutex_`.
+Take `std::shared_lock<RWMutex>` if the method only
 reads (all const accessors, `search`, `keyword_search`, `hybrid_search`,
-`context_chain`, `save`); take `std::unique_lock` if it mutates
+`context_chain`, `save`'s snapshot); take `std::unique_lock<RWMutex>` if it mutates
 `metadata_store_`, any derived index, or the HNSW graph — including anything
 that can trigger `resizeIndex`, which is not thread-safe. The one exception is
 salience: `Metadata::recall_count` / `last_recalled_at` are `mutable
@@ -690,6 +725,10 @@ on the file: `realpath` only resolves an existing file, and on macOS rewrites
 `/var/…` → `/private/var/…`, so keying on the file gave a different key before
 and after the first save — reentrancy missed and the handle reported *itself* as
 "another process (pid \<ourselves\>)".
+
+`close(save=False)` releases the handle WITHOUT checkpointing, so the WAL is
+kept. That is how a test simulates a crash. `close()` also stops the background
+compactor first, so call it before handing a file to another process.
 
 ### File saved on close
 `feather::DB::~DB()` calls `save()`. Call `db.save()` explicitly in long-running

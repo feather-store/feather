@@ -349,6 +349,151 @@ locking is the prerequisite for a fleet sharing one file — tracked separately.
 55 tests in `tests/test_pocket.py`. Suite 318 → 373.
 
 
+Concurrency and durability. See `CONCURRENCY.md` for the problems,
+`CONCURRENCY_BASELINE.md` for the before numbers and `CONCURRENCY_RESULTS.md`
+for the after numbers.
+
+### Breaking / behaviour changes
+- **`close(save=False)`.** The inter-process file lock itself shipped in
+  0.20.0 (exclusive for writers, shared for `read_only=True`, reentrant within
+  one process, `FEATHER_LOCK=0` to disable). This work builds on it:
+  - `db.close()` now also stops the background compactor before it
+    checkpoints and releases the lock.
+  - `db.close(save=False)` releases the handle without checkpointing, so the
+    WAL is kept. Tests use it to simulate a crash.
+  - `db.closed` is a property alias of `is_closed()`.
+  - Python never runs `~DB()`, so `del db` does **not** release the lock.
+- **Group commit.** A write can become visible to concurrent readers a few
+  milliseconds before its fsync completes. The writer still returns only
+  once the write is durable. `FEATHER_WAL_STRICT=1` restores the old
+  "never visible before durable" behaviour.
+- **Auto-compaction runs on a background thread.** Call
+  `wait_for_compaction()` to block until it finishes.
+- **`add_batch` applies records in chunks** (`FEATHER_BATCH_CHUNK`), so
+  readers may observe a partially applied batch.
+- **Cloud API: embeddings are never padded or truncated.** A dimension
+  mismatch returns 400.
+  - OpenAI and Azure `text-embedding-3-*` and Gemini are asked for the
+    configured dimension natively.
+  - Before this, a 1536-d model with the default dim of 768 was silently cut
+    in half.
+- **Cloud API: single-record mutations no longer save the whole file.** A
+  background checkpointer saves based on WAL size and age. Data stays durable
+  through the WAL.
+- **New WAL op `PURGE`.** Pre-0.19 builds skip it on replay.
+
+### Fixed
+- **`save()` durability:**
+  - The new base file is fsynced before it is renamed into place, and the
+    directory is fsynced after.
+  - Write errors (for example a full disk) are checked. Before, a truncated
+    snapshot could replace the file and the WAL was then deleted.
+- **Writer starvation.** The engine's lock is now a phase-fair
+  `FairSharedMutex` instead of glibc's reader-preferring rwlock. Before, 8
+  readers at 768-d cut a writer from 191 to 0.6 writes/s.
+- **The WAL fsync no longer runs while holding the exclusive lock**
+  (group commit). One fsync covers every concurrent writer.
+- **`add_batch` releases the lock between chunks.** Before, readers dropped
+  99% while batches ran.
+- **`compact()` builds without the lock and swaps at the end.** Before it
+  froze the DB for 40–86 s.
+- **Deleted HNSW slots are reused.** The vendored hnswlib was patched so
+  that re-adding a forgotten id works.
+- **`update_metadata` is O(edges of the record).** It used to be O(all
+  edges): 13 ms at 500k edges.
+- **`auto_link` and `purge` are WAL-logged.** `auto_link` also runs its kNN
+  pass under the shared lock.
+- **`save()` rotates the WAL and makes the base file durable outside the
+  lock**, so writers aren't blocked for the whole save. Snapshot readers use
+  a long-shared mode, so queries keep flowing during a checkpoint.
+- **A wrong-dimension `add()` is rejected before it reaches the WAL.**
+  Before, it was replayed on the next open, reading past the vector.
+- **`add()` with edges now updates the reverse edge index.**
+- **Array strides are handled.** Non-contiguous NumPy arrays passed to
+  `add`, `search`, `context_chain` and `hybrid_search` are now read
+  correctly.
+- **`IngestPipeline` no longer restarts its id counters per instance.** A
+  new pipeline on an existing DB used to overwrite earlier records. It now
+  continues after the highest stored id and re-learns stored entities.
+- **Internal self-queries no longer inflate `recall_count`.** This covers
+  ContextEngine sampling, ContradictionDetector, pipeline candidate lookup,
+  MMR over-fetch and tool over-fetch.
+- **`feather-serve` now starts.** `stdio_server` was called with the server
+  object as `stdin`.
+- **The LlamaIndex adapters are exported again**, as
+  `FeatherVectorStoreIndex` and `FeatherReader`.
+- **`merge()` closes the source DB.**
+
+### Performance: search
+- **Distance kernels are chosen at runtime** (`include/feather_simd.h`):
+  AVX-512F, AVX2+FMA, SSE2 or scalar on x86-64, and NEON on arm64. Each wide
+  kernel carries its own `target` attribute, so one portable binary uses the
+  best ISA the machine has.
+  - PyPI wheels were built SSE-only (`FEATHER_SIMD=sse`), so pip users never
+    got the AVX kernels. arm64 had no SIMD distance at all.
+  - Build modes: `FEATHER_SIMD=auto` (new default), `native` or `none`.
+  - `FEATHER_SIMD_RUNTIME` caps the level at run time.
+  - `feather_db.core.simd_info()` reports the kernel in use.
+  - int8 in-RAM distance also has AVX2 and NEON kernels.
+- **Filtered search:**
+  - The exact scan uses the index's SIMD distance function directly on the
+    stored vector. Before, it copied each candidate's vector and used a
+    scalar loop.
+  - Large, unselective candidate sets go through filtered HNSW with `ef`
+    raised for that one call (`searchKnnEf`). The route is picked by a cost
+    model (`candidates × selectivity² > C × k`), and the exact scan is the
+    fallback if the walk comes up short. `FEATHER_PREFILTER_MODE` forces a
+    route.
+  - Candidate sets are built as vectors instead of re-hashed sets.
+  - Only the top-k results get their metadata copied, on every search path.
+- **`search()` rejects a query of the wrong dimension** instead of reading
+  past its buffer.
+- **In-RAM int8 is now faster than float as well as 4× smaller.**
+  - The int8 AVX2 kernel processes 32 bytes per step, computing the difference
+    exactly via saturating subtracts.
+  - A new float-query × int8-row kernel (AVX2 and NEON) speeds up the int8
+    filtered scan.
+  - Measured unfiltered p50: 1.43× faster than float at 768-d and 1.82× at
+    1536-d.
+- **Atomic reader fast path in `FairSharedMutex`, and per-thread slots in the
+  HNSW visited-list pool.** Neither takes a mutex per read any more. Both are
+  verified with a ThreadSanitizer stress test (`tests/cpp/lock_stress.cpp`).
+  Measured throughput was unchanged on this machine; see
+  CONCURRENCY_RESULTS.md §8.
+- **Cloud API: hot-route request bodies are decoded with msgspec**
+  (`feather-api/app/fastparse.py`). The pydantic models remain the OpenAPI
+  schemas. Bulk import is 10–20% faster; search is unchanged within noise.
+
+### Added
+- **Python bindings:**
+  - `close(save=True)`, the `closed` property and context-manager support
+  - `wait_for_compaction(timeout)`, `is_compacting()`, `wal_size()`,
+    `wal_fsync_count()`
+  - `search(..., with_cosine=True)`, which fills `SearchResult.cosine`
+  - `SearchResult.to_dict()` and `Metadata.to_dict()`
+- **Cloud API: request options and transport:**
+  - `vector_b64` (base64 float32) as an alternative to `vector`
+  - `include_metadata=false` on search routes
+  - Responses serialized with orjson; `raw_score` cosine computed in C++
+- **Cloud API: execution:**
+  - A separate write thread pool (`FEATHER_WRITE_THREADS`)
+  - Async `ingest_text` with an embedding micro-batcher
+  - Pooled httpx clients, provider-side batch embedding and an LRU embedding
+    cache
+  - A pure ASGI metrics middleware
+  - A dev-only `mock` embedding provider
+- **Cloud API: deletes** prune edges through the reverse index, in
+  O(in-degree), for records in any modality.
+- **Sharding:**
+  - `FEATHER_SHARD_COUNT` and `FEATHER_SHARD_INDEX`; a shard answers 421 for
+    namespaces it doesn't own.
+  - New `feather-gateway/` proxy, `docker-compose.sharded.yml` and
+    `docs/deploy-sharding.md`.
+- **Benchmarks:** `benchmarks/concurrency_bench.py` and
+  `benchmarks/api_concurrency_bench.py`.
+- **Tests:** file lock, group commit, background compaction, slot reuse,
+  fair lock, API features, gateway, and Python-layer fixes.
+
 ---
 
 ## [0.19.0] — 2026-09-29

@@ -24,6 +24,8 @@ FEATHER_DEV_MODE=1 explicitly — never on a reachable host.
 
 import os
 import time
+import asyncio
+import functools
 import logging
 import pathlib
 import tempfile
@@ -32,16 +34,31 @@ from contextlib import asynccontextmanager
 from typing import Optional, List, Tuple, Dict
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
 
 import feather_db
 from feather_db import Metadata, ContextType, ScoringConfig
 from feather_db.core import SearchFilter
 
-from .db_manager import DBManager
+from .db_manager import DBManager, NotOwnedError
 from .metrics import METRICS, classify, namespace_from_path
-from .embedding import EMBEDDING, SUPPORTED_MODELS
+from .embedding import EMBEDDING, EMBED_BATCHER, SUPPORTED_MODELS
+from .fastparse import (parse_body, SearchBody, HybridBody, KeywordBody,
+                        ContextChainBody, AddVectorBody, ImportBody)
+
+from fastapi.responses import Response
+
+try:                                    # orjson: several x faster JSON encoding
+    import orjson
+
+    def FastJSONResponse(payload) -> Response:
+        return Response(orjson.dumps(payload), media_type="application/json")
+except ImportError:                     # pragma: no cover
+    FastJSONResponse = JSONResponse
 from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
     KeywordSearchRequest, HybridSearchRequest,
@@ -53,7 +70,7 @@ from .models import (
     CreateNamespaceRequest, NamespaceSchema, SchemaAttribute,
     TopRecalledItem, OpsTimeseriesResponse, OpsTimeseriesPoint,
     ConnectionInfo, EmbeddingConfig, EmbeddingConfigUpdate,
-    ImportRequest, ImportResponse, IngestTextRequest,
+    ImportRequest, ImportResponse, IngestTextRequest, MetadataIn,
     HierarchyNode, HierarchyResponse,
     AutoCompactRequest, QuantizeRequest, IndexStatsResponse,
 )
@@ -75,15 +92,51 @@ logger = logging.getLogger("feather-api")
 # ─────────────────────────────────────────────
 manager: Optional[DBManager] = None
 
+# ── Background checkpointer ──────────────────────────────────────────────
+# A full save rewrites the whole namespace file. Every mutation is already
+# durable in the WAL, so saves are checkpoints, not a durability step: they run
+# here, off the request path, when a namespace's WAL passes
+# FEATHER_CHECKPOINT_WAL_MB or has been dirty for FEATHER_CHECKPOINT_MAX_AGE_S.
+# (Before 0.19 a single DELETE rewrote the whole file — measured 15 deletes/s.)
+_CKPT_WAL_BYTES = int(float(os.getenv("FEATHER_CHECKPOINT_WAL_MB", "64")) * 1024 * 1024)
+_CKPT_MAX_AGE_S = float(os.getenv("FEATHER_CHECKPOINT_MAX_AGE_S", "300"))
+_CKPT_POLL_S = float(os.getenv("FEATHER_CHECKPOINT_POLL_S", "5"))
+
+
+async def _checkpointer():
+    while True:
+        await asyncio.sleep(_CKPT_POLL_S)
+        for ns in list(manager.list_namespaces()):
+            db = manager.peek(ns)
+            if db is None:
+                continue
+            try:
+                wal = db.wal_size()
+                if wal == 0:
+                    _last_save[ns] = time.time()
+                    continue
+                age = time.time() - _last_save.setdefault(ns, time.time())
+                if wal >= _CKPT_WAL_BYTES or age >= _CKPT_MAX_AGE_S:
+                    await asyncio.get_running_loop().run_in_executor(_WRITE_POOL, db.save)
+                    _last_save[ns] = time.time()
+            except Exception:  # noqa: BLE001  (closed/deleted meanwhile, disk error)
+                logger.exception("checkpoint of namespace %s failed", ns)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global manager
     logger.info("Starting Feather DB Cloud API...")
     manager = DBManager()
     logger.info(f"Loaded namespaces: {manager.list_namespaces()}")
+    EMBED_BATCHER.start()
+    ckpt = asyncio.get_running_loop().create_task(_checkpointer())
     yield
-    logger.info("Shutting down — saving all DBs...")
-    manager.save_all()
+    ckpt.cancel()
+    await EMBED_BATCHER.stop()
+    await EMBEDDING.aclose()
+    logger.info("Shutting down — checkpointing and closing all DBs...")
+    manager.close_all()
 
 app = FastAPI(
     title="Feather DB Cloud API",
@@ -93,21 +146,114 @@ app = FastAPI(
 )
 
 
-@app.middleware("http")
-async def _metrics_middleware(request: Request, call_next):
-    t0 = time.perf_counter()
-    response = await call_next(request)
-    dt = (time.perf_counter() - t0) * 1000
-    path = request.url.path
-    if path.startswith("/admin") or path.startswith("/static"):
-        return response          # don't count static asset hits
-    METRICS.record(
-        op=classify(request.method, path),
-        latency_ms=dt,
-        namespace=namespace_from_path(path),
-        status=response.status_code,
-    )
-    return response
+class _MetricsMiddleware:
+    """Pure ASGI middleware. @app.middleware("http") wraps every request in
+    Starlette's BaseHTTPMiddleware, which adds a task and a body-streaming
+    layer per request; this only observes the response status."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path = scope.get("path", "")
+        if path.startswith("/admin") or path.startswith("/static"):
+            return await self.app(scope, receive, send)   # don't count static asset hits
+        t0 = time.perf_counter()
+        status = {"code": 500}
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                status["code"] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            METRICS.record(
+                op=classify(scope.get("method", "GET"), path),
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                namespace=namespace_from_path(path),
+                status=status["code"],
+            )
+
+
+app.add_middleware(_MetricsMiddleware)
+
+_default_openapi = app.openapi
+
+
+def _openapi_with_body_schemas():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = _default_openapi()
+    comps = schema.setdefault("components", {}).setdefault("schemas", {})
+    for name, sub in _EXTRA_SCHEMAS.items():
+        comps.setdefault(name, sub)
+    return schema
+
+
+app.openapi = _openapi_with_body_schemas
+
+
+@app.exception_handler(NotOwnedError)
+async def _not_owned(request: Request, exc: NotOwnedError):
+    # Sharded deployment: this process doesn't own the namespace. 421 tells the
+    # gateway (or a misconfigured client) where it lives instead of opening the
+    # file here — two owners would corrupt it (the engine's file lock would
+    # refuse anyway).
+    return JSONResponse(status_code=421, content={
+        "detail": f"namespace '{exc.namespace}' is owned by shard {exc.owner}",
+        "namespace": exc.namespace, "owner_shard": exc.owner, "this_shard": exc.this_shard})
+
+
+# ── Write pool ───────────────────────────────────────────────────────────
+# Every sync route shares ONE AnyIO thread pool (40 threads). Writes block —
+# on the namespace lock, the engine's exclusive lock and the WAL fsync — so a
+# burst of them used to occupy the whole pool and queue searches behind them
+# (measured: 64 ingest clients cut search throughput 85%). Write routes run on
+# this separate bounded pool instead; searches keep the shared one.
+_WRITE_POOL = ThreadPoolExecutor(
+    max_workers=max(1, int(os.getenv("FEATHER_WRITE_THREADS", "8"))),
+    thread_name_prefix="feather-write")
+
+
+async def _in_write_pool(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_WRITE_POOL, functools.partial(fn, *args))
+
+
+def _metadata_in(data) -> MetadataIn:
+    """Strict metadata validation (unknown keys -> 422) for msgspec-decoded bodies."""
+    try:
+        return MetadataIn.model_validate(data)
+    except ValidationError as e:
+        raise HTTPException(422, jsonable_encoder(e.errors(include_url=False)))
+
+
+# Hot routes decode their bodies with msgspec (app/fastparse.py) instead of
+# pydantic. The pydantic models remain the documented request schemas: this
+# puts them in the OpenAPI output exactly as FastAPI would have.
+_EXTRA_SCHEMAS: Dict[str, dict] = {}
+
+
+def _body_doc(model) -> dict:
+    schema = model.model_json_schema(ref_template="#/components/schemas/{model}")
+    for name, sub in schema.pop("$defs", {}).items():
+        _EXTRA_SCHEMAS.setdefault(name, sub)
+    _EXTRA_SCHEMAS.setdefault(model.__name__, schema)
+    return {"requestBody": {"required": True, "content": {"application/json": {
+        "schema": {"$ref": f"#/components/schemas/{model.__name__}"}}}}}
+
+
+def _write_route(fn):
+    """Run a (sync) route body on the write pool. FastAPI still sees the
+    original signature through functools.wraps."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_WRITE_POOL, functools.partial(fn, *args, **kwargs))
+    return wrapper
 
 # ─────────────────────────────────────────────
 # Mount Atlas-style admin SPA at /admin (static).
@@ -315,17 +461,27 @@ def _embed_many(texts: List[str]) -> List[Tuple[Optional[list], Optional[str]]]:
     if not texts:
         return []
     out: List[Tuple[Optional[list], Optional[str]]] = [(None, None)] * len(texts)
+    CHUNK = 96   # provider-side batch: one HTTP request embeds up to 96 texts
+    chunks = [list(range(s, min(len(texts), s + CHUNK))) for s in range(0, len(texts), CHUNK)]
 
-    def work(i: int):
+    def work(idx: List[int]):
         try:
-            return i, EMBEDDING.embed(texts[i]), None
-        except Exception as e:  # noqa: BLE001
-            return i, None, str(e)
+            vecs = EMBEDDING.embed_many([texts[i] for i in idx])
+            return [(i, v, None) for i, v in zip(idx, vecs)]
+        except Exception:  # noqa: BLE001 — isolate the failing item(s)
+            res = []
+            for i in idx:
+                try:
+                    res.append((i, EMBEDDING.embed(texts[i]), None))
+                except Exception as e:  # noqa: BLE001
+                    res.append((i, None, str(e)))
+            return res
 
-    workers = min(_EMBED_WORKERS, len(texts))
+    workers = min(_EMBED_WORKERS, len(chunks))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for i, vec, err in ex.map(work, range(len(texts))):
-            out[i] = (vec, err)
+        for res in ex.map(work, chunks):
+            for i, vec, err in res:
+                out[i] = (vec, err)
     return out
 
 
@@ -341,10 +497,12 @@ _last_save: Dict[str, float] = {}
 
 
 def _throttled_save(namespace: str, db, force: bool = False) -> bool:
-    now = time.time()
-    if force or (now - _last_save.get(namespace, 0.0)) >= _IMPORT_SAVE_INTERVAL_S:
+    """Checkpoint on the request path only when explicitly asked (flush=true).
+    Everything else is left to the background checkpointer (see lifespan):
+    the WAL already makes each write durable."""
+    if force:
         db.save()
-        _last_save[namespace] = now
+        _last_save[namespace] = time.time()
         return True
     return False
 
@@ -420,20 +578,11 @@ def _prune_edges_to(db, dead_id: int) -> int:
     Called whenever a record is deleted so graph state stays consistent.
     Returns the number of edges removed.
     """
-    removed = 0
-    for rec_id in db.get_all_ids(modality="text"):
-        if rec_id == dead_id:
-            continue
-        meta = db.get_metadata(rec_id)
-        if meta is None:
-            continue
-        current = list(meta.edges)
-        kept    = [e for e in current if e.target_id != dead_id]
-        if len(kept) != len(current):
-            meta.edges = kept
-            db.update_metadata(rec_id, meta)
-            removed += len(current) - len(kept)
-    return removed
+    # The engine's reverse index names exactly the records that point at
+    # dead_id: O(in-degree). This used to fetch the metadata of EVERY record in
+    # Python (O(N) per delete), and only walked "text"-modality ids, so edges
+    # from records stored under another modality were never pruned.
+    return _prune_edges_to_set(db, [dead_id])
 
 
 def _prune_edges_to_set(db, dead_ids) -> int:
@@ -441,16 +590,17 @@ def _prune_edges_to_set(db, dead_ids) -> int:
     id in `dead_ids`. Unlike calling _prune_edges_to per id (O(deleted × records)),
     this sweeps all records exactly once."""
     dead = set(dead_ids)
+    sources = set()
+    for d in dead:
+        for inc in db.get_incoming(d):
+            if inc.source_id not in dead:
+                sources.add(inc.source_id)
     removed = 0
-    for rec_id in db.all_ids():
-        if rec_id in dead:
-            continue
+    for rec_id in sources:
         meta = db.get_metadata(rec_id)
         if meta is None:
             continue
         current = list(meta.edges)
-        if not current:
-            continue
         kept = [e for e in current if e.target_id not in dead]
         if len(kept) != len(current):
             meta.edges = kept
@@ -646,19 +796,25 @@ async def upload_feather(
 # Routes — vector operations
 # ─────────────────────────────────────────────
 @app.post("/v1/{namespace}/vectors", status_code=201, tags=["vectors"],
-          dependencies=[Depends(verify_api_key)])
-def add_vector(namespace: str, req: AddVectorRequest):
+          dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(AddVectorRequest))
+async def add_vector(namespace: str, request: Request):
+    req = await parse_body(request, AddVectorBody)
+    return await _in_write_pool(_add_vector_impl, namespace, req)
+
+
+def _add_vector_impl(namespace: str, req):
     db = manager.get(namespace)
-    meta = _meta_from_model(req.metadata) if req.metadata else Metadata()
+    meta = _meta_from_model(_metadata_in(req.metadata)) if req.metadata else Metadata()
+    vec = req.vector_array()
 
     # Reject a mismatch only against an *established* dim. On an empty namespace
     # the first vector defines the dim (any dimension allowed), so we never
     # coerce it to the server default.
     ns_dim = _established_dim(db, req.modality)
-    if ns_dim and len(req.vector) != ns_dim:
+    if ns_dim and len(vec) != ns_dim:
         raise HTTPException(
             400,
-            f"vector dim {len(req.vector)} != index dim {ns_dim} "
+            f"vector dim {len(vec)} != index dim {ns_dim} "
             f"for modality '{req.modality}'",
         )
 
@@ -667,14 +823,19 @@ def add_vector(namespace: str, req: AddVectorRequest):
         meta.namespace_id = namespace
 
     with manager.lock(namespace):
-        db.add(id=req.id, vec=req.vector, meta=meta, modality=req.modality)
+        db.add(id=req.id, vec=vec, meta=meta, modality=req.modality)
 
     return {"id": req.id, "namespace": namespace, "modality": req.modality}
 
 
 @app.post("/v1/{namespace}/search", response_model=SearchResponse, tags=["search"],
-          dependencies=[Depends(verify_api_key)])
-def search_vectors(namespace: str, req: SearchRequest):
+          dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(SearchRequest))
+async def search_vectors(namespace: str, request: Request):
+    req = await parse_body(request, SearchBody)
+    return await run_in_threadpool(_search_impl, namespace, req)
+
+
+def _search_impl(namespace: str, req):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
@@ -682,36 +843,24 @@ def search_vectors(namespace: str, req: SearchRequest):
 
     sf = _build_filter(req)
     sc = _build_scoring(req)
-    _check_query_dim(db, req.vector, req.modality)
+    q = req.vector_array()
+    _check_query_dim(db, q, req.modality)
 
     # track=false keeps evaluation and monitoring traffic from mutating the
-    # salience counters it is measuring.
-    raw = db.search(req.vector, k=req.k, filter=sf, scoring=sc,
-                    modality=req.modality, record_salience=req.track)
+    # salience counters it is measuring. raw_score: the default score is a
+    # ranking number, not a similarity (1/(1+L2^2)), so the engine computes the
+    # exact cosine against the stored vector for the returned hits.
+    raw = db.search(q, k=req.k, filter=sf, scoring=sc, modality=req.modality,
+                    record_salience=req.track, with_cosine=req.raw_score)
+    return _results_response(raw, req.include_metadata)
 
-    cosines = {}
-    if req.raw_score:
-        # The default score is a ranking number, not a similarity: it is
-        # 1/(1+L2_squared), so on unit vectors it compresses cosine into a narrow
-        # band and no scoring knob recovers the original — the error is not even a
-        # constant offset, it changes sign. Compute the real thing from the stored
-        # vector so a caller can threshold something meaningful.
-        q = np.asarray(req.vector, dtype=np.float32)
-        qn = float(np.linalg.norm(q))
-        for r in raw:
-            try:
-                v = np.asarray(db.get_vector(r.id, req.modality), dtype=np.float32)
-                vn = float(np.linalg.norm(v))
-                cosines[r.id] = (float(np.dot(q, v)) / (qn * vn)) if qn and vn else None
-            except Exception:
-                cosines[r.id] = None
 
-    items = [
-        SearchResultItem(id=r.id, score=r.score, cosine=cosines.get(r.id),
-                         metadata=_meta_to_model(r.metadata))
-        for r in raw
-    ]
-    return SearchResponse(results=items, count=len(items))
+def _results_response(raw, include_metadata: bool = True):
+    """Serialise hits straight from C++ dicts via orjson. Returning a Response
+    skips FastAPI's response_model validation; the declared model still
+    documents the shape (metadata additionally carries ttl/confidence)."""
+    results = [r.to_dict(include_metadata) for r in raw]
+    return FastJSONResponse({"results": results, "count": len(results)})
 
 
 # No response_model: the route returns the flat metadata fields (unchanged, so
@@ -761,6 +910,7 @@ def get_record(namespace: str, record_id: int, include_vector: bool = False,
 
 @app.put("/v1/{namespace}/records/{record_id}", tags=["records"],
          dependencies=[Depends(verify_api_key)])
+@_write_route
 def update_record_metadata(namespace: str, record_id: int, req: UpdateMetadataRequest):
     try:
         db = manager.get(namespace, create=False)
@@ -775,6 +925,7 @@ def update_record_metadata(namespace: str, record_id: int, req: UpdateMetadataRe
 
 @app.put("/v1/{namespace}/records/{record_id}/importance", tags=["records"],
          dependencies=[Depends(verify_api_key)])
+@_write_route
 def update_importance(namespace: str, record_id: int, req: UpdateImportanceRequest):
     try:
         db = manager.get(namespace, create=False)
@@ -788,6 +939,7 @@ def update_importance(namespace: str, record_id: int, req: UpdateImportanceReque
 
 @app.post("/v1/{namespace}/records/{record_id}/link", tags=["records"],
           dependencies=[Depends(verify_api_key)])
+@_write_route
 def link_records(namespace: str, record_id: int, req: LinkRequest):
     try:
         db = manager.get(namespace, create=False)
@@ -801,6 +953,7 @@ def link_records(namespace: str, record_id: int, req: LinkRequest):
 
 @app.delete("/v1/{namespace}/records/{record_id}", tags=["records"],
             dependencies=[Depends(verify_api_key)])
+@_write_route
 def delete_record(namespace: str, record_id: int):
     try:
         db = manager.get(namespace, create=False)
@@ -814,22 +967,20 @@ def delete_record(namespace: str, record_id: int):
     with manager.lock(namespace):
         db.forget(record_id)
         # Cascade: drop any edges pointing at this id so the graph isn't left
-        # with dangling pointers to a deleted record. Set ?cascade=false to opt
-        # out (rare; mostly for bulk-delete sequences that compact afterwards).
+        # with dangling pointers to a deleted record.
         edges_pruned = _prune_edges_to(db, record_id)
-        db.save()
+        # No save(): forget() and the edge updates are WAL-logged, and the
+        # background checkpointer folds them into the file.
     return {"id": record_id, "deleted": True, "edges_pruned": edges_pruned}
 
 
 @app.post("/v1/{namespace}/records/batch_delete", tags=["records"],
           dependencies=[Depends(verify_api_key)])
+@_write_route
 def batch_delete(namespace: str, req: BatchDeleteRequest):
-    """Delete many records in ONE pass: take the namespace lock once, forget
-    every id, then save once.
-
-    The single-record DELETE saves the whole namespace per call — a per-record
-    delete loop over a large namespace re-serializes it N times and can wedge
-    the server. Use this instead for any bulk delete.
+    """Delete many records in ONE pass: take the namespace lock once and forget
+    every id. Every forget is WAL-logged (one fsync for the batch is shared via
+    group commit); the background checkpointer folds them into the file.
 
     Targets = `ids` ∪ (all records with `entity_id`). `cascade` (default off)
     prunes graph edges to the deleted ids in a single sweep.
@@ -863,7 +1014,6 @@ def batch_delete(namespace: str, req: BatchDeleteRequest):
         edges_pruned = 0
         if req.cascade and deleted:
             edges_pruned = _prune_edges_to_set(db, ids)
-        db.save()   # ← single save for the whole batch
     return {"namespace": namespace, "requested": len(ids), "deleted": deleted,
             "not_found": not_found, "edges_pruned": edges_pruned,
             "hint": "run POST /compact to reclaim space" if deleted else None}
@@ -871,6 +1021,7 @@ def batch_delete(namespace: str, req: BatchDeleteRequest):
 
 @app.delete("/v1/{namespace}/records/{from_id}/link/{to_id}", tags=["records"],
             dependencies=[Depends(verify_api_key)])
+@_write_route
 def unlink_records(namespace: str, from_id: int, to_id: int):
     """Remove a single edge from `from_id` to `to_id`. Returns the number of
     edges removed (0 if the edge didn't exist, 1+ if multiple rel_types matched).
@@ -888,13 +1039,13 @@ def unlink_records(namespace: str, from_id: int, to_id: int):
     if removed > 0:
         with manager.lock(namespace):
             meta.edges = kept
-            db.update_metadata(from_id, meta)
-            db.save()
+            db.update_metadata(from_id, meta)   # WAL-logged; no full save needed
     return {"from_id": from_id, "to_id": to_id, "removed": removed}
 
 
 @app.post("/v1/{namespace}/purge", tags=["records"],
           dependencies=[Depends(verify_api_key)])
+@_write_route
 def purge_namespace(namespace: str, req: PurgeRequest):
     """Hard-delete all records whose metadata.namespace_id matches req.namespace_id.
     Removes from HNSW indices, metadata store, and reverse edge index. Returns count removed.
@@ -905,13 +1056,13 @@ def purge_namespace(namespace: str, req: PurgeRequest):
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
     with manager.lock(namespace):
-        removed = db.purge(req.namespace_id)
-        db.save()
+        removed = db.purge(req.namespace_id)   # WAL-logged since 0.19
     return {"namespace": namespace, "namespace_id": req.namespace_id, "removed": removed}
 
 
 @app.post("/v1/{namespace}/compact", tags=["records"],
           dependencies=[Depends(verify_api_key)])
+@_write_route
 def compact_namespace(namespace: str, prune_dead_edges: bool = True):
     """Rebuild HNSW indices, physically dropping any soft-deleted records.
     By default also sweeps every record's outgoing edges and drops those that
@@ -1059,8 +1210,13 @@ def list_records(namespace: str, limit: int = 50, after: int = -1,
 
 
 @app.post("/v1/{namespace}/keyword_search", response_model=SearchResponse, tags=["search"],
-          dependencies=[Depends(verify_api_key)])
-def keyword_search(namespace: str, req: KeywordSearchRequest):
+          dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(KeywordSearchRequest))
+async def keyword_search(namespace: str, request: Request):
+    req = await parse_body(request, KeywordBody)
+    return await run_in_threadpool(_keyword_search_impl, namespace, req)
+
+
+def _keyword_search_impl(namespace: str, req):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
@@ -1068,16 +1224,17 @@ def keyword_search(namespace: str, req: KeywordSearchRequest):
 
     sf = _build_filter(req)
     raw = db.keyword_search(req.query, k=req.k, filter=sf)
-    items = [
-        SearchResultItem(id=r.id, score=r.score, metadata=_meta_to_model(r.metadata))
-        for r in raw
-    ]
-    return SearchResponse(results=items, count=len(items))
+    return _results_response(raw, req.include_metadata)
 
 
 @app.post("/v1/{namespace}/hybrid_search", response_model=SearchResponse, tags=["search"],
-          dependencies=[Depends(verify_api_key)])
-def hybrid_search(namespace: str, req: HybridSearchRequest):
+          dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(HybridSearchRequest))
+async def hybrid_search(namespace: str, request: Request):
+    req = await parse_body(request, HybridBody)
+    return await run_in_threadpool(_hybrid_search_impl, namespace, req)
+
+
+def _hybrid_search_impl(namespace: str, req):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
@@ -1085,15 +1242,12 @@ def hybrid_search(namespace: str, req: HybridSearchRequest):
 
     sf = _build_filter(req)
     sc = _build_scoring(req)
-    _check_query_dim(db, req.vector, req.modality)
-    raw = db.hybrid_search(req.vector, req.query, k=req.k,
+    q = req.vector_array()
+    _check_query_dim(db, q, req.modality)
+    raw = db.hybrid_search(q, req.query, k=req.k,
                             rrf_k=req.rrf_k, filter=sf, scoring=sc,
                             modality=req.modality)
-    items = [
-        SearchResultItem(id=r.id, score=r.score, metadata=_meta_to_model(r.metadata))
-        for r in raw
-    ]
-    return SearchResponse(results=items, count=len(items))
+    return _results_response(raw, req.include_metadata)
 
 
 @app.post("/v1/{namespace}/save", tags=["admin"], dependencies=[Depends(verify_api_key)])
@@ -1160,16 +1314,22 @@ def get_record_edges(namespace: str, record_id: int):
 # Context chain — vector search + BFS expansion
 # ─────────────────────────────────────────────
 @app.post("/v1/{namespace}/context_chain", response_model=ContextChainResponse,
-          tags=["graph"], dependencies=[Depends(verify_api_key)])
-def context_chain(namespace: str, req: ContextChainRequest):
+          tags=["graph"], dependencies=[Depends(verify_api_key)],
+          openapi_extra=_body_doc(ContextChainRequest))
+async def context_chain(namespace: str, request: Request):
+    req = await parse_body(request, ContextChainBody)
+    return await run_in_threadpool(_context_chain_impl, namespace, req)
+
+
+def _context_chain_impl(namespace: str, req):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
-    if req.vector is not None:
-        _check_query_dim(db, req.vector, req.modality)
-        vec = np.asarray(req.vector, dtype=np.float32)
+    if req.has_vector():
+        vec = req.vector_array()
+        _check_query_dim(db, vec, req.modality)
     else:
         rng = np.random.default_rng(req.seed)
         vec = rng.random(db.dim()).astype(np.float32)
@@ -1419,13 +1579,21 @@ def embedding_models():
 
 @app.post("/v1/{namespace}/ingest_text", tags=["records"],
           dependencies=[Depends(verify_api_key)])
-def ingest_text(namespace: str, req: IngestTextRequest):
-    """Embed `text` via the configured provider, then ingest as a new record."""
+async def ingest_text(namespace: str, req: IngestTextRequest):
+    """Embed `text` via the configured provider, then ingest as a new record.
+
+    The embedding call is awaited (no thread is held while the provider
+    responds) and coalesced with concurrent ingests into one provider request
+    by the micro-batcher; only the engine write runs on the write pool."""
     try:
-        vec = EMBEDDING.embed(req.text)
+        vec = await EMBED_BATCHER.embed(req.text)
     except RuntimeError as e:
         raise HTTPException(400, str(e))
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_WRITE_POOL, _store_ingested, namespace, req, vec)
 
+
+def _store_ingested(namespace: str, req: IngestTextRequest, vec):
     db = manager.get(namespace)
     # The embedding model's output dim is fixed. If this namespace already has an
     # established dim and the model doesn't match it, reject honestly rather than
@@ -1449,13 +1617,17 @@ def ingest_text(namespace: str, req: IngestTextRequest):
     with manager.lock(namespace):
         db.add(id=rec_id, vec=np.asarray(vec, dtype=np.float32),
                meta=meta, modality=req.modality)
-        _throttled_save(namespace, db)   # WAL-durable; throttled full save
     return {"id": rec_id, "namespace": namespace, "embedded": True, "dim": len(vec)}
 
 
 @app.post("/v1/{namespace}/import", response_model=ImportResponse, tags=["records"],
-          dependencies=[Depends(verify_api_key)])
-def bulk_import(namespace: str, req: ImportRequest):
+          dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(ImportRequest))
+async def bulk_import(namespace: str, request: Request):
+    req = await parse_body(request, ImportBody)
+    return await _in_write_pool(_bulk_import_impl, namespace, req)
+
+
+def _bulk_import_impl(namespace: str, req):
     """Bulk insert N records. Each item has an id and EITHER a precomputed
     `vector` (must match the namespace dim) OR `metadata.content`, which is
     embedded server-side via the configured provider. Without this, records
@@ -1566,8 +1738,8 @@ def bulk_import(namespace: str, req: ImportRequest):
     with manager.lock(namespace):
         if ids:
             db.add_batch(ids, np.asarray(vecs, dtype=np.float32), metas, modality=req.modality)
-        # Throttled save instead of a full file rewrite per batch (WAL keeps the
-        # data durable in between). Pass flush=true on the final batch to force it.
+        # No full file rewrite per batch: the WAL keeps the data durable and the
+        # background checkpointer folds it in. flush=true forces a save now.
         _throttled_save(namespace, db, force=req.flush)
     # Collapse repeated identical errors. A misconfigured provider produced one
     # copy of the same message per item — a 1,000-item import returned 1,000
@@ -1604,6 +1776,7 @@ def bulk_import(namespace: str, req: ImportRequest):
 
 @app.post("/v1/{namespace}/flush", tags=["records"],
           dependencies=[Depends(verify_api_key)])
+@_write_route
 def flush_namespace(namespace: str):
     """Force a full save of the namespace now. Call this once after a bulk-import
     session (which uses throttled saves) to guarantee the .feather is fully

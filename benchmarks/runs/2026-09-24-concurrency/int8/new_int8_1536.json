@@ -1,0 +1,47 @@
+{
+  "_meta": {
+    "n": 80000,
+    "dim": 1536,
+    "queries": 400,
+    "build_s": 7.4,
+    "int8": true,
+    "simd": {
+      "active": "avx2+fma",
+      "detected": "avx2+fma"
+    },
+    "version": "0.18.2",
+    "FEATHER_SIMD_RUNTIME": null
+  },
+  "unfiltered_1t": {
+    "p50_ms": 0.1162,
+    "p99_ms": 0.2101,
+    "qps": 8246.6
+  },
+  "unfiltered_8t_qps": 24978.2,
+  "filtered_1t": {
+    "ns_500": {
+      "p50_ms": 0.1348,
+      "p99_ms": 0.1919,
+      "qps": 7290.5,
+      "recall@10": 0.985
+    },
+    "ns_5000": {
+      "p50_ms": 1.2872,
+      "p99_ms": 1.9508,
+      "qps": 747.1,
+      "recall@10": 0.985
+    },
+    "ns_25000": {
+      "p50_ms": 0.7667,
+      "p99_ms": 1.2203,
+      "qps": 1259.6,
+      "recall@10": 0.944
+    },
+    "ns_60000": {
+      "p50_ms": 0.9213,
+      "p99_ms": 1.1517,
+      "qps": 1064.3,
+      "recall@10": 0.946
+    }
+  }
+}

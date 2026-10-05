@@ -268,4 +268,5 @@ class FeatherReader(BaseReader):
                 doc.doc_id = str(nid)
             docs.append(doc)
 
+        db.close(save=False)   # read-only: release the file lock, no checkpoint
         return docs

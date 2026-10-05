@@ -239,7 +239,7 @@ def test_bm25_survives_save_reload(tmp_path):
         db.add(id=i, vec=EMBED(str(i)), meta=_meta(text))
     db.forget(3)
     before = [(r.id, round(r.score, 5)) for r in db.keyword_search("beta gamma", k=10)]
-    db.save()
+    db.close()
 
     reloaded = DB.open(path, dim=128)
     after = [(r.id, round(r.score, 5)) for r in reloaded.keyword_search("beta gamma", k=10)]

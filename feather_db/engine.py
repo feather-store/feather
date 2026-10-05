@@ -526,7 +526,9 @@ class ContextEngine:
         for making link suggestions and understanding existing entity types.
         """
         try:
-            results = self._db.search(vec, k=self._sample_k, modality=self._mod)
+            # Internal context sample, not a recall: must not bump salience.
+            results = self._db.search(vec, k=self._sample_k, modality=self._mod,
+                                      record_salience=False)
             nodes = []
             for r in results:
                 m = r.metadata
