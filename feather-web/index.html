@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Feather Desk</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* ──────────────────────────────────────────────────────────────────────────
+   Feather Desk — a brand's memory as a working surface.
+
+   The engine already distinguishes scope, trust, confidence, recency and
+   expiry. This renders those distinctions instead of flattening everything
+   into a list of rows: trust is an edge colour, confidence is a bar, an
+   expiring run record counts down. A list hides exactly the differences that
+   make an agent's memory trustworthy or not.
+   ────────────────────────────────────────────────────────────────────────── */
+:root{
+  --ground:#F4F2EF; --panel:#FFFFFF; --ink:#16181C; --muted:#6B7078;
+  --line:#E4E0DA; --line-2:#CFCAC2;
+  --accent:#C2410C;            /* a burnt orange, carried from the mark */
+  --accent-soft:#FBEDE6;
+  /* trust is semantic, not decorative — four levels, four fixed hues */
+  --t-auth:#1F6F4A;  --t-auth-bg:#E7F1EB;
+  --t-first:#2563A8; --t-first-bg:#E6EEF7;
+  --t-user:#7A4FB5;  --t-user-bg:#EFE9F8;
+  --t-untrust:#A8411F; --t-untrust-bg:#F8E9E3;
+  --shadow:0 1px 2px rgba(22,24,28,.04), 0 8px 24px rgba(22,24,28,.05);
+  --sans:"Instrument Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --r:14px;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#121316; --panel:#191B1F; --ink:#E9E7E3; --muted:#9398A0;
+    --line:#2A2D33; --line-2:#3C4047;
+    --accent:#F0875B; --accent-soft:#2B1B14;
+    --t-auth:#6FC79B;  --t-auth-bg:#16271F;
+    --t-first:#79AEE8; --t-first-bg:#16222F;
+    --t-user:#B698E5;  --t-user-bg:#211A2E;
+    --t-untrust:#E59579; --t-untrust-bg:#2C1B14;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.3);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#121316; --panel:#191B1F; --ink:#E9E7E3; --muted:#9398A0;
+  --line:#2A2D33; --line-2:#3C4047;
+  --accent:#F0875B; --accent-soft:#2B1B14;
+  --t-auth:#6FC79B;  --t-auth-bg:#16271F;
+  --t-first:#79AEE8; --t-first-bg:#16222F;
+  --t-user:#B698E5;  --t-user-bg:#211A2E;
+  --t-untrust:#E59579; --t-untrust-bg:#2C1B14;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.3);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+     font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+button,input{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+
+/* ── frame ─────────────────────────────────────────────────────────────── */
+.app{height:100%;display:flex;flex-direction:column;
+     padding:env(safe-area-inset-top,0) 0 0}
+.bar{display:flex;align-items:center;gap:14px;padding:12px 18px;
+     border-bottom:1px solid var(--line);background:var(--panel);flex:none;flex-wrap:wrap}
+.mark{font-weight:600;letter-spacing:-.02em;font-size:16px;display:flex;align-items:center;gap:8px}
+.mark i{width:10px;height:10px;border-radius:3px;background:var(--accent);display:block}
+.crumb{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.crumb b{color:var(--ink);font-weight:500}
+.spacer{flex:1}
+.stat{font-family:var(--mono);font-size:11.5px;color:var(--muted);white-space:nowrap}
+.ghost{background:none;border:1px solid var(--line-2);border-radius:7px;
+       padding:5px 11px;font-size:12.5px;cursor:pointer;color:var(--muted)}
+.ghost:hover{color:var(--ink);border-color:var(--ink)}
+
+.main{flex:1;display:flex;min-height:0}
+@media(max-width:860px){.main{flex-direction:column}}
+
+/* ── desk ──────────────────────────────────────────────────────────────── */
+.desk{flex:1;min-width:0;display:flex;flex-direction:column}
+.deskscroll{flex:1;overflow:auto;padding:22px 18px 10px}
+.deskhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.deskhead h1{margin:0;font-size:21px;font-weight:600;letter-spacing:-.02em}
+.deskhead p{margin:0;color:var(--muted);font-size:13px}
+
+.cards{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(248px,1fr));
+       align-items:start}
+.card{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--line-2);
+      border-radius:var(--r);padding:13px 14px;box-shadow:var(--shadow);
+      display:flex;flex-direction:column;gap:9px;cursor:default;
+      transition:transform .12s ease, box-shadow .12s ease}
+.card:hover{transform:translateY(-1px)}
+.card.hit{border-left-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft),var(--shadow)}
+.card.dim{opacity:.32}
+.card .key{font-family:var(--mono);font-size:11px;color:var(--muted);
+           display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+.card .body{font-size:13.5px;line-height:1.45}
+.card.auth{border-left-color:var(--t-auth)}
+.card.first{border-left-color:var(--t-first)}
+.card.user{border-left-color:var(--t-user)}
+.card.untrust{border-left-color:var(--t-untrust)}
+
+.pills{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.pill{font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase;
+      padding:2px 7px;border-radius:999px;white-space:nowrap}
+.pill.auth{background:var(--t-auth-bg);color:var(--t-auth)}
+.pill.first{background:var(--t-first-bg);color:var(--t-first)}
+.pill.user{background:var(--t-user-bg);color:var(--t-user)}
+.pill.untrust{background:var(--t-untrust-bg);color:var(--t-untrust)}
+.pill.ttl{background:var(--accent-soft);color:var(--accent)}
+
+/* confidence as a bar: a number invites false precision, a bar reads as a
+   degree of belief, which is what it is */
+.conf{display:flex;align-items:center;gap:7px}
+.conf .track{flex:1;height:3px;border-radius:2px;background:var(--line);overflow:hidden}
+.conf .fill{height:100%;background:var(--muted);border-radius:2px}
+.conf .n{font-family:var(--mono);font-size:10.5px;color:var(--muted);
+         font-variant-numeric:tabular-nums}
+
+.empty{color:var(--muted);padding:40px 0;text-align:center;font-size:13.5px}
+
+/* ── dock: scopes are the apps ─────────────────────────────────────────── */
+.dock{flex:none;display:flex;gap:8px;padding:10px 18px calc(12px + env(safe-area-inset-bottom,0px));
+      border-top:1px solid var(--line);background:var(--panel);overflow-x:auto}
+.tile{flex:none;display:flex;flex-direction:column;align-items:flex-start;gap:3px;
+      border:1px solid var(--line);background:var(--ground);border-radius:11px;
+      padding:8px 12px;cursor:pointer;min-width:112px;text-align:left}
+.tile:hover{border-color:var(--line-2)}
+.tile[aria-pressed="true"]{border-color:var(--ink);background:var(--panel);
+                           box-shadow:inset 0 0 0 1px var(--ink)}
+.tile .nm{font-size:12.5px;font-weight:500;white-space:nowrap}
+.tile .ct{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+.tile .sw{width:18px;height:3px;border-radius:2px;margin-bottom:3px}
+
+/* ── rail ──────────────────────────────────────────────────────────────── */
+.rail{width:340px;flex:none;border-left:1px solid var(--line);background:var(--panel);
+      display:flex;flex-direction:column;min-height:0}
+@media(max-width:860px){.rail{width:auto;border-left:0;border-top:1px solid var(--line);
+      max-height:52vh}}
+.railhead{padding:14px 16px 10px;border-bottom:1px solid var(--line)}
+.railhead h2{margin:0 0 3px;font-size:14px;font-weight:600}
+.railhead p{margin:0;font-size:12px;color:var(--muted)}
+.railbody{flex:1;overflow:auto;padding:12px 16px}
+.shortcuts{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+.sc{display:flex;gap:9px;align-items:center;background:none;border:0;padding:7px 9px;
+    border-radius:9px;cursor:pointer;text-align:left;width:100%}
+.sc:hover{background:var(--ground)}
+.sc svg{flex:none;opacity:.55}
+.sc span{font-size:13px}
+.res{display:flex;flex-direction:column;gap:9px}
+.r{border:1px solid var(--line);border-radius:10px;padding:10px 11px;background:var(--ground);
+   cursor:pointer}
+.r:hover{border-color:var(--line-2)}
+.r .rk{font-family:var(--mono);font-size:10.5px;color:var(--muted);
+       display:flex;justify-content:space-between;gap:6px}
+.r .rt{font-size:12.5px;margin-top:4px;line-height:1.4}
+.composer{flex:none;border-top:1px solid var(--line);padding:12px 16px
+          calc(14px + env(safe-area-inset-bottom,0px))}
+.field{display:flex;gap:8px;align-items:center;border:1px solid var(--line-2);
+       border-radius:10px;padding:7px 8px 7px 12px;background:var(--ground)}
+.field input{flex:1;background:none;border:0;outline:none;font-size:13px;min-width:0}
+.go{flex:none;width:28px;height:28px;border-radius:7px;border:0;background:var(--ink);
+    color:var(--ground);cursor:pointer;display:grid;place-items:center}
+.go[disabled]{opacity:.4;cursor:not-allowed}
+.note{font-size:11.5px;color:var(--muted);margin-top:8px}
+
+/* ── key gate ──────────────────────────────────────────────────────────── */
+.gate{position:fixed;inset:0;background:var(--ground);display:grid;place-items:center;
+      padding:24px;z-index:20}
+.gatebox{max-width:380px;width:100%;background:var(--panel);border:1px solid var(--line);
+         border-radius:var(--r);padding:22px;box-shadow:var(--shadow)}
+.gatebox h2{margin:0 0 6px;font-size:17px}
+.gatebox p{margin:0 0 14px;color:var(--muted);font-size:13px}
+.gatebox input{width:100%;padding:9px 11px;border:1px solid var(--line-2);
+               border-radius:9px;background:var(--ground);margin-bottom:10px}
+.gatebox button{width:100%;padding:9px;border:0;border-radius:9px;background:var(--ink);
+                color:var(--ground);font-weight:500;cursor:pointer}
+.err{color:var(--t-untrust);font-size:12.5px;margin-top:9px}
+</style>
+</head>
+<body>
+<div class="app" id="app" hidden>
+  <header class="bar">
+    <div class="mark"><i></i>Feather Desk</div>
+    <div class="crumb" id="crumb">—</div>
+    <div class="spacer"></div>
+    <div class="stat" id="stat"></div>
+    <button class="ghost" id="refresh">Refresh</button>
+  </header>
+
+  <div class="main">
+    <section class="desk">
+      <div class="deskscroll">
+        <div class="deskhead">
+          <h1 id="scopeTitle">—</h1>
+          <p id="scopeSub"></p>
+        </div>
+        <div class="cards" id="cards"></div>
+        <div class="empty" id="empty" hidden></div>
+      </div>
+      <nav class="dock" id="dock" aria-label="Scopes"></nav>
+    </section>
+
+    <aside class="rail">
+      <div class="railhead">
+        <h2>Ask this memory</h2>
+        <p>Searches every scope. Hits are highlighted on the desk.</p>
+      </div>
+      <div class="railbody">
+        <div class="shortcuts" id="shortcuts"></div>
+        <div class="res" id="results"></div>
+      </div>
+      <div class="composer">
+        <div class="field">
+          <input id="q" placeholder="What do we know about…" autocomplete="off">
+          <button class="go" id="ask" aria-label="Search">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg>
+          </button>
+        </div>
+        <div class="note" id="searchNote">Keyword search — set an embedder for semantic recall.</div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div class="gate" id="gate">
+  <form class="gatebox" id="gateForm">
+    <h2>Open a Feather file</h2>
+    <p>Reads through the Feather API. The key stays in this browser.</p>
+    <input id="apiBase" placeholder="http://127.0.0.1:7450" value="http://127.0.0.1:7450">
+    <input id="apiKey" type="password" placeholder="API key" autocomplete="off">
+    <input id="ns" placeholder="namespace, e.g. ck_nike" value="ck_nike">
+    <button type="submit">Open</button>
+    <div class="err" id="gateErr" hidden></div>
+  </form>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+var S = { base:"", key:"", ns:"", records:[], scopes:[], scope:null, hits:new Set() };
+
+/* localStorage is a per-viewer convenience only; it can throw in a private
+   window, so every touch is guarded and the app works without it. */
+function remember(k,v){ try{ localStorage.setItem("fd_"+k,v); }catch(e){} }
+function recall(k,d){ try{ return localStorage.getItem("fd_"+k) ?? d; }catch(e){ return d; } }
+
+var $ = function(id){ return document.getElementById(id); };
+function esc(t){ var d=document.createElement("div"); d.textContent=t==null?"":String(t); return d.innerHTML; }
+
+/* ── trust: four levels, each its own hue. Unknown falls back to first_party
+   rather than to "trusted", because guessing upward is the dangerous way. */
+var TRUST = {
+  authoritative:        {cls:"auth",     label:"authoritative"},
+  first_party:          {cls:"first",    label:"first party"},
+  user_supplied:        {cls:"user",     label:"user supplied"},
+  third_party_untrusted:{cls:"untrust",  label:"untrusted"}
+};
+function trustOf(m){
+  var t = (m.attributes && m.attributes.trust) || "first_party";
+  return TRUST[t] || TRUST.first_party;
+}
+
+/* A scope's last segment is what distinguishes it on screen; the brand prefix
+   is the same on every tile and would just take up room. */
+function leaf(scope){
+  var p = scope.split(".");
+  if (p.length <= 2) return scope;
+  if (p[2] === "agent")    return p.slice(3).join(".").replace(".run.", " / run ");
+  if (p[2] === "shared")   return p.slice(3).join(".");
+  return p.slice(2).join(".");
+}
+function hueOf(scope){
+  if (/\.core$/.test(scope))        return "var(--t-auth)";
+  if (/shared\.findings/.test(scope)) return "var(--t-first)";
+  if (/\.user\./.test(scope))       return "var(--t-user)";
+  if (/\.run\./.test(scope))        return "var(--accent)";
+  return "var(--line-2)";
+}
+
+function ago(ts){
+  if(!ts) return "";
+  var d = Math.floor((Date.now()/1000 - ts)/86400);
+  if (d <= 0) return "today";
+  if (d === 1) return "1 day ago";
+  if (d < 30) return d + " days ago";
+  return Math.floor(d/30) + " mo ago";
+}
+function expiresIn(m){
+  if(!m.ttl || !m.timestamp) return null;
+  var left = (m.timestamp + m.ttl) - Math.floor(Date.now()/1000);
+  if (left <= 0) return "expired";
+  var d = Math.floor(left/86400);
+  return d >= 1 ? ("expires in " + d + "d") : "expires today";
+}
+
+/* ── API ─────────────────────────────────────────────────────────────── */
+function api(path, opts){
+  opts = opts || {};
+  return fetch(S.base.replace(/\/$/,"") + path, {
+    method: opts.method || "GET",
+    headers: Object.assign({"x-api-key": S.key}, opts.body ? {"content-type":"application/json"} : {}),
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  }).then(function(r){
+    if(!r.ok) return r.text().then(function(t){ throw new Error(r.status + " " + t.slice(0,160)); });
+    return r.json();
+  });
+}
+
+function loadAll(){
+  // Page through: the API caps `limit`, and a namespace with tombstones can
+  // need several passes before it yields a full page of live records.
+  var out = [], after = -1;
+  function page(){
+    return api("/v1/" + encodeURIComponent(S.ns) + "/records?limit=200&after=" + after)
+      .then(function(d){
+        var rows = d.results || d.records || [];
+        rows.forEach(function(r){ out.push(r); });
+        if (rows.length) after = rows[rows.length-1].id;
+        return (d.has_more && rows.length) ? page() : out;
+      });
+  }
+  return page();
+}
+
+/* ── render ──────────────────────────────────────────────────────────── */
+function groupScopes(){
+  var by = {};
+  S.records.forEach(function(r){
+    var ns = (r.metadata && r.metadata.namespace_id) || "(unscoped)";
+    (by[ns] = by[ns] || []).push(r);
+  });
+  S.scopes = Object.keys(by).sort().map(function(k){ return {scope:k, rows:by[k]}; });
+  if (!S.scope || !by[S.scope]) S.scope = S.scopes.length ? S.scopes[0].scope : null;
+  return by;
+}
+
+function renderDock(){
+  var dock = $("dock"); dock.textContent = "";
+  S.scopes.forEach(function(s){
+    var b = document.createElement("button");
+    b.className = "tile";
+    b.setAttribute("aria-pressed", s.scope === S.scope ? "true" : "false");
+    b.innerHTML = '<span class="sw" style="background:' + hueOf(s.scope) + '"></span>' +
+                  '<span class="nm">' + esc(leaf(s.scope)) + '</span>' +
+                  '<span class="ct">' + s.rows.length + ' record' + (s.rows.length===1?'':'s') + '</span>';
+    b.addEventListener("click", function(){ S.scope = s.scope; render(); });
+    dock.appendChild(b);
+  });
+}
+
+function card(r){
+  var m = r.metadata || {}, t = trustOf(m), exp = expiresIn(m);
+  var conf = typeof m.confidence === "number" ? m.confidence : 1;
+  var el = document.createElement("article");
+  el.className = "card " + t.cls + (S.hits.size ? (S.hits.has(r.id) ? " hit" : " dim") : "");
+  el.innerHTML =
+    '<div class="key"><span>' + esc(m.entity_id || ("#" + r.id)) + '</span>' +
+      '<span>' + esc(ago(m.timestamp)) + '</span></div>' +
+    '<div class="body">' + esc(m.content || "(no content)") + '</div>' +
+    '<div class="pills"><span class="pill ' + t.cls + '">' + t.label + '</span>' +
+      (exp ? '<span class="pill ttl">' + esc(exp) + '</span>' : '') + '</div>' +
+    '<div class="conf"><span class="n">belief</span>' +
+      '<span class="track"><span class="fill" style="width:' + Math.round(conf*100) + '%"></span></span>' +
+      '<span class="n">' + conf.toFixed(2) + '</span></div>';
+  return el;
+}
+
+function render(){
+  var by = groupScopes();
+  renderDock();
+  var rows = (by[S.scope] || []).slice().sort(function(a,b){
+    return (b.metadata.importance||0) - (a.metadata.importance||0);
+  });
+  $("crumb").innerHTML = esc(S.ns) + ' / <b>' + esc(leaf(S.scope||"")) + '</b>';
+  $("scopeTitle").textContent = leaf(S.scope || "—");
+  $("scopeSub").textContent = S.scope || "";
+  $("stat").textContent = S.records.length + " records · " + S.scopes.length + " scopes";
+
+  var wrap = $("cards"); wrap.textContent = "";
+  rows.forEach(function(r){ wrap.appendChild(card(r)); });
+  $("empty").hidden = rows.length > 0;
+  $("empty").textContent = "Nothing in this scope yet.";
+}
+
+/* ── search ──────────────────────────────────────────────────────────── */
+function search(q){
+  if(!q.trim()) return;
+  $("results").innerHTML = '<div class="note">Searching…</div>';
+  api("/v1/" + encodeURIComponent(S.ns) + "/keyword_search",
+      {method:"POST", body:{query:q, k:12}})
+  .then(function(d){ showResults(d.results || [], q); })
+  .catch(function(e){ $("results").innerHTML = '<div class="note">' + esc(e.message) + '</div>'; });
+}
+
+function showResults(rows, q){
+  var box = $("results"); box.textContent = "";
+  S.hits = new Set(rows.map(function(r){ return r.id; }));
+  if(!rows.length){
+    box.innerHTML = '<div class="note">Nothing matched “' + esc(q) + '”. ' +
+      'Keyword search has no stemming, so try the word as it appears.</div>';
+    render(); return;
+  }
+  rows.forEach(function(r){
+    var m = r.metadata || {}, t = trustOf(m);
+    var el = document.createElement("button");
+    el.className = "r";
+    el.innerHTML = '<div class="rk"><span>' + esc(leaf(m.namespace_id||"")) + '</span>' +
+                   '<span class="pill ' + t.cls + '">' + t.label + '</span></div>' +
+                   '<div class="rt">' + esc((m.content||"").slice(0,150)) + '</div>';
+    el.addEventListener("click", function(){
+      S.scope = m.namespace_id; render();
+      var node = document.querySelector(".card.hit");
+      if (node) node.scrollIntoView({behavior:"smooth", block:"center"});
+    });
+    box.appendChild(el);
+  });
+  render();
+}
+
+var SHORTCUTS = [
+  ["What rules constrain us?", "claims"],
+  ["What did we learn?",       "creative"],
+  ["What is expiring?",        "finding"]
+];
+function renderShortcuts(){
+  var box = $("shortcuts"); box.textContent = "";
+  SHORTCUTS.forEach(function(p){
+    var b = document.createElement("button");
+    b.className = "sc";
+    b.innerHTML = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"' +
+      ' stroke-width="1.6"><circle cx="7" cy="7" r="5"/><path d="M11 11l3 3"/></svg>' +
+      '<span>' + esc(p[0]) + '</span>';
+    b.addEventListener("click", function(){ $("q").value = p[1]; search(p[1]); });
+    box.appendChild(b);
+  });
+}
+
+/* ── boot ────────────────────────────────────────────────────────────── */
+function start(){
+  $("gate").hidden = true; $("app").hidden = false;
+  renderShortcuts();
+  return loadAll().then(function(rows){
+    S.records = rows; render();
+  });
+}
+
+$("gateForm").addEventListener("submit", function(e){
+  e.preventDefault();
+  S.base = $("apiBase").value.trim();
+  S.key  = $("apiKey").value.trim();
+  S.ns   = $("ns").value.trim();
+  $("gateErr").hidden = true;
+  start().then(function(){
+    remember("base", S.base); remember("ns", S.ns);
+  }).catch(function(err){
+    $("gate").hidden = false; $("app").hidden = true;
+    $("gateErr").hidden = false;
+    $("gateErr").textContent = /401|403/.test(err.message)
+      ? "That key was refused."
+      : /404/.test(err.message) ? "No such namespace on that server."
+      : err.message;
+  });
+});
+
+$("ask").addEventListener("click", function(){ search($("q").value); });
+$("q").addEventListener("keydown", function(e){ if(e.key === "Enter") search($("q").value); });
+$("refresh").addEventListener("click", function(){
+  S.hits = new Set(); $("results").textContent = "";
+  loadAll().then(function(rows){ S.records = rows; render(); });
+});
+
+$("apiBase").value = recall("base", "http://127.0.0.1:7450");
+$("ns").value = recall("ns", "ck_nike");
+})();
+</script>
+</body>
+</html>

@@ -33,6 +33,22 @@ class MetadataIn(BaseModel):
     namespace_id: str = ""
     entity_id: str = ""
     attributes: Dict[str, str] = Field(default_factory=dict)
+    # Both have been engine fields for a long time, both are persisted, and
+    # neither was reachable over HTTP: `extra="forbid"` meant a POST carrying
+    # either got a 422, and the output model dropped them, so a client could
+    # not set them OR read them back.
+    #
+    # confidence is how likely a record is to be TRUE; importance is how much
+    # it matters. Keeping them separate is the point — a critical rule believed
+    # weakly and a trivial fact known for certain are different things. It
+    # became filterable in 0.21.0 (`confidence_gte`), which made an API that
+    # cannot write it actively confusing.
+    #
+    # ttl is seconds from `timestamp`, 0 meaning never. Without it over HTTP
+    # there is no way to write an expiring record — which is exactly what a
+    # short-lived agent run scope needs.
+    confidence: float = Field(1.0, ge=0.0, le=1.0)
+    ttl: int = Field(0, ge=0, description="Seconds from timestamp; 0 = never expires")
 
 
 class MetadataOut(MetadataIn):
