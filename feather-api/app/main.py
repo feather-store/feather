@@ -99,7 +99,7 @@ async def _metrics_middleware(request: Request, call_next):
     response = await call_next(request)
     dt = (time.perf_counter() - t0) * 1000
     path = request.url.path
-    if path.startswith("/admin") or path.startswith("/static"):
+    if path.startswith("/admin") or path.startswith("/static") or path.startswith("/app"):
         return response          # don't count static asset hits
     METRICS.record(
         op=classify(request.method, path),
@@ -137,6 +137,31 @@ if _STATIC_DIR.is_dir():
     app.mount("/admin/static", StaticFiles(directory=str(_STATIC_DIR)), name="admin_static")
 else:
     logger.warning("admin static dir not found at %s", _STATIC_DIR)
+
+# ─────────────────────────────────────────────
+# Feather Desk at /app — the context workspace, distinct from /admin.
+# /admin is an operator console: namespaces, index stats, compaction. /app is
+# for the person whose memory this is — scopes as a working surface, trust and
+# belief shown rather than flattened into rows. Served same-origin so the page
+# never needs CORS or a second credential path.
+# ─────────────────────────────────────────────
+_WEB_DIR = pathlib.Path(__file__).parent.parent.parent / "feather-web"
+_WEB_INDEX = _WEB_DIR / "index.html"
+
+@app.get("/app", include_in_schema=False)
+@app.get("/app/", include_in_schema=False)
+def _web_index():
+    if not _WEB_INDEX.is_file():
+        raise HTTPException(404, "Feather Desk not deployed")
+    return FileResponse(
+        str(_WEB_INDEX),
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+if _WEB_DIR.is_dir():
+    app.mount("/app/static", StaticFiles(directory=str(_WEB_DIR)), name="web_static")
+
 
 @app.get("/dashboard", include_in_schema=False)
 @app.get("/dashboard/", include_in_schema=False)
@@ -190,7 +215,7 @@ def verify_api_key(x_api_key: str = Header(default="")):
 # silently discarded — see the import path and MetadataIn.model_config.
 _METADATA_KEYS = {
     "timestamp", "importance", "type", "source", "content", "tags_json",
-    "namespace_id", "entity_id", "attributes",
+    "namespace_id", "entity_id", "attributes", "confidence", "ttl",
     # accepted on input and ignored (server-owned), but not an error to send back
     "recall_count", "last_recalled_at", "links",
 }
@@ -206,6 +231,8 @@ def _meta_from_model(m_in) -> Metadata:
     meta.tags_json       = m_in.tags_json
     meta.namespace_id    = m_in.namespace_id
     meta.entity_id       = m_in.entity_id
+    meta.confidence      = m_in.confidence
+    meta.ttl             = m_in.ttl
     for k, v in m_in.attributes.items():
         meta.set_attribute(k, v)
     return meta
@@ -222,6 +249,8 @@ def _meta_to_model(meta: Metadata) -> MetadataOut:
         namespace_id    = meta.namespace_id,
         entity_id       = meta.entity_id,
         attributes      = dict(meta.attributes),
+        confidence      = meta.confidence,
+        ttl             = meta.ttl,
         recall_count    = meta.recall_count,
         last_recalled_at= meta.last_recalled_at,
         links           = list(meta.links),
