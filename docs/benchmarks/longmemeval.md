@@ -1,6 +1,12 @@
 # Feather DB on LongMemEval
 
-> Status: in progress as of 2026-04-25. The numbers in this document are
+> **Status: STALE DRAFT, last updated 2026-04-25.** These numbers are draft and
+> have not been re-run in six months. The README badges link here, so treat any
+> figure on a badge as provisional until this document is refreshed. The
+> reproducible BM25 result (recall@10 0.986, 500 questions, 11 s, no API key) is
+> in `benchmarks/LONGMEMEVAL_RESULTS.md` and is the number to quote.
+>
+> Original note: the numbers in this document are
 > **draft**. Final headline (full 500-question oracle + S-variant run with
 > adaptive decay engaged) lands when both runs complete and the comparison
 > table is finalized.

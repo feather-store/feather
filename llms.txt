@@ -1,0 +1,96 @@
+# Feather
+
+> Agent memory in a single file. An embedded vector database with memory
+> semantics — adaptive decay, trust levels, confidence, scoped working sets and
+> context packets — that runs inside your agent process. No server, no daemon,
+> no network hop. `pip install feather-db`.
+
+Feather is not a general-purpose database and does not try to be. It has no
+transactions, no query planner, and one writer per file. It is built for one
+job: being the thing an agent remembers into.
+
+## Install
+
+```bash
+pip install feather-db          # Python, binary wheels for cp39-cp314
+cargo install feather-db-cli    # Rust CLI
+docker pull ghcr.io/feather-store/feather-api
+```
+
+## The 30-second version
+
+```python
+import feather_db, numpy as np
+db = feather_db.DB.open("memory.feather", dim=768)
+
+meta = feather_db.Metadata()
+meta.content = "user prefers written async updates"
+meta.namespace_id = "org.user_842.preferences"
+meta.confidence = 0.9
+db.add(id=1, vec=embedding, meta=meta)
+
+db.search(query_vec, k=5)            # vector
+db.keyword_search("async", k=5)      # BM25, Porter-stemmed
+db.hybrid_search(query_vec, "async") # reciprocal rank fusion
+db.close()                           # releases the file lock
+```
+
+## What makes it a memory engine rather than a vector store
+
+- **Adaptive decay** — `stickiness = 1 + ln(1 + recall_count)`; frequently
+  recalled memories age more slowly. Relevance, validity and importance are
+  separate fields, never collapsed.
+- **Trust and confidence** — `confidence` (how likely a record is true) is a
+  distinct axis from `importance` (how much it matters), and both are
+  filterable.
+- **Scoped working sets** — `Pocket` gives each agent a budget-fitted hot set
+  over dotted, inheriting scopes, with warm storage behind it.
+- **Context packets** — required constraints are resolved first and the packet
+  **fails closed** if one cannot be found, so a brand rule can never be silently
+  dropped to make room.
+- **Single file** — one `.feather` on disk. Copy it, back it up, delete it.
+
+## Honest limits
+
+- One writer process per file; a second is refused by name, not queued. Readers
+  are unlimited and lock-free, seeing a consistent snapshot as of their open.
+- No transactions and no query planner.
+- Prefiltered ANN is metadata equality, not graph traversal.
+- BM25 is Porter-stemmed, which handles plurals and verb forms but not every
+  derivational pair. Anything relying on paraphrase needs a real embedder.
+- Format v9; bitemporal fields (`valid_from` / `observed_at`) are not yet in the
+  record and are planned for v10.
+
+## Benchmarks
+
+LongMemEval (ICLR 2025), 500 questions, retrieval recall:
+
+| metric | BM25, no embedder |
+| --- | --- |
+| recall@1 | 0.874 |
+| recall@3 | 0.942 |
+| recall@5 | 0.974 |
+| recall@10 | 0.986 |
+
+11 seconds end to end on a laptop, no API key. Reproduce with
+`python benchmarks/longmemeval.py --data lme_s.json --mode keyword`.
+
+## Docs
+
+- [README](https://github.com/feather-store/feather/blob/master/README.md): full API
+- [CHANGELOG](https://github.com/feather-store/feather/blob/master/CHANGELOG.md): every release, including the defects each one fixed
+- [Technical reference](https://github.com/feather-store/feather/blob/master/CLAUDE.md): architecture, file format, gotchas — written for coding agents
+- [Storage spec](https://github.com/feather-store/feather/blob/master/docs/singularity-storage-spec.md): sizing, compaction, backup, measured numbers
+
+## Integrations
+
+- **MCP** — `feather-agent` exposes memory to Claude Desktop and Claude Code as
+  5 tools, 3 prompts and 2 resources.
+- **LangGraph** — `FeatherStore` is a `BaseStore`, so it is long-term,
+  cross-thread agent memory in one line: `builder.compile(store=FeatherStore(...))`.
+- **Cloud API** — optional FastAPI server when you want it over HTTP instead of
+  in-process.
+
+## Source
+
+https://github.com/feather-store/feather — MIT licensed.
