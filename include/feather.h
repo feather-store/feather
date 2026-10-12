@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <array>
 #ifndef _WIN32
 #include <fcntl.h>
@@ -480,6 +481,167 @@ private:
         return sw;
     }
 
+    // ── Porter stemmer ───────────────────────────────────────────────────
+    //
+    // Without it, BM25 matched only exact surface forms: a memory whose content
+    // said "allergic" was not found by searching "allergy", and "creative"
+    // missed "creatives". For an agent memory that failure is worse than it
+    // looks — the caller cannot tell "no such memory" from "stored, but you
+    // spelled it differently", so it reads as the agent having forgotten.
+    //
+    // Safe to change without a format bump: bm25_index_ is never serialised,
+    // it is rebuilt from `content` on every load() and after compact(), so an
+    // existing .feather re-indexes under the new rules the next time it opens.
+    // Both indexing and querying go through tokenize(), so they can never
+    // disagree about how a word is folded.
+    //
+    // FEATHER_STEM=0 restores exact-form matching.
+    static bool stemming_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("FEATHER_STEM");
+            return !(e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N'));
+        }();
+        return on;
+    }
+
+    static bool stem_is_consonant(const std::string& w, size_t i) {
+        switch (w[i]) {
+            case 'a': case 'e': case 'i': case 'o': case 'u': return false;
+            case 'y': return i == 0 ? true : !stem_is_consonant(w, i - 1);
+            default: return true;
+        }
+    }
+    /// Porter's `m`: how many vowel-consonant sequences the stem contains.
+    static int stem_measure(const std::string& w) {
+        int m = 0; size_t i = 0, n = w.size();
+        while (i < n && stem_is_consonant(w, i)) ++i;
+        while (i < n) {
+            while (i < n && !stem_is_consonant(w, i)) ++i;
+            if (i >= n) break;
+            ++m;
+            while (i < n && stem_is_consonant(w, i)) ++i;
+        }
+        return m;
+    }
+    static bool stem_has_vowel(const std::string& w) {
+        for (size_t i = 0; i < w.size(); ++i) if (!stem_is_consonant(w, i)) return true;
+        return false;
+    }
+    static bool stem_double_consonant(const std::string& w) {
+        size_t n = w.size();
+        return n >= 2 && w[n-1] == w[n-2] && stem_is_consonant(w, n-1);
+    }
+    /// consonant-vowel-consonant where the last is not w, x or y
+    static bool stem_cvc(const std::string& w) {
+        size_t n = w.size();
+        if (n < 3) return false;
+        if (!stem_is_consonant(w, n-3) || stem_is_consonant(w, n-2) ||
+            !stem_is_consonant(w, n-1)) return false;
+        char c = w[n-1];
+        return c != 'w' && c != 'x' && c != 'y';
+    }
+    static bool stem_ends(const std::string& w, const char* suf, size_t& stem_len) {
+        size_t sl = std::strlen(suf), n = w.size();
+        if (n < sl || w.compare(n - sl, sl, suf) != 0) return false;
+        stem_len = n - sl;
+        return true;
+    }
+    /// Replace suffix `suf` with `rep` when the remaining stem has measure > `min_m`.
+    static bool stem_replace(std::string& w, const char* suf, const char* rep, int min_m) {
+        size_t sl;
+        if (!stem_ends(w, suf, sl)) return false;
+        std::string stem = w.substr(0, sl);
+        if (stem_measure(stem) > min_m) w = stem + rep;
+        return true;   // the suffix matched, so no later rule in this step applies
+    }
+
+    static std::string stem(const std::string& word) {
+        if (word.size() <= 2) return word;
+        std::string w = word;
+        size_t sl;
+
+        // ── step 1a: plurals ──
+        if (stem_ends(w, "sses", sl) || stem_ends(w, "ies", sl)) {
+            w = w.substr(0, sl) + (w[w.size()-3] == 'i' ? "i" : "ss");
+        } else if (w.back() == 's' && w.size() > 1 && w[w.size()-2] != 's') {
+            w.pop_back();
+        }
+
+        // ── step 1b: -eed / -ed / -ing ──
+        bool step1b_hit = false;
+        if (stem_ends(w, "eed", sl)) {
+            if (stem_measure(w.substr(0, sl)) > 0) w.pop_back();
+        } else if ((stem_ends(w, "ed", sl) || stem_ends(w, "ing", sl)) &&
+                   stem_has_vowel(w.substr(0, sl))) {
+            w = w.substr(0, sl);
+            step1b_hit = true;
+        }
+        if (step1b_hit) {
+            if (stem_ends(w, "at", sl) || stem_ends(w, "bl", sl) || stem_ends(w, "iz", sl)) {
+                w += "e";
+            } else if (stem_double_consonant(w) &&
+                       w.back() != 'l' && w.back() != 's' && w.back() != 'z') {
+                w.pop_back();
+            } else if (stem_measure(w) == 1 && stem_cvc(w)) {
+                w += "e";
+            }
+        }
+
+        // ── step 1c: y → i ──
+        if (w.size() > 1 && w.back() == 'y' && stem_has_vowel(w.substr(0, w.size()-1)))
+            w.back() = 'i';
+
+        // ── step 2 ──
+        stem_replace(w, "ational", "ate", 0) || stem_replace(w, "tional", "tion", 0) ||
+        stem_replace(w, "enci", "ence", 0)   || stem_replace(w, "anci", "ance", 0) ||
+        stem_replace(w, "izer", "ize", 0)    || stem_replace(w, "abli", "able", 0) ||
+        stem_replace(w, "alli", "al", 0)     || stem_replace(w, "entli", "ent", 0) ||
+        stem_replace(w, "eli", "e", 0)       || stem_replace(w, "ousli", "ous", 0) ||
+        stem_replace(w, "ization", "ize", 0) || stem_replace(w, "ation", "ate", 0) ||
+        stem_replace(w, "ator", "ate", 0)    || stem_replace(w, "alism", "al", 0) ||
+        stem_replace(w, "iveness", "ive", 0) || stem_replace(w, "fulness", "ful", 0) ||
+        stem_replace(w, "ousness", "ous", 0) || stem_replace(w, "aliti", "al", 0) ||
+        stem_replace(w, "iviti", "ive", 0)   || stem_replace(w, "biliti", "ble", 0);
+
+        // ── step 3 ──
+        stem_replace(w, "icate", "ic", 0) || stem_replace(w, "ative", "", 0) ||
+        stem_replace(w, "alize", "al", 0) || stem_replace(w, "iciti", "ic", 0) ||
+        stem_replace(w, "ical", "ic", 0)  || stem_replace(w, "ful", "", 0) ||
+        stem_replace(w, "ness", "", 0);
+
+        // ── step 4 ──
+        bool s4 =
+            stem_replace(w, "al", "", 1)    || stem_replace(w, "ance", "", 1) ||
+            stem_replace(w, "ence", "", 1)  || stem_replace(w, "er", "", 1) ||
+            stem_replace(w, "ic", "", 1)    || stem_replace(w, "able", "", 1) ||
+            stem_replace(w, "ible", "", 1)  || stem_replace(w, "ant", "", 1) ||
+            stem_replace(w, "ement", "", 1) || stem_replace(w, "ment", "", 1) ||
+            stem_replace(w, "ent", "", 1);
+        if (!s4) {
+            if (stem_ends(w, "ion", sl)) {
+                std::string st = w.substr(0, sl);
+                if (stem_measure(st) > 1 && !st.empty() &&
+                    (st.back() == 's' || st.back() == 't')) w = st;
+            } else {
+                stem_replace(w, "ou", "", 1)   || stem_replace(w, "ism", "", 1) ||
+                stem_replace(w, "ate", "", 1)  || stem_replace(w, "iti", "", 1) ||
+                stem_replace(w, "ous", "", 1)  || stem_replace(w, "ive", "", 1) ||
+                stem_replace(w, "ize", "", 1);
+            }
+        }
+
+        // ── step 5 ──
+        if (w.size() > 1 && w.back() == 'e') {
+            std::string st = w.substr(0, w.size() - 1);
+            int m = stem_measure(st);
+            if (m > 1 || (m == 1 && !stem_cvc(st))) w = st;
+        }
+        if (stem_measure(w) > 1 && stem_double_consonant(w) && w.back() == 'l')
+            w.pop_back();
+
+        return w.empty() ? word : w;
+    }
+
     static std::vector<std::string> tokenize(const std::string& text) {
         std::vector<std::string> tokens;
         std::string tok;
@@ -489,12 +651,12 @@ private:
                 tok += static_cast<char>(std::tolower(c));
             } else {
                 if (tok.size() >= 2 && sw.find(tok) == sw.end())
-                    tokens.push_back(tok);
+                    tokens.push_back(stemming_enabled() ? stem(tok) : tok);
                 tok.clear();
             }
         }
         if (tok.size() >= 2 && sw.find(tok) == sw.end())
-            tokens.push_back(tok);
+            tokens.push_back(stemming_enabled() ? stem(tok) : tok);
         return tokens;
     }
 
