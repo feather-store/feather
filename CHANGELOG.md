@@ -9,7 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.21.0] — 2026-10-05
+## [0.21.0] — 2026-10-12
+
+### Feather Desk, and `confidence` / `ttl` over HTTP
+
+`feather-web/` is a context workspace mounted at `/app`, distinct from the
+operator console at `/admin`: scopes are the dock, trust is the card's edge
+colour, confidence is a bar rather than a number, and a record with a `ttl`
+counts down so an expiring run finding looks different from a standing rule.
+
+Building it surfaced that neither `confidence` nor `ttl` was reachable through
+the Cloud API at all. `MetadataIn` sets `extra="forbid"`, so a POST carrying
+either was rejected with 422, and `MetadataOut` omitted both. That made this
+release's own `confidence_gte` incoherent — a filter for a field the API
+refused to accept — and left no way to write an expiring record, which is what
+a short-lived agent run scope needs. Both are now accepted (validated:
+confidence in [0,1], ttl >= 0) and returned on get, list and search. Defaults
+are unchanged, so nothing starts expiring.
 
 Everything here landed after the v0.20.0 tag. The headline is a correctness fix
 for a defect that **was live in 0.20.0**: `recent()` and `len()` returned wrong
