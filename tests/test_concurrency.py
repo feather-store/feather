@@ -50,9 +50,17 @@ def test_concurrent_search_scales(tmp_path_feather):
     if cores < 4:
         pytest.skip(f"needs >=4 cores to demonstrate parallel scaling, found {cores}")
     nthreads = min(8, cores)
-    # Never demand more speedup than the hardware can supply, and leave room for
-    # scheduler noise on a shared runner.
-    expect = max(1.3, nthreads * 0.35)
+    # A FLAT bar, deliberately not scaled to core count.
+    #
+    # The property under test is that concurrent searches are not serialized:
+    # the reader lock is shared and the GIL is released. Serialized execution
+    # gives ~1.0x no matter how many cores there are, so any solid speedup
+    # proves it. The previous bar, nthreads * 0.35, demanded 2.8x on an 8-core
+    # machine — that is a claim about how well the scheduler happens to be
+    # scaling right now, not about the lock, and it made the test fail
+    # intermittently under full-suite load while the lock was working fine.
+    # Lowering it keeps the property and drops the hardware benchmark.
+    expect = 1.5
 
     db = DB.open(tmp_path_feather, dim=128)
     rng = np.random.default_rng(0)
@@ -81,7 +89,7 @@ def test_concurrent_search_scales(tmp_path_feather):
     # actually permits — a single sample made this test flaky (1 fail in 3 runs
     # on an otherwise-passing build).
     best = 0.0
-    for _ in range(3):
+    for _ in range(5):
         one = bench(1)
         many = bench(nthreads)
         best = max(best, many / one)
@@ -89,8 +97,9 @@ def test_concurrent_search_scales(tmp_path_feather):
             break              # already proven; don't burn time on more rounds
 
     assert best > expect, (
-        f"no parallel speedup on {cores} cores: best of 3 rounds was "
-        f"{best:.2f}x on {nthreads} threads, wanted >{expect:.2f}x")
+        f"searches appear serialized on {cores} cores: best of 5 rounds was "
+        f"{best:.2f}x on {nthreads} threads, wanted >{expect:.2f}x. "
+        f"At ~1.0x the shared reader lock or the GIL release has regressed.")
 
 
 def test_concurrent_readers_and_writers_are_safe(tmp_path_feather):
