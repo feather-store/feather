@@ -17,7 +17,7 @@
 - Graph visualizer — self-contained D3 force-graph HTML, fully offline
 - Single file persistence (`.feather` binary format, v9 with persisted HNSW graph for fast cold load, optional int8 on-disk and in-RAM; v3–v8 files load transparently)
 
-**Version:** `0.20.0` (Phase 9 — agent memory: pocket tiering, typed agent store, MCP over the real protocol, inter-process locking)
+**Version:** `0.21.0` (Phase 9 — agent memory: pocket tiering, typed agent store, context packets, MCP over the real protocol, inter-process locking)
 
 > **Phase 9 (v0.19–v0.20) additions** — the agent-memory layer. Four modules,
 > all Python, sitting on the unchanged engine:
@@ -148,7 +148,7 @@ feather/
 ├── real_data/               # Real dataset files (not committed)
 ├── p-test/                  # Rust CLI integration tests
 ├── setup.py                 # Python build (compiles C++ extension)
-├── pyproject.toml           # PEP 517 metadata (version: 0.20.0)
+├── pyproject.toml           # PEP 517 metadata (version: 0.21.0)
 ├── MANIFEST.in              # Source distribution manifest
 └── CHANGELOG.md             # Version history
 ```
@@ -318,7 +318,7 @@ final_score     = ((1 - time_weight) * similarity + time_weight * recency) * imp
 
 ### Install
 ```bash
-pip install feather-db  # v0.20.0 on PyPI (binary wheels, cp39-cp314)
+pip install feather-db  # v0.21.0 on PyPI (binary wheels, cp39-cp314)
 # or from source:
 python setup.py build_ext --inplace
 ```
@@ -511,7 +511,7 @@ data = export_graph(db, namespace_filter="nike")  # Python dict
 
 ## 6. Rust CLI (`feather-db-cli`)
 
-**Crate on Crates.io:** `feather-db-cli` v0.20.0
+**Crate on Crates.io:** `feather-db-cli` v0.21.0
 
 ```bash
 feather add    --db my.feather --id 1 --vec "0.1,0.2,0.3" --modality text
@@ -738,7 +738,7 @@ If the feature is agent-facing, it probably belongs in `feather_db/pocket.py`,
 | Rust CLI missing v0.5.0 features | namespace/entity/context_chain are Python-only for now |
 | Rust CLI now participates in locking | if a long-running Python process holds a DB, `feather add --db that.feather` is refused rather than silently discarding one side |
 | `mcp_server.py` is broken on SDK 2.0 | `Server.list_tools` was removed; `create_server()` raises on import. Use `mcp_agent.py` (`feather-agent`) |
-| BM25 fallback does no stemming | without an embedder, `allergic` matches but `allergy` does not, and the key is not indexed. A paraphrased query returns "nothing found", indistinguishable from "never stored" — set `FEATHER_EMBED_PROVIDER` for anything relying on paraphrase |
+| BM25 is Porter-stemmed, not semantic | plurals and verb forms now match (`creative`/`creatives`, `running`/`run`, `policy`/`policies`), but Porter does not unify every derivational pair — `allergy` still does not find `allergic` (it stems to `allergi` vs `allerg`). A paraphrase with no shared root still returns nothing, indistinguishable from "never stored" — set `FEATHER_EMBED_PROVIDER` for anything relying on paraphrase. `FEATHER_STEM=0` restores exact matching |
 | `all()` ties within one second | the engine timestamp is whole seconds, so items written in the same second order arbitrarily. `_Episodes` overrides this using the event time in the key; sub-second ordering needs format v10's second timestamp |
 
 ---
@@ -752,7 +752,7 @@ If the feature is agent-facing, it probably belongs in `feather_db/pocket.py`,
 ./scripts/verify.sh            # or `./scripts/verify.sh quick`
 
 pytest tests -q --deselect tests/test_engine.py::TestProviderInterface::test_provider_str
-# 488 passed as of v0.20.0. The deselected test needs `openai` installed.
+# 553 passed as of v0.21.0. The deselected test needs `openai` installed.
 
 # The agent-memory suites specifically:
 pytest tests/test_pocket.py tests/test_agent_memory.py \
