@@ -40,11 +40,11 @@ def test_concurrent_search_scales(tmp_path_feather):
     This asserts one property: the reader lock is shared and the GIL is
     released, so N threads beat 1 thread. It is NOT a performance target.
 
-    The expectation is scaled to the cores actually available, because the
-    original fixed ">1.5x on 8 threads" was unachievable on a shared 2-core CI
-    runner and failed there while passing on every other job — measured 1.28x
-    (15,821 -> 20,302 qps) on ubuntu-latest, against 4.94x on a real machine.
-    A test that fails on a loaded box is testing the box, not the lock.
+    The bar is flat and modest; see the comment on `expect`. Two earlier shapes
+    were both wrong: a fixed ">1.5x on 8 threads" a shared 2-core runner could
+    not reach (measured 1.28x on ubuntu-latest against 4.94x on a real
+    machine), then a bar scaled to core count that demanded 2.8x on 8 cores.
+    A test that fails on a loaded machine is testing the machine, not the lock.
     """
     cores = os.cpu_count() or 1
     if cores < 4:

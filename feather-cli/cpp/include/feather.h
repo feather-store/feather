@@ -504,12 +504,31 @@ private:
         return on;
     }
 
+    static bool stem_vowel(char c) {
+        return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u';
+    }
+    /// Porter's consonant test. 'y' is a consonant exactly when the character
+    /// before it is not, which makes a run of y's alternate.
+    ///
+    /// Resolved ARITHMETICALLY, not by recursing. The recursive form was one
+    /// frame deep per preceding 'y', so `stem_measure` became O(n^2) and the
+    /// stack depth equalled the token length. `tokenize()` splits only on
+    /// non-alphanumerics, so a single long run of y's — a base64 blob or an id
+    /// run will do, it need not be adversarial — is ONE token. Measured before
+    /// this fix: 20k chars 0.84 s, 50k chars 3.27 s, and because
+    /// rebuild_bm25_index() runs on every load(), a single 30 KB record cost
+    /// 0.58 s on EVERY open of that file, permanently.
     static bool stem_is_consonant(const std::string& w, size_t i) {
-        switch (w[i]) {
-            case 'a': case 'e': case 'i': case 'o': case 'u': return false;
-            case 'y': return i == 0 ? true : !stem_is_consonant(w, i - 1);
-            default: return true;
-        }
+        char c = w[i];
+        if (stem_vowel(c)) return false;
+        if (c != 'y')      return true;
+        size_t j = i;
+        while (j > 0 && w[j - 1] == 'y') --j;      // start of this run of y's
+        // Nothing before the run reads as a vowel, so the first 'y' is a
+        // consonant; each further 'y' flips.
+        bool base_is_consonant = (j > 0) && !stem_vowel(w[j - 1]);
+        bool first_y_consonant = !base_is_consonant;
+        return (((i - j) & 1u) == 0) ? first_y_consonant : !first_y_consonant;
     }
     /// Porter's `m`: how many vowel-consonant sequences the stem contains.
     static int stem_measure(const std::string& w) {
@@ -555,8 +574,14 @@ private:
         return true;   // the suffix matched, so no later rule in this step applies
     }
 
+    // The longest word in English is 45 letters. A token past this is a blob,
+    // an id or a hash, and folding it cannot help a search — while the scan
+    // back over a run of y's inside stem_is_consonant is linear, so leaving it
+    // unbounded keeps a superlinear term on the ingest AND load paths.
+    static constexpr size_t MAX_STEM_LEN = 64;
+
     static std::string stem(const std::string& word) {
-        if (word.size() <= 2) return word;
+        if (word.size() <= 2 || word.size() > MAX_STEM_LEN) return word;
         std::string w = word;
         size_t sl;
 
@@ -594,8 +619,16 @@ private:
         // ── step 2 ──
         stem_replace(w, "ational", "ate", 0) || stem_replace(w, "tional", "tion", 0) ||
         stem_replace(w, "enci", "ence", 0)   || stem_replace(w, "anci", "ance", 0) ||
-        stem_replace(w, "izer", "ize", 0)    || stem_replace(w, "abli", "able", 0) ||
+        stem_replace(w, "izer", "ize", 0)    ||
+        // The paper says ABLI; Porter's reference C and Snowball both use BLI,
+        // and that is what collapses -bly/-ble (possibly/possible,
+        // terribly/terrible). ABLI alone leaves those split.
+        stem_replace(w, "bli", "ble", 0)     ||
         stem_replace(w, "alli", "al", 0)     || stem_replace(w, "entli", "ent", 0) ||
+        // Porter's own reference implementation carries this as a documented
+        // addition to the 1980 paper. Without it the whole -ology family splits:
+        // technology -> technologi but technological -> technolog.
+        stem_replace(w, "logi", "log", 0)    ||
         stem_replace(w, "eli", "e", 0)       || stem_replace(w, "ousli", "ous", 0) ||
         stem_replace(w, "ization", "ize", 0) || stem_replace(w, "ation", "ate", 0) ||
         stem_replace(w, "ator", "ate", 0)    || stem_replace(w, "alism", "al", 0) ||

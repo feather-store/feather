@@ -140,3 +140,74 @@ def test_the_index_rebuilds_with_stemming_after_a_reload(tmp_path):
         assert finds(reopened, "delivering")
     finally:
         reopened.close()
+
+
+# ── the quadratic hang ────────────────────────────────────────────────────
+
+def test_a_long_token_does_not_blow_up_ingest(db):
+    """`tokenize()` splits only on non-alphanumerics, so a long run of letters
+    is ONE token. The first stemmer resolved Porter's 'y' rule by recursing
+    once per preceding 'y', which made stem_measure O(n^2) with stack depth
+    equal to the token length: 20k chars took 0.84 s and 50k took 3.27 s.
+
+    It needs no adversarial input — a base64 blob or an id run is enough.
+    """
+    import time
+    for n in (50_000, 500_000):
+        t0 = time.perf_counter()
+        store(db, n, "y" * n)
+        assert time.perf_counter() - t0 < 2.0, f"{n}-char token took too long"
+
+
+def test_a_long_token_does_not_poison_every_later_open(tmp_path):
+    """The severe half. rebuild_bm25_index() runs on every load(), so before
+    the fix a single 30 KB record cost 0.58 s on EVERY open of that file,
+    permanently — and a long enough run made the file effectively unopenable.
+    """
+    import time
+    path = str(tmp_path / "poison.feather")
+    first = DB.open(path, dim=DIM)
+    store(first, 1, "y" * 30_000)
+    store(first, 2, "an ordinary brand rule")
+    first.save(); first.close()
+
+    t0 = time.perf_counter()
+    reopened = DB.open(path, dim=DIM)
+    elapsed = time.perf_counter() - t0
+    try:
+        assert elapsed < 0.2, f"reopen took {elapsed:.3f}s; the index rebuild is superlinear again"
+        assert finds(reopened, "ordinary")      # and the file still works
+    finally:
+        reopened.close()
+
+
+def test_a_token_longer_than_a_word_is_left_alone(db):
+    """Past MAX_STEM_LEN a token is a blob, an id or a hash. Folding it cannot
+    help a search, and leaving it unbounded keeps a superlinear term on both
+    the ingest and the load path."""
+    blob = "a" * 200
+    store(db, 1, f"prefix {blob} suffix")
+    assert finds(db, blob)          # still exactly matchable
+    assert finds(db, "prefix")
+
+
+# ── the two rule gaps ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("stored,query", [
+    ("our methodology is documented", "methodological"),   # logi -> log
+    ("a technological breakthrough",  "technology"),
+    ("the psychology of it",          "psychological"),
+    ("the assembly is possible",      "possibly"),         # bli -> ble
+    ("it is terribly slow",           "terrible"),
+    ("an accessible format",          "accessibly"),
+])
+def test_derivational_families_unify(db, stored, query):
+    """Two rules were missing from step 2. `logi -> log` is in Porter's own
+    reference implementation as a documented addition to the 1980 paper, and
+    without it the whole -ology family splits (technology -> technologi but
+    technological -> technolog). `bli -> ble` is what Porter's reference C and
+    Snowball both use where the paper says ABLI; ABLI alone leaves -bly/-ble
+    pairs split.
+    """
+    store(db, 1, stored)
+    assert finds(db, query), f"{query!r} did not find {stored!r}"
