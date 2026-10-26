@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feather-db"
-version = "0.20.0"
+version = "0.21.0"
 description = "Embedded vector database + living context engine — multimodal pockets, context graph, adaptive decay, MCP server"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -69,7 +69,7 @@ all = [
     "llama-index-core>=0.10.0",
     "mcp>=2.0.0",
     "google-genai>=1.0.0",
-    "anthropic>=0.20.0",
+    "anthropic>=0.21.0",
     "openai>=1.0.0",
 ]
 

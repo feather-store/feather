@@ -113,44 +113,88 @@ def test_closing_hands_the_file_to_the_next_process(tmp_path):
 
 # ── many readers ──────────────────────────────────────────────────────────
 
-def test_several_processes_may_read_at_once(tmp_path):
-    """Single-writer, MANY-reader. Readers take a shared lock, so a fleet can
-    serve from one file as long as exactly one process writes it."""
+def test_readers_are_never_blocked_by_the_writer(tmp_path):
+    """One writer service, many agent processes reading the same file — the
+    architecture this has to support. Readers take NO lock: a shared lock would
+    conflict with the writer's exclusive one and refuse every reader while the
+    writer merely held the handle open."""
     path = str(tmp_path / "shared.feather")
     writer = DB.open(path, dim=8)
     writer.add(id=1, vec=np.ones(8, dtype=np.float32))
-    writer.save()
-    writer.close()                      # release before the readers arrive
-
-    reader = DB.open(path, dim=8, read_only=True)
+    writer.save()                       # NOT closed — still holding the lock
     try:
         out = child(f"""
             import feather_db
             db = feather_db.DB.open({path!r}, dim=8, read_only=True)
-            print("READERS OK", db.size())
+            print("READER OK", db.size())
         """)
-        assert "READERS OK 1" in out.stdout, out.stdout + out.stderr
-    finally:
-        reader.close()
+        assert "READER OK 1" in out.stdout, out.stdout + out.stderr
 
-
-def test_a_reader_is_refused_while_a_writer_holds_it(tmp_path):
-    """A reader must not be mid-read while a writer rewrites the file under it."""
-    path = str(tmp_path / "w.feather")
-    writer = DB.open(path, dim=8)
-    try:
-        out = child(f"""
-            import feather_db
-            try:
-                feather_db.DB.open({path!r}, dim=8, read_only=True)
-                print("OPENED")
-            except Exception as exc:
-                print("REFUSED:", exc)
-        """)
-        assert "REFUSED" in out.stdout
-        assert "exclusively" in out.stdout
+        # and several at once, still with the writer holding it
+        for _ in range(3):
+            out = child(f"""
+                import feather_db
+                db = feather_db.DB.open({path!r}, dim=8, read_only=True)
+                print("OK", db.size())
+            """)
+            assert "OK 1" in out.stdout
     finally:
         writer.close()
+
+
+def test_a_reader_sees_a_consistent_snapshot_across_a_save(tmp_path):
+    """save_vectors() writes <path>.tmp and renames it over the original, so a
+    reader holds the old inode and sees a complete file — just a stale one —
+    until it reopens. That is what makes lock-free reads safe."""
+    path = str(tmp_path / "snap.feather")
+    writer = DB.open(path, dim=8)
+    writer.add(id=1, vec=np.ones(8, dtype=np.float32))
+    writer.save()
+
+    reader = DB.open(path, dim=8, read_only=True)
+    assert reader.size() == 1
+
+    for i in range(2, 12):              # writer moves on underneath it
+        writer.add(id=i, vec=np.ones(8, dtype=np.float32))
+    writer.save()
+
+    assert reader.size() == 1, "the reader's snapshot changed under it"
+    reader.close()
+
+    fresh = DB.open(path, dim=8, read_only=True)
+    try:
+        assert fresh.size() == 11       # reopening advances
+    finally:
+        fresh.close()
+        writer.close()
+
+
+def test_a_read_only_handle_does_not_clear_the_writers_wal(tmp_path):
+    """A reader replays the WAL into its own memory to see uncheckpointed
+    records. It must not CLEAR it — only save_vectors() does that, and a reader
+    never saves. If it did, a crashed writer's unsaved records would be
+    destroyed by something merely looking at the file."""
+    path = str(tmp_path / "wal.feather")
+    out = child(f"""
+        import os, numpy as np, feather_db
+        db = feather_db.DB.open({path!r}, dim=8)
+        for i in range(20):
+            db.add(id=i, vec=np.ones(8, dtype=np.float32))
+        os._exit(0)          # crash: no checkpoint, records live only in the WAL
+    """)
+    assert out.returncode == 0
+    assert os.path.exists(path + ".wal"), "nothing in the WAL to test"
+
+    reader = DB.open(path, dim=8, read_only=True)
+    assert reader.size() == 20          # replayed into memory
+    reader.close()
+    assert os.path.exists(path + ".wal"), "a read-only open destroyed the WAL"
+
+    recovered = DB.open(path, dim=8)
+    try:
+        assert recovered.size() == 20   # the writer still recovers everything
+    finally:
+        recovered.close()
 
 
 # ── read-only handles ─────────────────────────────────────────────────────

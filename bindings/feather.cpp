@@ -199,6 +199,7 @@ PYBIND11_MODULE(core, m) {
         .def_readwrite("timestamp_after",  &feather::SearchFilter::timestamp_after)
         .def_readwrite("timestamp_before", &feather::SearchFilter::timestamp_before)
         .def_readwrite("importance_gte",   &feather::SearchFilter::importance_gte)
+        .def_readwrite("confidence_gte",   &feather::SearchFilter::confidence_gte)
         .def_readwrite("tags_contains",    &feather::SearchFilter::tags_contains)
         .def_readwrite("namespace_id",     &feather::SearchFilter::namespace_id)
         .def_readwrite("entity_id",        &feather::SearchFilter::entity_id)

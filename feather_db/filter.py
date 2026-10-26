@@ -30,6 +30,18 @@ class FilterBuilder:
     def min_importance(self, v):
         self._filter.importance_gte = float(v)
         return self
+
+    def min_confidence(self, v):
+        """Only records at least this certain.
+
+        `importance` is how much a record matters; `confidence` is how sure we
+        are it is true. Keeping them separate is deliberate — a critical rule
+        believed with low certainty and a trivial fact known for sure are not
+        the same thing, and collapsing them loses the distinction that makes
+        either useful.
+        """
+        self._filter.confidence_gte = float(v)
+        return self
     
     def contains_tags(self, tags):
         if not isinstance(tags, list):

@@ -30,7 +30,9 @@ from .providers import (
 from .engine import ContextEngine
 
 __all__ = [
-    "Pocket", "PocketItem", "pocket",
+    "Pocket", "PocketItem", "pocket", "scoped_id",
+    "PacketBuilder", "ContextPacket", "Ref", "Omission",
+    "RequiredRule", "RequiredContextUnavailable",
     "DB", "ContextType", "Metadata", "ScoringConfig",
     "Edge", "IncomingEdge",
     "ContextNode", "ContextEdge", "ContextChainResult",
@@ -50,4 +52,19 @@ __all__ = [
 ]
 from .pocket import Pocket, PocketItem, pocket  # noqa: E402
 
-__version__ = "0.20.0"
+__version__ = "0.21.0"
+
+
+# ── Context packets (Phase 9) ────────────────────────────────────────────
+# Lazy so a plain `import feather_db` does not pull the packet machinery.
+# `importlib` rather than `from feather_db import pocket`, because the name
+# `pocket` in this namespace is already the FACTORY FUNCTION exported above, so
+# that import returns the function and attribute lookup on it fails.
+def __getattr__(name):
+    import importlib
+    if name in ("PacketBuilder", "ContextPacket", "Ref", "Omission",
+                "RequiredRule", "RequiredContextUnavailable"):
+        return getattr(importlib.import_module("feather_db.packet"), name)
+    if name == "scoped_id":
+        return getattr(importlib.import_module("feather_db.pocket"), name)
+    raise AttributeError(f"module 'feather_db' has no attribute {name!r}")

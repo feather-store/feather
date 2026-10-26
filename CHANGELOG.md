@@ -7,6 +7,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+## [0.21.0] — 2026-10-12
+
+### Feather Desk, and `confidence` / `ttl` over HTTP
+
+`feather-web/` is a context workspace mounted at `/app`, distinct from the
+operator console at `/admin`: scopes are the dock, trust is the card's edge
+colour, confidence is a bar rather than a number, and a record with a `ttl`
+counts down so an expiring run finding looks different from a standing rule.
+
+Building it surfaced that neither `confidence` nor `ttl` was reachable through
+the Cloud API at all. `MetadataIn` sets `extra="forbid"`, so a POST carrying
+either was rejected with 422, and `MetadataOut` omitted both. That made this
+release's own `confidence_gte` incoherent — a filter for a field the API
+refused to accept — and left no way to write an expiring record, which is what
+a short-lived agent run scope needs. Both are now accepted (validated:
+confidence in [0,1], ttl >= 0) and returned on get, list and search. Defaults
+are unchanged, so nothing starts expiring.
+
+Everything here landed after the v0.20.0 tag. The headline is a correctness fix
+for a defect that **was live in 0.20.0**: `recent()` and `len()` returned wrong
+answers past a handful of records.
+
+### `confidence_gte` — filter on how certain a record is
+
+`Metadata.confidence` has been stored and persisted since Phase 2 but was never
+in `SearchFilter`, so a caller could record how sure it was about a fact and
+then had no way to ask for only the sure ones.
+
+Deliberately a separate axis from `importance`: importance is how much a record
+matters, confidence is how likely it is to be true. A critical rule believed
+weakly and a trivial fact known for certain are not the same thing, and
+collapsing them loses the distinction that makes either useful. Unset records
+default to `1.0`, so records written before anyone used the field do not vanish
+the moment someone filters on it.
+
+```python
+f = FilterBuilder().namespace("brand.b1.shared.findings").min_confidence(0.9).build()
+```
+
+### `recent()` and `all()` returned an arbitrary N, not the newest N
+
+Found by measuring at 2000 memories instead of the 2 the tests used. With two
+episodes, "the newest 1 of an arbitrary 8" and "the newest 1" are the same
+answer, so the tests passed over a real defect.
+
+`AgentMemory.recent()`/`all()` asked `search()` for `limit*4` items and sorted
+those, but `search()` has no ordering — it materialises every candidate under
+the prefix and slices in id order. At 300 episodes, `recent(5)` returned events
+299, 298, 296, 295, 293: two real episodes silently skipped. `len()` was capped
+at the 1000 items it fetched, so 1200 records reported 1000.
+
+Episodes also ordered by *write* time. The engine timestamp is whole seconds, so
+300 writes inside one second tie and `all(3)` returned 298, 297, 296. Episodes
+now sort on the event time encoded in the key, so a backdated `at=` also sorts
+where it belongs.
+
+New on `FeatherStore`, outside `BaseStore`: `scan()` (live rows, never parsing
+the value JSON), `count()` (a count, not a fetch — the engine's
+`namespace_size()` counts tombstones until compaction), `newest(n, key=)`
+(parses only the n that survive the sort). At 2000 memories: `recent(10)`
+17.59 → 3.97 ms, `len()` 17.67 → 2.59 ms, `summary()` 17.00 → 2.30 ms.
+
+### Readers take no lock
+
+A shared lock conflicts with the writer's exclusive one, so every reader process
+was refused while the writer merely held the handle open — not even while
+saving. That blocks the single-writer/many-reader topology locking was added to
+support. Readers are now never blocked.
+
+Nothing is given up, because the integrity was never coming from the lock:
+`save_vectors()` renames a complete temp file over the original, so `open()`
+returns a whole inode and a reader keeps a consistent snapshot until it reopens;
+WAL records are CRC-checked so replay of a log being appended to yields a clean
+prefix; and a read-only handle never clears the writer's WAL (verified: a
+crashed writer's 20 unsaved records survive a read-only open). Readers trade
+**freshness, not integrity** — reopen to advance.
+
+### Context packets — required context guaranteed, or the packet is degraded
+
+`Pocket.hot()` fits a budget by heat, which is right for a working set and wrong
+for an operating constraint: a rule saying "never make medical claims" is not
+more relevant for being recalled often, and must not fall out because forty
+creative notes outranked it.
+
+`PacketBuilder` puts required refs in first, judges the required set **whole**
+(dropping rules one at a time would hand a caller a partial constraint set with
+no signal), and raises `RequiredContextUnavailable` with the arithmetic when
+they are missing or will not fit. `allow_degraded=True` returns a packet with
+`may_mutate` False instead. Everything dropped is listed in `omitted` with a
+reason. `manifest()` records **references and versions, never content**, so a
+decision replays while still being revalidated against live scope. Real token
+counting via tiktoken when installed; `exact_tokens` says which was used.
+
+`resolve_required=` lets an authoritative store own the constraints. When given
+it is authoritative with **no pocket fallback** — otherwise index lag reads as a
+missing rule and blocks every mutation, and a stale Feather copy of a
+just-changed rule becomes enforceable.
+
+Two bugs it surfaced: a repeated required key counted as *missing* (so listing a
+rule twice blocked every mutation), and a forgotten record still resolving — a
+retracted rule satisfied its own requirement and kept authorising mutations.
+
+### Embedder defaults from the environment
+
+`FEATHER_EMBED_PROVIDER` / `FEATHER_EMBED_MODEL` now feed `FeatherStore` and
+`feather-agent` when no `embed=` is passed. A provider that is set but
+unbuildable **raises** rather than degrading to keyword search: BM25 does no
+stemming, so a paraphrased query returns "nothing found" and the caller cannot
+tell a misconfiguration from a memory that was never stored.
+
+### cp314 wheels
+
+cibuildwheel 2.23 → 4.2.1. 2.23 predates Python 3.14, so adding `cp314-*` to it
+built nothing. cp38 drops out (4.x will not build it; EOL since 2024-10) —
+`requires-python` stays `>=3.8` and the sdist still installs there.
+
+---
+
 ## [0.20.0] — 2026-10-04
 
 Agent memory, end to end: a tiered pocket per agent, a typed store for the five
@@ -102,9 +222,13 @@ loss:
 - `DB.open()` takes an exclusive advisory lock (`flock`) for the handle's
   lifetime. A second **process** is refused, naming the holder's pid and the
   single-writer model.
-- `DB.open(..., read_only=True)` takes a *shared* lock instead, so any number of
-  reader processes may hold the file at once. Every mutation on a read-only
-  handle raises at the call site — not at save time, because a handle that
+- `DB.open(..., read_only=True)` takes a *shared* lock, so several reader
+  processes may hold the file at once. Every mutation on a read-only handle
+  raises at the call site — not at save time, because a handle that accepts
+  `add()` and only complains on checkpoint has already lied to the caller. A
+  read-only close never rewrites the file. (Changed after release — see
+  Unreleased: a shared lock still conflicts with the writer's exclusive one,
+  so readers were refused while a writer merely held the file open.) — not at save time, because a handle that
   accepts `add()` and only complains on checkpoint has already lied to the
   caller. A read-only close never rewrites the file.
 - `db.close()` checkpoints, releases the WAL handle and drops the lock. It is

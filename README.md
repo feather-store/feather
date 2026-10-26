@@ -1,6 +1,6 @@
 # Feather DB
 
-**Embedded vector database + self-aligned context engine**
+**Agent memory in a single file**
 
 *Part of [Hawky.ai](https://hawky.ai) — AI-Native Development Tools*
 
@@ -18,9 +18,52 @@
 [![ANN p50](https://img.shields.io/badge/SIFT1M%20p50-0.19ms-blue)](docs/benchmarks/longmemeval.md)
 [![ANN Recall](https://img.shields.io/badge/recall%4010-0.972-blue)](docs/benchmarks/longmemeval.md)
 
-Feather DB is an embedded vector database and living context engine — zero-server, file-based, with a built-in knowledge graph, adaptive memory decay, LLM agent connectors, and a self-aligned ingestion engine that organises data automatically.
+Feather is the memory layer that runs **inside** your agent — not a database you
+deploy next to it. One `.feather` file on disk, no server, no daemon, no network
+hop. It is an embedded vector store with the things a memory actually needs:
+adaptive decay, trust levels, confidence, scoped working sets, and context
+packets that refuse to drop a required constraint.
+
+```python
+import feather_db, numpy as np
+db = feather_db.DB.open("memory.feather", dim=768)
+
+meta = feather_db.Metadata()
+meta.content    = "user prefers written async updates"
+meta.confidence = 0.9                       # how likely it is TRUE
+meta.importance = 1.0                       # how much it MATTERS - a separate axis
+db.add(id=1, vec=embedding, meta=meta)
+
+db.keyword_search("async updates", k=5)     # BM25, Porter-stemmed
+db.hybrid_search(query_vec, "async", k=5)   # reciprocal rank fusion
+db.close()
+```
+
+**What it is not.** Feather has no transactions, no query planner, and one
+writer per file (readers are unlimited and lock-free). Prefiltered search is
+metadata equality, not graph traversal. If you need a general-purpose graph or
+OLTP database, use one — Feather is built for the narrower job of being what an
+agent remembers into, and the limits are the price of being small enough to run
+in-process.
+
+**Memory semantics, concretely:**
+
+| | |
+|---|---|
+| Adaptive decay | `stickiness = 1 + ln(1 + recall_count)` — recalled memories age slower |
+| Trust and confidence | Separate from importance, and both filterable |
+| Scoped pockets | Budget-fitted hot set over dotted, inheriting scopes |
+| Context packets | Required constraints resolved first; **fails closed** if one is missing |
+| Expiry | Per-record `ttl`, so a short-lived agent run scope cleans itself up |
+
+Integrations that already exist: an **MCP server** for Claude Desktop and Claude
+Code, and a **LangGraph `BaseStore`** — cross-thread agent memory in one line,
+`builder.compile(store=FeatherStore(...))`.
 
 ---
+
+<details>
+<summary><b>Release history — v0.10 through v0.16</b> (click to expand)</summary>
 
 ## What's New in v0.13–v0.16 — Ingestion, Memory, Claude & Fast Load (Phase 8)
 
@@ -113,6 +156,8 @@ See [docs/quickstart.md](docs/quickstart.md) for a self-hosted setup walkthrough
 > Multi-tenant key isolation + HTTPS are on the roadmap.
 
 ---
+
+</details>
 
 ## What's Inside
 

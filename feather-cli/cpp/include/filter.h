@@ -15,6 +15,11 @@ struct SearchFilter {
     std::optional<int64_t> timestamp_after;
     std::optional<int64_t> timestamp_before;
     std::optional<float> importance_gte;
+    // Metadata::confidence has been persisted since Phase 2 but was never
+    // filterable, so a caller could store how certain a fact was and then had
+    // no way to ask for only the certain ones. Singularity's findings need
+    // exactly that: a claim at confidence 0.3 must not rank beside one at 0.95.
+    std::optional<float> confidence_gte;
     std::optional<std::vector<std::string>> tags_contains;
 
     // Phase 4 filters: namespace, entity, attributes
@@ -36,6 +41,7 @@ struct SearchFilter {
         if (timestamp_after && meta.timestamp < *timestamp_after) return false;
         if (timestamp_before && meta.timestamp > *timestamp_before) return false;
         if (importance_gte && meta.importance < *importance_gte) return false;
+        if (confidence_gte && meta.confidence < *confidence_gte) return false;
 
         if (tags_contains) {
             for (const auto& tag : *tags_contains) {

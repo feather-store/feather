@@ -85,7 +85,7 @@ ext_modules = [
 
 setup(
     name="feather-db",
-    version="0.20.0",
+    version="0.21.0",
     # auto-discover all subpackages (extractors/feedback/pipelines/reason/
     # integrations) — a hardcoded list silently shipped broken wheels missing
     # the Phase 9.1 subpackages added after 0.8.0.

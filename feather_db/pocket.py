@@ -95,6 +95,18 @@ SCOPE_SEP = "."
 INHERIT_DECAY = 0.7
 
 
+def scoped_id(namespace: str, key: str) -> int:
+    """The record id for `key` inside the flat scope `namespace`.
+
+    Module-level because resolution is not always done by the pocket that owns
+    the scope: a packet looking a required rule up in an ancestor needs the same
+    id this pocket would compute for it. Two copies of this hash would drift,
+    and the symptom would be a rule that silently cannot be found.
+    """
+    h = hashlib.sha1(f"{namespace}\x00{key}".encode()).hexdigest()
+    return int(h[:14], 16) & ((1 << 53) - 1)
+
+
 def _scope(scope) -> tuple[str, ...]:
     """Accept "a.b.c", ("a","b","c") or "a" and normalise to a tuple."""
     if isinstance(scope, str):
@@ -514,8 +526,7 @@ class Pocket:
 
     def _id(self, key: str) -> int:
         """Deterministic, so `remember()` on the same key updates in place."""
-        h = hashlib.sha1(f"{self.namespace}\x00{key}".encode()).hexdigest()
-        return int(h[:14], 16) & ((1 << 53) - 1)
+        return scoped_id(self.namespace, key)
 
     def _vec(self, text: str) -> np.ndarray:
         dim = self.db.dim("text")
