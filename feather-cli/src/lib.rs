@@ -42,9 +42,9 @@ impl DB {
             feather_add_with_meta(
                 self.0, id, vec.as_ptr(), vec.len(),
                 timestamp, importance, context_type,
-                c_source.map_or(std::ptr::null(), |s| s.as_ptr()),
-                c_content.map_or(std::ptr::null(), |s| s.as_ptr()),
-                c_modality.map_or(std::ptr::null(), |s| s.as_ptr())
+                c_source.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                c_content.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                c_modality.as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
             )
         }
     }
@@ -65,7 +65,7 @@ impl DB {
             feather_search(
                 self.0, query.as_ptr(), query.len(), k, 
                 ids.as_mut_ptr(), dists.as_mut_ptr(),
-                c_modality.map_or(std::ptr::null(), |s| s.as_ptr())
+                c_modality.as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
             )
         };
         (ids, dists)
@@ -82,9 +82,9 @@ impl DB {
             feather_search_with_filter(
                 self.0, query.as_ptr(), query.len(), k,
                 type_filter.unwrap_or(255),
-                c_source.map_or(std::ptr::null(), |s| s.as_ptr()),
+                c_source.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 ids.as_mut_ptr(), dists.as_mut_ptr(),
-                c_modality.map_or(std::ptr::null(), |s| s.as_ptr())
+                c_modality.as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
             )
         };
         (ids, dists)

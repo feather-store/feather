@@ -62,15 +62,15 @@ def print_test_commands(dim):
     print("   cd ..")
     
     print("\n2. Create a new database:")
-    print(f"   ./feather-cli/target/release/feather-cli new p-test/test.feather --dim {dim}")
+    print(f"   ./feather-cli/target/release/feather new p-test/test.feather --dim {dim}")
     
     print("\n3. Add vectors to database:")
-    print("   ./feather-cli/target/release/feather-cli add p-test/test.feather 1 -n p-test/test-data/vector1.npy")
-    print("   ./feather-cli/target/release/feather-cli add p-test/test.feather 2 -n p-test/test-data/vector2.npy")
-    print("   ./feather-cli/target/release/feather-cli add p-test/test.feather 3 -n p-test/test-data/vector3.npy")
+    print("   ./feather-cli/target/release/feather add p-test/test.feather 1 -n p-test/test-data/vector1.npy")
+    print("   ./feather-cli/target/release/feather add p-test/test.feather 2 -n p-test/test-data/vector2.npy")
+    print("   ./feather-cli/target/release/feather add p-test/test.feather 3 -n p-test/test-data/vector3.npy")
     
     print("\n4. Search for similar vectors:")
-    print("   ./feather-cli/target/release/feather-cli search p-test/test.feather -n p-test/test-data/query.npy --k 3")
+    print("   ./feather-cli/target/release/feather search p-test/test.feather -n p-test/test-data/query.npy --k 3")
     
     print("\n5. Verify database file:")
     print("   ls -lh p-test/test.feather")
@@ -109,8 +109,8 @@ cd ..
 echo "✓ Build successful"
 
 # Check if binary exists
-if [ ! -f "feather-cli/target/release/feather-cli" ]; then
-    echo "❌ Error: Binary not found at feather-cli/target/release/feather-cli"
+if [ ! -f "feather-cli/target/release/feather" ]; then
+    echo "❌ Error: Binary not found at feather-cli/target/release/feather"
     exit 1
 fi
 
@@ -119,7 +119,7 @@ echo "✓ Binary found"
 # Create test database
 echo ""
 echo "Test 1: Creating database..."
-./feather-cli/target/release/feather-cli new p-test/test.feather --dim 128
+./feather-cli/target/release/feather new p-test/test.feather --dim 128
 if [ -f "p-test/test.feather" ]; then
     echo "✓ Database created"
 else
@@ -130,19 +130,19 @@ fi
 # Add vectors
 echo ""
 echo "Test 2: Adding vectors..."
-./feather-cli/target/release/feather-cli add p-test/test.feather 1 -n p-test/test-data/vector1.npy
+./feather-cli/target/release/feather add p-test/test.feather 1 -n p-test/test-data/vector1.npy
 echo "✓ Added vector 1"
 
-./feather-cli/target/release/feather-cli add p-test/test.feather 2 -n p-test/test-data/vector2.npy
+./feather-cli/target/release/feather add p-test/test.feather 2 -n p-test/test-data/vector2.npy
 echo "✓ Added vector 2"
 
-./feather-cli/target/release/feather-cli add p-test/test.feather 3 -n p-test/test-data/vector3.npy
+./feather-cli/target/release/feather add p-test/test.feather 3 -n p-test/test-data/vector3.npy
 echo "✓ Added vector 3"
 
 # Search
 echo ""
 echo "Test 3: Searching for similar vectors..."
-./feather-cli/target/release/feather-cli search p-test/test.feather -n p-test/test-data/query.npy --k 3
+./feather-cli/target/release/feather search p-test/test.feather -n p-test/test-data/query.npy --k 3
 
 # Verify file
 echo ""
