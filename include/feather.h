@@ -35,6 +35,7 @@
 #  include <unistd.h>      // fsync
 #  include <fcntl.h>       // open
 #  include <sys/file.h>    // flock
+#  include <sys/stat.h>    // stat: exists / size (std::filesystem needs macOS 10.15+)
 #endif
 #include "hnswlib.h"
 #include "metadata.h"
@@ -217,8 +218,9 @@ inline void fsync_path(const std::string& p) {
 // Make a rename durable: on POSIX the directory entry must be synced too.
 inline void fsync_parent_dir(const std::string& p) {
 #if !defined(_WIN32)
-    auto dir = std::filesystem::path(p).parent_path();
-    std::string d = dir.empty() ? std::string(".") : dir.string();
+    const size_t slash = p.find_last_of('/');
+    const std::string d = slash == std::string::npos ? std::string(".")
+                        : slash == 0 ? std::string("/") : p.substr(0, slash);
     int fd = ::open(d.c_str(), O_RDONLY);
     if (fd >= 0) { ::fsync(fd); ::close(fd); }
 #else
@@ -244,14 +246,35 @@ inline void fsync_file(std::FILE* f) {
     sync_fd(fileno(f));
 #endif
 }
+// POSIX, not std::filesystem, outside Windows: the macOS wheels and CI build
+// for a deployment target below 10.15, where libc++ marks std::filesystem
+// unavailable and the extension fails to compile.
 inline bool exists(const std::string& p) {
+#if defined(_WIN32)
     std::error_code ec;
     return std::filesystem::exists(p, ec);
+#else
+    struct stat st;
+    return ::stat(p.c_str(), &st) == 0;
+#endif
 }
 inline uint64_t size_or_zero(const std::string& p) {
+#if defined(_WIN32)
     std::error_code ec;
     auto s = std::filesystem::file_size(p, ec);
     return ec ? 0 : static_cast<uint64_t>(s);
+#else
+    struct stat st;
+    return ::stat(p.c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) : 0;
+#endif
+}
+inline void truncate_to(const std::string& p, uint64_t size) {
+#if defined(_WIN32)
+    std::error_code ec;
+    std::filesystem::resize_file(p, static_cast<uintmax_t>(size), ec);
+#else
+    if (::truncate(p.c_str(), static_cast<off_t>(size)) != 0) { /* best effort */ }
+#endif
 }
 } // namespace fsio
 
@@ -1881,8 +1904,7 @@ private:
         // reach. A read-only handle shares the writer's WAL and must not touch it.
         if (!read_only_ && good_end >= 0 &&
             static_cast<uint64_t>(good_end) < fsio::size_or_zero(wal_path_)) {
-            std::error_code ec;
-            std::filesystem::resize_file(wal_path_, static_cast<uintmax_t>(good_end), ec);
+            fsio::truncate_to(wal_path_, static_cast<uint64_t>(good_end));
         }
         build_reverse_index();
         build_secondary_indexes();
