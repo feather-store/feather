@@ -8,6 +8,7 @@
 """
 import os
 import shutil
+import sys
 import threading
 
 import numpy as np
@@ -28,22 +29,51 @@ def _v(dim=16, seed=None):
     return np.random.default_rng(seed).random(dim).astype(np.float32)
 
 
-def test_concurrent_writers_share_fsyncs(tmp_path):
-    db = DB.open(str(tmp_path / "gc.feather"), dim=16)
+_GROUP_COMMIT = """
+import sys, threading
+sys.path.insert(0, {repo!r})
+import numpy as np, feather_db
+db = feather_db.DB.open({path!r}, dim=16)
+threads, per, rounds = 16, 40, []
+for r in range(3):
     before = db.wal_fsync_count()
-    threads, per = 16, 40
-
     def writer(t):
         for i in range(per):
-            db.add(t * 1000 + i, _v(), _m(f"t{t} i{i}"))
-
+            m = feather_db.Metadata(); m.content = "x"
+            db.add(r * 100_000 + t * 1000 + i, np.random.default_rng().random(16).astype(np.float32), m)
     ts = [threading.Thread(target=writer, args=(t,)) for t in range(threads)]
-    [t.start() for t in ts]
-    [t.join() for t in ts]
-    fsyncs = db.wal_fsync_count() - before
-    assert db.size() == threads * per
-    assert fsyncs < threads * per, f"{fsyncs} fsyncs for {threads * per} writes: no group commit"
-    db.close()
+    [t.start() for t in ts]; [t.join() for t in ts]
+    rounds.append(db.wal_fsync_count() - before)
+    assert db.size() == (r + 1) * threads * per
+    if rounds[-1] < threads * per:
+        break
+db.close()
+print("ROUNDS", rounds)
+"""
+
+
+def test_concurrent_writers_share_fsyncs(tmp_path):
+    """Without group commit every write gets its own fsync, every time, so one
+    round that shares any proves it; whether writers overlap in a given round
+    is up to the scheduler, so best of 3 with early exit — the same shape as
+    test_concurrent_search_scales.
+
+    It runs in a subprocess with FEATHER_WAL_FULLFSYNC=1 (read once per
+    process). On macOS plain fsync() skips the drive cache and takes ~25us, so
+    writers almost never overlap it: measured 611-640 fsyncs per 640 writes,
+    and 640 in every round once other suite files had run. F_FULLFSYNC costs
+    what fsync costs on Linux, where the variable is a no-op.
+    """
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = _GROUP_COMMIT.format(repo=repo, path=str(tmp_path / "gc.feather"))
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         env={**os.environ, "FEATHER_WAL_FULLFSYNC": "1"}, timeout=300)
+    assert out.returncode == 0, out.stdout + out.stderr
+    rounds = [int(x) for x in out.stdout.split("ROUNDS", 1)[1].strip(" []\n").split(",")]
+    assert min(rounds) < 16 * 40, (
+        f"fsyncs per round {rounds} for 640 writes each: one fsync per write in "
+        f"every round means writers never share one — no group commit")
 
 
 def test_every_acknowledged_write_survives_a_crash(tmp_path):

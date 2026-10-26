@@ -178,6 +178,26 @@ public:
 
 // ── Platform file helpers (durable checkpoints, single-owner lock) ─────
 namespace fsio {
+#if !defined(_WIN32)
+// macOS fsync() hands data to the drive without flushing its write cache, so
+// it survives a process or kernel crash but not a power cut. F_FULLFSYNC is the
+// durable form and costs ~150x (measured 25us -> 3.7ms per WAL write), so it is
+// opt-in, as SQLite's fullfsync is: FEATHER_WAL_FULLFSYNC=1. A no-op elsewhere,
+// and a filesystem that refuses F_FULLFSYNC gets plain fsync.
+inline bool full_fsync_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("FEATHER_WAL_FULLFSYNC");
+        return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' || e[0] == 't' || e[0] == 'T');
+    }();
+    return on;
+}
+inline int sync_fd(int fd) {
+#if defined(__APPLE__)
+    if (full_fsync_enabled() && ::fcntl(fd, F_FULLFSYNC) == 0) return 0;
+#endif
+    return ::fsync(fd);
+}
+#endif
 inline void fsync_path(const std::string& p) {
 #if defined(_WIN32)
     HANDLE h = CreateFileA(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -189,7 +209,7 @@ inline void fsync_path(const std::string& p) {
 #else
     int fd = ::open(p.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("fsync: cannot open " + p);
-    int rc = ::fsync(fd);
+    int rc = sync_fd(fd);
     ::close(fd);
     if (rc != 0) throw std::runtime_error("fsync failed for " + p);
 #endif
@@ -221,7 +241,7 @@ inline void fsync_file(std::FILE* f) {
 #if defined(_WIN32)
     _commit(_fileno(f));
 #else
-    ::fsync(fileno(f));
+    sync_fd(fileno(f));
 #endif
 }
 inline bool exists(const std::string& p) {
@@ -1182,6 +1202,9 @@ private:
             uint32_t magic = WAL_MAGIC, ver = WAL_VERSION;
             std::fwrite(&magic, 4, 1, wal_file_);
             std::fwrite(&ver,   4, 1, wal_file_);
+            // A new file's directory entry is not durable until the directory
+            // is synced: records fsynced into it could vanish with the name.
+            if (wal_sync_enabled()) fsio::fsync_parent_dir(wal_path_);
         }
         return true;
     }
@@ -1268,8 +1291,13 @@ private:
         static std::mutex m;
         return m;
     }
-    static std::unordered_map<std::string, int>& registry() {
-        static std::unordered_map<std::string, int> held;
+    // The flock lives on ONE descriptor per process, owned by the registry
+    // entry rather than by the handle that took it: when that handle closed
+    // first, a later close of the reentrant handle had no descriptor to
+    // release, and the lock stayed held until the process exited.
+    struct HeldLock { int count = 0; int fd = -1; };
+    static std::unordered_map<std::string, HeldLock>& registry() {
+        static std::unordered_map<std::string, HeldLock> held;
         return held;
     }
 
@@ -1343,8 +1371,8 @@ private:
         {
             std::lock_guard<std::mutex> g(registry_mutex());
             auto it = registry().find(lock_key_);
-            if (it != registry().end() && it->second > 0) {
-                it->second += 1;        // this process already holds it
+            if (it != registry().end() && it->second.count > 0) {
+                it->second.count += 1;  // this process already holds it
                 reentrant_ = true;
                 return;
             }
@@ -1363,7 +1391,7 @@ private:
             // reentrantly instead of reporting ourselves as another process.
             if (holder == std::to_string(static_cast<long>(::getpid()))) {
                 std::lock_guard<std::mutex> g(registry_mutex());
-                registry()[lock_key_] += 1;
+                registry()[lock_key_].count += 1;
                 reentrant_ = true;
                 return;
             }
@@ -1381,7 +1409,7 @@ private:
         lock_fd_ = fd;
         {
             std::lock_guard<std::mutex> g(registry_mutex());
-            registry()[lock_key_] = 1;
+            registry()[lock_key_] = HeldLock{1, fd};
         }
         if (exclusive) {           // record who holds it, for the next caller
             if (::ftruncate(fd, 0) == 0) {
@@ -1431,14 +1459,32 @@ public:
 private:
     void release_lock() {
         if (!lock_key_.empty()) {
-            std::lock_guard<std::mutex> g(registry_mutex());
-            auto it = registry().find(lock_key_);
-            if (it != registry().end() && --it->second > 0) {
+            int last_fd = -1;
+            bool registered = false;
+            {
+                std::lock_guard<std::mutex> g(registry_mutex());
+                auto it = registry().find(lock_key_);
+                if (it != registry().end()) {
+                    registered = true;
+                    if (--it->second.count > 0) {
+                        lock_key_.clear();
+                        lock_fd_ = -1;  // the entry still owns the descriptor
+                        return;         // other handles in this process still open
+                    }
+                    last_fd = it->second.fd;
+                    registry().erase(it);
+                }
                 lock_key_.clear();
-                return;             // other handles in this process still open
             }
-            if (it != registry().end()) registry().erase(it);
-            lock_key_.clear();
+#ifndef _WIN32
+            if (registered) {           // last handle in this process: release
+                lock_fd_ = -1;
+                if (last_fd >= 0) { ::flock(last_fd, LOCK_UN); ::close(last_fd); }
+                return;
+            }
+#else
+            (void)registered; (void)last_fd;
+#endif
         }
         if (reentrant_ || lock_fd_ < 0) return;
 #ifndef _WIN32
@@ -1502,10 +1548,12 @@ private:
         return true;
     }
 
-    void replay_wal(const std::string& path) {
-        if (path.empty()) return;
+    // Returns the offset just past the last record that checked out, or -1
+    // when there is nothing replayable to vouch for (no file, newer format).
+    std::streamoff replay_wal(const std::string& path) {
+        if (path.empty()) return -1;
         std::ifstream wf(path, std::ios::binary);
-        if (!wf) return;
+        if (!wf) return -1;
 
         // Size the file once so each record's declared length can be sanity
         // checked against what's actually left to read.
@@ -1525,13 +1573,14 @@ private:
                 magic == WAL_MAGIC) {
                 uint32_t ver = 0;
                 wf.read(reinterpret_cast<char*>(&ver), 4);
-                if (ver > WAL_VERSION) return;   // written by a newer build
+                if (ver > WAL_VERSION) return -1;   // written by a newer build
                 has_crc = true;
             } else {
                 wf.clear();
                 wf.seekg(0, std::ios::beg);      // v1: no header, rewind
             }
         }
+        std::streamoff good_end = wf.tellg();
 
         while (true) {
             uint8_t op_b; uint64_t id; uint32_t plen;
@@ -1566,6 +1615,7 @@ private:
                 crc ^= 0xFFFFFFFFu;
                 if (crc != stored) break;
             }
+            good_end = wf.tellg();
 
             std::istringstream ss(payload);
             auto op = static_cast<WalOp>(op_b);
@@ -1584,11 +1634,10 @@ private:
                 if (dim32 != m_idx.dim) continue;   // corrupt / mismatched record
                 reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
                 try { add_point(m_idx, id, vec.data(), /*reuse_slot=*/true); } catch (...) {}
-                metadata_store_[id] = std::move(meta);
+                replay_meta_upsert(id, std::move(meta));
 
             } else if (op == WalOp::UPDATE) {
-                Metadata meta = Metadata::deserialize(ss);
-                metadata_store_[id] = std::move(meta);
+                replay_meta_upsert(id, Metadata::deserialize(ss));
 
             } else if (op == WalOp::UIMP) {
                 float imp = 0.0f;
@@ -1638,6 +1687,19 @@ private:
         }
         // Derived indexes are built once by load_vectors() after this returns —
         // rebuilding them here too would do the expensive BM25 pass twice.
+        return good_end;
+    }
+
+    // The upsert rule of apply_meta_upsert_nolock(): metadata without edges
+    // keeps the record's existing edges. Replay used to overwrite them, so a
+    // re-add after link() lost the link on recovery, and replaying <wal>.old
+    // over a base that already held it was not idempotent. The reverse index
+    // is rebuilt from metadata after replay, so only the edges matter here.
+    void replay_meta_upsert(uint64_t id, Metadata meta) {
+        auto it = metadata_store_.find(id);
+        if (it == metadata_store_.end()) { metadata_store_.emplace(id, std::move(meta)); return; }
+        if (meta.edges.empty()) meta.edges = std::move(it->second.edges);
+        it->second = std::move(meta);
     }
 
     static std::string escape_json(const std::string& s) {
@@ -1813,7 +1875,15 @@ private:
         // a checkpoint was interrupted between rotating the WAL and deleting
         // the old one; its records are older than everything in <wal>.
         replay_wal(wal_old_path());
-        replay_wal(wal_path_);
+        const std::streamoff good_end = replay_wal(wal_path_);
+        // Cut a torn or corrupt tail. Replay stops there, and the next append
+        // would land BEHIND it: acknowledged writes the next recovery can never
+        // reach. A read-only handle shares the writer's WAL and must not touch it.
+        if (!read_only_ && good_end >= 0 &&
+            static_cast<uint64_t>(good_end) < fsio::size_or_zero(wal_path_)) {
+            std::error_code ec;
+            std::filesystem::resize_file(wal_path_, static_cast<uintmax_t>(good_end), ec);
+        }
         build_reverse_index();
         build_secondary_indexes();
         rebuild_bm25_index();
@@ -2237,6 +2307,7 @@ public:
                      float threshold = 0.80f,
                      const std::string& rel_type = "related_to",
                      size_t candidates = 15) {
+        check_writable("auto-link");
         struct Cand { uint64_t from, to; float sim; };
         std::vector<Cand> found;
 
@@ -2288,6 +2359,10 @@ public:
             for (const auto& c : found) {
                 auto mit = metadata_store_.find(c.from);   // may have changed meanwhile
                 if (mit == metadata_store_.end() || is_dead_meta(mit->second)) continue;
+                // The kNN pass ran under the shared lock; the target may have
+                // been purged or forgotten since. An edge to it would dangle.
+                auto tit = metadata_store_.find(c.to);
+                if (tit == metadata_store_.end() || is_dead_meta(tit->second)) continue;
                 auto& meta = mit->second;
                 bool exists = false;
                 for (const auto& e : meta.edges)
@@ -2390,7 +2465,6 @@ public:
 
         // Step 3: build result nodes with scores
         ContextChainResult result;
-        double now_ts = static_cast<double>(std::time(nullptr));
 
         for (const auto& [id, hop] : visited) {
             auto mit = metadata_store_.find(id);
@@ -2547,6 +2621,7 @@ public:
     }
 
     void update_importance(uint64_t id, float importance) {
+        check_writable("update importance");
         std::string payload(reinterpret_cast<const char*>(&importance), 4);
         uint64_t lsn = 0;
         {
@@ -2874,13 +2949,18 @@ private:
     // Filtered-search routing (see the cost model in search()).
     static constexpr size_t PREFILTER_MAX_EF = 4096;
     enum { PREFILTER_AUTO = 0, PREFILTER_EXACT = 1, PREFILTER_HNSW = 2 };
-    // FEATHER_PREFILTER_MODE=auto|exact|hnsw forces a route (tests, A/B).
+    // FEATHER_PREFILTER_MODE=exact|auto|hnsw. EXACT is the default: an indexed
+    // filter (namespace / entity / attribute) has always meant an exact,
+    // complete top-k, and callers such as Pocket.recall rely on it. `auto`
+    // opts in to the cost model, which walks the graph for large unselective
+    // sets — faster, but approximate (measured recall@10 0.86 on a 50% filter,
+    // and with scoring= it only re-ranks the nearest candidates).
     static int prefilter_mode() {
         static const int m = [] {
             const char* e = std::getenv("FEATHER_PREFILTER_MODE");
-            if (e && !std::strcmp(e, "exact")) return static_cast<int>(PREFILTER_EXACT);
-            if (e && !std::strcmp(e, "hnsw"))  return static_cast<int>(PREFILTER_HNSW);
-            return static_cast<int>(PREFILTER_AUTO);
+            if (e && !std::strcmp(e, "auto")) return static_cast<int>(PREFILTER_AUTO);
+            if (e && !std::strcmp(e, "hnsw")) return static_cast<int>(PREFILTER_HNSW);
+            return static_cast<int>(PREFILTER_EXACT);
         }();
         return m;
     }
@@ -2904,8 +2984,10 @@ private:
     using ScoredId = std::pair<float, uint64_t>;
 
     // Best first; ties go to the smaller id (same order as search()).
+    // Ties go to the higher id: the order std::greater<pair<score, id>> gave
+    // keyword_search before this comparator, which callers may depend on.
     static bool better_scored(const ScoredId& a, const ScoredId& b) {
-        return a.first > b.first || (a.first == b.first && a.second < b.second);
+        return a.first > b.first || (a.first == b.first && a.second > b.second);
     }
 
     // The best `limit` BM25 hits for `query` as (score, id), best first.
@@ -3070,7 +3152,7 @@ public:
         const auto top_end = fused.begin() + std::min(k, fused.size());
         std::partial_sort(fused.begin(), top_end, fused.end(),
             [](const std::pair<double, uint64_t>& a, const std::pair<double, uint64_t>& b) {
-                return a.first > b.first || (a.first == b.first && a.second < b.second);
+                return a.first > b.first || (a.first == b.first && a.second > b.second);
             });
 
         std::vector<ScoredId> ranked;
@@ -3161,6 +3243,7 @@ public:
     // metadata store + reverse index. Returns count of removed nodes.
     // WAL-logged since 0.19 (it used to survive a crash only via save()).
     size_t purge(const std::string& ns_id) {
+        check_writable("purge a namespace");
         std::string payload;
         {
             uint16_t len = static_cast<uint16_t>(std::min<size_t>(ns_id.size(), 65535));
@@ -3172,6 +3255,12 @@ public:
         {
             std::unique_lock<RWMutex> lock(mutex_);
             ensure_open();
+            // A FORGET per record first: a build without WalOp::PURGE (0.21.0
+            // and earlier) skips that op on replay, and after a crash would
+            // bring every purged record back. It replays the FORGETs instead,
+            // so a rollback leaves them deleted. Replaying both is idempotent.
+            for (const auto& [id, meta] : metadata_store_)
+                if (meta.namespace_id == ns_id) wal_append(WalOp::FORGET, id, "");
             lsn = wal_append(WalOp::PURGE, 0, payload);
             n = purge_core(ns_id, /*maintain_derived=*/true);
             maybe_auto_compact_nolock();
@@ -3184,6 +3273,7 @@ public:
     // Scan all nodes and soft-delete any with ttl>0 where now > timestamp+ttl.
     // Returns count of nodes forgotten.
     size_t forget_expired() {
+        check_writable("forget expired records");
         uint64_t last_lsn = 0;
         size_t count = 0;
         {
@@ -3320,7 +3410,9 @@ public:
         for (auto& sn : snaps) {
             auto mit = modality_indices_.find(sn.name);
             if (mit == modality_indices_.end()) continue;
-            sn.index->setEf(sn.ef);
+            // The live index's ef, not the phase-1 snapshot: a set_ef() made
+            // while compaction ran would otherwise be silently undone here.
+            sn.index->setEf(mit->second.index->ef_);
             mit->second.index = std::move(sn.index);   // old index freed here
             mit->second.space = std::move(sn.space);
         }

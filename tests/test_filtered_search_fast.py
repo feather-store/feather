@@ -6,7 +6,8 @@
   their metadata copied.
 * Large, unselective sets (candidates * selectivity^2 > C * k) go through
   filtered HNSW with ef raised ~1/selectivity, falling back to the exact scan
-  if the walk comes up short. FEATHER_PREFILTER_MODE=exact|hnsw forces a route.
+  if the walk comes up short. That route is opt-in (FEATHER_PREFILTER_MODE=auto);
+  the default is the exact scan, as it always was. `hnsw` forces the walk.
 """
 import os
 import subprocess
@@ -107,11 +108,21 @@ print("RECALL_BIG", rb / 400, "RECALL_TINY", rt / 400, "FULL", full)
 
 def test_large_candidate_set_uses_graph_with_good_recall():
     # 7.5k of 30k records (sel 25%): 7500 * 0.25^2 = 469 > 10 * 10 -> HNSW route
-    out = _run(_LARGE).split()
+    out = _run(_LARGE, FEATHER_PREFILTER_MODE="auto").split()
     recall_big, recall_tiny, full = float(out[1]), float(out[3]), out[5] == "True"
     assert full, "HNSW route returned fewer than k in-filter results"
     assert recall_big >= 0.9, f"recall@10 on the HNSW route: {recall_big}"
     assert recall_tiny == 1.0, "small candidate set must use the exact scan"
+
+
+def test_default_route_is_exact():
+    """An indexed filter means an exact, complete top-k unless the caller opts
+    in to the approximate route — the guarantee filtered search always gave."""
+    env = {k: v for k, v in os.environ.items() if k != "FEATHER_PREFILTER_MODE"}
+    r = subprocess.run([sys.executable, "-c", _LARGE], capture_output=True, text=True,
+                       timeout=600, env=env)
+    out = r.stdout.split()
+    assert float(out[1]) == 1.0 and float(out[3]) == 1.0, r.stdout + r.stderr
 
 
 def test_forced_exact_route_is_exact():

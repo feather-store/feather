@@ -206,6 +206,17 @@ def test_hybrid_search_excludes_forgotten(db):
     assert 1 not in {r.id for r in hits}
 
 
+def test_keyword_and_hybrid_ties_go_to_the_higher_id(db):
+    # The order keyword_search and RRF fusion always had (std::greater on
+    # (score, id)). On a tie at the k cutoff it decides which record is
+    # returned at all, so clients can depend on it.
+    for i in (3, 9, 5):
+        db.add(id=i, vec=EMBED("same"), meta=_meta("identical tied text"))
+    assert [r.id for r in db.keyword_search("identical", k=3)] == [9, 5, 3]
+    assert [r.id for r in db.keyword_search("identical", k=2)] == [9, 5]
+    assert [r.id for r in db.hybrid_search(EMBED("same"), "identical", k=3)] == [9, 5, 3]
+
+
 # ── 4. Incremental BM25 statistics stay correct ───────────────────────────
 
 def test_incremental_bm25_matches_rebuilt_index(tmp_path):
