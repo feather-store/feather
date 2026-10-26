@@ -65,6 +65,18 @@ def test_two_identical_episodes_are_still_two_events(mem):
     assert len(mem.episodes) == 2
 
 
+def test_the_same_episode_twice_in_one_second_is_two_events(mem):
+    """The key is `<second>_<slug>`, so a retry in the same second used to
+    produce the same key and replace the first record."""
+    now = time.time()
+    k1 = mem.episodes.record("deploy failed", at=now, outcome="first")
+    k2 = mem.episodes.record("deploy failed", at=now, outcome="second")
+    k3 = mem.episodes.record("deploy failed", at=now, outcome="third")
+    assert k1 == f"{int(now)}_deploy_failed", "an uncontested key changed format"
+    assert len({k1, k2, k3}) == 3 and len(mem.episodes) == 3
+    assert {e["outcome"] for e in mem.episodes.all()} == {"first", "second", "third"}
+
+
 # ── facts: corrected, with history ────────────────────────────────────────
 
 def test_correcting_a_fact_keeps_what_it_replaced(mem):

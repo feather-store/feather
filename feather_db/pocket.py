@@ -29,6 +29,7 @@ import hashlib
 import json
 import math
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
@@ -573,8 +574,10 @@ class PocketSession:
     def __init__(self, parent: "Pocket", session_id: Optional[str] = None,
                  scratch_ratio: float = 0.4):
         self.parent = parent
-        self.id = session_id or hashlib.sha1(
-            f"{parent.namespace}{time.time_ns()}".encode()).hexdigest()[:10]
+        # Random, not clock-derived: time_ns() ticks in microseconds on macOS,
+        # so two sessions opened back to back could hash to one id and share
+        # (and drop) each other's scratch.
+        self.id = session_id or uuid.uuid4().hex[:10]
         # Scratch is a CHILD scope, so it inherits everything the agent can see
         # and is ranked against it, while remaining trivially droppable.
         self.scratch = Pocket(
@@ -594,7 +597,10 @@ class PocketSession:
 
     def note(self, text: str, *, key: Optional[str] = None, importance: float = 0.6) -> str:
         """Write working memory for this run only."""
-        key = key or f"n{len(self._kept) + int(time.time_ns() % 100000)}"
+        # Random, not `time_ns() % 100000`: with microsecond ticks that left
+        # 100 possible keys, so ~1 in 100 note pairs collided and the second
+        # silently overwrote the first.
+        key = key or f"n{uuid.uuid4().hex[:12]}"
         self.scratch.remember(key, text, importance=importance)
         return key
 

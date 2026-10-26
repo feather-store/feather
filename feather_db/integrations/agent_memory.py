@@ -41,6 +41,7 @@ LangGraph agent can use this and `store.get(...)` interchangeably.
 from __future__ import annotations
 
 import re
+import threading
 import time
 from typing import Any, Iterable, Optional
 
@@ -54,6 +55,7 @@ OBSERVATIONS = "observations"
 KINDS = (PREFERENCES, EPISODES, FACTS, PROCEDURES, ENTITIES, OBSERVATIONS)
 
 _SLUG = re.compile(r"[^a-z0-9]+")
+_APPEND_LOCK = threading.Lock()   # check-then-write for episode keys
 
 
 def _slug(text: str, limit: int = 40) -> str:
@@ -128,15 +130,22 @@ class _Preferences(_Kind):
 
 class _Episodes(_Kind):
     """Append-only. An episode that can be overwritten is not a record of
-    anything — the key embeds the time so two writes never collide."""
+    anything. The key is `<unix second>_<slug>`; the same event recorded twice
+    in one second (a retry, a loop) gets `#2`, `#3`… rather than replacing the
+    first, which is what the bare key used to do."""
 
     def record(self, what: str, *, outcome: Optional[str] = None,
                at: Optional[float] = None, ttl: Optional[float] = None,
                **extra) -> str:
         at = at if at is not None else time.time()
-        key = f"{int(at)}_{_slug(what)}"
-        return self._write(key, {"text": what, "outcome": outcome,
-                                 "happened_at": at, **extra}, ttl=ttl)
+        base = key = f"{int(at)}_{_slug(what)}"
+        with _APPEND_LOCK:
+            n = 1
+            while self._mem.store.get(self.namespace, key) is not None:
+                n += 1
+                key = f"{base}#{n}"
+            return self._write(key, {"text": what, "outcome": outcome,
+                                     "happened_at": at, **extra}, ttl=ttl)
 
     def all(self, limit: int = 100) -> list[dict]:
         """Episodes order by event time, not by write time — same as recent().
