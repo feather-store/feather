@@ -227,8 +227,17 @@ def _metadata_in(data) -> MetadataIn:
     """Strict metadata validation (unknown keys -> 422) for msgspec-decoded bodies."""
     try:
         return MetadataIn.model_validate(data)
-    except ValidationError as e:
-        raise HTTPException(422, jsonable_encoder(e.errors(include_url=False)))
+    except ValidationError as direct:
+        # Re-validate as the nested field it used to be, so `detail` (type,
+        # msg, loc) is exactly what pydantic reported before the msgspec path.
+        errors = [{**err, "loc": ["body", "metadata", *err["loc"]]}
+                  for err in direct.errors(include_url=False)]
+        try:
+            AddVectorRequest.model_validate({"id": 0, "vector": [0.0], "metadata": data}, from_attributes=True)
+        except ValidationError as nested:
+            errors = [{**err, "loc": ["body", *err["loc"]]}
+                      for err in nested.errors(include_url=False) if err["loc"][:1] == ("metadata",)] or errors
+        raise HTTPException(422, jsonable_encoder(errors))
 
 
 # Hot routes decode their bodies with msgspec (app/fastparse.py) instead of
@@ -408,6 +417,7 @@ def _build_filter(req: SearchRequest) -> Optional[SearchFilter]:
         req.namespace_id, req.entity_id, req.attributes_match,
         req.source, req.source_prefix, req.importance_gte,
         req.tags_contains, req.timestamp_after, req.timestamp_before,
+        getattr(req, "confidence_gte", None) is not None,
     ])
     if not has_filter:
         return None
@@ -419,6 +429,8 @@ def _build_filter(req: SearchRequest) -> Optional[SearchFilter]:
     if req.source:            f.source          = req.source
     if req.source_prefix:     f.source_prefix   = req.source_prefix
     if req.importance_gte is not None: f.importance_gte = req.importance_gte
+    if getattr(req, "confidence_gte", None) is not None:
+        f.confidence_gte = req.confidence_gte
     if req.tags_contains:     f.tags_contains   = req.tags_contains
     if req.timestamp_after:   f.timestamp_after = req.timestamp_after
     if req.timestamp_before:  f.timestamp_before = req.timestamp_before
@@ -802,7 +814,15 @@ async def upload_feather(
         raise
 
     try:
-        db = manager.adopt(namespace, staged, overwrite=overwrite)
+        try:
+            db = manager.adopt(namespace, staged, overwrite=overwrite)
+        except BaseException:
+            # adopt() consumes the staged file on success and cleans it up on
+            # its own errors, but NotOwnedError (sharding) is raised before
+            # that — leaving up to FEATHER_MAX_UPLOAD_MB behind per attempt.
+            try: os.remove(staged)
+            except OSError: pass
+            raise
     except FileExistsError:
         raise HTTPException(
             409,
@@ -833,7 +853,9 @@ async def add_vector(namespace: str, request: Request):
 
 def _add_vector_impl(namespace: str, req):
     db = manager.get(namespace)
-    meta = _meta_from_model(_metadata_in(req.metadata)) if req.metadata else Metadata()
+    # `is not None`, not truthiness: `"metadata": {}` was a MetadataIn() before
+    # the msgspec path, which stamps timestamp=now; a bare Metadata() is 1970.
+    meta = _meta_from_model(_metadata_in(req.metadata)) if req.metadata is not None else Metadata()
     vec = req.vector_array()
 
     # Reject a mismatch only against an *established* dim. On an empty namespace
@@ -1653,6 +1675,12 @@ def _store_ingested(namespace: str, req: IngestTextRequest, vec):
           dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(ImportRequest))
 async def bulk_import(namespace: str, request: Request):
     req = await parse_body(request, ImportBody)
+    # Items without a vector are embedded inside the call, at provider latency.
+    # On the 8-thread write pool a few of those imports held every write slot
+    # and stalled all writes server-wide (measured 2.7 s for an unrelated add);
+    # they run on the shared pool, as before the write pool existed.
+    if any(not isinstance(it, dict) or not it.get("vector") for it in req.items):
+        return await run_in_threadpool(_bulk_import_impl, namespace, req)
     return await _in_write_pool(_bulk_import_impl, namespace, req)
 
 

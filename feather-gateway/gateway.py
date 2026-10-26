@@ -99,13 +99,25 @@ async def _fan_out(request: Request, path: str, method: str = "GET", body: bytes
     return await asyncio.gather(*[one(i) for i in range(len(SHARDS))])
 
 
-def _namespace_of(path: str) -> Optional[str]:
+# The API's own /v1/admin/<route> endpoints. Anything else under /v1/admin/ is
+# a namespace that happens to be called "admin" (/v1/{namespace}/search ...).
+_ADMIN_ROUTES = {"overview", "upload", "metrics", "activity", "ops_timeseries",
+                 "connection_info", "embedding_config", "embedding_models"}
+
+
+def _namespace_of(path: str, method: str = "GET") -> Optional[str]:
     parts = [p for p in path.split("/") if p]
     if len(parts) < 2 or parts[0] != "v1":
         return None
     if parts[1] == "namespaces":
-        return parts[2] if len(parts) >= 3 else None
-    if parts[1] == "admin":
+        if len(parts) == 2:
+            return None                                   # list / create
+        if len(parts) == 3 and method == "DELETE":
+            return parts[2]                               # DELETE /v1/namespaces/{ns}
+        if len(parts) == 4 and parts[3] == "stats":
+            return parts[2]                               # /v1/namespaces/{ns}/stats
+        return "namespaces"                               # /v1/namespaces/search etc.
+    if parts[1] == "admin" and (len(parts) == 2 or parts[2] in _ADMIN_ROUTES):
         return None
     return parts[1]
 
@@ -166,6 +178,12 @@ async def embedding_config_put(request: Request):
     res = await _fan_out(request, "/v1/admin/embedding_config", method="PUT", body=body)
     failed = [i for i, r in res if not (isinstance(r, httpx.Response) and r.status_code < 300)]
     first = next((r for _, r in res if isinstance(r, httpx.Response)), None)
+    # Every shard refused the request itself (bad key, invalid body): that is
+    # the client's error, so pass it through instead of calling it a 502.
+    codes = {r.status_code for _, r in res if isinstance(r, httpx.Response)}
+    if first is not None and len(codes) == 1 and 400 <= first.status_code < 500 \
+            and all(isinstance(r, httpx.Response) for _, r in res):
+        return Response(first.content, status_code=first.status_code, media_type="application/json")
     if failed or first is None:
         return JSONResponse(status_code=502, content={
             "detail": f"embedding config not applied on shards {failed}; re-send to converge",
@@ -180,7 +198,7 @@ async def create_namespace(request: Request):
         name = (await request.json()).get("name", "")
     except Exception:  # noqa: BLE001
         name = ""
-    if not name:
+    if not name or not isinstance(name, str):
         return await _forward(0, request, body)      # let the shard produce the 422
     return await _forward(shard_owner(name, len(SHARDS)), request, body)
 
@@ -200,7 +218,7 @@ async def upload(request: Request):
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy(full_path: str, request: Request):
     path = "/" + full_path
-    ns = _namespace_of(path)
+    ns = _namespace_of(path, request.method)
     if ns is not None:
         return await _forward(shard_owner(ns, len(SHARDS)), request)
     shard = 0

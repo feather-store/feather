@@ -89,6 +89,11 @@ def test_msgspec_bodies_validate_like_pydantic(client):
     # unknown top-level keys are ignored, exactly like pydantic's default
     ok = client.post(f"/v1/{NS}/search", json={"vector": q, "k": 2, "unexpected": 1})
     assert ok.status_code == 200 and ok.json()["count"] == 2
+    # pydantic's lax coercions still work: existing clients send these
+    lax = {"vector": [str(x) for x in q], "k": "2", "track": "true",
+           "importance_gte": "0", "timestamp_after": 0.0}
+    ok = client.post(f"/v1/{NS}/search", json=lax)
+    assert ok.status_code == 200 and ok.json()["count"] == 2, ok.text
     assert client.post(f"/v1/{NS}/hybrid_search", json={"vector": q, "k": 2}).status_code == 422  # no query
     assert client.post(f"/v1/{NS}/keyword_search", json={"query": "doc", "k": 2}).status_code == 200
     assert client.post(f"/v1/{NS}/context_chain", json={"k": 2, "hops": 11}).status_code == 422
@@ -167,6 +172,25 @@ def test_embedding_dim_mismatch_is_an_error_not_padding(tmp_path, monkeypatch):
         assert r.status_code == 400 and "24" in r.text
 
 
+def test_provider_dim_mismatch_fits_by_default_and_errors_when_strict(monkeypatch):
+    """A provider vector of the wrong length is padded/truncated (the pre-0.19
+    behaviour existing namespaces were filled with) unless
+    FEATHER_EMBED_STRICT_DIM=1, which raises and asks providers for the dim."""
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+    from app.embedding import _Cfg, _build, _check_dims  # noqa: WPS433
+    cfg = _Cfg(provider="openai", model="text-embedding-3-small", key="k", base_url="",
+               deployment="", api_version="", dim=4)
+    monkeypatch.delenv("FEATHER_EMBED_STRICT_DIM", raising=False)
+    assert _check_dims(cfg, [[1.0, 2.0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]) == \
+        [[1.0, 2.0, 0.0, 0.0], [1.0, 2.0, 3.0, 4.0]]
+    assert "dimensions" not in _build(cfg, ["x"])[2]
+    monkeypatch.setenv("FEATHER_EMBED_STRICT_DIM", "1")
+    with pytest.raises(RuntimeError, match="never padded"):
+        _check_dims(cfg, [[1.0, 2.0]])
+    assert _build(cfg, ["x"])[2]["dimensions"] == 4
+
+
 def test_mock_provider_requires_dev_mode(monkeypatch):
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
@@ -204,3 +228,91 @@ def test_shard_owner_is_stable_across_processes():
     runs = {subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                            env={**os.environ, "FEATHER_DATA_DIR": "/tmp"}).stdout for _ in range(2)}
     assert len(runs) == 1 and runs.pop().strip()
+
+
+def test_empty_metadata_object_still_stamps_now(client):
+    """`"metadata": {}` was a MetadataIn() before the msgspec path, which sets
+    timestamp=now; a bare engine Metadata() would date the record 1970."""
+    before = int(time.time())
+    r = client.post(f"/v1/{NS}/vectors", json={"id": 1, "vector": [0.1] * DIM, "metadata": {}})
+    assert r.status_code == 201
+    assert client.get(f"/v1/{NS}/records/1").json()["timestamp"] >= before
+
+
+def test_metadata_type_error_detail_matches_pydantic(client):
+    r = client.post(f"/v1/{NS}/vectors", json={"id": 1, "vector": [0.1] * DIM, "metadata": [1]})
+    assert r.status_code == 422
+    d = r.json()["detail"][0]
+    assert d["type"] == "model_attributes_type" and d["loc"] == ["body", "metadata"]
+
+
+def test_one_bad_text_does_not_fail_the_rest_of_its_batch():
+    """Providers reject a whole request for one invalid input; each caller must
+    only ever see its own text's outcome."""
+    import asyncio
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+    from app.embedding import EmbedBatcher  # noqa: WPS433
+
+    class Provider:
+        calls = 0
+
+        async def aembed_many(self, texts):
+            Provider.calls += 1
+            if "BAD" in texts:
+                raise RuntimeError("HTTP 400: input invalid")
+            return [[float(len(t))] for t in texts]
+
+    async def run():
+        b = EmbedBatcher(Provider())
+        b.window_s = 0.05
+        b.start()
+        res = await asyncio.gather(*[b.embed(t) for t in ("aa", "BAD", "cccc", "d")],
+                                   return_exceptions=True)
+        await b.stop()
+        return res
+
+    res = asyncio.run(run())
+    assert res[0] == [2.0] and res[2] == [4.0] and res[3] == [1.0]
+    assert isinstance(res[1], RuntimeError) and "input invalid" in str(res[1])
+
+
+def test_embedding_imports_do_not_hold_the_write_pool(tmp_path, monkeypatch):
+    """Server-side embedding runs at provider latency; on the 8-thread write
+    pool a few such imports stalled every write on the server."""
+    with _client(tmp_path, monkeypatch, FEATHER_EMBED_PROVIDER="mock", FEATHER_EMBED_DIM=DIM,
+                 FEATHER_WRITE_THREADS=1) as c:
+        import app.main as m  # noqa: WPS433
+        m.EMBEDDING._mock_delay_s = 0
+        orig = m.EMBEDDING.embed_many
+        started = threading.Event() if False else None   # placeholder, see below
+        gate = __import__("threading").Event()
+
+        def slow(texts):
+            gate.wait(10)
+            return orig(texts)
+        m.EMBEDDING.embed_many = slow
+        t = __import__("threading").Thread(target=lambda: c.post(
+            f"/v1/{NS}/import", json={"items": [{"id": 1, "metadata": {"content": "x"}}]}))
+        t.start()
+        time.sleep(0.3)                                   # import is now blocked embedding
+        t0 = time.time()
+        r = c.post(f"/v1/{NS}/vectors", json={"id": 2, "vector": [0.1] * DIM})
+        waited = time.time() - t0
+        gate.set(); t.join(10)
+        m.EMBEDDING.embed_many = orig
+        assert r.status_code == 201 and waited < 2, f"add waited {waited:.1f}s behind an embedding import"
+
+
+def test_confidence_gte_filters_search_keyword_and_hybrid(client):
+    """Additive: absent, every route behaves as before."""
+    for i, conf in enumerate((0.2, 0.5, 0.9), start=1):
+        client.post(f"/v1/{NS}/vectors", json={"id": i, "vector": [0.1 * i] * DIM,
+                                               "metadata": {"content": "shared word", "confidence": conf}})
+    q = [0.1] * DIM
+    ids = lambda r: sorted(x["id"] for x in r.json()["results"])
+    assert ids(client.post(f"/v1/{NS}/search", json={"vector": q, "k": 10})) == [1, 2, 3]
+    assert ids(client.post(f"/v1/{NS}/search", json={"vector": q, "k": 10, "confidence_gte": 0.5})) == [2, 3]
+    assert ids(client.post(f"/v1/{NS}/keyword_search", json={"query": "shared", "k": 10, "confidence_gte": 0.9})) == [3]
+    assert ids(client.post(f"/v1/{NS}/hybrid_search", json={"vector": q, "query": "shared", "k": 10,
+                                                             "confidence_gte": 0.5})) == [2, 3]

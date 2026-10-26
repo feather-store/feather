@@ -20,11 +20,14 @@ per call), a sync path for the bulk importer and an async path for
 micro-batcher (EmbedBatcher) that coalesces concurrent ingest requests into one
 provider call.
 
-Dimensions: vectors are NO LONGER silently padded or truncated to the
-configured dim. OpenAI/Azure text-embedding-3-* and Gemini are asked for the
-configured dim natively (Matryoshka truncation done by the provider, which is
-the correct way to shorten them). Any other mismatch raises RuntimeError
-naming both numbers — zero-padding or chopping a vector corrupts it silently.
+Dimensions: by default a provider vector whose length differs from the
+configured dim is zero-padded or truncated to it, exactly as before 0.19.
+Existing namespaces were filled that way, and changing how new vectors are
+shaped would make them rank inconsistently against the stored ones.
+FEATHER_EMBED_STRICT_DIM=1 opts in to the stricter behaviour: OpenAI/Azure
+text-embedding-3-* and Gemini are asked for the configured dim natively
+(provider-side Matryoshka shortening), and any other mismatch raises
+RuntimeError naming both numbers. Use it for new deployments.
 """
 from __future__ import annotations
 
@@ -64,7 +67,7 @@ SUPPORTED_MODELS: dict = {
         {"name": "text-embedding-ada-002", "dim": 1536, "label": "Azure OpenAI ada-002 (1536d)"},
     ],
     "gemini": [
-        {"name": "gemini-embedding-001",       "dim": 768, "label": "Gemini embedding-001 (768d requested, current)"},
+        {"name": "gemini-embedding-001",       "dim": 768, "label": "Gemini embedding-001 (768d, current)"},
         {"name": "gemini-embedding-exp-03-07", "dim": 768, "label": "Gemini embedding exp (768d, experimental)"},
         {"name": "text-embedding-004",         "dim": 768, "label": "Gemini text-embedding-004 (768d, deprecated)"},
         {"name": "embedding-001",              "dim": 768, "label": "Gemini embedding-001 (768d, legacy)"},
@@ -130,6 +133,10 @@ def _vec(v, provider: str, j) -> List[float]:
     return v
 
 
+def _strict_dims() -> bool:
+    return os.getenv("FEATHER_EMBED_STRICT_DIM", "").lower() in ("1", "true", "yes")
+
+
 def _build(cfg: _Cfg, texts: List[str]) -> Tuple[str, dict, dict, Callable[[dict], List[List[float]]]]:
     """(url, headers, json body, parse(response_json) -> vectors) for one batch."""
     p, n = cfg.provider, len(texts)
@@ -151,7 +158,7 @@ def _build(cfg: _Cfg, texts: List[str]) -> Tuple[str, dict, dict, Callable[[dict
             url = (f"{cfg.base_url.rstrip('/')}/openai/deployments/{dep}/embeddings"
                    f"?api-version={cfg.api_version or '2024-02-01'}")
             headers = {"api-key": cfg.key}
-        if "text-embedding-3" in (cfg.deployment or model):
+        if _strict_dims() and "text-embedding-3" in (cfg.deployment or model):
             body["dimensions"] = cfg.dim            # native Matryoshka shortening
 
         def parse(j):
@@ -167,7 +174,7 @@ def _build(cfg: _Cfg, texts: List[str]) -> Tuple[str, dict, dict, Callable[[dict
         reqs = []
         for t in texts:
             r = {"model": f"models/{model}", "content": {"parts": [{"text": t}]}}
-            if model.startswith("gemini-embedding"):
+            if _strict_dims() and model.startswith("gemini-embedding"):
                 r["outputDimensionality"] = cfg.dim
             reqs.append(r)
 
@@ -225,6 +232,11 @@ def _mock_vectors(cfg: _Cfg, texts: List[str]) -> List[List[float]]:
 
 
 def _check_dims(cfg: _Cfg, vecs: List[List[float]]) -> List[List[float]]:
+    if not _strict_dims():
+        # Legacy (default): fit to the configured dim — see the module docstring.
+        return [v if len(v) == cfg.dim
+                else (v + [0.0] * (cfg.dim - len(v)) if len(v) < cfg.dim else v[:cfg.dim])
+                for v in vecs]
     for v in vecs:
         if len(v) != cfg.dim:
             raise RuntimeError(
@@ -433,7 +445,7 @@ class EmbeddingProvider:
         results = await asyncio.gather(
             *[self._provider_batch_async(cfg, [texts[i] for i in idx]) for idx in chunks])
         for idx, vecs in zip(chunks, results):
-            _check_dims(cfg, vecs)
+            vecs = _check_dims(cfg, vecs)
             if len(vecs) != len(idx):
                 raise RuntimeError(f"{cfg.provider}: asked for {len(idx)} embeddings, got {len(vecs)}")
             for i, v in zip(idx, vecs):
@@ -459,8 +471,11 @@ class EmbeddingProvider:
 class EmbedBatcher:
     """Collects texts for up to FEATHER_EMBED_BATCH_WINDOW_MS (default 5 ms) or
     FEATHER_EMBED_BATCH_MAX texts (default 64), embeds them in one provider call
-    and resolves each caller's future. A failed batch fails every caller in it.
-    Awaiting callers hold no worker thread, so slow providers can't starve the
+    and resolves each caller's future. If the batch call fails, each text is
+    retried on its own, so a caller only ever sees its own text's error: a
+    provider rejects a whole request for one bad input (OpenAI, for an empty or
+    over-long string), and one tenant's bad text must not fail another's
+    ingest. Awaiting callers hold no worker thread, so slow providers can't starve the
     thread pool that searches run on."""
 
     def __init__(self, provider: EmbeddingProvider):
@@ -486,6 +501,11 @@ class EmbedBatcher:
             self._task = None
         if self._inflight:
             await asyncio.gather(*self._inflight, return_exceptions=True)
+        # Anything still queued would otherwise wait forever on its future.
+        while self._queue is not None and not self._queue.empty():
+            _, fut = self._queue.get_nowait()
+            if not fut.done():
+                fut.set_exception(RuntimeError("embedding service is shutting down"))
 
     async def embed(self, text: str) -> List[float]:
         if self._task is None:                    # not started (e.g. tests): direct call
@@ -500,14 +520,20 @@ class EmbedBatcher:
             first = await q.get()
             batch = [first]
             deadline = asyncio.get_running_loop().time() + self.window_s
-            while len(batch) < self.max_batch:
-                timeout = deadline - asyncio.get_running_loop().time()
-                if timeout <= 0:
-                    break
-                try:
-                    batch.append(await asyncio.wait_for(q.get(), timeout))
-                except asyncio.TimeoutError:
-                    break
+            try:
+                while len(batch) < self.max_batch:
+                    timeout = deadline - asyncio.get_running_loop().time()
+                    if timeout <= 0:
+                        break
+                    try:
+                        batch.append(await asyncio.wait_for(q.get(), timeout))
+                    except asyncio.TimeoutError:
+                        break
+            except asyncio.CancelledError:      # stop() while collecting
+                for _, fut in batch:
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("embedding service is shutting down"))
+                raise
             # Dispatch without awaiting, so the next batch can start collecting
             # while this one is in flight.
             t = asyncio.get_running_loop().create_task(self._dispatch(batch))
@@ -522,6 +548,9 @@ class EmbedBatcher:
                 if not fut.done():
                     fut.set_result(v)
         except Exception as e:  # noqa: BLE001
+            if len(batch) > 1:
+                await asyncio.gather(*[self._dispatch([item]) for item in batch])
+                return
             for _, fut in batch:
                 if not fut.done():
                     fut.set_exception(e if isinstance(e, RuntimeError) else RuntimeError(str(e)))

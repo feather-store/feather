@@ -98,3 +98,22 @@ def test_gateway_routes_and_merges(shards, monkeypatch):
         r = httpx.get(f"{other}/v1/{ns}/records/1")
         assert r.status_code == 421, (ns, r.status_code)
         assert (data_dir / f"{ns}.feather").exists() or (data_dir / f"{ns}.feather.wal").exists()
+
+
+def test_namespace_named_like_an_api_route_is_routed_to_its_owner(monkeypatch):
+    """`admin` and `namespaces` are legal namespace names; only the API's own
+    /v1/admin/<route> and /v1/namespaces[/{ns}[/stats]] are not namespace routes."""
+    monkeypatch.setenv("FEATHER_SHARDS", "http://a,http://b")
+    sys.path.insert(0, GW_DIR)
+    sys.modules.pop("gateway", None)
+    from gateway import _namespace_of  # noqa: WPS433
+    assert _namespace_of("/v1/admin/search", "POST") == "admin"
+    assert _namespace_of("/v1/admin/records/3", "GET") == "admin"
+    assert _namespace_of("/v1/admin/overview") is None
+    assert _namespace_of("/v1/admin/embedding_config", "PUT") is None
+    assert _namespace_of("/v1/namespaces/search", "POST") == "namespaces"
+    assert _namespace_of("/v1/namespaces/records", "GET") == "namespaces"
+    assert _namespace_of("/v1/namespaces/brand1", "DELETE") == "brand1"
+    assert _namespace_of("/v1/namespaces/brand1/stats") == "brand1"
+    assert _namespace_of("/v1/namespaces") is None
+    assert _namespace_of("/v1/brand1/search", "POST") == "brand1"

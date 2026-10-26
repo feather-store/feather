@@ -136,6 +136,7 @@ class SearchRequest(VectorInput):
     source: Optional[str] = None
     source_prefix: Optional[str] = None
     importance_gte: Optional[float] = None
+    confidence_gte: Optional[float] = None   # only records at least this certain
     tags_contains: Optional[List[str]] = None
     timestamp_after: Optional[int] = None
     timestamp_before: Optional[int] = None
@@ -176,6 +177,7 @@ class KeywordSearchRequest(BaseModel):
     source: Optional[str] = None
     source_prefix: Optional[str] = None
     importance_gte: Optional[float] = None
+    confidence_gte: Optional[float] = None   # only records at least this certain
     tags_contains: Optional[List[str]] = None
     timestamp_after: Optional[int] = None
     timestamp_before: Optional[int] = None
@@ -199,6 +201,7 @@ class HybridSearchRequest(VectorInput):
     source: Optional[str] = None
     source_prefix: Optional[str] = None
     importance_gte: Optional[float] = None
+    confidence_gte: Optional[float] = None   # only records at least this certain
     tags_contains: Optional[List[str]] = None
     timestamp_after: Optional[int] = None
     timestamp_before: Optional[int] = None
