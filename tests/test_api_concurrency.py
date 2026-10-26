@@ -9,6 +9,7 @@
 import base64
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -285,14 +286,13 @@ def test_embedding_imports_do_not_hold_the_write_pool(tmp_path, monkeypatch):
         import app.main as m  # noqa: WPS433
         m.EMBEDDING._mock_delay_s = 0
         orig = m.EMBEDDING.embed_many
-        started = threading.Event() if False else None   # placeholder, see below
-        gate = __import__("threading").Event()
+        gate = threading.Event()
 
         def slow(texts):
             gate.wait(10)
             return orig(texts)
         m.EMBEDDING.embed_many = slow
-        t = __import__("threading").Thread(target=lambda: c.post(
+        t = threading.Thread(target=lambda: c.post(
             f"/v1/{NS}/import", json={"items": [{"id": 1, "metadata": {"content": "x"}}]}))
         t.start()
         time.sleep(0.3)                                   # import is now blocked embedding
