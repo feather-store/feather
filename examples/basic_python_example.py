@@ -36,11 +36,11 @@ def main():
     # Step 4: Search for similar vectors
     print("\n4. Searching for similar vectors...")
     query = np.random.random(128).astype(np.float32)
-    ids, distances = db.search(query, k=5)
+    results = db.search(query, k=5)   # list of SearchResult(id, score, metadata)
     
-    print(f"   ✓ Found {len(ids)} similar vectors:")
-    for i, (id, dist) in enumerate(zip(ids, distances), 1):
-        print(f"      {i}. ID: {id:2d}, Distance: {dist:.4f}")
+    print(f"   ✓ Found {len(results)} similar vectors:")
+    for i, r in enumerate(results, 1):
+        print(f"      {i}. ID: {r.id:2d}, Score: {r.score:.4f}")
     
     print("\n" + "=" * 60)
     print("Example completed successfully!")

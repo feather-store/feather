@@ -73,12 +73,11 @@ def main():
         
         # Get query embedding and search
         query_embedding = get_embedding(query)
-        ids, distances = db.search(query_embedding, k=3)
+        results = db.search(query_embedding, k=3)   # score is already a similarity
         
         print("Top 3 results:")
-        for i, (doc_id, dist) in enumerate(zip(ids, distances), 1):
-            similarity = 1 / (1 + dist)  # Convert distance to similarity score
-            print(f"  {i}. [Score: {similarity:.3f}] {documents[doc_id]}")
+        for i, r in enumerate(results, 1):
+            print(f"  {i}. [Score: {r.score:.3f}] {documents[r.id]}")
     
     print("\n" + "=" * 70)
     print("Semantic search completed!")

@@ -9,6 +9,241 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Concurrency, compaction and search-path optimizations
+
+Concurrency and durability. See `CONCURRENCY.md` for the problems,
+`CONCURRENCY_BASELINE.md` for the before numbers and `CONCURRENCY_RESULTS.md`
+for the after numbers.
+
+### Breaking / behaviour changes
+- **`close(save=False)`.** The inter-process file lock itself shipped in
+  0.20.0 (exclusive for writers, shared for `read_only=True`, reentrant within
+  one process, `FEATHER_LOCK=0` to disable). This work builds on it:
+  - `db.close()` now also stops the background compactor before it
+    checkpoints and releases the lock.
+  - `db.close(save=False)` releases the handle without checkpointing, so the
+    WAL is kept. Tests use it to simulate a crash.
+  - `db.closed` is a property alias of `is_closed()`.
+  - Python never runs `~DB()`, so `del db` does **not** release the lock.
+- **Group commit.** A write can become visible to concurrent readers a few
+  milliseconds before its fsync completes. The writer still returns only
+  once the write is durable. `FEATHER_WAL_STRICT=1` restores the old
+  "never visible before durable" behaviour.
+- **Auto-compaction runs on a background thread.** Call
+  `wait_for_compaction()` to block until it finishes.
+- **`add_batch` applies records in chunks** (`FEATHER_BATCH_CHUNK`), so
+  readers may observe a partially applied batch.
+- **Cloud API: `FEATHER_EMBED_STRICT_DIM=1` (opt-in).** With it, a provider
+  dimension mismatch returns 400 instead of being padded or truncated, and
+  OpenAI/Azure `text-embedding-3-*` and Gemini are asked for the configured
+  dimension natively. Without it, nothing changes: vectors are fitted to the
+  configured dim as before, so existing namespaces keep ranking consistently.
+- **Cloud API: single-record mutations no longer save the whole file.** A
+  background checkpointer saves based on WAL size and age. Data stays durable
+  through the WAL.
+- **New WAL op `PURGE`.** Pre-0.19 builds skip it on replay.
+
+### Fixed
+- **`save()` durability:**
+  - The new base file is fsynced before it is renamed into place, and the
+    directory is fsynced after.
+  - Write errors (for example a full disk) are checked. Before, a truncated
+    snapshot could replace the file and the WAL was then deleted.
+- **Writer starvation.** The engine's lock is now a phase-fair
+  `FairSharedMutex` instead of glibc's reader-preferring rwlock. Before, 8
+  readers at 768-d cut a writer from 191 to 0.6 writes/s.
+- **The WAL fsync no longer runs while holding the exclusive lock**
+  (group commit). One fsync covers every concurrent writer.
+- **`add_batch` releases the lock between chunks.** Before, readers dropped
+  99% while batches ran.
+- **`compact()` builds without the lock and swaps at the end.** Before it
+  froze the DB for 40–86 s.
+- **Deleted HNSW slots are reused.** The vendored hnswlib was patched so
+  that re-adding a forgotten id works.
+- **`update_metadata` is O(edges of the record).** It used to be O(all
+  edges): 13 ms at 500k edges.
+- **`auto_link` and `purge` are WAL-logged.** `auto_link` also runs its kNN
+  pass under the shared lock.
+- **`save()` rotates the WAL and makes the base file durable outside the
+  lock**, so writers aren't blocked for the whole save. Snapshot readers use
+  a long-shared mode, so queries keep flowing during a checkpoint.
+- **A wrong-dimension `add()` is rejected before it reaches the WAL.**
+  Before, it was replayed on the next open, reading past the vector.
+- **`add()` with edges now updates the reverse edge index.**
+- **Array strides are handled.** Non-contiguous NumPy arrays passed to
+  `add`, `search`, `context_chain` and `hybrid_search` are now read
+  correctly.
+- **`IngestPipeline` no longer restarts its id counters per instance.** A
+  new pipeline on an existing DB used to overwrite earlier records. It now
+  continues after the highest stored id and re-learns stored entities.
+- **Internal self-queries no longer inflate `recall_count`.** This covers
+  ContextEngine sampling, ContradictionDetector, pipeline candidate lookup,
+  MMR over-fetch and tool over-fetch.
+- **`feather-serve` now starts.** `stdio_server` was called with the server
+  object as `stdin`.
+- **The LlamaIndex adapters are exported again**, as
+  `FeatherVectorStoreIndex` and `FeatherReader`.
+- **`merge()` closes the source DB.**
+
+### Performance: search
+- **Distance kernels are chosen at runtime** (`include/feather_simd.h`):
+  AVX-512F, AVX2+FMA, SSE2 or scalar on x86-64, and NEON on arm64. Each wide
+  kernel carries its own `target` attribute, so one portable binary uses the
+  best ISA the machine has.
+  - PyPI wheels were built SSE-only (`FEATHER_SIMD=sse`), so pip users never
+    got the AVX kernels. arm64 had no SIMD distance at all.
+  - Build modes: `FEATHER_SIMD=auto` (new default), `native` or `none`.
+  - `FEATHER_SIMD_RUNTIME` caps the level at run time.
+  - `feather_db.core.simd_info()` reports the kernel in use.
+  - int8 in-RAM distance also has AVX2 and NEON kernels.
+- **Filtered search:**
+  - The exact scan uses the index's SIMD distance function directly on the
+    stored vector. Before, it copied each candidate's vector and used a
+    scalar loop.
+  - Large, unselective candidate sets go through filtered HNSW with `ef`
+    raised for that one call (`searchKnnEf`). The route is picked by a cost
+    model (`candidates × selectivity² > C × k`), and the exact scan is the
+    fallback if the walk comes up short. This route is approximate, so it is
+    opt-in (`FEATHER_PREFILTER_MODE=auto`); the default stays exact.
+  - Candidate sets are built as vectors instead of re-hashed sets.
+  - Only the top-k results get their metadata copied, on every search path.
+- **`search()` rejects a query of the wrong dimension** instead of reading
+  past its buffer.
+- **In-RAM int8 is now faster than float as well as 4× smaller.**
+  - The int8 AVX2 kernel processes 32 bytes per step, computing the difference
+    exactly via saturating subtracts.
+  - A new float-query × int8-row kernel (AVX2 and NEON) speeds up the int8
+    filtered scan.
+  - Measured unfiltered p50: 1.43× faster than float at 768-d and 1.82× at
+    1536-d.
+- **Atomic reader fast path in `FairSharedMutex`, and per-thread slots in the
+  HNSW visited-list pool.** Neither takes a mutex per read any more. Both are
+  verified with a ThreadSanitizer stress test (`tests/cpp/lock_stress.cpp`).
+  Measured throughput was unchanged on this machine; see
+  CONCURRENCY_RESULTS.md §8.
+- **Cloud API: hot-route request bodies are decoded with msgspec**
+  (`feather-api/app/fastparse.py`). The pydantic models remain the OpenAPI
+  schemas. Bulk import is 10–20% faster; search is unchanged within noise.
+
+### Added
+- **Python bindings:**
+  - `close(save=True)`, the `closed` property and context-manager support
+  - `wait_for_compaction(timeout)`, `is_compacting()`, `wal_size()`,
+    `wal_fsync_count()`
+  - `search(..., with_cosine=True)`, which fills `SearchResult.cosine`
+  - `SearchResult.to_dict()` and `Metadata.to_dict()`
+- **Cloud API: request options and transport:**
+  - `vector_b64` (base64 float32) as an alternative to `vector`
+  - `include_metadata=false` on search routes
+  - Responses serialized with orjson; `raw_score` cosine computed in C++
+- **Cloud API: execution:**
+  - A separate write thread pool (`FEATHER_WRITE_THREADS`)
+  - Async `ingest_text` with an embedding micro-batcher
+  - Pooled httpx clients, provider-side batch embedding and an LRU embedding
+    cache
+  - A pure ASGI metrics middleware
+  - A dev-only `mock` embedding provider
+- **Cloud API: deletes** prune edges through the reverse index, in
+  O(in-degree), for records in any modality.
+- **Sharding:**
+  - `FEATHER_SHARD_COUNT` and `FEATHER_SHARD_INDEX`; a shard answers 421 for
+    namespaces it doesn't own.
+  - New `feather-gateway/` proxy, `docker-compose.sharded.yml` and
+    `docs/deploy-sharding.md`.
+- **Benchmarks:** `benchmarks/concurrency_bench.py` and
+  `benchmarks/api_concurrency_bench.py`.
+- **Tests:** file lock, group commit, background compaction, slot reuse,
+  fair lock, API features, gateway, and Python-layer fixes.
+
+---
+
+### Fixed: found by review of the concurrency rewrite (several also on 0.21.0)
+Each has a regression test (`tests/test_wal_and_lock_edges.py` unless noted).
+- **A read-only handle could delete the writer's data.** `purge()` and
+  `auto_link()` began WAL-logging without `check_writable()`; a reader shares
+  the writer's WAL, so its `purge()` was replayed by the writer and the records
+  were gone. `update_importance()` and `forget_expired()` had the same hole.
+  All four now raise on a read-only handle, as every other mutation does.
+- **WAL replay dropped links.** Replay overwrote metadata on ADD/UPDATE, while
+  the live path keeps existing edges when the new metadata has none: re-adding
+  a linked record and crashing lost the link, and replaying `<wal>.old` twice
+  was not idempotent.
+- **A torn WAL tail hid every later write.** Replay stopped at the torn record,
+  but new records were appended after it — acknowledged, then unreachable by
+  the next recovery. A writable open now cuts the tail; a read-only open never
+  touches the writer's WAL.
+- **The file lock leaked** when two same-process handles on one path closed in
+  open order: the descriptor now belongs to the per-process registry entry.
+- **Filtered search is exact again by default.** The cost model's graph walk
+  for large unselective filters is approximate (recall@10 0.86 on a 50%
+  namespace filter; with `scoring=` an important record could miss the top-k).
+  It is now opt-in: `FEATHER_PREFILTER_MODE=auto`. The default exact route is
+  still the new in-place SIMD scan.
+- `set_ef()` during a background compaction was undone at the swap;
+  `auto_link()` could link to a record purged during its unlocked kNN pass;
+  a new WAL's directory entry was never fsynced.
+- **Rollback safety:** `purge()` also logs a FORGET per record ahead of the new
+  PURGE op, so a 0.21.0 build replaying the WAL after a crash leaves the
+  records deleted instead of bringing them back.
+
+### Fixed: Cloud API and gateway (review)
+- `"metadata": {}` on add stored timestamp 0 (1970) instead of now.
+- One invalid text in an `/ingest_text` micro-batch failed every request in the
+  batch, across tenants: a failed batch is now retried text by text, so each
+  caller sees only its own outcome. Shutdown fails queued requests instead of
+  leaving them hanging.
+- Imports that embed server-side ran on the 8-thread write pool and could stall
+  every write on the server (2.7 s for an unrelated add); they use the shared
+  pool, as before.
+- A 421 (sharded) upload left its staged file (up to 256 MB) behind.
+- 422 `detail` for a non-object `metadata`, and bodies with `NaN`, now match
+  0.21.0 exactly.
+- Gateway: namespaces named `admin` or `namespaces` were routed to the wrong
+  shard; a non-string name on create was a 500; a broadcast every shard
+  refused (e.g. 401) was reported as 502.
+- Docker image: Feather Desk (`/app`) was not copied in and answered 404.
+
+### Fixed: Rust CLI
+- **Use-after-free on every string argument** (master since v0.3): `map_or`
+  moved each `CString` into the closure and returned a pointer to it after it
+  was freed. `--content`/`--source` were stored as garbage bytes and `search`
+  received a garbage modality and printed nothing.
+
+### Added
+- Cloud API: `confidence_gte` on `/search`, `/keyword_search` and
+  `/hybrid_search` (optional; omitted, nothing changes).
+
+### Fixed: silent overwrites in agent memory
+- **`PocketSession.note()` keys collided.** They were `time_ns() % 100000`,
+  and `time_ns()` ticks in microseconds on macOS, leaving 100 possible keys:
+  300 notes in one session produced 41 distinct keys, so most notes silently
+  replaced others. Keys are now random (`n<12 hex>`).
+- **Session ids could collide** for the same reason (hash of the clock), and
+  two sessions sharing an id share — and drop — one scratch scope. Now random.
+- **`episodes.record()` overwrote a same-second repeat.** The key is
+  `<unix second>_<slug>`, so recording one event twice in a second (a retry)
+  replaced the first, despite episodes being append-only. A taken key now gets
+  `#2`, `#3`…; an uncontested key is unchanged.
+
+### Added: `FEATHER_WAL_FULLFSYNC=1` (macOS)
+Plain `fsync()` on macOS leaves data in the drive's write cache, so a power cut
+can lose writes the WAL acknowledged. The variable switches the WAL and
+checkpoints to `F_FULLFSYNC`. Opt-in because it costs ~150× per sync (25 µs →
+3.7 ms measured); the default is unchanged. `test_concurrent_writers_share_fsyncs`
+uses it so group commit is observable on macOS (~140 fsyncs per 640 writes,
+against 611–640 without), instead of failing there.
+
+### Kept compatible with existing Cloud API clients
+Diffed against master over 99 requests (every route, the filters, errors,
+auth): identical status codes and bodies.
+- msgspec decodes with `strict=False`, so pydantic's coercions still work:
+  `"k": "5"`, `5.0` for an int, `"true"`, numeric strings in `vector`. Strict
+  mode returned 422 for all of them.
+- A 422 carries the exact `detail` pydantic produced (`loc`, `msg`, `type`,
+  `input`), rebuilt on the error path only.
+- `keyword_search` and hybrid fusion break score ties toward the higher id
+  again, as they always did; the rewrite had flipped it.
+
 ## [0.21.0] — 2026-10-12
 
 ### Feather Desk, and `confidence` / `ttl` over HTTP
@@ -363,154 +598,6 @@ one of two agent processes). Since agents are usually separate processes, file
 locking is the prerequisite for a fleet sharing one file — tracked separately.
 
 55 tests in `tests/test_pocket.py`. Suite 318 → 373.
-
-
-Concurrency and durability. See `CONCURRENCY.md` for the problems,
-`CONCURRENCY_BASELINE.md` for the before numbers and `CONCURRENCY_RESULTS.md`
-for the after numbers.
-
-### Breaking / behaviour changes
-- **`close(save=False)`.** The inter-process file lock itself shipped in
-  0.20.0 (exclusive for writers, shared for `read_only=True`, reentrant within
-  one process, `FEATHER_LOCK=0` to disable). This work builds on it:
-  - `db.close()` now also stops the background compactor before it
-    checkpoints and releases the lock.
-  - `db.close(save=False)` releases the handle without checkpointing, so the
-    WAL is kept. Tests use it to simulate a crash.
-  - `db.closed` is a property alias of `is_closed()`.
-  - Python never runs `~DB()`, so `del db` does **not** release the lock.
-- **Group commit.** A write can become visible to concurrent readers a few
-  milliseconds before its fsync completes. The writer still returns only
-  once the write is durable. `FEATHER_WAL_STRICT=1` restores the old
-  "never visible before durable" behaviour.
-- **Auto-compaction runs on a background thread.** Call
-  `wait_for_compaction()` to block until it finishes.
-- **`add_batch` applies records in chunks** (`FEATHER_BATCH_CHUNK`), so
-  readers may observe a partially applied batch.
-- **Cloud API: embeddings are never padded or truncated.** A dimension
-  mismatch returns 400.
-  - OpenAI and Azure `text-embedding-3-*` and Gemini are asked for the
-    configured dimension natively.
-  - Before this, a 1536-d model with the default dim of 768 was silently cut
-    in half.
-- **Cloud API: single-record mutations no longer save the whole file.** A
-  background checkpointer saves based on WAL size and age. Data stays durable
-  through the WAL.
-- **New WAL op `PURGE`.** Pre-0.19 builds skip it on replay.
-
-### Fixed
-- **`save()` durability:**
-  - The new base file is fsynced before it is renamed into place, and the
-    directory is fsynced after.
-  - Write errors (for example a full disk) are checked. Before, a truncated
-    snapshot could replace the file and the WAL was then deleted.
-- **Writer starvation.** The engine's lock is now a phase-fair
-  `FairSharedMutex` instead of glibc's reader-preferring rwlock. Before, 8
-  readers at 768-d cut a writer from 191 to 0.6 writes/s.
-- **The WAL fsync no longer runs while holding the exclusive lock**
-  (group commit). One fsync covers every concurrent writer.
-- **`add_batch` releases the lock between chunks.** Before, readers dropped
-  99% while batches ran.
-- **`compact()` builds without the lock and swaps at the end.** Before it
-  froze the DB for 40–86 s.
-- **Deleted HNSW slots are reused.** The vendored hnswlib was patched so
-  that re-adding a forgotten id works.
-- **`update_metadata` is O(edges of the record).** It used to be O(all
-  edges): 13 ms at 500k edges.
-- **`auto_link` and `purge` are WAL-logged.** `auto_link` also runs its kNN
-  pass under the shared lock.
-- **`save()` rotates the WAL and makes the base file durable outside the
-  lock**, so writers aren't blocked for the whole save. Snapshot readers use
-  a long-shared mode, so queries keep flowing during a checkpoint.
-- **A wrong-dimension `add()` is rejected before it reaches the WAL.**
-  Before, it was replayed on the next open, reading past the vector.
-- **`add()` with edges now updates the reverse edge index.**
-- **Array strides are handled.** Non-contiguous NumPy arrays passed to
-  `add`, `search`, `context_chain` and `hybrid_search` are now read
-  correctly.
-- **`IngestPipeline` no longer restarts its id counters per instance.** A
-  new pipeline on an existing DB used to overwrite earlier records. It now
-  continues after the highest stored id and re-learns stored entities.
-- **Internal self-queries no longer inflate `recall_count`.** This covers
-  ContextEngine sampling, ContradictionDetector, pipeline candidate lookup,
-  MMR over-fetch and tool over-fetch.
-- **`feather-serve` now starts.** `stdio_server` was called with the server
-  object as `stdin`.
-- **The LlamaIndex adapters are exported again**, as
-  `FeatherVectorStoreIndex` and `FeatherReader`.
-- **`merge()` closes the source DB.**
-
-### Performance: search
-- **Distance kernels are chosen at runtime** (`include/feather_simd.h`):
-  AVX-512F, AVX2+FMA, SSE2 or scalar on x86-64, and NEON on arm64. Each wide
-  kernel carries its own `target` attribute, so one portable binary uses the
-  best ISA the machine has.
-  - PyPI wheels were built SSE-only (`FEATHER_SIMD=sse`), so pip users never
-    got the AVX kernels. arm64 had no SIMD distance at all.
-  - Build modes: `FEATHER_SIMD=auto` (new default), `native` or `none`.
-  - `FEATHER_SIMD_RUNTIME` caps the level at run time.
-  - `feather_db.core.simd_info()` reports the kernel in use.
-  - int8 in-RAM distance also has AVX2 and NEON kernels.
-- **Filtered search:**
-  - The exact scan uses the index's SIMD distance function directly on the
-    stored vector. Before, it copied each candidate's vector and used a
-    scalar loop.
-  - Large, unselective candidate sets go through filtered HNSW with `ef`
-    raised for that one call (`searchKnnEf`). The route is picked by a cost
-    model (`candidates × selectivity² > C × k`), and the exact scan is the
-    fallback if the walk comes up short. `FEATHER_PREFILTER_MODE` forces a
-    route.
-  - Candidate sets are built as vectors instead of re-hashed sets.
-  - Only the top-k results get their metadata copied, on every search path.
-- **`search()` rejects a query of the wrong dimension** instead of reading
-  past its buffer.
-- **In-RAM int8 is now faster than float as well as 4× smaller.**
-  - The int8 AVX2 kernel processes 32 bytes per step, computing the difference
-    exactly via saturating subtracts.
-  - A new float-query × int8-row kernel (AVX2 and NEON) speeds up the int8
-    filtered scan.
-  - Measured unfiltered p50: 1.43× faster than float at 768-d and 1.82× at
-    1536-d.
-- **Atomic reader fast path in `FairSharedMutex`, and per-thread slots in the
-  HNSW visited-list pool.** Neither takes a mutex per read any more. Both are
-  verified with a ThreadSanitizer stress test (`tests/cpp/lock_stress.cpp`).
-  Measured throughput was unchanged on this machine; see
-  CONCURRENCY_RESULTS.md §8.
-- **Cloud API: hot-route request bodies are decoded with msgspec**
-  (`feather-api/app/fastparse.py`). The pydantic models remain the OpenAPI
-  schemas. Bulk import is 10–20% faster; search is unchanged within noise.
-
-### Added
-- **Python bindings:**
-  - `close(save=True)`, the `closed` property and context-manager support
-  - `wait_for_compaction(timeout)`, `is_compacting()`, `wal_size()`,
-    `wal_fsync_count()`
-  - `search(..., with_cosine=True)`, which fills `SearchResult.cosine`
-  - `SearchResult.to_dict()` and `Metadata.to_dict()`
-- **Cloud API: request options and transport:**
-  - `vector_b64` (base64 float32) as an alternative to `vector`
-  - `include_metadata=false` on search routes
-  - Responses serialized with orjson; `raw_score` cosine computed in C++
-- **Cloud API: execution:**
-  - A separate write thread pool (`FEATHER_WRITE_THREADS`)
-  - Async `ingest_text` with an embedding micro-batcher
-  - Pooled httpx clients, provider-side batch embedding and an LRU embedding
-    cache
-  - A pure ASGI metrics middleware
-  - A dev-only `mock` embedding provider
-- **Cloud API: deletes** prune edges through the reverse index, in
-  O(in-degree), for records in any modality.
-- **Sharding:**
-  - `FEATHER_SHARD_COUNT` and `FEATHER_SHARD_INDEX`; a shard answers 421 for
-    namespaces it doesn't own.
-  - New `feather-gateway/` proxy, `docker-compose.sharded.yml` and
-    `docs/deploy-sharding.md`.
-- **Benchmarks:** `benchmarks/concurrency_bench.py` and
-  `benchmarks/api_concurrency_bench.py`.
-- **Tests:** file lock, group commit, background compaction, slot reuse,
-  fair lock, API features, gateway, and Python-layer fixes.
-
----
 
 ## [0.19.0] — 2026-09-29
 

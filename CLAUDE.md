@@ -646,6 +646,14 @@ v1 WALs (≤0.17.0, no header, no CRC) still replay — the header sniff is exac
 because `'F'` cannot be a v1 opcode. Don't remove that path while any deployed
 build can still leave a v1 WAL behind. `FEATHER_WAL_SYNC=0` disables fsync.
 
+**macOS:** plain `fsync()` does not flush the drive's write cache, so by default
+a WAL write survives a process or kernel crash but not a power cut.
+`FEATHER_WAL_FULLFSYNC=1` uses `F_FULLFSYNC` (WAL and checkpoints) for real
+durability at ~150× the cost per sync (25 µs → 3.7 ms measured). Opt-in, as
+SQLite's `fullfsync` is; a no-op on other platforms. It is also why
+`test_concurrent_writers_share_fsyncs` sets it: a 25 µs fsync is too short for
+writers to overlap, so group commit is unobservable without it.
+
 **Checkpoints (0.19).** `save()` writes the snapshot under the SHARED lock, then
 `wal_rotate()` renames `<wal>` → `<wal>.old`, and the fsync + atomic replace of
 the base file happen after the lock is released; `<wal>.old` is deleted last.
@@ -676,6 +684,18 @@ listed `.cpp` sources, so before `depends=glob("include/*.h")` was added to
 `setup.py`, an incremental `build_ext` after a header edit reused stale objects
 and produced a build that looked fresh but contained none of the changes. If you
 ever see a change "not take effect", `rm -rf build` and rebuild.
+
+### Filtered search is exact unless you opt out
+An indexed filter (namespace / entity / attribute) ranks exactly over the
+candidate set — a complete top-k, which `Pocket.recall` depends on.
+`FEATHER_PREFILTER_MODE=auto` enables the cost model that walks the graph for
+large unselective sets: faster, approximate (recall@10 ≈ 0.86 on a 50%
+filter). Don't make `auto` the default; it silently changes results.
+
+### Auto-compaction is asynchronous
+`set_auto_compact()` compacts on a background thread. `size()` counts
+tombstones until it finishes, so read it after `wait_for_compaction()` if you
+need the post-compaction number.
 
 ### Max elements per index (adaptive since v0.15.3)
 Each modality index starts at `INITIAL_MAX_ELEMENTS = 4096` and grows on demand: `reserve()` calls `resizeIndex()` (doubling) before any insert exceeds capacity. There is no hard ceiling — indices grow to fit whatever you store. `resizeIndex` is **not thread-safe**, so `reserve()` runs before `parallel_add` for the full batch size, never from inside it.
