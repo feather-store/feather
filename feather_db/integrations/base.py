@@ -399,7 +399,8 @@ class FeatherTools:
         product: Optional[str] = None,
     ) -> str:
         vec     = self.embed(query)
-        results = self.db.search(vec, k=k * 3)  # over-fetch, then filter
+        # over-fetch, then filter; count a recall only for what is returned
+        results = self.db.search(vec, k=k * 3, record_salience=False)
 
         output = []
         for r in results:
@@ -423,6 +424,8 @@ class FeatherTools:
             if len(output) >= k:
                 break
 
+        for item in output:
+            self.db.touch(item["id"])
         return json.dumps({"results": output, "count": len(output)}, indent=2)
 
     def feather_context_chain(
@@ -783,7 +786,8 @@ class FeatherTools:
                     vec, query, k=k * 2, modality="text", scoring=scoring
                 )
             except Exception:
-                results = self.db.search(vec, k=k * 2, modality="text", scoring=scoring)
+                results = self.db.search(vec, k=k * 2, modality="text", scoring=scoring,
+                                         record_salience=False)
 
             output = []
             for r in results:
@@ -801,6 +805,8 @@ class FeatherTools:
                 if len(output) >= k:
                     break
 
+            for item in output:          # a recall = returned to the agent
+                self.db.touch(item["id"])
             return json.dumps({"results": output, "count": len(output),
                                "decay": {"half_life": half_life_days,
                                          "time_weight": time_weight}}, indent=2)

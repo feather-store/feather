@@ -109,12 +109,12 @@ class TestMetadata:
 
 class TestPersistence:
     def test_save_and_reload(self, populated_db, tmp_path_feather):
-        populated_db.save()
+        populated_db.close()
         db2 = DB.open(tmp_path_feather, dim=128)
         assert set(db2.get_all_ids()) == {1, 2, 3, 4, 5, 6}
 
     def test_metadata_survives_reload(self, populated_db, tmp_path_feather):
-        populated_db.save()
+        populated_db.close()
         db2 = DB.open(tmp_path_feather, dim=128)
         meta = db2.get_metadata(3)
         assert meta is not None
@@ -124,12 +124,12 @@ class TestPersistence:
         meta = feather_db.Metadata()
         meta.set_attribute("tier", "enterprise")
         db.add(id=99, vec=EMBED("client"), meta=meta)
-        db.save()
+        db.close()
         db2 = DB.open(tmp_path_feather, dim=128)
         assert db2.get_metadata(99).get_attribute("tier") == "enterprise"
 
     def test_multimodal_survives_reload(self, populated_db, tmp_path_feather):
-        populated_db.save()
+        populated_db.close()
         db2 = DB.open(tmp_path_feather, dim=128)
         visual_ids = db2.get_all_ids(modality="visual")
         assert len(visual_ids) == 6

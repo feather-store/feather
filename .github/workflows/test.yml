@@ -37,6 +37,9 @@ jobs:
         # langgraph + mcp on 3.10+: both require >=3.10, and both adapters must
         # not rot — the previous MCP server broke silently against SDK 2.0.
         if [ "${{ matrix.python-version }}" != "3.9" ]; then pip install langgraph "mcp>=2.0.0"; fi
+        # orjson: the API's fast response path; uvicorn: tests/test_gateway.py
+        # starts real API shards behind the gateway.
+        pip install orjson uvicorn msgspec
 
     - name: Build C++ extension
       run: python setup.py build_ext --inplace

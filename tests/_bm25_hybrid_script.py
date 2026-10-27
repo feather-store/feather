@@ -348,8 +348,7 @@ print("\n── Section 5: Persistence & Updates ─────────")
 db, f = make_db(BASE_CORPUS)
 before = [x.id for x in db.keyword_search("BM25 search retrieval", k=5)]
 db.save()
-del db
-
+db.close(save=False)   # drop the handle: no checkpoint, lock released
 db2 = feather_db.DB.open(f, dim=128)
 after = [x.id for x in db2.keyword_search("BM25 search retrieval", k=5)]
 check("T21 BM25 rebuilds from metadata after reload",
@@ -520,7 +519,7 @@ cleanup(f_large)
 # ── T32: BM25 on 5k corpus — save/reload preserves results ───────────────────
 db, f = make_db(BASE_CORPUS)
 r_before = [(x.id, round(x.score, 4)) for x in db.keyword_search("retrieval search systems", k=5)]
-db.save()
+db.close()
 db2 = feather_db.DB.open(f, dim=128)
 r_after = [(x.id, round(x.score, 4)) for x in db2.keyword_search("retrieval search systems", k=5)]
 check("T32 save+reload — BM25 scores identical", r_before == r_after,

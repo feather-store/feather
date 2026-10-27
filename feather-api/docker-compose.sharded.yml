@@ -1,0 +1,41 @@
+# Sharded Feather Cloud: 1 gateway + 4 single-core API shards over one volume.
+#
+#   FEATHER_API_KEY=... docker compose -f docker-compose.sharded.yml up
+#
+# Each shard serves only the namespaces with crc32(ns) % 4 == its index. They
+# can share one data volume safely: the engine's per-namespace file lock and
+# the shard ownership check both prevent two shards opening the same file.
+# Changing the shard count: see docs/deploy-sharding.md.
+x-shard: &shard
+  image: ghcr.io/feather-store/feather-api:latest
+  restart: unless-stopped
+  volumes: ["feather-data:/data"]
+  environment: &shard-env
+    FEATHER_API_KEY: ${FEATHER_API_KEY:?set FEATHER_API_KEY}
+    FEATHER_DATA_DIR: /data
+    FEATHER_SHARD_COUNT: "4"
+
+services:
+  api0:
+    <<: *shard
+    environment: { <<: *shard-env, FEATHER_SHARD_INDEX: "0" }
+  api1:
+    <<: *shard
+    environment: { <<: *shard-env, FEATHER_SHARD_INDEX: "1" }
+  api2:
+    <<: *shard
+    environment: { <<: *shard-env, FEATHER_SHARD_INDEX: "2" }
+  api3:
+    <<: *shard
+    environment: { <<: *shard-env, FEATHER_SHARD_INDEX: "3" }
+
+  gateway:
+    build: ../feather-gateway
+    restart: unless-stopped
+    ports: ["8000:8080"]
+    environment:
+      FEATHER_SHARDS: http://api0:8000,http://api1:8000,http://api2:8000,http://api3:8000
+    depends_on: [api0, api1, api2, api3]
+
+volumes:
+  feather-data:

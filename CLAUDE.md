@@ -551,11 +551,15 @@ python setup.py sdist bdist_wheel
 - `src/filter.cpp`, `src/metadata.cpp`, `src/scoring.cpp`
 - Flags: `-O3 -std=c++17`
 
-### Enabling SIMD (Performance Optimization)
-```python
-# In setup.py extra_compile_args:
-"-DUSE_AVX", "-march=native", "-ffast-math"
-```
+### SIMD (runtime-dispatched since 0.19)
+Distance kernels live in `include/feather_simd.h` and are picked at RUNTIME from
+CPUID: AVX-512F / AVX2+FMA / SSE2 / scalar on x86-64, NEON on arm64. Wide
+kernels use per-function `FEATHER_TARGET("avx2,fma")` attributes — never add a
+global `-mavx`/`-march` to the default build (it makes wheels crash on older
+CPUs). Build modes: `FEATHER_SIMD=auto` (default) | `native` | `none`;
+`FEATHER_SIMD_RUNTIME=scalar|sse|avx2|avx512` caps the level for A/B tests;
+`feather_db.core.simd_info()` reports it. A new kernel needs a numpy
+equivalence case in `tests/test_simd.py` (it runs every level the CPU has).
 
 ### Rust CLI
 ```bash
@@ -615,20 +619,59 @@ The WAL is format **v2**: an 8-byte header (`FWAL` + version) then records of
   at the first mismatch. A length check alone only catches a short tail; it
   cannot see a record that is the right size with the wrong bytes, and replaying
   one writes garbage into the next checkpoint.
-- **Sync is per-mutation, not per-append.** `wal_append()` writes and flushes;
-  `wal_sync()` is what reaches stable storage. Single-record mutations call it
-  immediately. `add_batch()` and `forget_expired()` call it **once at the end** —
-  one fsync per batch, not per record (measured: `add()` +19%, `add_batch()` ~0%).
-  If you add a new bulk mutation, follow that pattern or you will fsync per item.
+- **Append inside the lock, wait for durability outside it (group commit, 0.19).**
+  `wal_append()` writes + flushes and returns the record's LSN; call it while
+  holding `mutex_` exclusively so WAL order == apply order. After releasing
+  `mutex_`, call `wal_wait_durable(lsn)` — a leader fsyncs everything appended
+  so far and releases every writer it covers. A new mutation follows this shape:
+
+  ```cpp
+  const std::string payload = encode_...(...);          // no lock
+  uint64_t lsn = 0;
+  {
+      std::unique_lock<RWMutex> lock(mutex_);
+      ensure_open();
+      /* validate BEFORE logging */  lsn = wal_append(WalOp::X, id, payload);
+      /* apply in memory */
+      if (wal_strict()) wal_wait_durable(lsn);           // FEATHER_WAL_STRICT=1
+  }
+  wal_wait_durable(lsn);                                // never inside mutex_ otherwise
+  ```
+
+  Bulk mutations append all records and wait once on the last LSN. Never fsync
+  (or call `wal_wait_durable`) inside the exclusive lock outside strict mode:
+  it blocks every reader for the disk flush (measured −68% reads, 1 writer).
 
 v1 WALs (≤0.17.0, no header, no CRC) still replay — the header sniff is exact
 because `'F'` cannot be a v1 opcode. Don't remove that path while any deployed
 build can still leave a v1 WAL behind. `FEATHER_WAL_SYNC=0` disables fsync.
 
+**macOS:** plain `fsync()` does not flush the drive's write cache, so by default
+a WAL write survives a process or kernel crash but not a power cut.
+`FEATHER_WAL_FULLFSYNC=1` uses `F_FULLFSYNC` (WAL and checkpoints) for real
+durability at ~150× the cost per sync (25 µs → 3.7 ms measured). Opt-in, as
+SQLite's `fullfsync` is; a no-op on other platforms. It is also why
+`test_concurrent_writers_share_fsyncs` sets it: a 25 µs fsync is too short for
+writers to overlap, so group commit is unobservable without it.
+
+**Checkpoints (0.19).** `save()` writes the snapshot under the SHARED lock, then
+`wal_rotate()` renames `<wal>` → `<wal>.old`, and the fsync + atomic replace of
+the base file happen after the lock is released; `<wal>.old` is deleted last.
+`load_vectors()` replays `<wal>.old` then `<wal>`. Replay must stay idempotent
+(a crash after the rename replays `<wal>.old` over a base that already has it).
+Every new WalOp must be replayable twice without changing the result.
+
 ### Locking model — which lock does your new method need?
-`mutex_` is a `std::shared_mutex`. Take `std::shared_lock` if the method only
+`mutex_` is a `FairSharedMutex` (phase-fair, atomic reader fast path; alias
+`RWMutex`; any change to it must pass `tests/cpp/lock_stress.cpp`, including
+under `-fsanitize=thread`) — glibc's
+`std::shared_mutex` prefers readers and starved writers under read load. It is
+**not recursive**: never take it shared while already holding it shared (a
+waiting writer would deadlock you). Lock order is `save_mutex_` → `mutex_` →
+`wal_mutex_`; never join the compactor thread while holding `mutex_`.
+Take `std::shared_lock<RWMutex>` if the method only
 reads (all const accessors, `search`, `keyword_search`, `hybrid_search`,
-`context_chain`, `save`); take `std::unique_lock` if it mutates
+`context_chain`, `save`'s snapshot); take `std::unique_lock<RWMutex>` if it mutates
 `metadata_store_`, any derived index, or the HNSW graph — including anything
 that can trigger `resizeIndex`, which is not thread-safe. The one exception is
 salience: `Metadata::recall_count` / `last_recalled_at` are `mutable
@@ -641,6 +684,18 @@ listed `.cpp` sources, so before `depends=glob("include/*.h")` was added to
 `setup.py`, an incremental `build_ext` after a header edit reused stale objects
 and produced a build that looked fresh but contained none of the changes. If you
 ever see a change "not take effect", `rm -rf build` and rebuild.
+
+### Filtered search is exact unless you opt out
+An indexed filter (namespace / entity / attribute) ranks exactly over the
+candidate set — a complete top-k, which `Pocket.recall` depends on.
+`FEATHER_PREFILTER_MODE=auto` enables the cost model that walks the graph for
+large unselective sets: faster, approximate (recall@10 ≈ 0.86 on a 50%
+filter). Don't make `auto` the default; it silently changes results.
+
+### Auto-compaction is asynchronous
+`set_auto_compact()` compacts on a background thread. `size()` counts
+tombstones until it finishes, so read it after `wait_for_compaction()` if you
+need the post-compaction number.
 
 ### Max elements per index (adaptive since v0.15.3)
 Each modality index starts at `INITIAL_MAX_ELEMENTS = 4096` and grows on demand: `reserve()` calls `resizeIndex()` (doubling) before any insert exceeds capacity. There is no hard ceiling — indices grow to fit whatever you store. `resizeIndex` is **not thread-safe**, so `reserve()` runs before `parallel_add` for the full batch size, never from inside it.
@@ -690,6 +745,10 @@ on the file: `realpath` only resolves an existing file, and on macOS rewrites
 `/var/…` → `/private/var/…`, so keying on the file gave a different key before
 and after the first save — reentrancy missed and the handle reported *itself* as
 "another process (pid \<ourselves\>)".
+
+`close(save=False)` releases the handle WITHOUT checkpointing, so the WAL is
+kept. That is how a test simulates a crash. `close()` also stops the background
+compactor first, so call it before handing a file to another process.
 
 ### File saved on close
 `feather::DB::~DB()` calls `save()`. Call `db.save()` explicitly in long-running

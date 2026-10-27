@@ -32,7 +32,7 @@ V = (centers[assign] + rng.standard_normal((N, DIM)).astype(np.float32) * 0.5).a
 for i in range(N):
     db.add(id=i, vec=V[i])
 db.save()
-del db
+db.close(save=False)
 sz = os.path.getsize(path)
 print(f"  saved {sz/1e6:.1f} MB (graph persisted)")
 
@@ -64,20 +64,22 @@ check("persisted load restored all N", dbp.size() == N, f"got {dbp.size()}")
 rp = recall(dbp, qs)
 print(f"  recall@10 (persisted, == serial-build quality) = {rp:.3f}")
 check("persisted recall@10 >= 0.88", rp >= 0.88, f"{rp:.3f}")
-del dbp
+dbp.close(save=False)
 
 # ── 2) parallel rebuild fallback (forget one id => graph not persisted) ──
 print("forcing rebuild fallback (forget 1 id) ...")
-d = fc.DB.open(path, dim=DIM); d.forget(id=0); d.save(); del d
+d = fc.DB.open(path, dim=DIM); d.forget(id=0); d.save(); d.close(save=False)
 with open(path, "rb") as fh:
     fh.read(4); ver2 = int.from_bytes(fh.read(4), "little")
 print(f"  re-saved (v{ver2}, rebuild path: live<total)")
 db1, t_serial = timed_load(1)
+r1 = recall(db1, qs)
+db1.close(save=False)          # single owner: release before the second load
 db8, t_par = timed_load(8)
 print(f"  serial rebuild:   {t_serial*1000:8.1f} ms")
 print(f"  parallel rebuild: {t_par*1000:8.1f} ms   ({t_serial/t_par:.2f}x faster)")
 check("rebuild loaded all (N-1)", db8.size() == N - 1, f"got {db8.size()}")
-r1, r8 = recall(db1, qs), recall(db8, qs)
+r8 = recall(db8, qs)
 print(f"  recall@10 — serial={r1:.3f}  parallel={r8:.3f}")
 check("serial rebuild recall@10 >= 0.88", r1 >= 0.88, f"{r1:.3f}")
 check("parallel rebuild recall@10 >= 0.88", r8 >= 0.88, f"{r8:.3f}")

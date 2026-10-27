@@ -382,7 +382,16 @@ def main():
         print(f"    • {spec['name']}", file=sys.stderr)
     print("", file=sys.stderr)
 
-    asyncio.run(stdio_server(server))
+    # stdio_server() is an async context manager yielding the (read, write)
+    # streams; the server runs inside it. (It was previously called as
+    # stdio_server(server), which passed the server object as `stdin` and
+    # never started serving.)
+    async def _serve():
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream,
+                             server.create_initialization_options())
+
+    asyncio.run(_serve())
 
 
 if __name__ == "__main__":

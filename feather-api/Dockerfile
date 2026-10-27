@@ -38,6 +38,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy API source + static admin SPA
 COPY feather-api/app /app/app
 COPY feather-api/static /app/static
+# Feather Desk (/app). main.py looks for it three levels above app/main.py,
+# which in this image is /feather-web; without it /app answers 404.
+COPY feather-web/index.html /feather-web/index.html
 
 # Data directory (override with -v /host/data:/data)
 RUN mkdir -p /data

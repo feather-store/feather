@@ -1,0 +1,245 @@
+{
+  "_meta": {
+    "n": 20000,
+    "dim": 128,
+    "seconds": 10.0,
+    "slow_embed_ms": 300.0,
+    "workers": 1,
+    "cpus": 32,
+    "wal_sync": "1",
+    "import_s": 3.5,
+    "final_stats": {
+      "namespace": "bench",
+      "db_path": "bench.feather",
+      "dim": 128,
+      "modalities": [
+        "text"
+      ],
+      "records": 67456
+    }
+  },
+  "search_c1": {
+    "search": {
+      "ops": 3373,
+      "ops_per_s": 337.3,
+      "p50_ms": 2.92,
+      "p90_ms": 3.24,
+      "p99_ms": 3.65,
+      "max_ms": 22.7,
+      "over_100ms": 0,
+      "over_1s": 0,
+      "status": {
+        "200": 3373
+      }
+    },
+    "server_cpu_pct": 79.4,
+    "loads": {
+      "search": 1
+    }
+  },
+  "search_c16": {
+    "search": {
+      "ops": 4878,
+      "ops_per_s": 487.8,
+      "p50_ms": 32.31,
+      "p90_ms": 38.01,
+      "p99_ms": 53.93,
+      "max_ms": 65.3,
+      "over_100ms": 0,
+      "over_1s": 0,
+      "status": {
+        "200": 4878
+      }
+    },
+    "server_cpu_pct": 113.8,
+    "loads": {
+      "search": 16
+    }
+  },
+  "search_c64": {
+    "search": {
+      "ops": 4970,
+      "ops_per_s": 497.0,
+      "p50_ms": 127.12,
+      "p90_ms": 152.23,
+      "p99_ms": 180.92,
+      "max_ms": 200.1,
+      "over_100ms": 4868,
+      "over_1s": 0,
+      "status": {
+        "200": 4970
+      }
+    },
+    "server_cpu_pct": 113.1,
+    "loads": {
+      "search": 64
+    }
+  },
+  "search_c16_plus_write_c8": {
+    "search": {
+      "ops": 2644,
+      "ops_per_s": 264.4,
+      "p50_ms": 59.86,
+      "p90_ms": 71.89,
+      "p99_ms": 86.28,
+      "max_ms": 108.3,
+      "over_100ms": 10,
+      "over_1s": 0,
+      "status": {
+        "200": 2644
+      }
+    },
+    "write": {
+      "ops": 1435,
+      "ops_per_s": 143.5,
+      "p50_ms": 54.67,
+      "p90_ms": 67.46,
+      "p99_ms": 80.9,
+      "max_ms": 110.2,
+      "over_100ms": 2,
+      "over_1s": 0,
+      "status": {
+        "201": 1435
+      }
+    },
+    "server_cpu_pct": 101.9,
+    "loads": {
+      "search": 16,
+      "write": 8
+    }
+  },
+  "search_c16_plus_ingest_c64_fast_embed": {
+    "search": {
+      "ops": 746,
+      "ops_per_s": 74.6,
+      "p50_ms": 214.61,
+      "p90_ms": 239.04,
+      "p99_ms": 264.47,
+      "max_ms": 300.0,
+      "over_100ms": 746,
+      "over_1s": 0,
+      "status": {
+        "200": 746
+      }
+    },
+    "ingest": {
+      "ops": 1893,
+      "ops_per_s": 189.3,
+      "p50_ms": 340.92,
+      "p90_ms": 371.24,
+      "p99_ms": 402.11,
+      "max_ms": 571.8,
+      "over_100ms": 1893,
+      "over_1s": 0,
+      "status": {
+        "200": 1893
+      }
+    },
+    "server_cpu_pct": 106.3,
+    "loads": {
+      "search": 16,
+      "ingest": 64
+    },
+    "embed_delay_ms": 5
+  },
+  "search_c16_plus_ingest_c64_slow_embed": {
+    "search": {
+      "ops": 518,
+      "ops_per_s": 51.8,
+      "p50_ms": 309.7,
+      "p90_ms": 341.83,
+      "p99_ms": 467.63,
+      "max_ms": 614.5,
+      "over_100ms": 515,
+      "over_1s": 0,
+      "status": {
+        "200": 518
+      }
+    },
+    "ingest": {
+      "ops": 1276,
+      "ops_per_s": 127.6,
+      "p50_ms": 513.72,
+      "p90_ms": 557.42,
+      "p99_ms": 698.97,
+      "max_ms": 777.8,
+      "over_100ms": 1276,
+      "over_1s": 0,
+      "status": {
+        "200": 1276
+      }
+    },
+    "server_cpu_pct": 72.5,
+    "loads": {
+      "search": 16,
+      "ingest": 64
+    },
+    "embed_delay_ms": 300.0
+  },
+  "search_c16_plus_delete_c2": {
+    "search": {
+      "ops": 2707,
+      "ops_per_s": 270.7,
+      "p50_ms": 61.33,
+      "p90_ms": 72.0,
+      "p99_ms": 95.92,
+      "max_ms": 107.7,
+      "over_100ms": 12,
+      "over_1s": 0,
+      "status": {
+        "200": 2707
+      }
+    },
+    "delete": {
+      "ops": 148,
+      "ops_per_s": 14.8,
+      "p50_ms": 134.81,
+      "p90_ms": 162.69,
+      "p99_ms": 185.35,
+      "max_ms": 208.6,
+      "over_100ms": 140,
+      "over_1s": 0,
+      "status": {
+        "200": 148
+      }
+    },
+    "server_cpu_pct": 153.5,
+    "loads": {
+      "search": 16,
+      "delete": 2
+    }
+  },
+  "search_c16_plus_import_c1": {
+    "import": {
+      "ops": 43,
+      "ops_per_s": 4.3,
+      "p50_ms": 231.69,
+      "p90_ms": 241.1,
+      "p99_ms": 293.12,
+      "max_ms": 310.0,
+      "over_100ms": 43,
+      "over_1s": 0,
+      "status": {
+        "200": 43
+      }
+    },
+    "search": {
+      "ops": 3004,
+      "ops_per_s": 300.4,
+      "p50_ms": 38.81,
+      "p90_ms": 105.77,
+      "p99_ms": 124.7,
+      "max_ms": 145.3,
+      "over_100ms": 327,
+      "over_1s": 0,
+      "status": {
+        "200": 3004
+      }
+    },
+    "server_cpu_pct": 281.8,
+    "loads": {
+      "search": 16,
+      "import": 1
+    }
+  }
+}

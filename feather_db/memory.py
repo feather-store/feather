@@ -184,8 +184,11 @@ class MemoryManager:
             fetch_k = min(k * 5, 200)
 
         # Over-fetch candidates
+        # Over-fetch without recording recalls: only the k records MMR finally
+        # returns are "recalled" (touched below), not all fetch_k candidates.
         candidates = db.search(query_vec, k=fetch_k,
-                               filter=filter, scoring=scoring, modality=modality)
+                               filter=filter, scoring=scoring, modality=modality,
+                               record_salience=False)
         if not candidates:
             return []
 
@@ -233,6 +236,8 @@ class MemoryManager:
             if chosen.id in vecs:
                 selected_vecs.append(vecs[chosen.id])
 
+        for r in selected:
+            db.touch(r.id)
         return selected
 
     # ── Tier assignment ──────────────────────────────────────────────────────

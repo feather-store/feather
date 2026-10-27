@@ -64,7 +64,7 @@ def main():
         query = np.random.random(DIM).astype(np.float32)
         
         start = time.time()
-        ids, distances = db.search(query, k=10)
+        results = db.search(query, k=10)
         search_time = (time.time() - start) * 1000  # Convert to ms
         
         search_times.append(search_time)

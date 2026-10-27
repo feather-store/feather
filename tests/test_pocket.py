@@ -489,6 +489,18 @@ def test_close_reports_what_happened(fleet):
     assert r["kept"] == ["k"]
 
 
+def test_notes_and_sessions_never_collide(fleet):
+    """Both were derived from time_ns(), which ticks in microseconds on macOS:
+    note keys had 100 possible values (so ~1% of pairs overwrote each other)
+    and back-to-back sessions could get one id and share scratch."""
+    agent = pocket(fleet, ("org", "a"))
+    s = agent.session()
+    keys = [s.note(f"note {i}") for i in range(300)]
+    assert len(set(keys)) == 300
+    assert s.close()["scratch_dropped"] == 300
+    assert len({agent.session().id for _ in range(1000)}) == 1000
+
+
 def test_sessions_are_isolated_from_each_other(fleet):
     agent = pocket(fleet, ("org", "a"))
     s1 = agent.session()

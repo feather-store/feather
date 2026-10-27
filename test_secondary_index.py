@@ -74,7 +74,7 @@ check("email now {1}", db.ids_with_attribute("channel","email") == [1])
 
 print("6) persistence: save + reload rebuilds indexes (dead excluded)")
 db.save()
-del db
+db.close(save=False)
 db2 = feather_db.DB.open(path, dim=DIM)
 check("reload acme {1}", db2.ids_in_namespace("acme") == [1])
 check("reload globex empty (purged)", db2.ids_in_namespace("globex") == [])

@@ -188,7 +188,7 @@ class ContradictionDetector:
             return []
 
         # Search for highly similar nodes
-        results = db.search(query_vec, k=top_k + 1)
+        results = db.search(query_vec, k=top_k + 1, record_salience=False)
 
         contradictions: list[int] = []
         for r in results:
@@ -237,7 +237,7 @@ class ContradictionDetector:
             if meta is None:
                 continue
 
-            results = db.search(q, k=top_k + 1, modality=modality)
+            results = db.search(q, k=top_k + 1, modality=modality, record_salience=False)
             for r in results:
                 if r.id == nid:
                     continue

@@ -1,7 +1,33 @@
 #pragma once
 #include "hnswlib.h"
+#include "feather_simd.h"
 
 namespace hnswlib {
+
+// ── Feather: runtime-dispatched distance functions (see feather_simd.h) ──
+// One wrapper per kernel, chosen ONCE when a space is constructed, so the
+// search hot path is a plain indirect call with no per-call dispatch.
+template <feather_simd::L2Fn F>
+static float FeatherL2Dist(const void *a, const void *b, const void *qty_ptr) {
+    return F(static_cast<const float *>(a), static_cast<const float *>(b),
+             *static_cast<const size_t *>(qty_ptr));
+}
+
+static DISTFUNC<float> feather_l2_distfunc(int level) {
+    switch (level) {
+#if defined(FEATHER_SIMD_X86)
+        case feather_simd::AVX512: return FeatherL2Dist<feather_simd::l2_avx512>;
+        case feather_simd::AVX2:   return FeatherL2Dist<feather_simd::l2_avx2>;
+#  if defined(FEATHER_HAVE_SSE2)
+        case feather_simd::SSE:    return FeatherL2Dist<feather_simd::l2_sse>;
+#  endif
+#endif
+#if defined(FEATHER_SIMD_NEON)
+        case feather_simd::NEON:   return FeatherL2Dist<feather_simd::l2_neon>;
+#endif
+        default:                   return FeatherL2Dist<feather_simd::l2_scalar>;
+    }
+}
 
 static float
 L2Sqr(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
@@ -212,27 +238,10 @@ class L2Space : public SpaceInterface<float> {
 
  public:
     L2Space(size_t dim) {
-        fstdistfunc_ = L2Sqr;
-#if defined(USE_SSE) || defined(USE_AVX) || defined(USE_AVX512)
-    #if defined(USE_AVX512)
-        if (AVX512Capable())
-            L2SqrSIMD16Ext = L2SqrSIMD16ExtAVX512;
-        else if (AVXCapable())
-            L2SqrSIMD16Ext = L2SqrSIMD16ExtAVX;
-    #elif defined(USE_AVX)
-        if (AVXCapable())
-            L2SqrSIMD16Ext = L2SqrSIMD16ExtAVX;
-    #endif
-
-        if (dim % 16 == 0)
-            fstdistfunc_ = L2SqrSIMD16Ext;
-        else if (dim % 4 == 0)
-            fstdistfunc_ = L2SqrSIMD4Ext;
-        else if (dim > 16)
-            fstdistfunc_ = L2SqrSIMD16ExtResiduals;
-        else if (dim > 4)
-            fstdistfunc_ = L2SqrSIMD4ExtResiduals;
-#endif
+        // Feather: pick the widest kernel this CPU supports at runtime
+        // (AVX-512 / AVX2+FMA / SSE2 / NEON / scalar); every kernel handles
+        // any dim, tails included.
+        fstdistfunc_ = feather_l2_distfunc(feather_simd::level());
         dim_ = dim;
         data_size_ = dim * sizeof(float);
     }
@@ -278,6 +287,26 @@ Int8L2SqrGlobal(const void *pa, const void *pb, const void *param_ptr) {
     return p->scale * p->scale * static_cast<float>(acc);
 }
 
+template <feather_simd::I8L2Fn F>
+static float FeatherInt8L2Dist(const void *pa, const void *pb, const void *param_ptr) {
+    const Int8Params *p = static_cast<const Int8Params *>(param_ptr);
+    return p->scale * p->scale *
+           static_cast<float>(F(static_cast<const int8_t *>(pa), static_cast<const int8_t *>(pb), p->dim));
+}
+
+static DISTFUNC<float> feather_int8_distfunc(int level) {
+#if defined(FEATHER_SIMD_X86)
+    if (level == feather_simd::AVX2 || level == feather_simd::AVX512)
+        return FeatherInt8L2Dist<feather_simd::i8_l2_avx2>;
+#endif
+#if defined(FEATHER_SIMD_NEON)
+    if (level == feather_simd::NEON)
+        return FeatherInt8L2Dist<feather_simd::i8_l2_neon>;
+#endif
+    (void)level;
+    return Int8L2SqrGlobal;
+}
+
 class Int8L2Space : public SpaceInterface<float> {
     DISTFUNC<float> fstdistfunc_;
     Int8Params params_;
@@ -288,7 +317,7 @@ class Int8L2Space : public SpaceInterface<float> {
         params_.dim = dim;
         params_.scale = scale;
         data_size_ = dim * sizeof(int8_t);
-        fstdistfunc_ = Int8L2SqrGlobal;
+        fstdistfunc_ = feather_int8_distfunc(feather_simd::level());
     }
 
     size_t get_data_size() { return data_size_; }
