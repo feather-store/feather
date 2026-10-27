@@ -7,6 +7,19 @@
 # exists, so a failure tells you what broke rather than just that something did.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Default to the newest local venv that can actually run every leg. The MCP
+# SDK requires Python >=3.10, so a 3.9 .venv cannot run the MCP suite at all
+# and reports four failures that are environment, not code. Override with PY=.
+if [ -z "${PY:-}" ]; then
+  for cand in .venv313/bin/python .venv312/bin/python .venv311/bin/python \
+              .venv310/bin/python .venv/bin/python; do
+    [ -x "$cand" ] || continue
+    if "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
+      PY=$cand; break
+    fi
+    PY=${PY:-$cand}   # remember a too-old one only as a last resort
+  done
+fi
 PY=${PY:-.venv/bin/python}
 QUICK=${1:-full}
 pass=0; fail=0; skip=0
