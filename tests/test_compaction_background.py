@@ -57,10 +57,35 @@ def test_writes_during_compaction_are_kept(tmp_path):
     stop.set()
     t.join()
     assert removed >= n // 3 - 1
-    for rid, v in added:
-        hits = [r.id for r in db.search(v, k=1, record_salience=False)]
-        assert hits == [rid], f"record {rid} added during compaction is not searchable"
+
+    # "Kept" means the record survived the swap, so assert presence, not ANN
+    # recall. HNSW is approximate: a k=1 query at the default ef=10 can miss a
+    # record that is present and perfectly intact, and about 0.06-0.09% of the
+    # records added during compaction are exactly that. The miss is reachable
+    # at a wider beam, so nothing is lost or orphaned.
+    #
+    # The original assertion (hits == [rid] at default ef) made this test a
+    # coin flip on machine speed. It failed on macos CI with the same two ids
+    # on 3.9 and on 3.13 — deterministic, because the fixtures are seeded, so
+    # WHICH record is hard to reach is fixed and only whether the writer gets
+    # that far varies. It passed everywhere the writer stopped short of it.
     ids = set(db.get_all_ids())
+    for rid, v in added:
+        assert rid in ids, f"record {rid} added during compaction was dropped"
+        stored = db.get_vector(rid)
+        assert stored is not None and len(stored) == 32, f"record {rid} lost its vector"
+        assert np.allclose(stored, v), f"record {rid} came back with the wrong vector"
+
+    # And it must still be retrievable through the graph at a beam wide enough
+    # for an exact self-match, which is what "searchable" can honestly mean.
+    db.set_ef(400)
+    try:
+        for rid, v in added:
+            hits = [r.id for r in db.search(v, k=50, record_salience=False)]
+            assert rid in hits, f"record {rid} is in the index but unreachable"
+    finally:
+        db.set_ef(10)
+
     assert not ids & set(forgotten), "a record forgotten during compaction came back"
     db.close()
 
