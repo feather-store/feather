@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — post-merge review of the concurrency work
+
+Three defects found reviewing PR #8 and fixed on master directly after it
+merged. Each has a regression test.
+
+- **`hybrid_search()` returned soft-deleted records that `search()` filtered
+  out.** `is_dead_meta()` is meant to be one rule applied by every search
+  path, but the vector-side filter functor inside `hybrid_search` never got
+  it, so with a filter set the BM25 half dropped a tombstone and the vector
+  half fused it straight back in through RRF. Measured on a three-record
+  namespace: `search() -> [1]`, `keyword_search() -> [1]`,
+  `hybrid_search() -> [1, 2]`. A `_deleted` record is not `markDelete`d in
+  HNSW — only `forget()` does that — so this check was the only thing
+  keeping it out of the graph walk.
+- **A corrupt dim in a v1 WAL sized an allocation before it was validated.**
+  `replay_wal`'s ADD handler read `dim32` off disk and used it for both
+  `std::vector<float> vec(dim32)` and `get_or_create_index(modality, dim32)`
+  before the only bound (`dim32 != m_idx.dim`) ran. `dim32 * 4` is unsigned,
+  so `0x40000000` wrapped the read length to zero while still reserving
+  4 GB. v2 records are CRC-protected; v1 WALs (<=0.17.0) are not and are
+  deliberately still replayed, so one corrupt byte was enough to OOM a
+  memory-capped container on startup. `dim32` is now bounded against the
+  bytes the record actually carries, before either allocation — the same
+  rule the `plen` guard above it already applied.
+- **The BM25 tie-break comment stated both rules and matched neither.** Two
+  consecutive lines claimed ties go to the smaller id and to the higher id.
+  The code does the latter; `search()` does the former. Behaviour is
+  unchanged — the comment now says so, and says why the two are not unified.
+
 ### Concurrency, compaction and search-path optimizations
 
 Concurrency and durability. See `CONCURRENCY.md` for the problems,

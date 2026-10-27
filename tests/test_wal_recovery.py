@@ -166,3 +166,77 @@ def test_save_checkpoints_and_clears_the_wal(tmp_path):
     assert not os.path.exists(path + ".wal"), "save() should checkpoint the WAL away"
     db.close(save=False)   # drop the handle: no checkpoint, lock released
     assert DB.open(path, dim=16).size() == 1
+
+
+# ---------------------------------------------------------------------------
+# A count read off disk is an allocation size, and must be bounded first.
+# ---------------------------------------------------------------------------
+
+def _poisoned_v1_wal(dim32):
+    """A v1 ADD record (no header, no CRC) whose declared dim is a lie.
+
+    v1 WALs (<=0.17.0) carry no checksum and are deliberately still replayed,
+    so a single corrupt byte in the dim field reaches the allocator unchecked.
+    Payload layout: [mod_len:2][modality][dim32:4][vector][metadata].
+    """
+    modality = b"text"
+    payload = (struct.pack("<H", len(modality)) + modality
+               + struct.pack("<I", dim32))
+    return (struct.pack("<B", 0)           # op = ADD
+            + struct.pack("<Q", 99)        # id
+            + struct.pack("<I", len(payload))
+            + payload)
+
+
+@pytest.mark.parametrize("dim32,label", [
+    (0x40000000, "wraps dim32*4 to zero while sizing 4 GB"),
+    (0xFFFFFFFF, "maximum declared dim"),
+    (1_000_000, "large but non-wrapping"),
+])
+def test_corrupt_dim_in_v1_wal_is_skipped_not_allocated(tmp_path, dim32, label):
+    """open() must skip the record, not size an allocation from the lie.
+
+    Before the guard, `std::vector<float> vec(dim32)` and
+    `get_or_create_index(modality, dim32)` both ran before the only bound
+    (`dim32 != m_idx.dim`). dim32*4 is unsigned, so 0x40000000 wraps the read
+    length to 0 and still reserves 4 GB — the same failure the plen guard
+    above was added to prevent.
+    """
+    path = str(tmp_path / "poisoned.feather")
+    db = DB.open(path, dim=8)
+    meta = feather_db.Metadata()
+    meta.content = "real record"
+    db.add(id=1, vec=[1.0] * 8, meta=meta)
+    db.save()
+    db.close()
+
+    with open(path + ".wal", "wb") as fh:
+        fh.write(_poisoned_v1_wal(dim32))
+
+    reopened = DB.open(path, dim=8)
+    try:
+        ids = sorted(reopened.get_all_ids())
+        assert 99 not in ids, f"corrupt record was replayed ({label})"
+        assert ids == [1], f"real record lost ({label}): {ids}"
+    finally:
+        reopened.close()
+
+
+def test_valid_wal_record_still_replays(tmp_path):
+    """The guard must not reject well-formed records."""
+    path = str(tmp_path / "ok.feather")
+    db = DB.open(path, dim=8)
+    meta = feather_db.Metadata()
+    meta.content = "seed"
+    db.add(id=1, vec=[1.0] * 8, meta=meta)
+    db.save()
+    second = feather_db.Metadata()
+    second.content = "after checkpoint"
+    db.add(id=2, vec=[0.5] * 8, meta=second)
+    db.close()
+
+    reopened = DB.open(path, dim=8)
+    try:
+        assert sorted(reopened.get_all_ids()) == [1, 2]
+    finally:
+        reopened.close()

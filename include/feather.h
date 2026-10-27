@@ -1650,6 +1650,16 @@ private:
                 if (mod_len > 0) ss.read(&modality[0], mod_len);
                 uint32_t dim32 = 0;
                 ss.read(reinterpret_cast<char*>(&dim32), 4);
+                // Bound dim32 against the bytes this record actually carries BEFORE it
+                // sizes anything. Both the vector below and get_or_create_index() below
+                // allocate from it, while the only existing check (dim32 != m_idx.dim)
+                // runs after both. dim32*4 is unsigned, so 0x40000000 wraps the read
+                // length to 0 and still reserves 4 GB. v2 records are CRC-protected but
+                // v1 WALs (<=0.17.0) are not, and we still replay those, so one corrupt
+                // byte in a legacy dim field is enough. Same reasoning as the plen guard
+                // above -- a count read off disk is a loop trip count or an allocation
+                // size, and must be bounded by the bytes remaining.
+                if (static_cast<uint64_t>(dim32) * 4u + 2u + mod_len + 4u > plen) continue;
                 std::vector<float> vec(dim32);
                 ss.read(reinterpret_cast<char*>(vec.data()), dim32 * 4);
                 Metadata meta = Metadata::deserialize(ss);
@@ -3005,9 +3015,11 @@ public:
 private:
     using ScoredId = std::pair<float, uint64_t>;
 
-    // Best first; ties go to the smaller id (same order as search()).
-    // Ties go to the higher id: the order std::greater<pair<score, id>> gave
-    // keyword_search before this comparator, which callers may depend on.
+    // Best first; ties go to the HIGHER id -- the order std::greater<pair<score,
+    // id>> gave keyword_search before this comparator existed, which callers may
+    // depend on. Note this is the opposite of search()'s finish lambda, which
+    // breaks ties toward the smaller id; the two paths are deliberately not
+    // unified here because changing either reorders results callers have seen.
     static bool better_scored(const ScoredId& a, const ScoredId& b) {
         return a.first > b.first || (a.first == b.first && a.second > b.second);
     }
@@ -3129,7 +3141,15 @@ public:
                     FW(const SearchFilter* f, const std::unordered_map<uint64_t,Metadata>& s): f_(f),s_(s){}
                     bool operator()(hnswlib::labeltype id) override {
                         if (!f_) return true;
-                        auto it = s_.find(id); return it!=s_.end() && f_->matches(it->second);
+                        auto it = s_.find(id);
+                        if (it == s_.end()) return false;
+                        // Same rule as search()'s FilterWrapper and bm25_top_nolock's
+                        // eligible(). Without it the BM25 half of the fusion drops a
+                        // tombstone and the vector half puts it back through RRF: a
+                        // soft-deleted record (_deleted=true) is not markDelete'd in
+                        // HNSW, so only this check keeps it out.
+                        if (is_dead_meta(it->second)) return false;
+                        return f_->matches(it->second);
                     }
                 } fw(filter, metadata_store_);
                 size_t cands = scoring ? candidates * 3 : candidates;
