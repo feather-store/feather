@@ -20,7 +20,10 @@ import pytest
 
 pytest.importorskip("langgraph", reason="FeatherStore needs langgraph")
 
-from feather_db.integrations.langgraph_store import FeatherStore  # noqa: E402
+from feather_db.integrations.langgraph_store import (  # noqa: E402
+    FeatherStore,
+    _ns_key,
+)
 
 DIM = 128
 
@@ -179,6 +182,11 @@ def test_works_without_an_embedder(tmp_path):
 # silently ignored or actively inverted. Each was found by exercising the
 # contract rather than the code.
 
+def _stored_ttl(store, key):
+    """The ttl Feather actually persisted, in seconds (0 = never expires)."""
+    return store.db.get_metadata(_ns_key(NS, key)).ttl
+
+
 def test_ttl_is_declared_and_enforced(store):
     """BaseStore.put() refuses a ttl unless the subclass sets supports_ttl, and
     raises before reaching batch() — so Feather's own ttl and forget_expired()
@@ -189,7 +197,17 @@ def test_ttl_is_declared_and_enforced(store):
     store.put(NS, "short", {"text": "expires"}, ttl=0.001)   # sub-second
     store.put(NS, "long", {"text": "stays"}, ttl=60)
     store.put(NS, "never", {"text": "no ttl"})
-    assert store.get(NS, "short") is not None
+
+    # Assert the ttl REACHED Feather, not that the record is still alive.
+    # Liveness here is a race: a sub-second ttl floors to 1 whole second and
+    # is measured against a whole-second timestamp, so the record's real
+    # lifetime is however much of the current second was left when it was
+    # written — a few milliseconds if the write landed late in the second.
+    # The original assertion passed locally for weeks and failed on
+    # macos-latest/3.10 once the suite got slower.
+    assert _stored_ttl(store, "short") >= 1, "a positive ttl floored to 0 = forever"
+    assert _stored_ttl(store, "long") >= 1
+    assert _stored_ttl(store, "never") == 0, "no ttl must mean never expires"
 
     time.sleep(1.4)
     assert store.get(NS, "short") is None, "expired item still readable"
