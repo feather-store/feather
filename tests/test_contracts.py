@@ -333,9 +333,10 @@ _WRITER = """
 import sys, time, numpy as np
 sys.path.insert(0, {repo!r})
 import feather_db
+import os
 db = feather_db.DB.open({path!r}, dim=4)
-i, end = 0, time.time() + {secs}
-while time.time() < end:
+i, end = 0, time.time() + 120                        # a cap; the test stops us
+while time.time() < end and not os.path.exists({stop!r}):
     b = feather_db.WriteBatch()                      # three records, one atomic write
     for j in range(3):
         m = feather_db.Metadata(); m.content = str(i + j)
@@ -352,13 +353,14 @@ def test_a_read_only_open_is_a_consistent_snapshot(tmp_path):
     full rewrites racing the readers. A consistent snapshot is a prefix:
     no gap, no partial batch, every record's content its own id. Before the
     WALGEN chain check, 187 of 7395 opens were torn."""
-    path = str(tmp_path / "s.feather")
-    secs = 6
-    w = subprocess.Popen([sys.executable, "-c", _WRITER.format(repo=REPO, path=path, secs=secs)])
+    path, stop = str(tmp_path / "s.feather"), str(tmp_path / "stop")
+    w = subprocess.Popen([sys.executable, "-c", _WRITER.format(repo=REPO, path=path, stop=stop)])
     time.sleep(0.5)
     opens = torn = 0
-    end = time.time() + secs - 1
-    while time.time() < end:
+    # At least 5 s of racing, then on until enough opens: a slow runner
+    # (macOS, 3.9) managed 39 in a fixed 5 s while the file kept growing.
+    start = time.time()
+    while time.time() - start < 5 or (opens <= 50 and time.time() - start < 60):
         try:
             r = DB.open(path, dim=4, read_only=True)
         except Exception:
@@ -369,6 +371,7 @@ def test_a_read_only_open_is_a_consistent_snapshot(tmp_path):
         r.close()
         opens += 1
         torn += bool(bad)
+    open(stop, "w").close()
     w.wait()
     assert opens > 50, f"only {opens} opens: the test measured nothing"
     assert torn == 0, f"{torn} of {opens} read-only opens saw a torn view"

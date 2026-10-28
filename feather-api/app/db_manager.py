@@ -95,6 +95,17 @@ class NamespaceLoadingError(Exception):
         self.namespace = namespace
 
 
+class NamespaceHeldError(Exception):
+    """Another process holds the namespace's write lock: during a placement
+    move, the source shard until its checkpoint finishes. HTTP 503 with
+    Retry-After. If it persists, something else has the file open."""
+
+    def __init__(self, namespace: str, why: str):
+        super().__init__(f"namespace '{namespace}' is held by another process; "
+                         f"retry shortly ({why.splitlines()[0]})")
+        self.namespace = namespace
+
+
 class InvalidNamespaceError(ValueError):
     """A namespace name that is not exactly its own file name. HTTP 400."""
 
@@ -365,11 +376,13 @@ class DBManager:
             busy.wait()                   # another thread is opening or closing it
         try:
             db = DB.open(path, dim=dim or self._default_dim)
-        except Exception:
+        except Exception as e:
             with self._global_lock:
                 self._file_ids.pop(namespace, None)
                 self._transit.pop(namespace, None)
             done.set()
+            if "holds the write lock" in str(e):
+                raise NamespaceHeldError(namespace, str(e)) from e
             raise
         with self._global_lock:
             self._dbs[namespace] = db

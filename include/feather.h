@@ -966,15 +966,17 @@ private:
             m_idx.index->resizeIndex(std::max(target, cap * 2));
     }
 
-    // Every index is created with allow_replace_deleted: a new insert reuses the
-    // slot of a vector that forget()/purge() marked deleted instead of growing
-    // the index, so tombstones stop accumulating and compaction is needed far
-    // less often.
+    // Deleted slots are NOT reused: a new insert always takes a fresh slot and
+    // tombstones stay as routing nodes until compact(). hnswlib's replace path
+    // (updatePoint on the reused slot) re-prunes every old neighbour of the
+    // slot and can drop another record's last incoming link, leaving it
+    // unreachable even to its own vector (0.2-0.3% of records under
+    // forget+add churn at ef=400). Reclaim space with set_auto_compact().
     static std::unique_ptr<hnswlib::HierarchicalNSW<float>>
     make_hnsw(hnswlib::SpaceInterface<float>* space, size_t capacity,
               size_t M = 16, size_t ef_construction = 200) {
         auto index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-            space, capacity, M, ef_construction, /*random_seed=*/100, /*allow_replace_deleted=*/true);
+            space, capacity, M, ef_construction, /*random_seed=*/100, /*allow_replace_deleted=*/false);
         index->setEf(DEFAULT_EF);
         return index;
     }
@@ -1017,32 +1019,25 @@ private:
         }
     }
 
-    // Insert raw storage-format bytes. `reuse_slot` lets a NEW label take over a
-    // deleted slot. It is only ever passed from single-threaded paths under the
-    // exclusive lock: hnswlib's replace path assumes no concurrent operation on
-    // the slot being reused, so parallel_add never reuses. An existing label is
-    // always updated in place (reusing a slot for it would orphan its old node
-    // and return it twice from search).
-    static void insert_raw(ModalityIndex& m_idx, uint64_t id, const void* data, bool reuse_slot) {
-        auto& idx = *m_idx.index;
-        bool reuse = reuse_slot && idx.getDeletedCount() > 0 &&
-                     idx.label_lookup_.find(id) == idx.label_lookup_.end();
-        idx.addPoint(data, id, reuse);
+    // Insert raw storage-format bytes. A new label takes a fresh slot (see
+    // make_hnsw); an existing label, a forgotten one included, is updated in
+    // place.
+    static void insert_raw(ModalityIndex& m_idx, uint64_t id, const void* data) {
+        m_idx.index->addPoint(data, id);
     }
 
     // Insert a float vector into a modality index, quantizing to int8 first if
     // the modality is in-RAM int8. Centralises the float-vs-int8 store decision.
-    static void add_point(ModalityIndex& m_idx, uint64_t id, const float* vec,
-                          bool reuse_slot = false) {
+    static void add_point(ModalityIndex& m_idx, uint64_t id, const float* vec) {
         if (m_idx.int8) {
             // Reusable per-thread buffer — a fresh std::vector per call across the
             // parallel insert pool churns the allocator and inflates RSS by ~MBs.
             static thread_local std::vector<int8_t> q;
             q.resize(m_idx.dim);
             quantize_global(vec, m_idx.dim, m_idx.scale, q.data());
-            insert_raw(m_idx, id, q.data(), reuse_slot);
+            insert_raw(m_idx, id, q.data());
         } else {
-            insert_raw(m_idx, id, vec, reuse_slot);
+            insert_raw(m_idx, id, vec);
         }
     }
 
@@ -1088,7 +1083,7 @@ private:
     // ── Full precision for in-RAM int8 (refine) ──────────────────────
     // Remember the float original of `id`'s vector until a commit writes it
     // to the file. Called after the insert, so it lands under the slot the
-    // insert chose (a reused one included). Caller holds mutex_ exclusively.
+    // insert chose. Caller holds mutex_ exclusively.
     // `at` is where the WAL record of this write holds the floats; without
     // one (a reader that could not pin the WAL it replays) they are copied.
     void keep_full(ModalityIndex& m, uint64_t id, const float* vec, const WalPos& at) {
@@ -1633,8 +1628,8 @@ private:
             const size_t e = std::min(members.size(), s + NS_ANN_CHUNK);
             run_parallel(e - s, [&](size_t k) {
                 const auto [id, slot] = members[s + k];
-                // A slot can be handed to another record since the snapshot
-                // (a re-add reuses deleted slots); the install picks it up.
+                // A slot can be deleted (or relabelled by compaction's swap)
+                // since the snapshot; the install picks it up.
                 if (idx.getExternalLabel(slot) != id || idx.isMarkedDeleted(slot)) return;
                 const uint64_t ref = slot;
                 g->index->addPoint(&ref, id);
@@ -2949,7 +2944,7 @@ private:
             if (dim32 != m_idx.dim) return;   // corrupt / mismatched record
             reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
             try {
-                add_point(m_idx, id, vec.data(), /*reuse_slot=*/true);
+                add_point(m_idx, id, vec.data());
                 keep_full(m_idx, id, vec.data(),
                           {wal_pin, wal_vector_offset(static_cast<uint64_t>(rec_start), modality)});
             } catch (...) {}
@@ -4845,7 +4840,7 @@ private:
         at.off = wal_vector_offset(at.off, modality);
         auto& m_idx = get_or_create_index(modality, dim);
         reserve(m_idx, m_idx.index->getCurrentElementCount() + 1);
-        add_point(m_idx, id, vec, /*reuse_slot=*/true);
+        add_point(m_idx, id, vec);
         keep_full(m_idx, id, vec, at);
         log_compaction_add(modality, id, vec, dim);
         apply_meta_upsert_nolock(id, meta);
@@ -6884,7 +6879,7 @@ public:
             Snap& sn = *it->second;
             ModalityIndex tmp{std::move(sn.index), nullptr, sn.dim, sn.int8, sn.scale};
             reserve(tmp, tmp.index->getCurrentElementCount() + 1);
-            add_point(tmp, op.id, op.vec.data(), /*reuse_slot=*/true);
+            add_point(tmp, op.id, op.vec.data());
             sn.index = std::move(tmp.index);
         }
         compaction_log_.clear();

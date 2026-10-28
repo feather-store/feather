@@ -361,8 +361,14 @@ try:
     feather_db.DB.open({path!r}, dim={DIM}, read_only={read_only}).close(); print("opened")
 except Exception as e:
     print("error:", type(e).__name__, e)
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-print(peak / (1 << 20 if sys.platform == "darwin" else 1 << 10))
+if sys.platform.startswith("linux"):
+    # Linux carries ru_maxrss across execve (and vfork shares the parent's mm),
+    # so it reports the pytest parent's peak. VmHWM is this image's own.
+    peak = next(int(l.split()[1]) for l in open("/proc/self/status") if l.startswith("VmHWM:"))
+    print(peak / (1 << 10))
+else:
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    print(peak / (1 << 20 if sys.platform == "darwin" else 1 << 10))
 """], capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         return f"exit {r.returncode}", r.stderr[-500:], None

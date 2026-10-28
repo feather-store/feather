@@ -7,7 +7,7 @@ is a stable machine-readable type and `retryable` says whether the SAME
 request may be sent again to the SAME server:
 
     retry          429 overloaded, 503 unavailable / write_failed /
-                   namespace_loading (honour Retry-After)
+                   namespace_loading / namespace_held (honour Retry-After)
     go elsewhere   421 wrong_shard (body names owner_shard)
     your fault     every other 4xx: sending it again cannot succeed
     our fault      500 internal, 501 not_implemented, 502 upstream_error

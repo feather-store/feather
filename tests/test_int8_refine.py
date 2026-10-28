@@ -12,7 +12,7 @@ What each test pins:
   * originals are never copied into RAM on the write path: they point into
     the WAL until a save puts them in the file                 -> TestRefine
   * every way a slot's vector changes, and every way the file is written,
-    keeps each live record's original exact: delta commits, slot reuse,
+    keeps each live record's original exact: delta commits, forget + add,
     compaction, crash + WAL replay, vacuum                      -> TestPersistence
   * a reader keeps its snapshot's originals while the writer rewrites the file
   * a GRAPH record with no FULLVEC after it (a build without refine) voids
@@ -311,7 +311,7 @@ class TestPersistence:
         db.add_batch(list(range(n)), X)
         return db, {i: X[i] for i in range(n)}
 
-    def test_delta_commits_update_and_slot_reuse(self, tmp_path):
+    def test_delta_commits_update_and_forget(self, tmp_path):
         rng = np.random.default_rng(12)
         p = str(tmp_path / "d.feather")
         db, exp = self.fresh(p, 500, rng)
@@ -323,7 +323,7 @@ class TestPersistence:
             db.add(i, new[100 + k]); exp[i] = new[100 + k]
         for i in range(100, 130):                         # forgotten...
             db.forget(i); exp.pop(i)
-        for k, i in enumerate(range(700, 730)):           # ...and their slots reused
+        for k, i in enumerate(range(700, 730)):           # ...and new ones in fresh slots
             db.add(i, new[150 + k]); exp[i] = new[150 + k]
         db.save()
         assert not db.storage_stats()["last_commit_full"], "expected an appended commit"
@@ -331,7 +331,8 @@ class TestPersistence:
         db.close()
         db = self.open(p)
         assert_originals(db, exp)
-        assert db.int8_info("text")["originals_on_disk"] == len(exp)
+        # The forgotten slots keep their originals in the file until compact().
+        assert db.int8_info("text")["originals_on_disk"] == len(exp) + 30
         db.close()
 
     def test_crash_replays_originals_from_the_wal(self, tmp_path):

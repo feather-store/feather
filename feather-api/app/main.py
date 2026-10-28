@@ -49,7 +49,8 @@ from feather_db import Metadata, ContextType, ScoringConfig
 from feather_db.core import SearchFilter
 
 from .db_manager import (DBManager, InvalidNamespaceError, NamespaceAliasError,
-                         NamespaceLoadingError, NotOwnedError, RECOVER_RETRY_S, write_error)
+                         NamespaceHeldError, NamespaceLoadingError, NotOwnedError, RECOVER_RETRY_S,
+                         write_error)
 from . import errors
 from .admission import Admission
 from fastapi.exceptions import RequestValidationError
@@ -260,23 +261,28 @@ async def _not_owned(request: Request, exc: NotOwnedError):
 ClosedError = getattr(feather_db, "ClosedError", None)
 
 
+_CLOSED_ATTEMPTS = 5
+
+
 def _retry_closed(fn, *args, **kwargs):
     """Run a route body; if a namespace it used was closed under it (idle
-    close, a placement move), run it once more on a fresh handle. Safe:
+    close, a placement move), run it again on a fresh handle. Safe:
     ClosedError is raised before the engine call does anything, and the
-    closer takes the namespace's write lock, so no write is ever half done."""
-    try:
-        return fn(*args, **kwargs)
-    except Exception as e:  # noqa: BLE001
-        if ClosedError is None or not isinstance(e, ClosedError):
-            raise
-        return fn(*args, **kwargs)
+    closer takes the namespace's write lock, so no write is ever half done.
+    More than one retry: with a short FEATHER_IDLE_CLOSE_S a loaded host can
+    lose the reopened handle too (seen in CI at 1 ms)."""
+    for attempt in range(_CLOSED_ATTEMPTS):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            if ClosedError is None or not isinstance(e, ClosedError) or attempt == _CLOSED_ATTEMPTS - 1:
+                raise
 
 
 if ClosedError is not None:
     @app.exception_handler(ClosedError)
     async def _closed(request: Request, exc: Exception):
-        # Closed twice in a row under the same request: let the client retry.
+        # Closed on every attempt under the same request: let the client retry.
         return JSONResponse(status_code=503, headers={"Retry-After": "1"},
                             content=errors.body(503, f"namespace reopening: {exc}", "namespace_reopening"))
 
@@ -287,6 +293,13 @@ async def _namespace_loading(request: Request, exc: NamespaceLoadingError):
     # request; it will succeed once the load finishes.
     return JSONResponse(status_code=503, headers={"Retry-After": "1"},
                         content=errors.body(503, str(exc), "namespace_loading", namespace=exc.namespace))
+
+
+@app.exception_handler(NamespaceHeldError)
+async def _namespace_held(request: Request, exc: NamespaceHeldError):
+    # A placement move's source still holds the file until its checkpoint ends.
+    return JSONResponse(status_code=503, headers={"Retry-After": "1"},
+                        content=errors.body(503, str(exc), "namespace_held", namespace=exc.namespace))
 
 
 @app.exception_handler(StarletteHTTPException)

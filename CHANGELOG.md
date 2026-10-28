@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deleted HNSW slots are no longer reused
+
+- **`add()` after `forget()` could make other records unfindable.** Reusing
+  a deleted slot ran hnswlib's `updatePoint`, which re-prunes every old
+  neighbour of the slot and could drop another record's last incoming link.
+  Under forget + add churn, 44 of 24,000 new and 30 of 16,000 untouched
+  records were unreachable even by their own vector at `ef=400`. A new
+  record now always takes a fresh slot, which brings that back to a clean
+  build's rate (~0.02%, inherent to HNSW pruning). Tombstones stay as
+  routing nodes until `compact()`; use `set_auto_compact()` to bound them.
+  Reverses 0.19's "Deleted HNSW slots are reused".
+
+### Cloud API
+
+- **A namespace move no longer answers 500 mid-handover.** A request that
+  reached the target shard while the source still held the file's write
+  lock got a 500 (a 502 through the gateway). It is now a retryable 503
+  `namespace_held` with Retry-After.
+- **A request whose handle is closed under it retries up to 5 times**, not
+  once. With a short `FEATHER_IDLE_CLOSE_S`, a loaded host could lose the
+  reopened handle as well.
+
 ### Three slowdowns against 0.21 removed
 
 A full benchmark run of this branch against master (v0.21.0) on an M1
