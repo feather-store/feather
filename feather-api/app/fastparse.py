@@ -22,6 +22,7 @@ from typing import Annotated, Any, Dict, List, Optional
 import msgspec
 import numpy as np
 from fastapi import HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
@@ -67,6 +68,8 @@ class SearchBody(_VectorMixin, msgspec.Struct, kw_only=True):
     raw_score: bool = False
     include_metadata: bool = True
     namespace_id: Optional[str] = None
+    namespace_prefix: Optional[str] = None
+    types: Optional[List[int]] = None
     entity_id: Optional[str] = None
     attributes_match: Optional[Dict[str, str]] = None
     source: Optional[str] = None
@@ -90,6 +93,8 @@ class HybridBody(_VectorMixin, msgspec.Struct, kw_only=True):
     modality: str = "text"
     include_metadata: bool = True
     namespace_id: Optional[str] = None
+    namespace_prefix: Optional[str] = None
+    types: Optional[List[int]] = None
     entity_id: Optional[str] = None
     attributes_match: Optional[Dict[str, str]] = None
     source: Optional[str] = None
@@ -109,6 +114,8 @@ class KeywordBody(msgspec.Struct, kw_only=True):
     k: K = 10
     include_metadata: bool = True
     namespace_id: Optional[str] = None
+    namespace_prefix: Optional[str] = None
+    types: Optional[List[int]] = None
     entity_id: Optional[str] = None
     attributes_match: Optional[Dict[str, str]] = None
     source: Optional[str] = None
@@ -188,15 +195,28 @@ def _legacy_error(struct: type, body: bytes) -> Optional[list]:
     return None
 
 
+# A body larger than this is decoded on a worker thread: a 50 MB /import
+# decodes in ~100 ms, and on the event loop that is 100 ms in which no other
+# request on the worker makes progress. Small bodies stay inline, where a
+# thread hop would cost more than the decode.
+_INLINE_DECODE_MAX = 256 * 1024
+
+
 async def parse_body(request: Request, struct: type):
     """Decode + validate a JSON body into `struct`; 422 on any problem."""
+    body = await request.body()
+    if len(body) > _INLINE_DECODE_MAX:
+        return await run_in_threadpool(_parse, struct, body)
+    return _parse(struct, body)
+
+
+def _parse(struct: type, body: bytes):
     dec = _DECODERS.get(struct)
     if dec is None:
         # strict=False matches pydantic's lax coercion, which these routes used
         # before: "5" -> 5, 5.0 -> 5, "true" -> True, ["0.1"] -> [0.1]. Strict
         # mode 422s those, breaking existing clients that send them.
         dec = _DECODERS[struct] = msgspec.json.Decoder(struct, strict=False)
-    body = await request.body()
     try:
         obj = dec.decode(body)
         if isinstance(obj, _VectorMixin):

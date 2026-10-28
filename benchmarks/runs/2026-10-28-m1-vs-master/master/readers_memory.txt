@@ -1,0 +1,3 @@
+10 read-only processes on /var/folders/wy/dfnfq8l12ts5dc980ytyhyd00000gn/T/tmp.MFzimq4qDS/r.feather (175 MB)
+  heap  private per reader    211 MB   all readers   2114 MB   open  2439 ms
+  mmap  private per reader    213 MB   all readers   2134 MB + 0 MB shared once   open  1594 ms

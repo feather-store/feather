@@ -126,10 +126,12 @@ def test_recall_reaches_memories_too_cold_to_be_carried(tmp_path):
 
 def test_without_an_embedder_recall_is_exact_keyword_matching(tmp_path):
     """Characterisation, not an endorsement. `feather-agent` with no
-    --embed-provider falls back to BM25, which does no stemming: a memory whose
-    content says "allergic" is not found by searching "allergy", and the key is
-    not searchable at all. The model cannot tell that from "never told me", so
-    any deployment relying on paraphrased recall needs a real embedder.
+    --embed-provider falls back to BM25. Since 0.22 BM25 indexes the key too,
+    so the memory stored under "allergy" is found by "allergy" and "allergies"
+    (both stem to "allergi") although its content only says "allergic". A
+    paraphrase sharing no root with key or content still finds nothing, which
+    the model cannot tell from "never told me": any deployment relying on
+    paraphrased recall needs a real embedder.
 
     If this starts failing because more queries match, retrieval improved —
     update the expectations rather than restoring the old behaviour.
@@ -141,10 +143,10 @@ def test_without_an_embedder_recall_is_exact_keyword_matching(tmp_path):
             await mcp.call("remember", key="allergy",
                            content="severely allergic to shellfish")
 
-            for query in ("shellfish", "allergic", "severely allergic"):
+            for query in ("shellfish", "allergic", "severely allergic", "allergy", "allergies"):
                 assert "shellfish" in await mcp.call("recall", query=query), query
 
-            for query in ("allergy", "allergies", "what food should be avoided"):
+            for query in ("what food should be avoided",):
                 answer = await mcp.call("recall", query=query)
                 assert answer == "nothing found", f"{query!r} now matches: {answer}"
 

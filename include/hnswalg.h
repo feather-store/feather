@@ -9,6 +9,12 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#if !defined(_WIN32)
+#include <sys/mman.h>     // munmap: the vector array may be a file mapping
+#endif
 
 // Software prefetch for the graph walk. Search is bound by memory latency (each
 // hop touches a vector that is not in cache), so the hint matters more than the
@@ -62,7 +68,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     size_t size_links_level0_{0};
     size_t offsetData_{0}, offsetLevel0_{0}, label_offset_{ 0 };
 
+    // Feather: level 0 holds [links][label] per slot; vectors live apart in
+    // vectors_ (data_size_ bytes per slot). Upstream interleaves them, which
+    // made the vectors impossible to share: a read-only process can now map
+    // vectors_ straight from the file, so N readers hold one copy, not N.
     char *data_level0_memory_{nullptr};
+    char *vectors_{nullptr};
+    size_t vectors_mapped_bytes_{0};   // > 0: vectors_ is an mmap of this many bytes
     char **linkLists_{nullptr};
     std::vector<int> element_levels_;  // keeps level of each element
 
@@ -81,9 +93,21 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     mutable std::atomic<long> metric_hops{0};
 
     bool allow_replace_deleted_ = false;  // flag to replace deleted elements (marked as deleted) during insertions
+    size_t dirty_cap_ = 0;
 
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
+
+    // Feather: what changed per slot since the last commit (file format v10),
+    // so a save writes those slots instead of the whole graph. Set at every
+    // site that writes a slot's link lists, delete mark, vector or label —
+    // a missed site would mean a change that never reaches disk, which is why
+    // they are all marked here rather than inferred by the caller. fetch_or,
+    // because add_batch inserts from several threads at once. Read and
+    // cleared only by a commit, which runs with no writer active.
+    static constexpr uint8_t DIRTY_LINKS = 0x01;  // any link list, or the delete mark
+    static constexpr uint8_t DIRTY_DATA  = 0x02;  // vector, label or level
+    mutable std::unique_ptr<std::atomic<uint8_t>[]> dirty_;
 
 
     HierarchicalNSW(SpaceInterface<dist_t> *s) {
@@ -133,14 +157,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         update_probability_generator_.seed(random_seed + 1);
 
         size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
-        size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
-        offsetData_ = size_links_level0_;
-        label_offset_ = size_links_level0_ + data_size_;
-        offsetLevel0_ = 0;
+        setSplitLayout();
 
         data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
             throw std::runtime_error("Not enough memory");
+        resizeVectors(max_elements_);
 
         cur_element_count = 0;
 
@@ -156,6 +178,160 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
         mult_ = 1 / log(1.0 * M_);
         revSize_ = 1.0 / mult_;
+        allocDirty(max_elements_);
+    }
+
+    // ── Feather: split layout ───────────────────────────────────────────
+    void setSplitLayout() {
+        size_data_per_element_ = size_links_level0_ + sizeof(labeltype);
+        offsetLevel0_ = 0;
+        label_offset_ = size_links_level0_;
+        offsetData_   = 0;          // unused: vectors are in vectors_
+    }
+    // Size of one slot in upstream's interleaved layout — the v9 file format.
+    size_t legacyElementSize() const { return size_links_level0_ + data_size_ + sizeof(labeltype); }
+
+    void freeVectors() {
+#if !defined(_WIN32)
+        if (vectors_mapped_bytes_) munmap(vectors_, vectors_mapped_bytes_);
+        else
+#endif
+        free(vectors_);
+        vectors_ = nullptr;
+        vectors_mapped_bytes_ = 0;
+    }
+    // Room for n vectors. A mapping keeps serving while n fits its
+    // reservation; beyond that the vectors move to the heap (and stop being
+    // shared) — only a process that outgrows its file image pays that.
+    void resizeVectors(size_t n) {
+        const size_t bytes = std::max<size_t>(n * data_size_, 1);
+        if (vectors_mapped_bytes_) {
+            if (bytes <= vectors_mapped_bytes_) return;
+            char *heap = (char *) malloc(bytes);
+            if (heap == nullptr) throw std::runtime_error("Not enough memory: vectors");
+            memcpy(heap, vectors_, cur_element_count * data_size_);
+            freeVectors();
+            vectors_ = heap;
+            return;
+        }
+        char *p = (char *) realloc(vectors_, bytes);
+        if (p == nullptr) throw std::runtime_error("Not enough memory: vectors");
+        vectors_ = p;
+    }
+    // Serve vectors from `base`, an mmap of `bytes` that already holds every
+    // slot below cur_element_count. The index unmaps it when done.
+    void attachVectorMapping(char *base, size_t bytes) {
+        if (bytes < max_elements_ * data_size_)
+            throw std::runtime_error("vector mapping smaller than the index");
+        freeVectors();
+        vectors_ = base;
+        vectors_mapped_bytes_ = bytes;
+    }
+
+    // ── Feather: dirty tracking + restore (file format v10) ──────────────
+    void allocDirty(size_t n) {
+        std::unique_ptr<std::atomic<uint8_t>[]> d(new std::atomic<uint8_t>[n]);
+        const size_t keep = dirty_ ? std::min(n, dirty_cap_) : 0;
+        for (size_t i = 0; i < n; ++i)
+            d[i].store(i < keep ? dirty_[i].load(std::memory_order_relaxed) : 0,
+                       std::memory_order_relaxed);
+        dirty_ = std::move(d);
+        dirty_cap_ = n;
+    }
+    inline void markDirty(tableint id, uint8_t bits) const {
+        if (dirty_) dirty_[id].fetch_or(bits, std::memory_order_relaxed);
+    }
+    inline uint8_t dirtyBits(tableint id) const {
+        return dirty_ ? dirty_[id].load(std::memory_order_relaxed) : 0;
+    }
+    void clearDirty() {
+        for (size_t i = 0; i < dirty_cap_; ++i) dirty_[i].store(0, std::memory_order_relaxed);
+    }
+
+    // Restore protocol: restoreBegin(count) for each patch, restoreElement()
+    // per record, restoreFinish() once at the end. Grows geometrically so a
+    // file of many small commits is not one realloc of the whole base layer
+    // per commit; restoreFinish() trims back to the real count.
+    void restoreBegin(size_t count) {
+        if (count < cur_element_count)
+            throw std::runtime_error("corrupt .feather: graph patch shrinks the index");
+        if (count > max_elements_)
+            resizeIndex(std::max(count, max_elements_ + max_elements_ / 2));
+        for (size_t i = cur_element_count; i < count; ++i) {
+            element_levels_[i] = 0;
+            linkLists_[i] = nullptr;
+            memset(data_level0_memory_ + i * size_data_per_element_, 0, size_data_per_element_);
+        }
+        cur_element_count = count;
+    }
+
+    // Write one slot verbatim. `label`/`data` are null for a links-only record.
+    void restoreElement(tableint id, int level, const char *links0, const char *upper,
+                        const labeltype *label, const char *data) {
+        if (level != element_levels_[id]) {
+            if (element_levels_[id] > 0) free(linkLists_[id]);
+            linkLists_[id] = nullptr;
+            if (level > 0) {
+                linkLists_[id] = (char *) malloc(size_links_per_element_ * level + 1);
+                if (linkLists_[id] == nullptr)
+                    throw std::runtime_error("Not enough memory: restoreElement failed to allocate linklist");
+                memset(linkLists_[id], 0, size_links_per_element_ * level + 1);
+            }
+            element_levels_[id] = level;
+        }
+        char *slot = data_level0_memory_ + id * size_data_per_element_;
+        memcpy(slot + offsetLevel0_, links0, size_links_level0_);
+        if (level > 0) memcpy(linkLists_[id], upper, size_links_per_element_ * level);
+        if (label) memcpy(slot + label_offset_, label, sizeof(labeltype));
+        if (data)  memcpy(vectors_ + id * data_size_, data, data_size_);
+    }
+
+    // Rebuild what the slots imply (label table, delete set), then check that
+    // the graph holds together. Search follows these links without checks, so
+    // anything it could trip on is rejected here: a link to a slot that does
+    // not exist, a link into a layer its target does not have (read through
+    // linkLists_[target] past its end), or a node above the entry point.
+    void checkGraph(tableint enterpoint, int maxlevel) {
+        const size_t n = cur_element_count;
+        if (n == 0) {
+            enterpoint_node_ = -1;
+            maxlevel_ = -1;
+        } else {
+            if (enterpoint >= n || maxlevel < 0 || maxlevel != element_levels_[enterpoint])
+                throw std::runtime_error("corrupt .feather: graph entry point is not a top-level node");
+            enterpoint_node_ = enterpoint;
+            maxlevel_ = maxlevel;
+        }
+        label_lookup_.clear();
+        label_lookup_.reserve(n);
+        deleted_elements.clear();
+        num_deleted_ = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (element_levels_[i] > maxlevel_)
+                throw std::runtime_error("corrupt .feather: graph node above the entry point");
+            for (int l = 0; l <= element_levels_[i]; ++l) {
+                linklistsizeint *ll = get_linklist_at_level(i, l);
+                size_t cnt = getListCount(ll);
+                if (cnt > (l == 0 ? maxM0_ : maxM_))
+                    throw std::runtime_error("corrupt .feather: graph node has too many links");
+                tableint *nb = (tableint *) (ll + 1);
+                for (size_t j = 0; j < cnt; ++j)
+                    if (nb[j] >= n || element_levels_[nb[j]] < l)
+                        throw std::runtime_error("corrupt .feather: graph link to a missing node");
+            }
+            label_lookup_[getExternalLabel(i)] = i;
+            if (isMarkedDeleted(i)) {
+                num_deleted_ += 1;
+                if (allow_replace_deleted_) deleted_elements.insert(i);
+            }
+        }
+    }
+
+    void restoreFinish(tableint enterpoint, int maxlevel) {
+        checkGraph(enterpoint, maxlevel);
+        const size_t n = cur_element_count;
+        if (max_elements_ > n && n > 0) resizeIndex(n);
+        clearDirty();
     }
 
 
@@ -166,9 +342,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     void clear() {
         free(data_level0_memory_);
         data_level0_memory_ = nullptr;
-        for (tableint i = 0; i < cur_element_count; i++) {
-            if (element_levels_[i] > 0)
-                free(linkLists_[i]);
+        freeVectors();
+        if (linkLists_) {
+            for (size_t i = 0; i < cur_element_count && i < element_levels_.size(); i++) {
+                if (element_levels_[i] > 0)
+                    free(linkLists_[i]);
+            }
         }
         free(linkLists_);
         linkLists_ = nullptr;
@@ -206,6 +385,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     inline void setExternalLabel(tableint internal_id, labeltype label) const {
         memcpy((data_level0_memory_ + internal_id * size_data_per_element_ + label_offset_), &label, sizeof(labeltype));
+        markDirty(internal_id, DIRTY_DATA);
     }
 
 
@@ -215,7 +395,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     inline char *getDataByInternalId(tableint internal_id) const {
-        return (data_level0_memory_ + internal_id * size_data_per_element_ + offsetData_);
+        return vectors_ + internal_id * data_size_;
     }
 
 
@@ -378,14 +558,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             FEATHER_PREFETCH((char *) (visited_array + *(data + 1)));
             FEATHER_PREFETCH((char *) (visited_array + *(data + 1) + 64));
-            FEATHER_PREFETCH(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_);
+            FEATHER_PREFETCH(getDataByInternalId(*(data + 1)));
             FEATHER_PREFETCH((char *) (data + 2));
 
             for (size_t j = 1; j <= size; j++) {
                 int candidate_id = *(data + j);
 //                    if (candidate_id == 0) continue;
                 FEATHER_PREFETCH((char *) (visited_array + *(data + j + 1)));
-                FEATHER_PREFETCH(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_);  ////////////
+                FEATHER_PREFETCH(getDataByInternalId(*(data + j + 1)));
                 if (!(visited_array[candidate_id] == visited_array_tag)) {
                     visited_array[candidate_id] = visited_array_tag;
 
@@ -541,6 +721,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 throw std::runtime_error("The newly inserted element should have blank link list");
             }
             setListCount(ll_cur, selectedNeighbors.size());
+            markDirty(cur_c, DIRTY_LINKS);
             tableint *data = (tableint *) (ll_cur + 1);
             for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
                 if (data[idx] && !isUpdate)
@@ -584,6 +765,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             // If cur_c is already present in the neighboring connections of `selectedNeighbors[idx]` then no need to modify any connections or run the heuristics.
             if (!is_cur_c_present) {
+                markDirty(selectedNeighbors[idx], DIRTY_LINKS);
                 if (sz_link_list_other < Mcurmax) {
                     data[sz_link_list_other] = cur_c;
                     setListCount(ll_other, sz_link_list_other + 1);
@@ -646,6 +828,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (data_level0_memory_new == nullptr)
             throw std::runtime_error("Not enough memory: resizeIndex failed to allocate base layer");
         data_level0_memory_ = data_level0_memory_new;
+        resizeVectors(new_max_elements);
 
         // Reallocate all other layers
         char ** linkLists_new = (char **) realloc(linkLists_, sizeof(void *) * new_max_elements);
@@ -653,28 +836,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             throw std::runtime_error("Not enough memory: resizeIndex failed to allocate other layers");
         linkLists_ = linkLists_new;
 
+        allocDirty(new_max_elements);
         max_elements_ = new_max_elements;
     }
 
     size_t indexFileSize() const {
-        size_t size = 0;
-        size += sizeof(offsetLevel0_);
-        size += sizeof(max_elements_);
-        size += sizeof(cur_element_count);
-        size += sizeof(size_data_per_element_);
-        size += sizeof(label_offset_);
-        size += sizeof(offsetData_);
-        size += sizeof(maxlevel_);
-        size += sizeof(enterpoint_node_);
-        size += sizeof(maxM_);
-
-        size += sizeof(maxM0_);
-        size += sizeof(M_);
-        size += sizeof(mult_);
-        size += sizeof(ef_construction_);
-
-        size += cur_element_count * size_data_per_element_;
-
+        size_t size = sizeof(offsetLevel0_) + sizeof(max_elements_) + sizeof(cur_element_count) +
+                      sizeof(size_data_per_element_) + sizeof(label_offset_) + sizeof(offsetData_) +
+                      sizeof(maxlevel_) + sizeof(enterpoint_node_) + sizeof(maxM_) + sizeof(maxM0_) +
+                      sizeof(M_) + sizeof(mult_) + sizeof(ef_construction_);
+        size += cur_element_count * legacyElementSize();
         for (size_t i = 0; i < cur_element_count; i++) {
             unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
             size += sizeof(linkListSize);
@@ -685,158 +856,32 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     void saveIndex(const std::string &location) {
         std::ofstream output(location, std::ios::binary);
-        std::streampos position;
-
-        writeBinaryPOD(output, offsetLevel0_);
-        writeBinaryPOD(output, max_elements_);
-        writeBinaryPOD(output, cur_element_count);
-        writeBinaryPOD(output, size_data_per_element_);
-        writeBinaryPOD(output, label_offset_);
-        writeBinaryPOD(output, offsetData_);
-        writeBinaryPOD(output, maxlevel_);
-        writeBinaryPOD(output, enterpoint_node_);
-        writeBinaryPOD(output, maxM_);
-
-        writeBinaryPOD(output, maxM0_);
-        writeBinaryPOD(output, M_);
-        writeBinaryPOD(output, mult_);
-        writeBinaryPOD(output, ef_construction_);
-
-        output.write(data_level0_memory_, cur_element_count * size_data_per_element_);
-
-        for (size_t i = 0; i < cur_element_count; i++) {
-            unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
-            writeBinaryPOD(output, linkListSize);
-            if (linkListSize)
-                output.write(linkLists_[i], linkListSize);
-        }
-        output.close();
+        saveIndexStream(output);
     }
-
 
     void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
         std::ifstream input(location, std::ios::binary);
-
         if (!input.is_open())
             throw std::runtime_error("Cannot open file");
-
-        clear();
-        // get file size:
-        input.seekg(0, input.end);
-        std::streampos total_filesize = input.tellg();
-        input.seekg(0, input.beg);
-
-        readBinaryPOD(input, offsetLevel0_);
-        readBinaryPOD(input, max_elements_);
-        readBinaryPOD(input, cur_element_count);
-
-        size_t max_elements = max_elements_i;
-        if (max_elements < cur_element_count)
-            max_elements = max_elements_;
-        max_elements_ = max_elements;
-        readBinaryPOD(input, size_data_per_element_);
-        readBinaryPOD(input, label_offset_);
-        readBinaryPOD(input, offsetData_);
-        readBinaryPOD(input, maxlevel_);
-        readBinaryPOD(input, enterpoint_node_);
-
-        readBinaryPOD(input, maxM_);
-        readBinaryPOD(input, maxM0_);
-        readBinaryPOD(input, M_);
-        readBinaryPOD(input, mult_);
-        readBinaryPOD(input, ef_construction_);
-
-        data_size_ = s->get_data_size();
-        fstdistfunc_ = s->get_dist_func();
-        dist_func_param_ = s->get_dist_func_param();
-
-        auto pos = input.tellg();
-
-        /// Optional - check if index is ok:
-        input.seekg(cur_element_count * size_data_per_element_, input.cur);
-        for (size_t i = 0; i < cur_element_count; i++) {
-            if (input.tellg() < 0 || input.tellg() >= total_filesize) {
-                throw std::runtime_error("Index seems to be corrupted or unsupported");
-            }
-
-            unsigned int linkListSize;
-            readBinaryPOD(input, linkListSize);
-            if (linkListSize != 0) {
-                input.seekg(linkListSize, input.cur);
-            }
-        }
-
-        // throw exception if it either corrupted or old index
-        if (input.tellg() != total_filesize)
-            throw std::runtime_error("Index seems to be corrupted or unsupported");
-
-        input.clear();
-        /// Optional check end
-
-        input.seekg(pos, input.beg);
-
-        data_level0_memory_ = (char *) malloc(max_elements * size_data_per_element_);
-        if (data_level0_memory_ == nullptr)
-            throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
-        input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
-
-        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
-
-        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
-        std::vector<std::mutex>(max_elements).swap(link_list_locks_);
-        std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
-
-        visited_list_pool_.reset(new VisitedListPool(1, max_elements));
-
-        linkLists_ = (char **) malloc(sizeof(void *) * max_elements);
-        if (linkLists_ == nullptr)
-            throw std::runtime_error("Not enough memory: loadIndex failed to allocate linklists");
-        element_levels_ = std::vector<int>(max_elements);
-        revSize_ = 1.0 / mult_;
-        ef_ = 10;
-        for (size_t i = 0; i < cur_element_count; i++) {
-            label_lookup_[getExternalLabel(i)] = i;
-            unsigned int linkListSize;
-            readBinaryPOD(input, linkListSize);
-            if (linkListSize == 0) {
-                element_levels_[i] = 0;
-                linkLists_[i] = nullptr;
-            } else {
-                element_levels_[i] = linkListSize / size_links_per_element_;
-                linkLists_[i] = (char *) malloc(linkListSize);
-                if (linkLists_[i] == nullptr)
-                    throw std::runtime_error("Not enough memory: loadIndex failed to allocate linklist");
-                input.read(linkLists_[i], linkListSize);
-            }
-        }
-
-        for (size_t i = 0; i < cur_element_count; i++) {
-            if (isMarkedDeleted(i)) {
-                num_deleted_ += 1;
-                if (allow_replace_deleted_) deleted_elements.insert(i);
-            }
-        }
-
-        input.close();
-
-        return;
+        loadIndexStream(input, s, max_elements_i);
     }
 
 
     // Stream variants of saveIndex/loadIndex — write/read the full HNSW graph
-    // (header + base layer, which already contains the vectors, + per-element
-    // link lists) into an arbitrary stream rather than a standalone file. This
-    // lets Feather embed the graph inside the single .feather file so load()
-    // can restore it directly instead of rebuilding the graph from vectors.
-    // The block is self-delimited by cur_element_count, so no total-filesize
-    // check is needed (it lives inside a larger stream).
+    // (header + base layer + per-element link lists) into an arbitrary stream,
+    // so Feather can embed it in a v9 .feather file. The stream keeps
+    // upstream's interleaved [links][vector][label] slots, byte-identical to
+    // before the split; it is converted on the way out and in.
     void saveIndexStream(std::ostream &output) {
+        const size_t legacy_size = legacyElementSize();
+        const size_t legacy_label = size_links_level0_ + data_size_;
+        const size_t legacy_data = size_links_level0_;
         writeBinaryPOD(output, offsetLevel0_);
         writeBinaryPOD(output, max_elements_);
         writeBinaryPOD(output, cur_element_count);
-        writeBinaryPOD(output, size_data_per_element_);
-        writeBinaryPOD(output, label_offset_);
-        writeBinaryPOD(output, offsetData_);
+        writeBinaryPOD(output, legacy_size);
+        writeBinaryPOD(output, legacy_label);
+        writeBinaryPOD(output, legacy_data);
         writeBinaryPOD(output, maxlevel_);
         writeBinaryPOD(output, enterpoint_node_);
         writeBinaryPOD(output, maxM_);
@@ -845,7 +890,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         writeBinaryPOD(output, mult_);
         writeBinaryPOD(output, ef_construction_);
 
-        output.write(data_level0_memory_, cur_element_count * size_data_per_element_);
+        std::vector<char> slot(legacy_size);
+        for (size_t i = 0; i < cur_element_count; i++) {
+            const char *l0 = data_level0_memory_ + i * size_data_per_element_;
+            memcpy(slot.data(), l0, size_links_level0_);
+            memcpy(slot.data() + legacy_data, getDataByInternalId(i), data_size_);
+            memcpy(slot.data() + legacy_label, l0 + label_offset_, sizeof(labeltype));
+            output.write(slot.data(), legacy_size);
+        }
 
         for (size_t i = 0; i < cur_element_count; i++) {
             unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
@@ -859,87 +911,108 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     void loadIndexStream(std::istream &input, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
         clear();
 
-        readBinaryPOD(input, offsetLevel0_);
-        readBinaryPOD(input, max_elements_);
-        readBinaryPOD(input, cur_element_count);
+        // Every field below comes off disk. Read the whole header and check
+        // it against this build BEFORE any of it sizes an allocation or a
+        // loop: the base layer used to be bounded by count * slot_size while
+        // slot_size was still unchecked, so a forged pair could wrap that
+        // product under the remaining-bytes guard and overflow the heap.
+        auto rd = [&](auto &v) {
+            if (!input.read(reinterpret_cast<char *>(&v), sizeof(v)))
+                throw std::runtime_error("corrupt index stream: truncated");
+        };
+        const std::streampos here = input.tellg();
+        input.seekg(0, std::ios::end);
+        const std::streampos stop = input.tellg();
+        input.seekg(here);
+        if (here < 0 || stop < here)
+            throw std::runtime_error("corrupt index stream: cannot size the stream");
 
-        // Fit capacity to the actual data and ignore any (possibly corrupt or
-        // inflated) on-disk max_elements, so a forged header can't trigger a
-        // giant allocation. Growth after load is handled by resizeIndex() on
-        // the next insert.
-        size_t max_elements = max_elements_i;
-        if (max_elements < cur_element_count)
-            max_elements = cur_element_count;
-        if (max_elements < 1) max_elements = 1;
-        max_elements_ = max_elements;
-        readBinaryPOD(input, size_data_per_element_);
+        size_t offset0 = 0, max_el = 0, count = 0, legacy_size = 0, legacy_label = 0, legacy_data = 0;
+        size_t maxM = 0, maxM0 = 0, M = 0, efc = 0;
+        int maxlevel = 0;
+        tableint ep = 0;
+        double mult = 0;
+        rd(offset0); rd(max_el); rd(count); rd(legacy_size); rd(legacy_label); rd(legacy_data);
+        rd(maxlevel); rd(ep); rd(maxM); rd(maxM0); rd(M); rd(mult); rd(efc);
+        (void) max_el;   // capacity is fitted to the data, never taken from disk
 
-        // The persisted base layer (cur_element_count elements) must actually be
-        // present in the stream; reject truncated/forged headers up front.
-        {
-            std::streampos _cur = input.tellg();
-            input.seekg(0, std::ios::end);
-            std::streamoff _rem = (input.tellg() >= _cur) ? (input.tellg() - _cur) : -1;
-            input.seekg(_cur);
-            if (_rem >= 0 &&
-                (uint64_t)cur_element_count * (uint64_t)size_data_per_element_ > (uint64_t)_rem)
-                throw std::runtime_error("corrupt index stream: base layer exceeds remaining bytes");
-        }
-        readBinaryPOD(input, label_offset_);
-        readBinaryPOD(input, offsetData_);
-        readBinaryPOD(input, maxlevel_);
-        readBinaryPOD(input, enterpoint_node_);
-        readBinaryPOD(input, maxM_);
-        readBinaryPOD(input, maxM0_);
-        readBinaryPOD(input, M_);
-        readBinaryPOD(input, mult_);
-        readBinaryPOD(input, ef_construction_);
-
+        // Exactly the geometry the constructor derives from M, or not ours.
+        if (M < 2 || M > 10000 || maxM != M || maxM0 != 2 * M || efc == 0 ||
+            !std::isfinite(mult) || std::fabs(mult * log(1.0 * M) - 1.0) > 1e-9)
+            throw std::runtime_error("corrupt index stream: implausible HNSW parameters");
         data_size_ = s->get_data_size();
         fstdistfunc_ = s->get_dist_func();
         dist_func_param_ = s->get_dist_func_param();
+        M_ = M; maxM_ = maxM; maxM0_ = maxM0; ef_construction_ = efc;
+        mult_ = mult;
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        if (offset0 != 0 || legacy_size != legacyElementSize() ||
+            legacy_data != size_links_level0_ || legacy_label != size_links_level0_ + data_size_)
+            throw std::runtime_error("corrupt index stream: unexpected element layout");
+        setSplitLayout();
 
+        // Internal ids are 32-bit; the base layer must actually be present.
+        uint64_t left = static_cast<uint64_t>(stop - input.tellg());
+        if (count > std::numeric_limits<tableint>::max() || count > left / legacy_size)
+            throw std::runtime_error("corrupt index stream: base layer exceeds remaining bytes");
+        left -= count * legacy_size;
+
+        size_t max_elements = std::max<size_t>({max_elements_i, count, 1});
+        max_elements_ = max_elements;
         data_level0_memory_ = (char *) malloc(max_elements * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
             throw std::runtime_error("Not enough memory: loadIndexStream failed to allocate level0");
-        input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
-
-        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
-        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
-
-        std::vector<std::mutex>(max_elements).swap(link_list_locks_);
-        std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
-
-        visited_list_pool_.reset(new VisitedListPool(1, max_elements));
-
-        linkLists_ = (char **) malloc(sizeof(void *) * max_elements);
+        resizeVectors(max_elements);
+        linkLists_ = (char **) calloc(max_elements, sizeof(void *));
         if (linkLists_ == nullptr)
             throw std::runtime_error("Not enough memory: loadIndexStream failed to allocate linklists");
         element_levels_ = std::vector<int>(max_elements);
-        revSize_ = 1.0 / mult_;
-        ef_ = 10;
-        for (size_t i = 0; i < cur_element_count; i++) {
-            label_lookup_[getExternalLabel(i)] = i;
-            unsigned int linkListSize;
-            readBinaryPOD(input, linkListSize);
-            if (linkListSize == 0) {
-                element_levels_[i] = 0;
-                linkLists_[i] = nullptr;
-            } else {
-                element_levels_[i] = linkListSize / size_links_per_element_;
-                linkLists_[i] = (char *) malloc(linkListSize);
-                if (linkLists_[i] == nullptr)
-                    throw std::runtime_error("Not enough memory: loadIndexStream failed to allocate linklist");
-                input.read(linkLists_[i], linkListSize);
+        // Only now: clear() walks cur_element_count slots of linkLists_.
+        cur_element_count = count;
+
+        // Split each interleaved slot, a few MB at a time.
+        {
+            const size_t per_chunk = std::max<size_t>(1, (4u << 20) / legacy_size);
+            std::vector<char> buf(std::min(per_chunk, std::max<size_t>(count, 1)) * legacy_size);
+            for (size_t i = 0; i < count; i += per_chunk) {
+                const size_t n = std::min(per_chunk, count - i);
+                if (!input.read(buf.data(), n * legacy_size))
+                    throw std::runtime_error("corrupt index stream: truncated base layer");
+                for (size_t k = 0; k < n; ++k) {
+                    const char *src = buf.data() + k * legacy_size;
+                    char *l0 = data_level0_memory_ + (i + k) * size_data_per_element_;
+                    memcpy(l0, src, size_links_level0_);
+                    memcpy(l0 + label_offset_, src + legacy_label, sizeof(labeltype));
+                    memcpy(vectors_ + (i + k) * data_size_, src + legacy_data, data_size_);
+                }
             }
         }
 
-        for (size_t i = 0; i < cur_element_count; i++) {
-            if (isMarkedDeleted(i)) {
-                num_deleted_ += 1;
-                if (allow_replace_deleted_) deleted_elements.insert(i);
-            }
+        std::vector<std::mutex>(max_elements).swap(link_list_locks_);
+        std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
+        visited_list_pool_.reset(new VisitedListPool(1, max_elements));
+        dirty_.reset();
+        allocDirty(max_elements);
+        revSize_ = 1.0 / mult_;
+        ef_ = 10;
+        for (size_t i = 0; i < count; i++) {
+            unsigned int linkListSize;
+            rd(linkListSize);
+            if (left < sizeof(linkListSize) + static_cast<uint64_t>(linkListSize) ||
+                linkListSize % size_links_per_element_ != 0)
+                throw std::runtime_error("corrupt index stream: bad link list size");
+            left -= sizeof(linkListSize) + linkListSize;
+            if (linkListSize == 0) continue;
+            linkLists_[i] = (char *) malloc(linkListSize);
+            if (linkLists_[i] == nullptr)
+                throw std::runtime_error("Not enough memory: loadIndexStream failed to allocate linklist");
+            element_levels_[i] = static_cast<int>(linkListSize / size_links_per_element_);
+            if (!input.read(linkLists_[i], linkListSize))
+                throw std::runtime_error("corrupt index stream: truncated link list");
         }
+        checkGraph(ep, maxlevel);
+        clearDirty();
     }
 
 
@@ -996,6 +1069,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (!isMarkedDeleted(internalId)) {
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(internalId))+2;
             *ll_cur |= DELETE_MARK;
+            markDirty(internalId, DIRTY_LINKS);
             num_deleted_ += 1;
             if (allow_replace_deleted_) {
                 std::unique_lock <std::mutex> lock_deleted_elements(deleted_elements_lock);
@@ -1038,6 +1112,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (isMarkedDeleted(internalId)) {
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(internalId)) + 2;
             *ll_cur &= ~DELETE_MARK;
+            markDirty(internalId, DIRTY_LINKS);
             num_deleted_ -= 1;
             if (allow_replace_deleted_) {
                 std::unique_lock <std::mutex> lock_deleted_elements(deleted_elements_lock);
@@ -1116,6 +1191,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     void updatePoint(const void *dataPoint, tableint internalId, float updateNeighborProbability) {
         // update the feature vector associated with existing point with new vector
         memcpy(getDataByInternalId(internalId), dataPoint, data_size_);
+        markDirty(internalId, DIRTY_DATA);
 
         int maxLevelCopy = maxlevel_;
         tableint entryPointCopy = enterpoint_node_;
@@ -1179,6 +1255,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     ll_cur = get_linklist_at_level(neigh, layer);
                     size_t candSize = candidates.size();
                     setListCount(ll_cur, candSize);
+                    markDirty(neigh, DIRTY_LINKS);
                     tableint *data = (tableint *) (ll_cur + 1);
                     for (size_t idx = 0; idx < candSize; idx++) {
                         data[idx] = candidates.top().second;
@@ -1321,6 +1398,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // Initialisation of the data and label
         memcpy(getExternalLabeLp(cur_c), &label, sizeof(labeltype));
         memcpy(getDataByInternalId(cur_c), data_point, data_size_);
+        markDirty(cur_c, DIRTY_DATA | DIRTY_LINKS);
 
         if (curlevel) {
             linkLists_[cur_c] = (char *) malloc(size_links_per_element_ * curlevel + 1);

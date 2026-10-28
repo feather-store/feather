@@ -31,17 +31,17 @@ Note: the judge here is a single-rubric semantic-match prompt, simpler than
 LongMemEval's official per-type GPT-4o rubric — treat the number as an internal
 signal, not an official leaderboard submission.
 """
-import os, sys, glob, json, time, argparse, importlib.util
+import os, sys, json, time, argparse, tempfile
 from collections import defaultdict
 import numpy as np
 
+# The repo's feather_db, built in place (no install needed). Imported as the
+# package, not by loading core*.so under another name: the embedders and LLM
+# clients import feather_db too, and a second load of the extension fails
+# ("type ... is already registered"), so every dense, hybrid or LLM run died.
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_tag = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
-_cands = [p for p in glob.glob(os.path.join(_HERE, "feather_db/core*.so")) if _tag in p]
-_so = (_cands or sorted(glob.glob(os.path.join(_HERE, "feather_db/core*.so"))))[0]
-_spec = importlib.util.spec_from_file_location("core", _so)
-fc = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(fc)
 sys.path.insert(0, _HERE)
+import feather_db as fc  # noqa: E402
 
 ANSWER_SYS = ("You answer questions about a user using excerpts from their past "
               "conversations with an assistant. Use ONLY the provided context. "
@@ -77,6 +77,8 @@ def run(args):
     data = json.load(open(args.data))
     if args.limit:
         data = data[: args.limit]
+    if not data:
+        sys.exit(f"{args.data}: no questions")
 
     embed = get_embedder(args.embed_provider, args.embed_model, args.embed_key, args.dim)
     if args.mode != "keyword" and embed is None:
@@ -92,15 +94,14 @@ def run(args):
     correct = 0
     by_type = defaultdict(int); by_type_n = defaultdict(int)
     n = len(data); t0 = time.time()
+    # Per-question files in this run's own directory (see longmemeval.py).
+    tmp = tempfile.TemporaryDirectory(prefix="lmeqa_")
 
     for qi, item in enumerate(data):
         sessions, sids = item["haystack_sessions"], item["haystack_session_ids"]
         gold = item["answer"]; q = item["question"]; qtype = item.get("question_type", "?")
 
-        path = f"/tmp/lmeqa_{qi}.feather"
-        for ext in ("", ".wal", ".tmp"):
-            if os.path.exists(path + ext): os.remove(path + ext)
-        db = fc.DB.open(path, dim=vdim)
+        db = fc.DB.open(os.path.join(tmp.name, f"q{qi}.feather"), dim=vdim)
         for si, sess in enumerate(sessions):
             m = fc.Metadata(); m.content = session_text(sess); m.entity_id = sids[si]
             vec = np.asarray(embed(m.content), dtype=np.float32) if embed else np.zeros(vdim, np.float32)
@@ -109,22 +110,22 @@ def run(args):
         if args.mode == "keyword":
             res = db.keyword_search(q, k=args.k)
         elif args.mode == "dense":
-            res = db.search(np.asarray(embed(q), np.float32), k=args.k)
+            res = db.search(np.asarray(embed(q), np.float32), k=args.k, record_salience=False)
         else:
             res = db.hybrid_search(np.asarray(embed(q), np.float32), q, k=args.k)
         ranked_idx = [r.id for r in res]
         ctx = build_context(item, ranked_idx, args.k)
-
-        for ext in ("", ".wal", ".tmp"):
-            if os.path.exists(path + ext): os.remove(path + ext)
+        db.close(save=False)        # closed, not dropped: see longmemeval.py
 
         user = f"Context:\n{ctx}\n\nQuestion: {q}\nAnswer:"
         if args.dry_run:
             print(f"\n──── Q{qi} [{qtype}] ────")
             print(f"question: {q}")
             print(f"gold:     {gold}")
-            print(f"retrieved sessions (idx): {ranked_idx}  "
-                  f"(gold sids={item['answer_session_ids']})")
+            got = [sids[i] for i in ranked_idx]
+            hit = bool(set(got) & set(item["answer_session_ids"]))
+            print(f"retrieved sessions: {got}  gold: {item['answer_session_ids']}  "
+                  f"({'hit' if hit else 'MISS'})")
             print(f"answer-prompt chars: {len(user)} | first ctx block:\n"
                   f"{ctx[:280]}...")
             by_type_n[qtype] += 1
@@ -138,6 +139,7 @@ def run(args):
         if (qi + 1) % 20 == 0 or qi + 1 == n:
             print(f"  [{qi+1:3d}/{n}] acc={correct/(qi+1):.3f}  ({time.time()-t0:.0f}s)")
 
+    tmp.cleanup()
     if args.dry_run:
         print(f"\nDRY RUN ok — pipeline assembled prompts for {sum(by_type_n.values())} "
               f"questions across {len(by_type_n)} types. Add --answer-provider to run for real.")

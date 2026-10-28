@@ -247,10 +247,22 @@ def _check_dims(cfg: _Cfg, vecs: List[List[float]]) -> List[List[float]]:
     return vecs
 
 
+class UpstreamError(RuntimeError):
+    """The embedding provider failed. `transient`: rate-limited, overloaded or
+    unreachable, so the same request may succeed later; otherwise the provider
+    refused it (bad key, unknown model), which no retry fixes."""
+
+    def __init__(self, msg: str, status: Optional[int] = None):
+        super().__init__(msg)
+        self.status = status
+        self.transient = status is None or status in (408, 425, 429) or status >= 500
+
+
 def _http_error(url: str, e: Exception) -> RuntimeError:
     if isinstance(e, httpx.HTTPStatusError):
-        return RuntimeError(f"{url} -> HTTP {e.response.status_code}: {e.response.text[:300]}")
-    return RuntimeError(f"{url} -> {type(e).__name__}: {e}")
+        code = e.response.status_code
+        return UpstreamError(f"{url} -> HTTP {code}: {e.response.text[:300]}", code)
+    return UpstreamError(f"{url} -> {type(e).__name__}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

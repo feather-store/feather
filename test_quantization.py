@@ -1,4 +1,4 @@
-"""Test feature B: on-disk int8 quantization (file format v7)."""
+"""Test feature B: on-disk int8 quantization (file format v7, and v10)."""
 import os, sys, glob, tempfile, importlib.util, numpy as np
 
 _tag = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
@@ -43,8 +43,18 @@ pf = tempfile.mktemp(suffix=".feather"); pq = tempfile.mktemp(suffix=".feather")
 build(pf, False); build(pq, True)
 sz_f, sz_q = os.path.getsize(pf), os.path.getsize(pq)
 ratio = sz_f / sz_q
-check("quantized file >2.5x smaller", ratio > 2.5,
+# v10 also persists the graph's link lists (~132 B/node) so a quantized file
+# loads without a rebuild; at 128-d they are a third of what remains. The v9
+# file stores int8 vectors only and rebuilds the graph on every load.
+check("v10 quantized file >1.9x smaller", ratio > 1.9,
       f"float={sz_f}B quant={sz_q}B ratio={ratio:.2f}x")
+os.environ["FEATHER_FORMAT"] = "9"
+pf9 = tempfile.mktemp(suffix=".feather"); pq9 = tempfile.mktemp(suffix=".feather")
+build(pf9, False); build(pq9, True)
+del os.environ["FEATHER_FORMAT"]
+r9 = os.path.getsize(pf9) / os.path.getsize(pq9)
+check("v9 quantized file >2.5x smaller", r9 > 2.5, f"ratio={r9:.2f}x")
+cleanup(pf9); cleanup(pq9)
 
 print("2) quant flag persists across reload")
 dbq = fc.DB.open(pq, dim=DIM)

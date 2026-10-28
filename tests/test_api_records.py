@@ -419,3 +419,56 @@ def test_only_returned_records_are_touched(client):
     touched = [i for i in range(30)
                if client.get(f"/v1/{NS}/records/{i}").json()["recall_count"] > 0]
     assert len(touched) == 3, f"k=3 touched {len(touched)} records"
+
+
+# ── PUT replaces metadata, never the graph ────────────────────────────────
+# MetadataIn has no edges field, and update_metadata() replaces the whole
+# record, so every PUT used to unlink the record from everything it pointed at.
+
+def _links(client, rec_id):
+    return client.get(f"/v1/{NS}/records/{rec_id}").json()["links"]
+
+
+def test_put_keeps_the_record_edges(client):
+    for i in (1, 2, 3):
+        _add(client, i, content=f"asset {i}")
+    for to in (2, 3):
+        assert client.post(f"/v1/{NS}/records/1/link", json={"to_id": to}).status_code == 200
+
+    r = client.put(f"/v1/{NS}/records/1",
+                   json={"metadata": {"content": "asset 1 revised",
+                                      "attributes": {"s3_key": "new/path.png"}}})
+    assert r.status_code == 200, r.text
+    meta = client.get(f"/v1/{NS}/records/1").json()
+    assert meta["content"] == "asset 1 revised"
+    assert sorted(meta["links"]) == [2, 3], "PUT dropped the record's edges"
+
+
+def test_unlink_still_removes_the_last_edge(client):
+    """The fix belongs in the route, not the engine: unlink and the delete
+    cascade remove edges by writing a record with fewer, possibly none."""
+    for i in (1, 2):
+        _add(client, i)
+    client.post(f"/v1/{NS}/records/1/link", json={"to_id": 2})
+    r = client.delete(f"/v1/{NS}/records/1/link/2")
+    assert r.json()["removed"] == 1
+    assert _links(client, 1) == []
+    client.put(f"/v1/{NS}/records/1", json={"metadata": {"content": "edited"}})
+    assert _links(client, 1) == [], "PUT brought back an unlinked edge"
+
+
+def test_put_keeps_the_record_key(client):
+    """A key is identity, like the edges: MetadataIn has no key field, so a
+    PUT that replaced it would unbind the record from its key."""
+    import feather_db
+    _add(client, 1, content="asset")
+    sys.path.insert(0, API_DIR)
+    from app.main import manager                         # noqa: WPS433
+    db = manager.get(NS)
+    m = db.get_metadata(1)
+    m.key = "hero-image"
+    db.update_metadata(1, m)
+    assert client.put(f"/v1/{NS}/records/1", json={"metadata": {"content": "edited"}}).status_code == 200
+    rec = client.get(f"/v1/{NS}/records/1").json()
+    assert rec["key"] == "hero-image" and rec["content"] == "edited"
+    assert db.id_for("hero-image", m.namespace_id) == 1

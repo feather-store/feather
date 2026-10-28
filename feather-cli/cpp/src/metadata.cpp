@@ -1,5 +1,7 @@
 #include "../include/metadata.h"
+#include <algorithm>
 #include <iostream>
+#include <stdexcept>
 
 namespace feather {
 
@@ -41,16 +43,20 @@ void Metadata::serialize(std::ostream& os) const {
     os.write(reinterpret_cast<const char*>(&eid_len), 2);
     os.write(entity_id.data(), eid_len);
 
-    uint16_t attr_count = static_cast<uint16_t>(attributes.size());
-    os.write(reinterpret_cast<const char*>(&attr_count), 2);
-    for (const auto& [key, val] : attributes) {
-        uint16_t key_len = static_cast<uint16_t>(key.size());
+    // The native key travels as the first attribute, under a name no caller
+    // can mean (it starts with NUL): see Metadata::key.
+    auto put_attr = [&os](const std::string& k, const std::string& v) {
+        uint16_t key_len = static_cast<uint16_t>(k.size());
         os.write(reinterpret_cast<const char*>(&key_len), 2);
-        os.write(key.data(), key_len);
-        uint32_t val_len = static_cast<uint32_t>(val.size());
+        os.write(k.data(), key_len);
+        uint32_t val_len = static_cast<uint32_t>(v.size());
         os.write(reinterpret_cast<const char*>(&val_len), 4);
-        os.write(val.data(), val_len);
-    }
+        os.write(v.data(), val_len);
+    };
+    uint16_t attr_count = static_cast<uint16_t>(attributes.size() + (key.empty() ? 0 : 1));
+    os.write(reinterpret_cast<const char*>(&attr_count), 2);
+    if (!key.empty()) put_attr(key_attr(), key);
+    for (const auto& [k, val] : attributes) put_attr(k, val);
 
     // Phase 5: typed, weighted edges
     uint16_t edge_count = static_cast<uint16_t>(edges.size());
@@ -68,92 +74,110 @@ void Metadata::serialize(std::ostream& os) const {
     os.write(reinterpret_cast<const char*>(&confidence), 4);
 }
 
+namespace {
+
+// Every length below comes off disk. A record is read from a stream that
+// does not know where the record ends, so a length is checked by reading:
+// strings grow a chunk at a time as bytes actually arrive, so a corrupt
+// 4 GB length costs at most one chunk past the end of the stream instead of a
+// 4 GB zero-filled allocation, and a short read is an error rather than a
+// field silently left half-filled.
+[[noreturn]] void truncated() {
+    throw std::runtime_error("corrupt metadata record: truncated");
+}
+
+template <class T> void get(std::istream& is, T& v) {
+    if (!is.read(reinterpret_cast<char*>(&v), sizeof(T))) truncated();
+}
+
+// A trailing field older writers did not emit: false at a clean end of the
+// record, an error if the field is cut part way.
+template <class T> bool get_opt(std::istream& is, T& v) {
+    is.read(reinterpret_cast<char*>(&v), sizeof(T));
+    if (is.gcount() == static_cast<std::streamsize>(sizeof(T))) return true;
+    if (is.gcount() == 0) return false;
+    truncated();
+}
+
+void get_bytes(std::istream& is, std::string& s, size_t n) {
+    constexpr size_t CHUNK = 64 * 1024;
+    s.clear();
+    while (s.size() < n) {
+        const size_t at = s.size();
+        const size_t k = std::min(CHUNK, n - at);
+        s.resize(at + k);
+        if (!is.read(&s[at], static_cast<std::streamsize>(k))) truncated();
+    }
+}
+
+template <class Len> std::string get_str(std::istream& is) {
+    Len n = 0;
+    get(is, n);
+    std::string s;
+    get_bytes(is, s, n);
+    return s;
+}
+
+} // namespace
+
 Metadata Metadata::deserialize(std::istream& is) {
     Metadata m;
-    is.read(reinterpret_cast<char*>(&m.timestamp), 8);
-    is.read(reinterpret_cast<char*>(&m.importance), 4);
-    uint8_t type_val;
-    is.read(reinterpret_cast<char*>(&type_val), 1);
+    get(is, m.timestamp);
+    get(is, m.importance);
+    uint8_t type_val = 0;
+    get(is, type_val);
     m.type = static_cast<ContextType>(type_val);
-
-    uint16_t source_len;
-    is.read(reinterpret_cast<char*>(&source_len), 2);
-    m.source.resize(source_len);
-    is.read(&m.source[0], source_len);
-
-    uint32_t content_len;
-    is.read(reinterpret_cast<char*>(&content_len), 4);
-    m.content.resize(content_len);
-    is.read(&m.content[0], content_len);
-
-    uint16_t tags_len;
-    is.read(reinterpret_cast<char*>(&tags_len), 2);
-    m.tags_json.resize(tags_len);
-    is.read(&m.tags_json[0], tags_len);
+    m.source    = get_str<uint16_t>(is);
+    m.content   = get_str<uint32_t>(is);
+    m.tags_json = get_str<uint16_t>(is);
 
     // Phase 3: legacy links slot (v3/v4 used this; v5 writes 0 here but reads edges below)
     uint16_t links_count = 0;
-    if (!is.read(reinterpret_cast<char*>(&links_count), 2)) return m;
-    if (links_count > 0) {
+    if (!get_opt(is, links_count)) return m;
+    for (uint16_t i = 0; i < links_count; ++i) {
         // Old v3/v4 plain link IDs — promote to edges with default type/weight
-        for (uint16_t i = 0; i < links_count; ++i) {
-            uint64_t target;
-            is.read(reinterpret_cast<char*>(&target), 8);
-            m.edges.push_back({target, "related_to", 1.0f});
-        }
+        uint64_t target = 0;
+        get(is, target);
+        m.edges.push_back({target, "related_to", 1.0f});
     }
     uint32_t rc = 0;
-    is.read(reinterpret_cast<char*>(&rc), 4);
+    get(is, rc);
     m.recall_count.store(rc, std::memory_order_relaxed);
     uint64_t lr = 0;
-    is.read(reinterpret_cast<char*>(&lr), 8);
+    get(is, lr);
     m.last_recalled_at.store(lr, std::memory_order_relaxed);
 
     // Phase 4: namespace_id, entity_id, attributes
     uint16_t ns_len = 0;
-    if (!is.read(reinterpret_cast<char*>(&ns_len), 2)) return m;
-    m.namespace_id.resize(ns_len);
-    if (ns_len > 0) is.read(&m.namespace_id[0], ns_len);
-
-    uint16_t eid_len = 0;
-    is.read(reinterpret_cast<char*>(&eid_len), 2);
-    m.entity_id.resize(eid_len);
-    if (eid_len > 0) is.read(&m.entity_id[0], eid_len);
+    if (!get_opt(is, ns_len)) return m;
+    get_bytes(is, m.namespace_id, ns_len);
+    m.entity_id = get_str<uint16_t>(is);
 
     uint16_t attr_count = 0;
-    is.read(reinterpret_cast<char*>(&attr_count), 2);
+    get(is, attr_count);
     for (uint16_t i = 0; i < attr_count; ++i) {
-        uint16_t key_len = 0;
-        is.read(reinterpret_cast<char*>(&key_len), 2);
-        std::string key(key_len, '\0');
-        if (key_len > 0) is.read(&key[0], key_len);
-        uint32_t val_len = 0;
-        is.read(reinterpret_cast<char*>(&val_len), 4);
-        std::string val(val_len, '\0');
-        if (val_len > 0) is.read(&val[0], val_len);
-        m.attributes[key] = val;
+        std::string key = get_str<uint16_t>(is);
+        if (key == Metadata::key_attr()) m.key = get_str<uint32_t>(is);
+        else                             m.attributes[std::move(key)] = get_str<uint32_t>(is);
     }
 
     // Phase 5: typed, weighted edges
     uint16_t edge_count = 0;
-    if (!is.read(reinterpret_cast<char*>(&edge_count), 2)) return m;
+    if (!get_opt(is, edge_count)) return m;
     for (uint16_t i = 0; i < edge_count; ++i) {
         Edge e;
-        is.read(reinterpret_cast<char*>(&e.target_id), 8);
-        uint8_t rt_len = 0;
-        is.read(reinterpret_cast<char*>(&rt_len), 1);
-        e.rel_type.resize(rt_len);
-        if (rt_len > 0) is.read(&e.rel_type[0], rt_len);
-        is.read(reinterpret_cast<char*>(&e.weight), 4);
+        get(is, e.target_id);
+        e.rel_type = get_str<uint8_t>(is);
+        get(is, e.weight);
         m.edges.push_back(std::move(e));
     }
 
     // Phase 6: ttl + confidence (guarded — v5 files default to 0 / 1.0)
     int64_t ttl_val = 0;
-    if (!is.read(reinterpret_cast<char*>(&ttl_val), 8)) return m;
+    if (!get_opt(is, ttl_val)) return m;
     m.ttl = ttl_val;
     float conf_val = 1.0f;
-    if (!is.read(reinterpret_cast<char*>(&conf_val), 4)) return m;
+    if (!get_opt(is, conf_val)) return m;
     m.confidence = conf_val;
 
     return m;

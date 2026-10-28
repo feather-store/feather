@@ -159,8 +159,10 @@ def main():
     for k in (1, 50, 100):
         log("search", f"latency k={k} (ef=50)", time_each(lambda q: db.search(q, k=k, record_salience=False), qs[:500]))
     log("search", "k=10 WITH record_salience=True (default)", time_each(lambda q: db.search(q, k=10), qs[:500]))
-    sres = db.search(qs[0], k=5, modality="visual")
-    log("search", "modality='visual' k=10", time_each(lambda q: db.search(q[:64].copy(), k=10, modality="visual", record_salience=False), qs[:500]))
+    # Queries of the visual modality's own dim: a text query (DIM wide) is
+    # refused, and q[:64] does not exist when DIM < 64.
+    vqs = np.random.default_rng(4).standard_normal((500, 64)).astype(np.float32)
+    log("search", "modality='visual' k=10", time_each(lambda q: db.search(q, k=10, modality="visual", record_salience=False), vqs))
 
     # concurrent throughput (GIL released in C++)
     big = np.concatenate([qs] * 4)

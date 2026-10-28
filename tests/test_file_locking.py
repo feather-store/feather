@@ -143,9 +143,10 @@ def test_readers_are_never_blocked_by_the_writer(tmp_path):
 
 
 def test_a_reader_sees_a_consistent_snapshot_across_a_save(tmp_path):
-    """save_vectors() writes <path>.tmp and renames it over the original, so a
-    reader holds the old inode and sees a complete file — just a stale one —
-    until it reopens. That is what makes lock-free reads safe."""
+    """A commit appends past the committed end and only then switches the
+    header (a full rewrite goes to <path>.tmp and is renamed), so a reader
+    sees one complete commit — just a stale one — until it reopens. That is
+    what makes lock-free reads safe."""
     path = str(tmp_path / "snap.feather")
     writer = DB.open(path, dim=8)
     writer.add(id=1, vec=np.ones(8, dtype=np.float32))

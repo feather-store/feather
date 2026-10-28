@@ -72,7 +72,7 @@ def test_int8_filtered_scan_matches_float_scan(tmp_path):
     n, dim, max_abs = 3000, 96, 4.0
     V = rng.uniform(-max_abs, max_abs, (n, dim)).astype(np.float32)
     db = DB.open(str(tmp_path / "i8.feather"), dim=dim)
-    db.set_int8_ram("text", max_abs)
+    db.set_int8_ram("text", max_abs, refine=0)    # the kernel's own ranking, not the re-rank
     metas = []
     for i in range(n):
         m = feather_db.Metadata(); m.namespace_id = "a" if i % 2 else "b"; metas.append(m)

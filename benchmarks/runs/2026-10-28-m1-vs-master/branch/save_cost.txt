@@ -1,0 +1,13 @@
+building 100000 x 384 ...
+  built in 52s, 178 MB
+
+100000 x 384, save after 100 adds + 100 importance updates (median of 5):
+                                        v9           v10
+bytes written per save            176.5 MB       0.42 MB
+save wall time                      846 ms        1.2 ms
+file size after rounds            176.8 MB      180.4 MB
+
+add() latency on a writer thread:
+  no save running, p99             1.87 ms       1.01 ms
+  while saving, p99                3.05 ms       7.47 ms
+  while saving, max             1236.14 ms       8.38 ms

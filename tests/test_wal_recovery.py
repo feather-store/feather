@@ -94,7 +94,6 @@ def test_corrupt_wal_length_does_not_allocate_wildly(tmp_path):
     db.add(1, np.random.rand(16).astype(np.float32), m)
     db.save()
     db.close(save=False)   # hand the file on: no checkpoint, lock released.
-    del db                 # `del` alone cannot release it (py::nodelete)
 
     with open(path + ".wal", "wb") as fh:
         fh.write(struct.pack("<B", 0x01))         # WalOp::ADD
@@ -116,7 +115,8 @@ sys.path.insert(0, {REPO!r})
 import feather_db
 db = feather_db.DB.open({db_path!r}, dim=16)
 rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-print(db.size(), rss)
+print(db.size(), rss, flush=True)
+import os; os._exit(0)   # no checkpoint on exit: the parent reuses this WAL
 '''
         proc = subprocess.run([sys.executable, "-c", src], capture_output=True,
                               text=True, timeout=180)
@@ -240,3 +240,51 @@ def test_valid_wal_record_still_replays(tmp_path):
         assert sorted(reopened.get_all_ids()) == [1, 2]
     finally:
         reopened.close()
+
+
+def test_update_metadata_edges_after_a_crash_match_before_it(tmp_path):
+    """update_metadata() replaces the record, edges included. Replay used the
+    add rule (no edges given -> keep the old ones), so an edge a caller had
+    removed came back after a crash: the recovered graph was not the one the
+    process had been serving. The cases: drop every edge, keep a subset, add one.
+    """
+    path = str(tmp_path / "edges.feather")
+    src = f'''
+import sys, os, signal, json
+sys.path.insert(0, {REPO!r})
+import numpy as np, feather_db
+db = feather_db.DB.open({path!r}, dim=16)
+for i in range(1, 6):
+    m = feather_db.Metadata(); m.content = f"rec {{i}}"
+    db.add(i, np.random.rand(16).astype(np.float32), m)
+db.link(1, 2, "a"); db.link(1, 3, "b"); db.link(2, 3, "a"); db.link(4, 5, "a")
+db.save()                                    # the base file holds every edge
+
+def update(i, edges):
+    m = db.get_metadata(i); m.content = f"rev {{i}}"; m.edges = edges
+    db.update_metadata(i, m)
+update(1, [feather_db.Edge(3, "b", 0.5)])    # a subset, reweighted
+update(2, [])                                # every edge dropped
+update(4, list(db.get_edges(4)) + [feather_db.Edge(1, "c", 1.0)])
+
+state = {{i: sorted((e.target_id, e.rel_type, round(e.weight, 3)) for e in db.get_edges(i))
+         for i in range(1, 6)}}
+inc = {{i: sorted((e.source_id, e.rel_type) for e in db.get_incoming(i)) for i in range(1, 6)}}
+print(json.dumps([state, inc]), flush=True)
+os.kill(os.getpid(), signal.SIGKILL)
+'''
+    proc = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True)
+    assert proc.returncode == -9, f"child did not die by SIGKILL: {proc.returncode} {proc.stderr}"
+    import json
+    before_edges, before_inc = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert before_edges["2"] == [], "live update_metadata no longer drops edges"
+
+    db = DB.open(path, dim=16)
+    after_edges = {str(i): [list(t) for t in sorted((e.target_id, e.rel_type, round(e.weight, 3))
+                                                    for e in db.get_edges(i))] for i in range(1, 6)}
+    after_inc = {str(i): [list(t) for t in sorted((e.source_id, e.rel_type)
+                                                  for e in db.get_incoming(i))] for i in range(1, 6)}
+    assert after_edges == before_edges
+    assert after_inc == before_inc
+    assert db.get_metadata(2).content == "rev 2"
+    db.close()

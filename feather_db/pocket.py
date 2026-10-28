@@ -25,7 +25,6 @@ database already keeps.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import time
@@ -36,6 +35,7 @@ from typing import Any, Callable, Iterable, Optional
 import numpy as np
 
 import feather_db
+from feather_db import keys
 from feather_db.filter import FilterBuilder
 
 # ~4 characters per token is the usual rough figure for English prose. It is an
@@ -97,15 +97,18 @@ INHERIT_DECAY = 0.7
 
 
 def scoped_id(namespace: str, key: str) -> int:
-    """The record id for `key` inside the flat scope `namespace`.
+    """The id a pre-0.22 pocket derived for `key` in `namespace` (a 53-bit SHA-1).
 
-    Module-level because resolution is not always done by the pocket that owns
-    the scope: a packet looking a required rule up in an ancestor needs the same
-    id this pocket would compute for it. Two copies of this hash would drift,
-    and the symptom would be a rule that silently cannot be found.
+    Kept for code that still calls it. It no longer places records: two keys
+    that collided shared one, and the second write overwrote the first. Records
+    are now addressed by native key — see feather_db.keys.resolve().
     """
-    h = hashlib.sha1(f"{namespace}\x00{key}".encode()).hexdigest()
-    return int(h[:14], 16) & ((1 << 53) - 1)
+    return keys.legacy_id(namespace, key)
+
+
+# (id(db), namespace) pairs already migrated in this process: migrate() is
+# idempotent, but it reads every record of the scope.
+_MIGRATED: set = set()
 
 
 def _scope(scope) -> tuple[str, ...]:
@@ -132,6 +135,7 @@ class PocketItem:
     scope: tuple[str, ...] = ()      # which layer it came from
     inherited: bool = False          # True when it came from an ancestor scope
     relevance: float = 0.0           # normalised search score; 0 outside recall()
+    version: int = 0                 # the record's version: moves on writes, never on reads
 
     def __repr__(self) -> str:          # readable in a debugger / log line
         p = "*" if self.pinned else " "
@@ -176,6 +180,12 @@ class Pocket:
         self.inherit = inherit
         self._embed = embed
         self._hot_cache: dict = {}
+        # Records written before native keys get theirs, so they are found by
+        # key — keyword search included — like everything written since.
+        if (id(db), self.namespace) not in _MIGRATED and not db.is_read_only():
+            if keys.migrate(db, [self.namespace]):
+                _bump(db)
+            _MIGRATED.add((id(db), self.namespace))
 
     # ── scope resolution ─────────────────────────────────────────────────
 
@@ -274,7 +284,7 @@ class Pocket:
             # them at the tail, so exclude them by kind rather than by score.
             if meta.source == _CACHE_KIND:
                 continue
-            key = meta.entity_id or str(rid)
+            key = meta.key or meta.entity_id or str(rid)
             # Shadowing: the agent's own version of a key wins over an inherited
             # one. Scopes are walked deepest first, so the first sighting is the
             # most specific — the same rule as a variable shadowing an outer one.
@@ -292,6 +302,7 @@ class Pocket:
                 pinned=meta.get_attribute(_PINNED) == "true",
                 scope=sc,
                 inherited=depth > 0,
+                version=meta.version,
             ))
 
         scored.sort(key=lambda x: -x.heat)
@@ -321,8 +332,7 @@ class Pocket:
         attributes: Optional[dict] = None,
     ) -> int:
         """Store a memory. Same key overwrites, so re-learning is not duplication."""
-        rid = self._id(key)
-        prev = self.db.get_metadata(rid)
+        _, prev = keys.get(self.db, self.namespace, key)
 
         meta = feather_db.Metadata()
         meta.timestamp    = int(time.time())
@@ -340,13 +350,12 @@ class Pocket:
         if prev is not None and prev.recall_count:
             meta.recall_count = prev.recall_count
 
-        self.db.add(rid, self._vec(content), meta)
+        rid = keys.write(self.db, self.namespace, key, meta, self._vec(content))
         _bump(self.db)
         return rid
 
     def pin(self, key: str, pinned: bool = True) -> None:
-        rid = self._id(key)
-        meta = self.db.get_metadata(rid)
+        rid, meta = keys.get(self.db, self.namespace, key)
         if meta is None:
             return
         meta.set_attribute(_PINNED, "true" if pinned else "false")
@@ -354,7 +363,9 @@ class Pocket:
         _bump(self.db)
 
     def forget(self, key: str) -> None:
-        self.db.forget(self._id(key))
+        rid = self._id(key)
+        if rid is not None:
+            self.db.forget(rid)
         _bump(self.db)
 
     # ── WARM ─────────────────────────────────────────────────────────────
@@ -387,7 +398,7 @@ class Pocket:
             m = h.metadata
             if m.source == "_forgotten" or m.source == _CACHE_KIND:
                 continue
-            key = m.entity_id or str(h.id)
+            key = m.key or m.entity_id or str(h.id)
             if key in seen:
                 continue
             seen.add(key)
@@ -400,6 +411,7 @@ class Pocket:
                 scope=tuple(m.namespace_id.split(SCOPE_SEP)) if m.namespace_id else (),
                 inherited=depth > 0,
                 relevance=float(h.score) / top,
+                version=m.version,
             ))
         # Rank by RELEVANCE, with heat as a modest tiebreaker.
         #
@@ -427,8 +439,7 @@ class Pocket:
         Putting it here means one store, one expiry mechanism, and cached results
         that can be inspected alongside everything else the agent knows.
         """
-        rid = self._id(f"__cache__/{key}")
-        meta = self.db.get_metadata(rid)
+        _, meta = keys.get(self.db, self.namespace, f"__cache__/{key}")
         if meta is not None and meta.source != "_forgotten":
             expires = float(meta.get_attribute(_CACHE_EXPIRY) or 0)
             if time.time() < expires:
@@ -447,7 +458,7 @@ class Pocket:
         m.importance   = 0.0      # never competes with real memory for budget
         m.set_attribute(_CACHE_EXPIRY, str(time.time() + ttl_seconds))
         m.ttl = int(ttl_seconds)  # so forget_expired() reaps it
-        self.db.add(rid, self._vec(key), m)
+        keys.write(self.db, self.namespace, f"__cache__/{key}", m, self._vec(key))
         _bump(self.db)
         return value
 
@@ -525,9 +536,9 @@ class Pocket:
 
     # ── internals ────────────────────────────────────────────────────────
 
-    def _id(self, key: str) -> int:
-        """Deterministic, so `remember()` on the same key updates in place."""
-        return scoped_id(self.namespace, key)
+    def _id(self, key: str) -> Optional[int]:
+        """The record holding `key` in this scope, or None."""
+        return keys.resolve(self.db, self.namespace, key)
 
     def _vec(self, text: str) -> np.ndarray:
         dim = self.db.dim("text")

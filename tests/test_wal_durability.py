@@ -47,22 +47,31 @@ def _seed(path, n=5, start=0):
 
 def test_wal_is_written_with_a_versioned_header(tmp_path):
     path = str(tmp_path / "hdr.feather")
-    _seed(path, 2)
+    db = _seed(path, 2)                 # held: dropping it would checkpoint the WAL away
     with open(path + ".wal", "rb") as fh:
         magic, ver = struct.unpack("<II", fh.read(8))
     assert magic == WAL_MAGIC, f"missing WAL magic, got {magic:#x}"
     assert ver == 2, f"unexpected WAL version {ver}"
+    db.close(save=False)
 
 
 def test_records_carry_a_checksum(tmp_path):
     """One record must occupy exactly op+id+plen+payload+crc bytes."""
     path = str(tmp_path / "crc.feather")
-    _seed(path, 1)
+    db = _seed(path, 1)                 # held: dropping it would checkpoint the WAL away
     raw = open(path + ".wal", "rb").read()
+    db.close(save=False)
     body = raw[HEADER_LEN:]
+    # First the WALGEN record (op 10): the base generation this WAL follows.
+    assert body[0] == 10 and struct.unpack("<I", body[9:13])[0] == 8
+    body = body[1 + 8 + 4 + 8 + 4:]
     plen = struct.unpack("<I", body[9:13])[0]
-    assert len(body) == 1 + 8 + 4 + plen + 4, (
-        f"record is {len(body)}B, expected {1+8+4+plen+4}B incl. 4B CRC")
+    rec = 1 + 8 + 4 + plen + 4
+    # ...followed by its STAMP (op 7): the record's version, 8 bytes.
+    stamp = body[rec:]
+    assert len(stamp) == 1 + 8 + 4 + 8 + 4, (
+        f"{len(body)}B, expected a {rec}B record incl. 4B CRC, then a 25B STAMP")
+    assert stamp[0] == 7 and struct.unpack("<I", stamp[9:13])[0] == 8
 
 
 # ── corruption detection ──────────────────────────────────────────────────
@@ -163,6 +172,7 @@ db = feather_db.DB.open({path!r}, dim=16)
 for i in range(5):
     m = feather_db.Metadata(); m.content = f"r{{i}}"
     db.add(i, np.random.rand(16).astype(np.float32), m)
+import os; os._exit(0)   # crash: the records must survive in the WAL alone
 '''
     e = dict(os.environ); e.update(env); e.pop("FEATHER_SIMD", None)
     return subprocess.run([sys.executable, "-c", src], capture_output=True,

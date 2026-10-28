@@ -42,8 +42,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Sequence
 
+from feather_db import keys
 from feather_db.pocket import (
-    Pocket, SCOPE_SEP, estimate_tokens, scoped_id, _CACHE_KIND,
+    Pocket, SCOPE_SEP, estimate_tokens, _CACHE_KIND,
 )
 
 # Reasons a ref did not make it into the packet. Stable strings — callers and
@@ -58,7 +59,11 @@ class Ref:
     """A pointer to one memory, with the version it was read at."""
     key: str
     scope: tuple[str, ...] = ()
-    version: Optional[int] = None      # recall_count stands in until format v10
+    # The record's version (Metadata.version) when the packet read it: moves on
+    # every write to the record and never on a read. It used to be
+    # recall_count, which every search changed and an edit of the rule did not,
+    # so a replay could neither trust an unchanged ref nor see a changed one.
+    version: Optional[int] = None
     tokens: int = 0
     required: bool = False
 
@@ -186,6 +191,9 @@ class ContextPacket:
             "exact_tokens": self.exact_tokens,
             "required_refs": [str(r) for r in self.refs if r.required],
             "memory_refs": [str(r) for r in self.refs if not r.required],
+            # The same refs, structured, for revalidate().
+            "refs": [{"key": r.key, "scope": list(r.scope), "version": r.version,
+                      "required": r.required} for r in self.refs],
             "omitted_context": [
                 {"ref": o.ref, "reason": o.reason, "tokens": o.tokens,
                  "required": o.required} for o in self.omitted
@@ -272,12 +280,12 @@ class PacketBuilder:
         Nearest wins, which is what lets a campaign-level rule override a
         brand-level one without deleting the brand rule.
 
-        O(levels) direct id lookups rather than a scan: the id is derived from
-        (flat scope, key) by the same `scoped_id` the pocket itself uses.
+        O(levels) key lookups rather than a scan. By native key, not by an id
+        hashed from it: under a collision the hashed id held ANOTHER key's
+        record, and a required rule resolved to whatever that was.
         """
         for depth, scope in enumerate(self.pocket.scopes()):
-            rid = scoped_id(SCOPE_SEP.join(scope), key)
-            meta = self.pocket.db.get_metadata(rid)
+            rid, meta = keys.get(self.pocket.db, SCOPE_SEP.join(scope), key)
             if meta is None:
                 continue
             # A forgotten record and a cache entry both exist in the index but
@@ -304,7 +312,7 @@ class PacketBuilder:
         rid, meta, scope, _depth = self._resolve(key)
         if meta is None:
             return None, None, ()
-        return meta.content, meta.recall_count, tuple(scope)
+        return meta.content, meta.version, tuple(scope)
 
     def build(self, *, required: Iterable[str] = (), query: Optional[str] = None,
               k: int = 10, budget_tokens: Optional[int] = None,
@@ -375,12 +383,12 @@ class PacketBuilder:
             cost = self._count(block)
             if packet.tokens_used + cost > budget:
                 packet.omitted.append(Omission(
-                    str(Ref(item.key, item.scope, item.recalls)), BUDGET, cost, False))
+                    str(Ref(item.key, item.scope, item.version)), BUDGET, cost, False))
                 continue
             seen.add(item.key)
             chosen.append(block)
             packet.tokens_used += cost
-            packet.refs.append(Ref(item.key, item.scope, item.recalls, cost, False))
+            packet.refs.append(Ref(item.key, item.scope, item.version, cost, False))
 
         # ── 3. render ─────────────────────────────────────────────────────
         sections = []
@@ -390,3 +398,46 @@ class PacketBuilder:
             sections.append(self.context_header + "\n" + "\n".join(chosen))
         packet.text = "\n\n".join(sections)
         return packet
+
+    # ── replay ────────────────────────────────────────────────────────────
+    def revalidate(self, manifest: dict) -> dict:
+        """Is what a packet was built from still what it would be built from?
+
+        For each ref in `manifest` (a `ContextPacket.manifest()`, e.g. one that
+        was persisted with a decision): the record must still be there, at the
+        version the packet read. Versions move on every write to a record and
+        never on a read, so an unchanged ref is one nobody has edited, however
+        often it has been recalled since — and an edited rule is caught, which
+        a recall counter could not do.
+
+        Required refs are checked against the resolver when this builder has
+        one (that is where build() read them), else against the pocket. Returns
+        {"current", "may_mutate", "stale", "unverified"}: `stale` lists refs
+        that are missing or changed ({ref, required, reason, was, now});
+        `may_mutate` is False if the packet could not mutate then, or a
+        required ref is stale now. A required rule the resolver returns without
+        a version can only be checked for presence: it is listed in
+        `unverified`.
+        """
+        stale, unverified = [], []
+        for r in manifest.get("refs", []):
+            scope, key, was, required = tuple(r["scope"]), r["key"], r["version"], r["required"]
+            name = str(Ref(key, scope, was))
+            if required and self.resolve_required is not None:
+                _text, now, _ = self._resolve_required_one(key)
+                if _text is None:
+                    stale.append({"ref": name, "required": True, "reason": MISSING, "was": was, "now": None})
+                elif was is None or now is None:
+                    unverified.append(name)
+                elif now != was:
+                    stale.append({"ref": name, "required": True, "reason": "changed", "was": was, "now": now})
+                continue
+            _rid, meta = keys.get(self.pocket.db, SCOPE_SEP.join(scope), key)
+            if meta is None or meta.source in ("_forgotten", _CACHE_KIND):
+                stale.append({"ref": name, "required": required, "reason": MISSING, "was": was, "now": None})
+            elif meta.version != was:
+                stale.append({"ref": name, "required": required, "reason": "changed",
+                              "was": was, "now": meta.version})
+        blocked = any(x["required"] for x in stale)
+        return {"current": not stale, "may_mutate": bool(manifest.get("may_mutate")) and not blocked,
+                "stale": stale, "unverified": unverified}

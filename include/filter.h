@@ -24,8 +24,19 @@ struct SearchFilter {
 
     // Phase 4 filters: namespace, entity, attributes
     std::optional<std::string> namespace_id;
+    // A namespace and everything below it, '.' separating the levels:
+    // "acme.u1" matches "acme.u1" and "acme.u1.prefs", not "acme.u10".
+    // Indexed (DB::ns_names_), so it pre-filters like namespace_id does.
+    std::optional<std::string> namespace_prefix;
     std::optional<std::string> entity_id;
     std::optional<std::unordered_map<std::string, std::string>> attributes_match;
+
+    // `ns` is `prefix` or a namespace below it. The empty prefix is the root.
+    static bool under(const std::string& ns, const std::string& prefix) {
+        if (prefix.empty()) return true;
+        if (ns.size() < prefix.size() || ns.compare(0, prefix.size(), prefix) != 0) return false;
+        return ns.size() == prefix.size() || ns[prefix.size()] == '.';
+    }
 
     bool matches(const Metadata& meta) const {
         if (types) {
@@ -50,6 +61,7 @@ struct SearchFilter {
         }
 
         if (namespace_id && meta.namespace_id != *namespace_id) return false;
+        if (namespace_prefix && !under(meta.namespace_id, *namespace_prefix)) return false;
         if (entity_id && meta.entity_id != *entity_id) return false;
 
         if (attributes_match) {

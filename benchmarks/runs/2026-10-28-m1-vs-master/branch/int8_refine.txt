@@ -1,0 +1,7 @@
+100000 x 384, 1000 queries, k=10, ef=50
+
+                            recall  p50 ms  p99 ms  mem MB  peak MB  file MB  open s   clip
+float32                     0.9989   0.203   1.118     221      285    168.9    0.32  0.000
+int8 clip 1.0, refine 0     0.9380   0.085   0.241     112      172     59.1    0.15  1.000
+int8 trained, refine 0      0.9526   0.074   0.159     112      170     59.1    0.14  0.649
+int8 trained, refine 2      1.0000   0.149   0.461     113      198    205.9    0.16  0.649

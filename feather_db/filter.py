@@ -53,6 +53,14 @@ class FilterBuilder:
         self._filter.namespace_id = ns
         return self
 
+    def namespace_prefix(self, prefix: str) -> "FilterBuilder":
+        """`prefix` and every namespace below it, '.' separating levels:
+        "acme.u1" matches "acme.u1" and "acme.u1.prefs", not "acme.u10".
+        Indexed: the search ranks within those namespaces, not over a global
+        top-k filtered afterwards."""
+        self._filter.namespace_prefix = prefix
+        return self
+
     def entity(self, eid: str) -> "FilterBuilder":
         self._filter.entity_id = eid
         return self

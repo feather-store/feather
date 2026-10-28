@@ -82,6 +82,18 @@ jobs:
     - name: Run pytest suite
       run: pytest tests -q --deselect tests/test_engine.py::TestProviderInterface::test_provider_str
 
+    # The suite above runs the corruption fuzz on a fixed seed. This runs it
+    # deeper on a seed that changes every run, so CI keeps exploring new
+    # cases; a failure prints FEATHER_FUZZ_SEED, which reproduces it locally.
+    - name: Corruption fuzz (rotating seed)
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+      env:
+        FEATHER_FUZZ_SEED: ${{ github.run_id }}
+        FEATHER_FUZZ_CASES: '400'
+      run: |
+        echo "FEATHER_FUZZ_SEED=$FEATHER_FUZZ_SEED"
+        pytest tests/test_corrupt_files.py -q
+
     - name: MCP suite must run, not skip
       if: matrix.python-version != '3.9'
       # `importorskip` turns a missing/broken SDK into a green skip. That is

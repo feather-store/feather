@@ -43,13 +43,13 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::New { path, dim } => {
-            DB::open(&path, dim).ok_or_else(|| anyhow::anyhow!("Failed to create DB"))?;
+            DB::try_open(&path, dim).map_err(|e| anyhow::anyhow!("Failed to create DB: {e}"))?;
             println!("Created: {:?}", path);
         }
         Commands::Add { db, id, npy, timestamp, importance, context_type, source, content, modality } => {
             let arr: Array1<f32> = ndarray_npy::read_npy(&npy)?;
             let dim = arr.len();
-            let db = DB::open(&db, dim).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
+            let db = DB::try_open(&db, dim).map_err(|e| anyhow::anyhow!("Open failed: {e}"))?;
             
             let ts = timestamp.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -58,30 +58,30 @@ fn main() -> anyhow::Result<()> {
                     .as_secs() as i64
             });
 
-            db.add_with_meta(
+            db.try_add_with_meta(
                 id, arr.as_slice().unwrap(), 
                 ts, importance, context_type, 
                 source.as_deref(), content.as_deref(), Some(&modality)
-            );
-            db.save();
+            ).map_err(|e| anyhow::anyhow!("Add failed: {e}"))?;
+            db.try_save().map_err(|e| anyhow::anyhow!("Save failed: {e}"))?;
             println!("Added ID {} to modality '{}'", id, modality);
         }
         Commands::Link { db, from, to } => {
-            let db = DB::open(&db, 0).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
-            db.link(from, to);
-            db.save();
+            let db = DB::try_open(&db, 0).map_err(|e| anyhow::anyhow!("Open failed: {e}"))?;
+            db.try_link(from, to).map_err(|e| anyhow::anyhow!("Link failed: {e}"))?;
+            db.try_save().map_err(|e| anyhow::anyhow!("Save failed: {e}"))?;
             println!("Linked {} -> {}", from, to);
         }
         Commands::Search { db, npy, k, type_filter, source_filter, modality } => {
             let arr: Array1<f32> = ndarray_npy::read_npy(&npy)?;
             let dim = arr.len();
-            let db = DB::open(&db, dim).ok_or_else(|| anyhow::anyhow!("Open failed"))?;
+            let db = DB::try_open(&db, dim).map_err(|e| anyhow::anyhow!("Open failed: {e}"))?;
             
             let (ids, dists) = if type_filter.is_some() || source_filter.is_some() {
-                db.search_with_filter(arr.as_slice().unwrap(), k, type_filter, source_filter.as_deref(), Some(&modality))
+                db.try_search_with_filter(arr.as_slice().unwrap(), k, type_filter, source_filter.as_deref(), Some(&modality))
             } else {
-                db.search(arr.as_slice().unwrap(), k, Some(&modality))
-            };
+                db.try_search(arr.as_slice().unwrap(), k, Some(&modality))
+            }.map_err(|e| anyhow::anyhow!("Search failed: {e}"))?;
 
             for (id, dist) in ids.iter().zip(dists.iter()) {
                 if *id != 0 || *dist != 0.0 {

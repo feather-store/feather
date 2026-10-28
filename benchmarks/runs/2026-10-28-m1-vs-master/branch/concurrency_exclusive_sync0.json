@@ -1,0 +1,114 @@
+{
+  "compaction_stall": {
+    "readers_before": {
+      "ops": 66655,
+      "ops_per_s": 22176.8,
+      "p50_ms": 0.201,
+      "p90_ms": 0.6,
+      "p99_ms": 2.587,
+      "p999_ms": 9.19,
+      "max_ms": 40.03,
+      "over_10ms": 54,
+      "over_50ms": 0
+    },
+    "during": {
+      "read": {
+        "ops": 23078,
+        "ops_per_s": 1205.3,
+        "p50_ms": 0.605,
+        "p90_ms": 14.892,
+        "p99_ms": 63.205,
+        "p999_ms": 166.671,
+        "max_ms": 2801.7,
+        "over_10ms": 3914,
+        "over_50ms": 342
+      },
+      "write": {
+        "ops": 4514,
+        "ops_per_s": 235.7,
+        "p50_ms": 2.66,
+        "p90_ms": 5.3,
+        "p99_ms": 23.391,
+        "p999_ms": 96.819,
+        "max_ms": 2801.7,
+        "over_10ms": 127,
+        "over_50ms": 17
+      }
+    },
+    "compaction": {
+      "compact_s": 18.64,
+      "removed": 10000
+    },
+    "window_s": 19.15
+  },
+  "auto_compact_background_s": 27.95,
+  "auto_compact_forget": {
+    "forgets": 20000,
+    "slowest_forget_ms": 17.1,
+    "forgets_over_100ms": 0,
+    "median_forget_ms": 0.0158,
+    "elapsed_s": 28.44
+  },
+  "update_metadata_vs_edges": {
+    "10000": {
+      "update_metadata_ms_mean": 0.044,
+      "update_metadata_ms_p99": 0.15,
+      "update_importance_ms_mean": 0.0047
+    },
+    "100000": {
+      "update_metadata_ms_mean": 0.028,
+      "update_metadata_ms_p99": 0.05,
+      "update_importance_ms_mean": 0.0033
+    },
+    "500000": {
+      "update_metadata_ms_mean": 0.047,
+      "update_metadata_ms_p99": 0.221,
+      "update_importance_ms_mean": 0.0037
+    }
+  },
+  "readers_during_update_metadata_500k_edges": {
+    "readers_alone": {
+      "ops": 118110,
+      "ops_per_s": 39324.9,
+      "p50_ms": 0.132,
+      "p90_ms": 0.408,
+      "p99_ms": 1.255,
+      "p999_ms": 4.211,
+      "max_ms": 26.58,
+      "over_10ms": 13,
+      "over_50ms": 0
+    },
+    "read": {
+      "ops": 94368,
+      "ops_per_s": 18852.6,
+      "p50_ms": 0.271,
+      "p90_ms": 0.876,
+      "p99_ms": 2.358,
+      "p999_ms": 7.291,
+      "max_ms": 47.83,
+      "over_10ms": 55,
+      "over_50ms": 0
+    },
+    "update_metadata": {
+      "ops": 51520,
+      "ops_per_s": 10292.5,
+      "p50_ms": 0.086,
+      "p90_ms": 0.146,
+      "p99_ms": 0.532,
+      "p999_ms": 1.98,
+      "max_ms": 37.84,
+      "over_10ms": 5,
+      "over_50ms": 0
+    }
+  },
+  "_meta": {
+    "suite": "exclusive",
+    "wal_sync": "0",
+    "n": 100000,
+    "dim": 128,
+    "seconds": 5.0,
+    "cpus": 8,
+    "wall_s": 156.1,
+    "version": "0.21.0"
+  }
+}

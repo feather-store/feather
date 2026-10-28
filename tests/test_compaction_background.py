@@ -130,7 +130,7 @@ def test_auto_compaction_does_not_block_forget(tmp_path):
         worst = max(worst, time.perf_counter() - t0)
     assert db.wait_for_compaction(timeout=120)
     assert worst < 0.5, f"a forget() blocked {worst:.2f}s (compaction ran inline?)"
-    assert db.get_metadata(0) is None, "auto-compaction never ran"
+    assert db.get_metadata(0, include_dead=True) is None, "auto-compaction never ran"
     db.close()
 
 

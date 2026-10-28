@@ -29,7 +29,7 @@ db, p = fresh()
 check("get_auto_compact == 0", db.get_auto_compact() == 0.0)
 for i in range(5): db.add(id=i, vec=vec(), meta=Metadata())
 db.forget(0)
-check("forgotten shell still present (no auto-compact)", db.get_metadata(0) is not None)
+check("forgotten shell still present (no auto-compact)", db.get_metadata(0, include_dead=True) is not None)
 check("size unchanged at 5", db.size() == 5, f"got {db.size()}")
 cleanup(p)
 
@@ -39,8 +39,8 @@ for i in range(6): db.add(id=i, vec=vec(), meta=Metadata())
 db.forget(1); db.forget(4)
 removed = db.compact()
 check("compact removed 2", removed == 2, f"got {removed}")
-check("forgotten id 1 erased", db.get_metadata(1) is None)
-check("forgotten id 4 erased", db.get_metadata(4) is None)
+check("forgotten id 1 erased", db.get_metadata(1, include_dead=True) is None)
+check("forgotten id 4 erased", db.get_metadata(4, include_dead=True) is None)
 check("live id 2 survives", db.get_metadata(2) is not None)
 check("size now 4", db.size() == 4, f"got {db.size()}")
 check("survivors searchable", len(db.search(vec(), k=10)) == 4)
@@ -65,7 +65,7 @@ check("threshold stored", abs(db.get_auto_compact() - 0.25) < 1e-6)
 for i in range(12): db.add(id=i, vec=vec(), meta=Metadata())
 # forget 2/12 = 0.167 < 0.25 -> no compaction yet
 db.forget(0); db.forget(1)
-check("below threshold: shells remain", db.get_metadata(0) is not None and db.size() == 12,
+check("below threshold: shells remain", db.get_metadata(0, include_dead=True) is not None and db.size() == 12,
       f"size {db.size()}")
 # forget a 3rd -> 3/12 = 0.25 >= 0.25 -> auto-compact fires, dead erased.
 # Since 0.19 it runs on a background thread (forget() no longer blocks for the
@@ -73,7 +73,7 @@ check("below threshold: shells remain", db.get_metadata(0) is not None and db.si
 db.forget(2)
 db.wait_for_compaction()
 check("at threshold: auto-compacted (dead erased)",
-      db.get_metadata(0) is None and db.get_metadata(2) is None)
+      db.get_metadata(0, include_dead=True) is None and db.get_metadata(2, include_dead=True) is None)
 check("size dropped to 9", db.size() == 9, f"got {db.size()}")
 check("live records still searchable", len(db.search(vec(), k=20)) == 9)
 cleanup(p)

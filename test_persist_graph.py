@@ -1,12 +1,12 @@
-"""Test: persisted HNSW graph (file format v9).
+"""Test: persisted HNSW graph (file format v9, and v10 since 0.22).
 
 save() embeds the prebuilt graph; load() restores it verbatim instead of
 rebuilding from vectors. Asserts:
   1) round-trip — search results IDENTICAL before vs after save+reload
   2) recall preserved (no parallel-rebuild loss) and load is fast (no rebuild)
-  3) fallback — a DB with forgotten records still saves/loads correctly
-     (graph not persisted; rebuild path used)
-  4) on-disk quantized modality still round-trips (persist_graph forced off)
+  3) forgotten records — the graph is kept with its delete marks (v9 used to
+     fall back to the rebuild path here: 53 s instead of 0.1 s at 100k x 384)
+  4) on-disk quantized modality round-trips (v10: graph links + int8 vectors)
 """
 import os, sys, glob, time, tempfile, importlib.util, numpy as np
 
@@ -52,13 +52,13 @@ print(f"1) round-trip: {N}x{DIM}, file {fsz:.1f}MB, reload {load_dt*1000:.0f}ms"
 identical = sum(1 for a, b in zip(before, after) if a == b)
 check(identical == len(queries), "all 50 queries identical after reload",
       f"{identical}/{len(queries)}")
-# version on disk should be 9
+# version on disk should be 10
 with open(p, "rb") as fh:
     fh.read(4); ver = int.from_bytes(fh.read(4), "little")
-check(ver == 9, "file format v9", f"got v{ver}")
+check(ver == 10, "file format v10", f"got v{ver}")
 
 # ── compare to a pure-rebuild reload time (force fallback via a forget) ──
-print("2) fallback path: forgotten record disables graph-persist")
+print("2) a forgotten record persists as an appended commit")
 db2.forget(id=0)
 db2.save()
 db2.close(save=False)
@@ -74,7 +74,7 @@ db3.close(save=False)
 os.remove(p)
 
 # ── on-disk quantized modality still round-trips ────────────────────────
-print("3) on-disk quantized modality round-trips (persist_graph off)")
+print("3) on-disk quantized modality round-trips")
 pq = tempfile.mktemp(suffix=".feather")
 dbq = fc.DB.open(pq, dim=DIM)
 dbq.set_quantized("text")

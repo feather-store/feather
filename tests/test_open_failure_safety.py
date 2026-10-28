@@ -111,10 +111,13 @@ def test_failed_open_does_not_clear_the_wal(tmp_path):
 
 # ── it must fail fast, not spin ───────────────────────────────────────────
 
-def test_absurd_metadata_count_fails_fast(tmp_path):
+def test_absurd_metadata_count_fails_fast(tmp_path, monkeypatch):
     """meta_count is a loop trip count. A forged 0xFFFFFF00 previously left the
-    process spinning for over ten minutes; it must be rejected by arithmetic."""
+    process spinning for over ten minutes; it must be rejected by arithmetic.
+    The count lives at offset 8 of a v3-v9 file, so build one; v10's
+    equivalents are in test_format_v10.py."""
     path = str(tmp_path / "count.feather")
+    monkeypatch.setenv("FEATHER_FORMAT", "9")
     _make(path, n=1)
 
     raw = bytearray(open(path, "rb").read())

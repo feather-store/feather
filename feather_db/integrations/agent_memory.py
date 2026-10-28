@@ -282,12 +282,19 @@ class AgentMemory:
                subject: Optional[str] = None, limit: int = 5) -> list[dict]:
         """Semantic search, optionally narrowed to certain kinds."""
         subject = subject or self.user or self.brand or self.agent
-        prefix = (self.org, subject) if subject else (self.org,)
-        wanted = set(kinds) if kinds else None
-        hits = self.store.search(prefix, query=query, limit=limit * 4 if wanted else limit)
-        values = [h.value for h in hits
-                  if wanted is None or h.value.get("kind") in wanted]
-        return values[:limit]
+        if not kinds:
+            prefix = (self.org, subject) if subject else (self.org,)
+            return [h.value for h in self.store.search(prefix, query=query, limit=limit)]
+        # Each kind is its own namespace: search those, inside the engine, and
+        # merge. Searching the subject and keeping the wanted kinds afterwards
+        # (it fetched limit x 4) came back empty for a subject whose other
+        # kinds outranked them.
+        hits = []
+        for kind in dict.fromkeys(kinds):
+            ns = (self.org, ENTITIES) if kind == ENTITIES else (self.org, subject, kind)
+            hits += self.store.search(ns, query=query, limit=limit)
+        hits.sort(key=lambda h: -(h.score if h.score is not None else 0.0))
+        return [h.value for h in hits[:limit]]
 
     def summary(self) -> dict[str, int]:
         """How much of each kind is held — cheap enough to log every turn."""

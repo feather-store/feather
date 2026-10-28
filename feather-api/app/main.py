@@ -15,7 +15,11 @@ Endpoints:
   PUT  /v1/{namespace}/records/{id}     — update full metadata
   PUT  /v1/{namespace}/records/{id}/importance  — update importance
   POST /v1/{namespace}/records/{id}/link        — link two records
+  POST /v1/{namespace}/batch            — several records, atomically
   POST /v1/{namespace}/save             — flush to disk
+
+Record writes take `Idempotency-Key` (a retry gets the first response), and
+PUTs take `If-Match: <version>` (a stale write is a 412): see app/writes.py.
 
 Authentication: X-API-Key header (set FEATHER_API_KEY env var).
 Startup fails if FEATHER_API_KEY is unset. To run without auth locally, set
@@ -44,9 +48,16 @@ import feather_db
 from feather_db import Metadata, ContextType, ScoringConfig
 from feather_db.core import SearchFilter
 
-from .db_manager import DBManager, NotOwnedError
+from .db_manager import (DBManager, InvalidNamespaceError, NamespaceAliasError,
+                         NamespaceLoadingError, NotOwnedError, RECOVER_RETRY_S, write_error)
+from . import errors
+from .admission import Admission
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from .metrics import METRICS, classify, namespace_from_path
-from .embedding import EMBEDDING, EMBED_BATCHER, SUPPORTED_MODELS
+from . import writes
+from .writes import Idem, Op
+from .embedding import EMBEDDING, EMBED_BATCHER, SUPPORTED_MODELS, UpstreamError
 from .fastparse import (parse_body, SearchBody, HybridBody, KeywordBody,
                         ContextChainBody, AddVectorBody, ImportBody)
 
@@ -63,7 +74,7 @@ from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
     KeywordSearchRequest, HybridSearchRequest,
     LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest, PurgeRequest,
-    BatchDeleteRequest,
+    BatchDeleteRequest, BatchWriteRequest, AutoLinkRequest, EngineSettings, PlacementUpdate,
     MetadataOut, NamespaceStats, HealthResponse, AdminOverview,
     SeedRequest, ContextChainRequest, EdgesResponse, EdgeOut, IncomingEdgeOut,
     ContextChainNode, ContextChainEdge, ContextChainResponse,
@@ -103,31 +114,47 @@ _CKPT_MAX_AGE_S = float(os.getenv("FEATHER_CHECKPOINT_MAX_AGE_S", "300"))
 _CKPT_POLL_S = float(os.getenv("FEATHER_CHECKPOINT_POLL_S", "5"))
 
 
+def _checkpoint_pass():
+    """One pass over the open namespaces. Runs on the write pool: a save, a
+    reopen and even the WAL stat are disk work the event loop must not wait
+    on."""
+    for ns in list(manager.open_namespaces()):
+        db = manager.peek(ns)
+        if db is None:
+            continue
+        try:
+            if write_error(db) is not None:
+                # Never checkpoint a handle whose write failed: reopen it,
+                # which replays the WAL that reached the disk.
+                manager.recover(ns)
+                continue
+            wal = db.wal_size()
+            if wal == 0:
+                _last_save[ns] = time.time()
+                continue
+            age = time.time() - _last_save.setdefault(ns, time.time())
+            if wal >= _CKPT_WAL_BYTES or age >= _CKPT_MAX_AGE_S:
+                db.save()
+                _last_save[ns] = time.time()
+        except Exception:  # noqa: BLE001  (closed/deleted meanwhile, disk error)
+            logger.exception("checkpoint of namespace %s failed", ns)
+
+
 async def _checkpointer():
     while True:
         await asyncio.sleep(_CKPT_POLL_S)
-        for ns in list(manager.list_namespaces()):
-            db = manager.peek(ns)
-            if db is None:
-                continue
-            try:
-                wal = db.wal_size()
-                if wal == 0:
-                    _last_save[ns] = time.time()
-                    continue
-                age = time.time() - _last_save.setdefault(ns, time.time())
-                if wal >= _CKPT_WAL_BYTES or age >= _CKPT_MAX_AGE_S:
-                    await asyncio.get_running_loop().run_in_executor(_WRITE_POOL, db.save)
-                    _last_save[ns] = time.time()
-            except Exception:  # noqa: BLE001  (closed/deleted meanwhile, disk error)
-                logger.exception("checkpoint of namespace %s failed", ns)
+        try:
+            await asyncio.get_running_loop().run_in_executor(_WRITE_POOL, _checkpoint_pass)
+        except Exception:  # noqa: BLE001
+            logger.exception("checkpoint pass failed")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global manager
     logger.info("Starting Feather DB Cloud API...")
-    manager = DBManager()
+    # Opening every namespace is disk work: off the loop, like every other load.
+    manager = await run_in_threadpool(DBManager)
     logger.info(f"Loaded namespaces: {manager.list_namespaces()}")
     EMBED_BATCHER.start()
     ckpt = asyncio.get_running_loop().create_task(_checkpointer())
@@ -136,7 +163,7 @@ async def lifespan(app: FastAPI):
     await EMBED_BATCHER.stop()
     await EMBEDDING.aclose()
     logger.info("Shutting down — checkpointing and closing all DBs...")
-    manager.close_all()
+    await run_in_threadpool(manager.close_all)
 
 app = FastAPI(
     title="Feather DB Cloud API",
@@ -179,6 +206,27 @@ class _MetricsMiddleware:
             )
 
 
+class _IdempotencyGuard:
+    """Refuse an Idempotency-Key on a write route that cannot honour it
+    (writes.key_unsupported): the caller is relying on it, and ignoring it
+    would apply a retried import twice."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and writes.key_unsupported(scope.get("method", ""), scope.get("path", "")):
+            if any(k.lower() == b"idempotency-key" for k, _ in scope.get("headers", [])):
+                resp = JSONResponse(status_code=400, content={
+                    "detail": f"{scope['method']} {scope['path']} does not support Idempotency-Key"})
+                return await resp(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
+# Last added = outermost: metrics sees every response, 429s included;
+# admission refuses before any body is read or any work is queued.
+app.add_middleware(_IdempotencyGuard)
+app.add_middleware(Admission)
 app.add_middleware(_MetricsMiddleware)
 
 _default_openapi = app.openapi
@@ -203,9 +251,79 @@ async def _not_owned(request: Request, exc: NotOwnedError):
     # gateway (or a misconfigured client) where it lives instead of opening the
     # file here — two owners would corrupt it (the engine's file lock would
     # refuse anyway).
-    return JSONResponse(status_code=421, content={
-        "detail": f"namespace '{exc.namespace}' is owned by shard {exc.owner}",
-        "namespace": exc.namespace, "owner_shard": exc.owner, "this_shard": exc.this_shard})
+    # Not retryable HERE: the request is fine, but only the owner can serve it.
+    return JSONResponse(status_code=421, content=errors.body(
+        421, f"namespace '{exc.namespace}' is owned by shard {exc.owner}",
+        namespace=exc.namespace, owner_shard=exc.owner, this_shard=exc.this_shard))
+
+
+ClosedError = getattr(feather_db, "ClosedError", None)
+
+
+def _retry_closed(fn, *args, **kwargs):
+    """Run a route body; if a namespace it used was closed under it (idle
+    close, a placement move), run it once more on a fresh handle. Safe:
+    ClosedError is raised before the engine call does anything, and the
+    closer takes the namespace's write lock, so no write is ever half done."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        if ClosedError is None or not isinstance(e, ClosedError):
+            raise
+        return fn(*args, **kwargs)
+
+
+if ClosedError is not None:
+    @app.exception_handler(ClosedError)
+    async def _closed(request: Request, exc: Exception):
+        # Closed twice in a row under the same request: let the client retry.
+        return JSONResponse(status_code=503, headers={"Retry-After": "1"},
+                            content=errors.body(503, f"namespace reopening: {exc}", "namespace_reopening"))
+
+
+@app.exception_handler(NamespaceLoadingError)
+async def _namespace_loading(request: Request, exc: NamespaceLoadingError):
+    # An upload of this namespace is being loaded. Nothing is wrong with the
+    # request; it will succeed once the load finishes.
+    return JSONResponse(status_code=503, headers={"Retry-After": "1"},
+                        content=errors.body(503, str(exc), "namespace_loading", namespace=exc.namespace))
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(status_code=exc.status_code, content=errors.of(exc),
+                        headers=getattr(exc, "headers", None))
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content=errors.body(422, jsonable_encoder(exc.errors())))
+
+
+@app.exception_handler(InvalidNamespaceError)
+async def _invalid_namespace(request: Request, exc: InvalidNamespaceError):
+    # Used to be a silent rewrite (`ni.ke` -> `nike`, sharing its file) or,
+    # when nothing was left, an unhandled ValueError -> 500. A name the
+    # filesystem folds onto an open namespace is a conflict, not a typo.
+    alias = isinstance(exc, NamespaceAliasError)
+    return JSONResponse(status_code=409 if alias else 400, content=errors.body(
+        409 if alias else 400, str(exc), "namespace_alias" if alias else "invalid_namespace"))
+
+
+async def _write_failed(request: Request, exc: Exception):
+    # A WAL write or fsync failed: this write was NOT acknowledged, and the
+    # namespace refuses writes until DBManager reopens it (next request or
+    # checkpointer pass). Retryable, so 503 rather than an opaque 500.
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": str(max(1, int(RECOVER_RETRY_S)))},
+        content=errors.body(503, f"write not saved: {exc}", "write_failed"))
+
+
+# Registered only when the engine has it: this app must still start on a
+# feather-db wheel from before the write-failure handling.
+if getattr(feather_db, "WriteFailedError", None) is not None:
+    app.add_exception_handler(feather_db.WriteFailedError, _write_failed)
 
 
 # ── Write pool ───────────────────────────────────────────────────────────
@@ -220,7 +338,8 @@ _WRITE_POOL = ThreadPoolExecutor(
 
 
 async def _in_write_pool(fn, *args):
-    return await asyncio.get_running_loop().run_in_executor(_WRITE_POOL, functools.partial(fn, *args))
+    return await asyncio.get_running_loop().run_in_executor(
+        _WRITE_POOL, functools.partial(_retry_closed, fn, *args))
 
 
 def _metadata_in(data) -> MetadataIn:
@@ -261,7 +380,7 @@ def _write_route(fn):
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_WRITE_POOL, functools.partial(fn, *args, **kwargs))
+        return await loop.run_in_executor(_WRITE_POOL, functools.partial(_retry_closed, fn, *args, **kwargs))
     return wrapper
 
 # ─────────────────────────────────────────────
@@ -376,21 +495,54 @@ _METADATA_KEYS = {
 }
 
 
-def _meta_from_model(m_in) -> Metadata:
+def _meta_from_model(m_in, default_ns: str = "") -> Metadata:
+    """A field the request omits (null) takes the API's default; a value it
+    gives — 0 and "" included — is stored as given, exactly as embedded
+    Feather stores it. (0 and "" used to be read as "omitted", so the same
+    Metadata written over HTTP and in-process came back different.)"""
     meta = Metadata()
-    meta.timestamp       = m_in.timestamp if m_in.timestamp else int(time.time())
+    meta.timestamp       = m_in.timestamp if m_in.timestamp is not None else int(time.time())
     meta.importance      = m_in.importance
     meta.type            = ContextType(int(m_in.type))
     meta.source          = m_in.source
     meta.content         = m_in.content
     meta.tags_json       = m_in.tags_json
-    meta.namespace_id    = m_in.namespace_id
+    meta.namespace_id    = m_in.namespace_id if m_in.namespace_id is not None else default_ns
     meta.entity_id       = m_in.entity_id
     meta.confidence      = m_in.confidence
     meta.ttl             = m_in.ttl
+    if getattr(m_in, "key", None):
+        meta.key = m_in.key
+    if getattr(m_in, "recall_count", None) is not None:
+        meta.recall_count = m_in.recall_count
+    if getattr(m_in, "last_recalled_at", None) is not None:
+        meta.last_recalled_at = m_in.last_recalled_at
+    if getattr(m_in, "edges", None):
+        meta.edges = [feather_db.Edge(e.target_id, e.rel_type, e.weight) for e in m_in.edges]
     for k, v in m_in.attributes.items():
         meta.set_attribute(k, v)
     return meta
+
+
+def _keep_identity(meta: Metadata, m_in, old) -> None:
+    """For a replacing write (PUT, batch update): the request's edges and key
+    when it gives them, else the record's — they are not content, and the
+    common PUT that only means to change content must not unlink it."""
+    if _is_dead_meta(old):
+        return
+    if m_in is None or m_in.edges is None:
+        meta.edges = list(old.edges)
+    if m_in is None or m_in.key is None:
+        meta.key = getattr(old, "key", "")
+
+
+def _with_version(response: Response, body: dict, result) -> dict:
+    """A single-record write's response: the new `version`, also as the ETag
+    the next If-Match sends back."""
+    out = writes.respond(response, body, result, lambda r: {"version": r.versions[-1]})
+    if result is not None and response is not None:
+        response.headers["ETag"] = writes.etag(result.versions[-1])
+    return out
 
 
 def _meta_to_model(meta: Metadata) -> MetadataOut:
@@ -409,12 +561,17 @@ def _meta_to_model(meta: Metadata) -> MetadataOut:
         recall_count    = meta.recall_count,
         last_recalled_at= meta.last_recalled_at,
         links           = list(meta.links),
+        version         = getattr(meta, "version", 0),
+        key             = getattr(meta, "key", ""),
+        edges           = [{"target_id": e.target_id, "rel_type": e.rel_type, "weight": e.weight}
+                           for e in meta.edges],
     )
 
 
 def _build_filter(req: SearchRequest) -> Optional[SearchFilter]:
     has_filter = any([
-        req.namespace_id, req.entity_id, req.attributes_match,
+        req.namespace_id, getattr(req, "namespace_prefix", None), getattr(req, "types", None),
+        req.entity_id, req.attributes_match,
         req.source, req.source_prefix, req.importance_gte,
         req.tags_contains, req.timestamp_after, req.timestamp_before,
         getattr(req, "confidence_gte", None) is not None,
@@ -424,6 +581,10 @@ def _build_filter(req: SearchRequest) -> Optional[SearchFilter]:
 
     f = SearchFilter()
     if req.namespace_id:      f.namespace_id    = req.namespace_id
+    if getattr(req, "namespace_prefix", None):
+        f.namespace_prefix = req.namespace_prefix
+    if getattr(req, "types", None):
+        f.types = [ContextType(int(t)) for t in req.types]
     if req.entity_id:         f.entity_id       = req.entity_id
     if req.attributes_match:  f.attributes_match = req.attributes_match
     if req.source:            f.source          = req.source
@@ -555,7 +716,9 @@ def health():
     return HealthResponse(
         status="ok",
         version=feather_db.__version__,
-        namespaces_loaded=len(manager.list_namespaces()),
+        namespaces_loaded=len(manager.open_namespaces()),
+        namespaces_known=len(manager.list_namespaces()),
+        admission=Admission.stats(),
     )
 
 @app.get("/v1/namespaces", tags=["meta"], dependencies=[Depends(verify_api_key)])
@@ -609,6 +772,15 @@ def _is_dead_meta(meta) -> bool:
     return False
 
 
+def _get_meta(db, rec_id: int, include_dead: bool = False):
+    """get_metadata(), with tombstones when asked — on a wheel older than
+    include_dead (0.22), get_metadata() returns them anyway."""
+    try:
+        return db.get_metadata(rec_id, include_dead=include_dead)
+    except TypeError:
+        return db.get_metadata(rec_id)
+
+
 def _is_dead_record(db, rec_id: int) -> bool:
     """True if a record is missing, forgotten, or soft-deleted."""
     return _is_dead_meta(db.get_metadata(rec_id))
@@ -630,14 +802,23 @@ def _prune_edges_to_set(db, dead_ids) -> int:
     """One-pass cascade for a *batch* delete: remove every edge pointing at any
     id in `dead_ids`. Unlike calling _prune_edges_to per id (O(deleted × records)),
     this sweeps all records exactly once."""
+    ops, removed = _prune_ops(db, dead_ids)
+    writes.apply(db, ops)
+    return removed
+
+
+def _prune_ops(db, dead_ids):
+    """The writes that remove every edge pointing at an id in `dead_ids`, and
+    how many edges they remove. Returned rather than applied, so a delete can
+    put them in the same atomic batch as its forgets."""
     dead = set(dead_ids)
     sources = set()
     for d in dead:
         for inc in db.get_incoming(d):
             if inc.source_id not in dead:
                 sources.add(inc.source_id)
-    removed = 0
-    for rec_id in sources:
+    ops, removed = [], 0
+    for rec_id in sorted(sources):
         meta = db.get_metadata(rec_id)
         if meta is None:
             continue
@@ -645,9 +826,9 @@ def _prune_edges_to_set(db, dead_ids) -> int:
         kept = [e for e in current if e.target_id not in dead]
         if len(kept) != len(current):
             meta.edges = kept
-            db.update_metadata(rec_id, meta)
+            ops.append(Op("update", rec_id, meta))
             removed += len(current) - len(kept)
-    return removed
+    return ops, removed
 
 
 def _prune_dead_edges(db) -> int:
@@ -739,19 +920,53 @@ def namespace_stats(namespace: str):
     )
 
 
+@app.get("/v1/admin/placement", tags=["admin"], dependencies=[Depends(verify_api_key)])
+def get_placement(namespace: Optional[str] = None):
+    """This shard's placement table, and (with `namespace`) whether this
+    shard owns it, has it open, and can see its file — what a move checks
+    before handing a namespace over."""
+    out = manager.placement.state()
+    if namespace is not None:
+        out["namespace"] = {
+            "name": namespace, "owner": manager.placement.owner(namespace),
+            "open": namespace in manager.open_namespaces(),
+            "has_file": os.path.exists(os.path.join(manager.data_dir(), f"{namespace}.feather"))}
+    return out
+
+
+@app.put("/v1/admin/placement", tags=["admin"], dependencies=[Depends(verify_api_key)])
+@_write_route
+def put_placement(req: PlacementUpdate):
+    """Adopt a newer placement table (an older epoch is ignored), and hand
+    over every open namespace this shard no longer owns: drained, checkpointed
+    and closed, so the new owner can open it."""
+    try:
+        return manager.adopt_placement(req.epoch, req.overrides)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/v1/admin/overview", response_model=AdminOverview,
          tags=["meta"], dependencies=[Depends(verify_api_key)])
 def admin_overview():
     """Aggregate stats for the dashboard overview screen."""
     items = []
     total = 0
+    open_now = set(manager.open_namespaces())
     for name in manager.list_namespaces():
         try:
-            db = manager.get(name, create=False)
-            n = _live_record_count(db)
+            if name in open_now:
+                db = manager.get(name, create=False)
+                n = _live_record_count(db)
+                items.append({"name": name, "dim": _primary_dim(db),
+                              "modalities": _modalities(db), "records": n, "open": True})
+            else:
+                # Not opened just to count it: what it held when last closed.
+                st = manager.stats_of(name) or {}
+                n = int(st.get("records") or 0)
+                items.append({"name": name, "dim": st.get("dim"), "modalities": st.get("modalities", []),
+                              "records": n, "open": False, "closed_at": st.get("closed_at")})
             total += n
-            items.append({"name": name, "dim": _primary_dim(db),
-                          "modalities": _modalities(db), "records": n})
         except Exception:
             continue
     items.sort(key=lambda x: x["records"], reverse=True)
@@ -791,54 +1006,64 @@ async def upload_feather(
     if not namespace:
         raise HTTPException(400, "namespace is required")
 
-    # Stream to a temp file inside the data dir so the final move is an atomic
-    # same-filesystem rename (and so a huge upload never lands in RAM).
+    # Everything below is disk work and a database load, so none of it runs
+    # on the event loop: one 256 MB upload used to stall every other request
+    # on this worker for the whole copy and the whole load.
+    staged, size = await run_in_threadpool(_stage_upload, file.file)
+    try:
+        db = await run_in_threadpool(manager.adopt, namespace, staged, overwrite)
+    except FileExistsError:
+        raise errors.APIError(
+            409, f"Namespace '{namespace}' already exists. "
+                 f"Re-send with overwrite=true to replace it.", "namespace_exists")
+    except InvalidNamespaceError:
+        raise                            # 400 / 409 via _invalid_namespace
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        # adopt() consumes the staged file on success and cleans it up on its
+        # own errors, but NotOwnedError (sharding) and NamespaceLoadingError
+        # are raised before that — leaving up to FEATHER_MAX_UPLOAD_MB behind.
+        _remove_quietly(staged)
+
+    records, dim = await run_in_threadpool(lambda: (_live_record_count(db), db.dim()))
+    return {
+        "namespace": namespace,
+        "records": records,
+        "dim": dim,
+        "bytes": size,
+        "imported": True,
+    }
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _stage_upload(src) -> Tuple[str, int]:
+    """Copy the received upload into a temp file in the data dir, so the final
+    move is an atomic same-filesystem rename and a huge upload never lands in
+    RAM. Runs on a worker thread."""
     fd, staged = tempfile.mkstemp(suffix=".upload", dir=manager.data_dir())
     size = 0
     try:
         with os.fdopen(fd, "wb") as out:
             while True:
-                chunk = await file.read(1 << 20)
+                chunk = src.read(1 << 20)
                 if not chunk:
                     break
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
                     raise HTTPException(
-                        413,
-                        f"file exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit",
-                    )
+                        413, f"file exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit")
                 out.write(chunk)
-    except HTTPException:
-        try: os.remove(staged)
-        except OSError: pass
+    except BaseException:
+        _remove_quietly(staged)
         raise
-
-    try:
-        try:
-            db = manager.adopt(namespace, staged, overwrite=overwrite)
-        except BaseException:
-            # adopt() consumes the staged file on success and cleans it up on
-            # its own errors, but NotOwnedError (sharding) is raised before
-            # that — leaving up to FEATHER_MAX_UPLOAD_MB behind per attempt.
-            try: os.remove(staged)
-            except OSError: pass
-            raise
-    except FileExistsError:
-        raise HTTPException(
-            409,
-            f"Namespace '{namespace}' already exists. "
-            f"Re-send with overwrite=true to replace it.",
-        )
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-    return {
-        "namespace": namespace,
-        "records": _live_record_count(db),
-        "dim": db.dim(),
-        "bytes": size,
-        "imported": True,
-    }
+    return staged, size
 
 
 # ─────────────────────────────────────────────
@@ -846,16 +1071,21 @@ async def upload_feather(
 # ─────────────────────────────────────────────
 @app.post("/v1/{namespace}/vectors", status_code=201, tags=["vectors"],
           dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(AddVectorRequest))
-async def add_vector(namespace: str, request: Request):
+async def add_vector(namespace: str, request: Request, response: Response,
+                     idem: Idem = Depends(writes.idempotency)):
     req = await parse_body(request, AddVectorBody)
-    return await _in_write_pool(_add_vector_impl, namespace, req)
+    return await _in_write_pool(_add_vector_impl, namespace, req, idem, response)
 
 
-def _add_vector_impl(namespace: str, req):
+def _add_vector_impl(namespace: str, req, idem: Idem = Idem(), response: Optional[Response] = None):
     db = manager.get(namespace)
     # `is not None`, not truthiness: `"metadata": {}` was a MetadataIn() before
     # the msgspec path, which stamps timestamp=now; a bare Metadata() is 1970.
-    meta = _meta_from_model(_metadata_in(req.metadata)) if req.metadata is not None else Metadata()
+    if req.metadata is not None:
+        meta = _meta_from_model(_metadata_in(req.metadata), namespace)
+    else:
+        meta = Metadata()
+        meta.namespace_id = namespace
     vec = req.vector_array()
 
     # Reject a mismatch only against an *established* dim. On an empty namespace
@@ -869,21 +1099,18 @@ def _add_vector_impl(namespace: str, req):
             f"for modality '{req.modality}'",
         )
 
-    # Always stamp namespace_id from the URL namespace if not set in body
-    if not meta.namespace_id:
-        meta.namespace_id = namespace
-
+    body = {"id": req.id, "namespace": namespace, "modality": req.modality}
     with manager.lock(namespace):
-        db.add(id=req.id, vec=vec, meta=meta, modality=req.modality)
-
-    return {"id": req.id, "namespace": namespace, "modality": req.modality}
+        r = writes.prior(db, idem) or writes.apply(
+            db, [Op("put", req.id, meta, vec, req.modality)], idem, body)
+    return _with_version(response, body, r)
 
 
 @app.post("/v1/{namespace}/search", response_model=SearchResponse, tags=["search"],
           dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(SearchRequest))
 async def search_vectors(namespace: str, request: Request):
     req = await parse_body(request, SearchBody)
-    return await run_in_threadpool(_search_impl, namespace, req)
+    return await run_in_threadpool(_retry_closed, _search_impl, namespace, req)
 
 
 def _search_impl(namespace: str, req):
@@ -919,8 +1146,8 @@ def _results_response(raw, include_metadata: bool = True):
 # `vector`. A MetadataOut model would strip exactly those additions.
 @app.get("/v1/{namespace}/records/{record_id}",
          tags=["records"], dependencies=[Depends(verify_api_key)])
-def get_record(namespace: str, record_id: int, include_vector: bool = False,
-               modality: str = "text"):
+def get_record(namespace: str, record_id: int, response: Response, include_vector: bool = False,
+               modality: str = "text", include_deleted: bool = False):
     """Fetch one record.
 
     `include_vector=true` returns the stored vector. Without it there was no way
@@ -939,8 +1166,8 @@ def get_record(namespace: str, record_id: int, include_vector: bool = False,
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
-    meta = db.get_metadata(record_id)
-    if _is_dead_meta(meta):
+    meta = _get_meta(db, record_id, include_deleted)
+    if meta is None or (_is_dead_meta(meta) and not include_deleted):
         raise HTTPException(404, f"Record {record_id} not found in namespace '{namespace}'")
 
     model = _meta_to_model(meta)
@@ -950,6 +1177,8 @@ def get_record(namespace: str, record_id: int, include_vector: bool = False,
     out = dict(body)
     out["id"] = record_id
     out["metadata"] = body
+    if out.get("version"):
+        response.headers["ETag"] = writes.etag(out["version"])
     if include_vector:
         try:
             vec = db.get_vector(record_id, modality)
@@ -962,73 +1191,126 @@ def get_record(namespace: str, record_id: int, include_vector: bool = False,
 @app.put("/v1/{namespace}/records/{record_id}", tags=["records"],
          dependencies=[Depends(verify_api_key)])
 @_write_route
-def update_record_metadata(namespace: str, record_id: int, req: UpdateMetadataRequest):
+def update_record_metadata(namespace: str, record_id: int, req: UpdateMetadataRequest,
+                           response: Response, idem: Idem = Depends(writes.idempotency),
+                           if_match: Optional[str] = Header(default=None)):
+    """Replace a record's metadata. Its edges are kept: they belong to /link.
+    With `If-Match: <version>` the write is refused (412) if the record changed
+    since that version was read, instead of overwriting the change."""
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
-    meta = _meta_from_model(req.metadata)
+    # namespace_id omitted -> the URL's, as POST /vectors does. Without it a
+    # PUT that did not repeat the namespace moved the record out of it.
+    meta = _meta_from_model(req.metadata, namespace)
+    expected = writes.if_match_version(if_match)
+    body = {"id": record_id, "updated": True}
     with manager.lock(namespace):
-        db.update_metadata(record_id, meta)
-    return {"id": record_id, "updated": True}
+        r = writes.prior(db, idem)
+        if r is None:
+            # update_metadata() replaces the whole record, edges and key
+            # included: a PUT that omits them keeps the record's (it used to
+            # unlink the record on every PUT). Read under the lock so a
+            # concurrent link() is not overwritten; a forgotten record starts
+            # fresh, as a re-add does.
+            _keep_identity(meta, req.metadata, db.get_metadata(record_id))
+            try:
+                r = writes.apply(db, [Op("update", record_id, meta, expected=expected)], idem, body)
+            except HTTPException as e:
+                raise writes.precondition_failed(e)
+    return _with_version(response, body, r)
 
 
 @app.put("/v1/{namespace}/records/{record_id}/importance", tags=["records"],
          dependencies=[Depends(verify_api_key)])
 @_write_route
-def update_importance(namespace: str, record_id: int, req: UpdateImportanceRequest):
+def update_importance(namespace: str, record_id: int, req: UpdateImportanceRequest,
+                      response: Response, idem: Idem = Depends(writes.idempotency),
+                      if_match: Optional[str] = Header(default=None)):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
+    expected = writes.if_match_version(if_match)
+    body = {"id": record_id, "importance": req.importance}
     with manager.lock(namespace):
-        db.update_importance(record_id, req.importance)
-    return {"id": record_id, "importance": req.importance}
+        r = writes.prior(db, idem)
+        if r is None:
+            meta = db.get_metadata(record_id)
+            if _is_dead_meta(meta):
+                raise HTTPException(404, f"Record {record_id} not found")
+            meta.importance = req.importance
+            try:
+                r = writes.apply(db, [Op("update", record_id, meta, expected=expected)], idem, body)
+            except HTTPException as e:
+                raise writes.precondition_failed(e)
+    return _with_version(response, body, r)
 
 
 @app.post("/v1/{namespace}/records/{record_id}/link", tags=["records"],
           dependencies=[Depends(verify_api_key)])
 @_write_route
-def link_records(namespace: str, record_id: int, req: LinkRequest):
+def link_records(namespace: str, record_id: int, req: LinkRequest,
+                 response: Response, idem: Idem = Depends(writes.idempotency)):
+    """Link a record to another. As embedded link(): the source must exist
+    (404 otherwise — this used to answer 200 "linked" without linking
+    anything); the target may be a forward reference. A /batch link
+    requires both."""
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
+    body = {"from_id": record_id, "to_id": req.to_id, "linked": True}
     with manager.lock(namespace):
-        db.link(from_id=record_id, to_id=req.to_id)
-    return {"from_id": record_id, "to_id": req.to_id, "linked": True}
+        r = writes.prior(db, idem)
+        if r is None:
+            # As embedded link(): the source must be live (an edge from a
+            # forgotten record would vanish); the target may not exist yet.
+            if _is_dead_meta(db.get_metadata(record_id)):
+                raise HTTPException(404, f"Record {record_id} not found")
+            r = writes.apply(db, [Op("link", record_id, to_id=req.to_id, rel_type=req.rel_type,
+                                     weight=req.weight, require_target=False)], idem, body)
+    return _with_version(response, body, r)
 
 
 @app.delete("/v1/{namespace}/records/{record_id}", tags=["records"],
             dependencies=[Depends(verify_api_key)])
 @_write_route
-def delete_record(namespace: str, record_id: int):
+def delete_record(namespace: str, record_id: int, response: Response,
+                  idem: Idem = Depends(writes.idempotency), cascade: bool = True):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
-    meta = db.get_metadata(record_id)
-    if _is_dead_meta(meta):
-        raise HTTPException(404, f"Record {record_id} not found")
-
+    body = {}
     with manager.lock(namespace):
-        db.forget(record_id)
-        # Cascade: drop any edges pointing at this id so the graph isn't left
-        # with dangling pointers to a deleted record.
-        edges_pruned = _prune_edges_to(db, record_id)
-        # No save(): forget() and the edge updates are WAL-logged, and the
-        # background checkpointer folds them into the file.
-    return {"id": record_id, "deleted": True, "edges_pruned": edges_pruned}
+        # Before the existence check: a retry of a delete that succeeded finds
+        # no record, and must get the first answer, not a 404.
+        r = writes.prior(db, idem)
+        if r is None:
+            if _is_dead_meta(db.get_metadata(record_id)):
+                raise HTTPException(404, f"Record {record_id} not found")
+            # Cascade: drop any edges pointing at this id so the graph isn't
+            # left with dangling pointers to a deleted record — in the same
+            # atomic write as the forget, so a crash cannot leave them behind.
+            prune, edges_pruned = _prune_ops(db, [record_id]) if cascade else ([], 0)
+            body = {"id": record_id, "deleted": True, "edges_pruned": edges_pruned}
+            r = writes.apply(db, [Op("forget", record_id)] + prune, idem, body)
+            # No save(): the batch is WAL-logged, and the background
+            # checkpointer folds it into the file.
+    return writes.respond(response, body, r)
 
 
 @app.post("/v1/{namespace}/records/batch_delete", tags=["records"],
           dependencies=[Depends(verify_api_key)])
 @_write_route
-def batch_delete(namespace: str, req: BatchDeleteRequest):
+def batch_delete(namespace: str, req: BatchDeleteRequest, response: Response,
+                 idem: Idem = Depends(writes.idempotency)):
     """Delete many records in ONE pass: take the namespace lock once and forget
     every id. Every forget is WAL-logged (one fsync for the batch is shared via
     group commit); the background checkpointer folds them into the file.
@@ -1040,6 +1322,9 @@ def batch_delete(namespace: str, req: BatchDeleteRequest):
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
+    prior = writes.prior(db, idem)        # before the checks a retry would fail
+    if prior is not None:
+        return writes.respond(response, {}, prior)
 
     ids = set(int(i) for i in (req.ids or []))
     if req.entity_id:
@@ -1052,28 +1337,36 @@ def batch_delete(namespace: str, req: BatchDeleteRequest):
     if len(ids) > 100_000:
         raise HTTPException(413, f"too many ids ({len(ids)}); cap is 100000 per call")
 
-    deleted = 0
+    ops = []
     not_found = 0
     with manager.lock(namespace):
-        for rid in ids:
-            meta = db.get_metadata(rid)
-            if _is_dead_meta(meta):
-                not_found += 1
-                continue
-            db.forget(rid)
-            deleted += 1
-        edges_pruned = 0
-        if req.cascade and deleted:
-            edges_pruned = _prune_edges_to_set(db, ids)
-    return {"namespace": namespace, "requested": len(ids), "deleted": deleted,
-            "not_found": not_found, "edges_pruned": edges_pruned,
-            "hint": "run POST /compact to reclaim space" if deleted else None}
+        r = writes.prior(db, idem)
+        if r is None:
+            for rid in sorted(ids):
+                if _is_dead_meta(db.get_metadata(rid)):
+                    not_found += 1
+                else:
+                    ops.append(Op("forget", rid))
+            deleted = len(ops)
+            edges_pruned = 0
+            if req.cascade and deleted:
+                prune, edges_pruned = _prune_ops(db, ids)
+                ops += prune
+            body = {"namespace": namespace, "requested": len(ids), "deleted": deleted,
+                    "not_found": not_found, "edges_pruned": edges_pruned,
+                    "hint": "run POST /compact to reclaim space" if deleted else None}
+            # One atomic batch: every forget and every pruned edge, or none.
+            r = writes.apply(db, ops, idem, body)
+        else:
+            body = {}
+    return writes.respond(response, body, r)
 
 
 @app.delete("/v1/{namespace}/records/{from_id}/link/{to_id}", tags=["records"],
             dependencies=[Depends(verify_api_key)])
 @_write_route
-def unlink_records(namespace: str, from_id: int, to_id: int):
+def unlink_records(namespace: str, from_id: int, to_id: int, response: Response,
+                   idem: Idem = Depends(writes.idempotency)):
     """Remove a single edge from `from_id` to `to_id`. Returns the number of
     edges removed (0 if the edge didn't exist, 1+ if multiple rel_types matched).
     """
@@ -1081,17 +1374,221 @@ def unlink_records(namespace: str, from_id: int, to_id: int):
         db = manager.get(namespace, create=False)
     except KeyError:
         raise HTTPException(404, f"Namespace '{namespace}' not found")
-    meta = db.get_metadata(from_id)
+    with manager.lock(namespace):
+        r = writes.prior(db, idem)
+        if r is not None:
+            return writes.respond(response, {}, r)
+        # Read under the lock: read outside it, a link() landing in between
+        # was overwritten by the write-back below.
+        meta = db.get_metadata(from_id)
+        if meta is None:
+            raise HTTPException(404, f"Record {from_id} not found")
+        current = list(meta.edges)
+        kept    = [e for e in current if e.target_id != to_id]
+        removed = len(current) - len(kept)
+        body = {"from_id": from_id, "to_id": to_id, "removed": removed}
+        meta.edges = kept
+        r = writes.apply(db, [Op("update", from_id, meta)] if removed else [], idem, body)
+    return writes.respond(response, body, r)
+
+
+@app.post("/v1/{namespace}/batch", tags=["records"], dependencies=[Depends(verify_api_key)])
+@_write_route
+def write_batch(namespace: str, req: BatchWriteRequest, response: Response,
+                idem: Idem = Depends(writes.idempotency)):
+    """Write several records atomically: every op is applied, or none.
+
+    For an extracted fact, its entity links and its provenance — a crash, a
+    failed check or a concurrent reader never sees half of them. Ops are
+    `put` (vector + metadata, as POST /vectors), `update` (metadata, as PUT
+    /records: edges are kept), `link` (both ends must exist once the ops
+    before it are applied) and `forget`. Each takes `expected_version` for
+    compare-and-set (0 = must not exist yet); every check runs before
+    anything is written, against the state before the batch, and a conflict
+    is a 409 naming the record. Send `Idempotency-Key` to make a retry safe.
+    """
+    if not writes.HAS_BATCH:
+        raise HTTPException(501, "atomic batches need feather-db >= 0.22 on the server")
+    db = manager.get(namespace)
+    with manager.lock(namespace):
+        r = writes.prior(db, idem)
+        if r is None:
+            ops = []
+            for i, o in enumerate(req.ops):
+                if o.metadata is not None:
+                    meta = _meta_from_model(o.metadata, namespace)
+                else:
+                    meta = Metadata()
+                    meta.namespace_id = namespace
+                ref = (o.key_namespace, o.key) if o.key is not None else None
+                if o.op not in ("put", "upsert") and ref is None and o.id is None:
+                    raise HTTPException(400, f"ops[{i}]: give id or key")
+                vec = np.asarray(o.vector, dtype=np.float32) if o.vector else None
+                if o.op == "put":
+                    if vec is None or o.id is None:
+                        raise HTTPException(400, f"ops[{i}]: put needs id and vector")
+                    ops.append(Op("put", o.id, meta, vec, o.modality, expected=o.expected_version))
+                elif o.op == "upsert":
+                    if not meta.key:
+                        raise HTTPException(400, f"ops[{i}]: upsert needs metadata.key")
+                    ops.append(Op("upsert", 0, meta, vec, o.modality, expected=o.expected_version))
+                elif o.op == "update":
+                    if o.metadata is None:
+                        raise HTTPException(400, f"ops[{i}]: update needs metadata")
+                    rid = o.id if ref is None else db.id_for(o.key, o.key_namespace)
+                    if rid is not None:               # edges and key kept, as PUT /records
+                        _keep_identity(meta, o.metadata, db.get_metadata(rid))
+                    ops.append(Op("update", o.id or 0, meta, expected=o.expected_version, ref=ref))
+                elif o.op == "link":
+                    to_ref = (o.to_key_namespace, o.to_key) if o.to_key is not None else None
+                    if o.to_id is None and to_ref is None:
+                        raise HTTPException(400, f"ops[{i}]: link needs to_id or to_key")
+                    ops.append(Op("link", o.id or 0, to_id=o.to_id or 0, rel_type=o.rel_type,
+                                  weight=o.weight, expected=o.expected_version, ref=ref,
+                                  to_ref=to_ref, require_target=o.require_target))
+                else:
+                    ops.append(Op("forget", o.id or 0, expected=o.expected_version, ref=ref))
+            r = writes.apply(db, ops, idem, {})
+    return writes.respond(response, {}, r, lambda r: {
+        "results": [{"id": i, "version": v} for i, v in zip(r.ids, r.versions)]})
+
+
+# ─────────────────────────────────────────────
+# Engine parity — the rest of embedded Feather, over HTTP
+# ─────────────────────────────────────────────
+# Every public DB method has a route (or an explicit reason it has none):
+# feather_db/remote.py's PARITY maps one to the other, and
+# tests/test_parity.py fails when a method is added to the engine without
+# one. The same contract suite runs against embedded and remote
+# (tests/test_contracts.py), so the API cannot drift from the engine.
+
+def _db_or_404(namespace: str):
+    try:
+        return manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+
+
+@app.get("/v1/{namespace}/by_key", tags=["records"], dependencies=[Depends(verify_api_key)])
+def get_by_key(namespace: str, key: str, key_namespace: str = ""):
+    """The live record holding `key` in metadata namespace `key_namespace`."""
+    db = _db_or_404(namespace)
+    rid = db.id_for(key, key_namespace)
+    meta = db.get_metadata(rid) if rid is not None else None
     if meta is None:
-        raise HTTPException(404, f"Record {from_id} not found")
-    current = list(meta.edges)
-    kept    = [e for e in current if e.target_id != to_id]
-    removed = len(current) - len(kept)
-    if removed > 0:
-        with manager.lock(namespace):
-            meta.edges = kept
-            db.update_metadata(from_id, meta)   # WAL-logged; no full save needed
-    return {"from_id": from_id, "to_id": to_id, "removed": removed}
+        raise HTTPException(404, f"no record has key '{key}' in '{key_namespace}'")
+    body = _meta_to_model(meta)
+    body = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+    return {**body, "id": rid, "metadata": body}
+
+
+@app.get("/v1/{namespace}/newest", tags=["records"], dependencies=[Depends(verify_api_key)])
+def newest(namespace: str, metadata_namespace: str = "", limit: int = 10, prefix: bool = False,
+           before_ts: Optional[int] = None, before_id: Optional[int] = None):
+    """Ids of the `limit` newest live records, newest first by (timestamp, id).
+    `before_ts` (+ `before_id`) pages from the last record of a previous page."""
+    db = _db_or_404(namespace)
+    before = None if before_ts is None else ((before_ts, before_id) if before_id is not None else before_ts)
+    return {"ids": db.newest(metadata_namespace, max(0, min(limit, 10_000)), prefix=prefix, before=before)}
+
+
+@app.get("/v1/{namespace}/ids", tags=["records"], dependencies=[Depends(verify_api_key)])
+def list_ids(namespace: str, metadata_namespace: Optional[str] = None, entity_id: Optional[str] = None,
+             attr_key: Optional[str] = None, attr_value: Optional[str] = None,
+             modality: Optional[str] = None):
+    """Live record ids: in a metadata namespace, for an entity, with an
+    attribute, or (only `modality`) with a vector there; none: every record."""
+    db = _db_or_404(namespace)
+    if metadata_namespace is not None:
+        ids = db.ids_in_namespace(metadata_namespace)
+    elif entity_id is not None:
+        ids = db.ids_for_entity(entity_id)
+    elif attr_key is not None:
+        ids = db.ids_with_attribute(attr_key, attr_value or "")
+    elif modality is not None:
+        ids = db.get_all_ids(modality)
+    else:
+        ids = db.all_ids()
+    return {"ids": list(ids)}
+
+
+@app.get("/v1/{namespace}/metadata_namespaces", tags=["meta"], dependencies=[Depends(verify_api_key)])
+def metadata_namespaces(namespace: str):
+    """Every metadata namespace with live records, and how many."""
+    db = _db_or_404(namespace)
+    return {"namespaces": [{"id": n, "size": db.namespace_size(n)} for n in db.list_namespaces()]}
+
+
+@app.post("/v1/{namespace}/records/{record_id}/touch", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+def touch_record(namespace: str, record_id: int):
+    """Count a recall without a search (salience, adaptive decay)."""
+    db = _db_or_404(namespace)
+    db.touch(record_id)
+    return {"id": record_id, "touched": True}
+
+
+@app.post("/v1/{namespace}/forget_expired", tags=["records"], dependencies=[Depends(verify_api_key)])
+@_write_route
+def forget_expired(namespace: str):
+    db = _db_or_404(namespace)
+    with manager.lock(namespace):
+        return {"forgotten": db.forget_expired()}
+
+
+@app.post("/v1/{namespace}/auto_link", tags=["graph"], dependencies=[Depends(verify_api_key)])
+@_write_route
+def auto_link(namespace: str, req: AutoLinkRequest):
+    db = _db_or_404(namespace)
+    with manager.lock(namespace):
+        n = db.auto_link(modality=req.modality, threshold=req.threshold,
+                         rel_type=req.rel_type, candidates=req.candidates)
+    return {"links_created": n}
+
+
+@app.post("/v1/{namespace}/vacuum", tags=["admin"], dependencies=[Depends(verify_api_key)])
+@_write_route
+def vacuum(namespace: str):
+    """Rewrite the file now, dropping superseded bytes."""
+    db = _db_or_404(namespace)
+    with manager.lock(namespace):
+        db.vacuum()
+    return {"vacuumed": True}
+
+
+@app.get("/v1/{namespace}/admin/engine", tags=["admin"], dependencies=[Depends(verify_api_key)])
+def engine_state(namespace: str):
+    """Everything embedded Feather reports about itself, for this namespace."""
+    db = _db_or_404(namespace)
+    modalities = {}
+    for name in db.modality_names():
+        modalities[name] = {"dim": db.dim(name), "ef": db.get_ef(name),
+                            "quantized": db.is_quantized(name), "int8_ram": db.is_int8_ram(name),
+                            "int8": db.int8_info(name)}
+    return {"size": db.size(), "dim": db.dim(), "modalities": modalities,
+            "auto_compact": db.get_auto_compact(), "compacting": db.is_compacting(),
+            "namespace_ann": db.namespace_ann_info(), "storage": db.storage_stats(),
+            "wal_size": db.wal_size(), "wal_fsync_count": db.wal_fsync_count()}
+
+
+@app.put("/v1/{namespace}/admin/settings", tags=["admin"], dependencies=[Depends(verify_api_key)])
+@_write_route
+def engine_settings(namespace: str, req: EngineSettings):
+    """Set any engine knob. Only the fields given change."""
+    db = _db_or_404(namespace)
+    with manager.lock(namespace):
+        if req.ef is not None:
+            db.set_ef(req.ef, req.ef_modality)
+        if req.auto_compact is not None:
+            db.set_auto_compact(req.auto_compact)
+        if req.namespace_ann_min is not None:
+            db.set_namespace_ann_min(req.namespace_ann_min)
+        for modality, on in (req.quantized or {}).items():
+            db.set_quantized(modality, on)
+        for modality, cfg in (req.int8_ram or {}).items():
+            refine = cfg.get("refine")
+            db.set_int8_ram(modality, cfg.get("max_abs"), refine=2 if refine is None else int(refine))
+    return engine_state(namespace)
 
 
 @app.post("/v1/{namespace}/purge", tags=["records"],
@@ -1225,7 +1722,7 @@ def list_records(namespace: str, limit: int = 50, after: int = -1,
         if record_id <= after:
             continue
         last_seen = record_id
-        meta = db.get_metadata(record_id)
+        meta = _get_meta(db, record_id, include_deleted)
         if meta is None:
             continue
         # Must match _is_dead_record() exactly. DELETE /records/{id} calls
@@ -1235,18 +1732,18 @@ def list_records(namespace: str, limit: int = 50, after: int = -1,
         dead = _is_dead_meta(meta)
         if dead and not include_deleted:
             continue
-        item = SearchResultItem(
-            id=record_id, score=float(meta.importance),
-            metadata=_meta_to_model(meta)
-        )
-        results.append((item, dead))
+        # Metadata.to_dict() is the SearchResultItem row, built in C++ in one
+        # call: a pydantic model per record read ~17 bound properties each and
+        # cost most of a page.
+        row = {"id": record_id, "score": float(meta.importance), "cosine": None,
+               "metadata": meta.to_dict()}
+        results.append((row, dead))
         if len(results) >= limit:
             break
 
     has_more = bool(all_ids) and all_ids[-1] > last_seen
     payload = []
-    for item, dead in results:
-        row = item.model_dump() if hasattr(item, "model_dump") else item.dict()
+    for row, dead in results:
         # An explicit boolean, so no client has to know the "_forgotten" string.
         if include_deleted:
             row["deleted"] = dead
@@ -1264,7 +1761,7 @@ def list_records(namespace: str, limit: int = 50, after: int = -1,
           dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(KeywordSearchRequest))
 async def keyword_search(namespace: str, request: Request):
     req = await parse_body(request, KeywordBody)
-    return await run_in_threadpool(_keyword_search_impl, namespace, req)
+    return await run_in_threadpool(_retry_closed, _keyword_search_impl, namespace, req)
 
 
 def _keyword_search_impl(namespace: str, req):
@@ -1282,7 +1779,7 @@ def _keyword_search_impl(namespace: str, req):
           dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(HybridSearchRequest))
 async def hybrid_search(namespace: str, request: Request):
     req = await parse_body(request, HybridBody)
-    return await run_in_threadpool(_hybrid_search_impl, namespace, req)
+    return await run_in_threadpool(_retry_closed, _hybrid_search_impl, namespace, req)
 
 
 def _hybrid_search_impl(namespace: str, req):
@@ -1369,7 +1866,7 @@ def get_record_edges(namespace: str, record_id: int):
           openapi_extra=_body_doc(ContextChainRequest))
 async def context_chain(namespace: str, request: Request):
     req = await parse_body(request, ContextChainBody)
-    return await run_in_threadpool(_context_chain_impl, namespace, req)
+    return await run_in_threadpool(_retry_closed, _context_chain_impl, namespace, req)
 
 
 def _context_chain_impl(namespace: str, req):
@@ -1387,7 +1884,8 @@ def _context_chain_impl(namespace: str, req):
 
     result = db.context_chain(q=vec, k=req.k, hops=req.hops, modality=req.modality)
     nodes = [ContextChainNode(
-                id=n.id, score=float(n.score), hop_distance=int(n.hop),
+                id=n.id, score=float(n.score), similarity=float(n.similarity),
+                hop_distance=int(n.hop),
                 metadata=_meta_to_model(n.metadata) if n.metadata else None)
              for n in result.nodes]
     edges = [ContextChainEdge(
@@ -1405,7 +1903,7 @@ GRAPH_NODE_LIMIT = int(os.getenv("FEATHER_GRAPH_NODE_LIMIT", "4000"))
 
 @app.get("/v1/{namespace}/graph", tags=["graph"],
          dependencies=[Depends(verify_api_key)])
-def export_graph(namespace: str, ns_filter: str = "", entity_filter: str = ""):
+def export_graph(namespace: str, ns_filter: str = "", entity_filter: str = "", full: bool = False):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
@@ -1415,7 +1913,7 @@ def export_graph(namespace: str, ns_filter: str = "", entity_filter: str = ""):
     # serializing them all is pointless. If the namespace is large and the
     # caller didn't narrow it down, return a friendly guard instead of trying
     # (and either freezing the tab or crashing on dirty bytes — see below).
-    if not ns_filter and not entity_filter:
+    if not ns_filter and not entity_filter and not full:
         try:
             total = db.size()
         except Exception:
@@ -1630,7 +2128,8 @@ def embedding_models():
 
 @app.post("/v1/{namespace}/ingest_text", tags=["records"],
           dependencies=[Depends(verify_api_key)])
-async def ingest_text(namespace: str, req: IngestTextRequest):
+async def ingest_text(namespace: str, req: IngestTextRequest, response: Response,
+                      idem: Idem = Depends(writes.idempotency)):
     """Embed `text` via the configured provider, then ingest as a new record.
 
     The embedding call is awaited (no thread is held while the provider
@@ -1638,13 +2137,21 @@ async def ingest_text(namespace: str, req: IngestTextRequest):
     by the micro-batcher; only the engine write runs on the write pool."""
     try:
         vec = await EMBED_BATCHER.embed(req.text)
+    except UpstreamError as e:
+        # The provider failed, not the request. Rate-limited or down is worth
+        # a retry (503); refused (bad key or model) is our misconfiguration
+        # (502), and retrying it only adds load.
+        if e.transient:
+            raise errors.APIError(503, str(e), "upstream_unavailable", headers={"Retry-After": "1"})
+        raise errors.APIError(502, str(e), "upstream_error")
     except RuntimeError as e:
         raise HTTPException(400, str(e))
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_WRITE_POOL, _store_ingested, namespace, req, vec)
+    return await loop.run_in_executor(_WRITE_POOL, _store_ingested, namespace, req, vec, idem, response)
 
 
-def _store_ingested(namespace: str, req: IngestTextRequest, vec):
+def _store_ingested(namespace: str, req: IngestTextRequest, vec, idem: Idem = Idem(),
+                    response: Optional[Response] = None):
     db = manager.get(namespace)
     # The embedding model's output dim is fixed. If this namespace already has an
     # established dim and the model doesn't match it, reject honestly rather than
@@ -1658,17 +2165,22 @@ def _store_ingested(namespace: str, req: IngestTextRequest, vec):
             f"'{req.modality}'; the configured model doesn't match this namespace",
         )
     rec_id = int(np.random.default_rng().integers(1, 2**53))   # JS-safe id
-    meta = _meta_from_model(req.metadata) if req.metadata else Metadata()
-    if not meta.namespace_id:
+    if req.metadata:
+        meta = _meta_from_model(req.metadata, namespace)
+    else:
+        meta = Metadata()
         meta.namespace_id = namespace
     meta.content = meta.content or req.text
     if not meta.timestamp:
         meta.timestamp = int(time.time())
 
+    # The id is random: a retry without a key would create a second record.
+    # With one, the retry gets the first record's id back.
+    body = {"id": rec_id, "namespace": namespace, "embedded": True, "dim": len(vec)}
     with manager.lock(namespace):
-        db.add(id=rec_id, vec=np.asarray(vec, dtype=np.float32),
-               meta=meta, modality=req.modality)
-    return {"id": rec_id, "namespace": namespace, "embedded": True, "dim": len(vec)}
+        r = writes.prior(db, idem) or writes.apply(
+            db, [Op("put", rec_id, meta, np.asarray(vec, dtype=np.float32), req.modality)], idem, body)
+    return _with_version(response, body, r)
 
 
 @app.post("/v1/{namespace}/import", response_model=ImportResponse, tags=["records"],
@@ -1776,14 +2288,22 @@ def _bulk_import_impl(namespace: str, req):
             continue
         md = entry["md"]
         meta = Metadata()
-        meta.timestamp    = int(md.get("timestamp") or time.time())
+        # Omitted takes the default, given is stored as given (0 included) —
+        # the same rule as every other write route.
+        ts = md.get("timestamp")
+        meta.timestamp    = int(ts) if ts is not None else int(time.time())
         meta.importance   = float(md.get("importance", 1.0))
         meta.type         = ContextType(int(md.get("type", 0)))
         meta.source       = str(md.get("source", ""))
         meta.content      = entry["content"]
         meta.tags_json    = str(md.get("tags_json", ""))
-        meta.namespace_id = str(md.get("namespace_id", namespace))
+        ns_given = md.get("namespace_id")
+        meta.namespace_id = str(ns_given) if ns_given is not None else namespace
         meta.entity_id    = str(md.get("entity_id", ""))
+        meta.confidence   = float(md.get("confidence", 1.0))
+        meta.ttl          = int(md.get("ttl", 0))
+        if md.get("key"):
+            meta.key = str(md["key"])
         for k, v in (md.get("attributes") or {}).items():
             meta.set_attribute(str(k), str(v))
         ids.append(entry["id"])
