@@ -44,7 +44,7 @@ import feather_db
 from feather_db import Metadata, ContextType, ScoringConfig
 from feather_db.core import SearchFilter
 
-from .db_manager import DBManager, NotOwnedError
+from .db_manager import DBManager, NotOwnedError, NamespaceUnavailable
 from .metrics import METRICS, classify, namespace_from_path
 from .embedding import EMBEDDING, EMBED_BATCHER, SUPPORTED_MODELS
 from .fastparse import (parse_body, SearchBody, HybridBody, KeywordBody,
@@ -106,7 +106,10 @@ _CKPT_POLL_S = float(os.getenv("FEATHER_CHECKPOINT_POLL_S", "5"))
 async def _checkpointer():
     while True:
         await asyncio.sleep(_CKPT_POLL_S)
-        for ns in list(manager.list_namespaces()):
+        # Also the eviction heartbeat: get() only triggers eviction on an
+        # open, so without this nothing idle would close until the next open.
+        await asyncio.get_running_loop().run_in_executor(None, manager.evict)
+        for ns in manager.loaded_namespaces():
             db = manager.peek(ns)
             if db is None:
                 continue
@@ -128,7 +131,7 @@ async def lifespan(app: FastAPI):
     global manager
     logger.info("Starting Feather DB Cloud API...")
     manager = DBManager()
-    logger.info(f"Loaded namespaces: {manager.list_namespaces()}")
+    logger.info(f"Namespaces on disk (opened on first use): {manager.list_namespaces()}")
     EMBED_BATCHER.start()
     ckpt = asyncio.get_running_loop().create_task(_checkpointer())
     yield
@@ -181,6 +184,38 @@ class _MetricsMiddleware:
 
 app.add_middleware(_MetricsMiddleware)
 
+
+def _request_namespace(path: str) -> str:
+    """The namespace a request touches: /v1/<ns>/... or /v1/namespaces/<ns>/..."""
+    parts = path.strip("/").split("/")
+    if len(parts) >= 3 and parts[:2] == ["v1", "namespaces"]:
+        return parts[2]
+    return namespace_from_path(path)
+
+
+class _PinMiddleware:
+    """Pins a request's namespace for the request's whole lifetime so eviction
+    never closes a handle a route is still using. Routes keep the DB get()
+    returned, and reads on a closed handle return EMPTY results rather than
+    raising — an eviction mid-request would be a silent wrong answer, not an
+    error. Pure ASGI, like _MetricsMiddleware."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        ns = _request_namespace(scope.get("path", "")) if scope["type"] == "http" else ""
+        if not ns or manager is None:
+            return await self.app(scope, receive, send)
+        manager.pin(ns)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            manager.unpin(ns)
+
+
+app.add_middleware(_PinMiddleware)
+
 _default_openapi = app.openapi
 
 
@@ -195,6 +230,14 @@ def _openapi_with_body_schemas():
 
 
 app.openapi = _openapi_with_body_schemas
+
+
+@app.exception_handler(NamespaceUnavailable)
+async def _ns_unavailable(request: Request, exc: NamespaceUnavailable):
+    # Namespaces open on first use, so a corrupt file or one held by another
+    # process surfaces here rather than as a skipped file at startup.
+    return JSONResponse(status_code=503, content={
+        "detail": str(exc), "namespace": exc.namespace, "reason": exc.reason})
 
 
 @app.exception_handler(NotOwnedError)
@@ -555,11 +598,18 @@ def health():
     return HealthResponse(
         status="ok",
         version=feather_db.__version__,
-        namespaces_loaded=len(manager.list_namespaces()),
+        namespaces_loaded=len(manager.loaded_namespaces()),
+        namespaces_total=len(manager.list_namespaces()),
+        memory=manager.memory_info(),
     )
 
 @app.get("/v1/namespaces", tags=["meta"], dependencies=[Depends(verify_api_key)])
-def list_namespaces():
+def list_namespaces(detail: bool = False):
+    """Every namespace on disk, loaded or not. `detail=true` adds per-namespace
+    stats without opening anything (see _namespace_summaries)."""
+    if detail:
+        items = _namespace_summaries()
+        return {"namespaces": [x["name"] for x in items], "details": items}
     return {"namespaces": manager.list_namespaces()}
 
 
@@ -584,6 +634,7 @@ def delete_namespace(namespace: str):
     if namespace not in manager.list_namespaces():
         raise HTTPException(404, f"Namespace '{namespace}' not found")
     removed = manager.delete(namespace)
+    _overview_cache.pop(namespace, None)
     return {"namespace": namespace, "deleted": bool(removed)}
 
 
@@ -739,22 +790,37 @@ def namespace_stats(namespace: str):
     )
 
 
+_overview_cache: Dict[str, dict] = {}
+
+
+def _namespace_summaries() -> List[dict]:
+    """One summary per namespace, WITHOUT opening any. A dashboard refresh that
+    loaded every file would undo lazy opening and evict whatever real traffic
+    needs. Namespaces not in memory report their last-seen stats, or
+    records=None if this process has never had them open."""
+    items = []
+    for name in manager.list_namespaces():
+        db = manager.peek(name)
+        if db is not None:
+            try:
+                _overview_cache[name] = {"dim": _primary_dim(db),
+                                         "modalities": _modalities(db),
+                                         "records": _live_record_count(db)}
+            except Exception:
+                pass   # closed or evicted meanwhile: fall back to the cache
+        seen = _overview_cache.get(name, {"dim": None, "modalities": [], "records": None})
+        items.append({"name": name, "loaded": db is not None,
+                      "size_bytes": manager.footprint(name), **seen})
+    return items
+
+
 @app.get("/v1/admin/overview", response_model=AdminOverview,
          tags=["meta"], dependencies=[Depends(verify_api_key)])
 def admin_overview():
-    """Aggregate stats for the dashboard overview screen."""
-    items = []
-    total = 0
-    for name in manager.list_namespaces():
-        try:
-            db = manager.get(name, create=False)
-            n = _live_record_count(db)
-            total += n
-            items.append({"name": name, "dim": _primary_dim(db),
-                          "modalities": _modalities(db), "records": n})
-        except Exception:
-            continue
-    items.sort(key=lambda x: x["records"], reverse=True)
+    """Aggregate stats for the dashboard overview screen. Opens nothing."""
+    items = _namespace_summaries()
+    total = sum(x["records"] or 0 for x in items)
+    items.sort(key=lambda x: x["records"] or 0, reverse=True)
 
     return AdminOverview(
         version       = feather_db.__version__,

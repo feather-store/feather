@@ -3593,7 +3593,31 @@ public:
         wal_close();
         release_lock();
         closed_ = true;
+        release_memory_nolock();
     }
+
+private:
+    // Drop the dataset a closed handle still holds. py::nodelete means Python
+    // never destroys a DB, so before this a closed handle kept every vector,
+    // graph and metadata record resident until process exit — a server that
+    // closed idle namespaces to bound RAM freed nothing. Safe because closed_
+    // is already set: save()/save_vectors() and every mutation refuse a closed
+    // handle (check_writable), so this empty view can never be written back
+    // over the file. swap(), not clear(): clear() keeps the bucket arrays.
+    void release_memory_nolock() {
+        decltype(modality_indices_)().swap(modality_indices_);
+        decltype(metadata_store_)().swap(metadata_store_);
+        decltype(reverse_index_)().swap(reverse_index_);
+        decltype(ns_index_)().swap(ns_index_);
+        decltype(entity_index_)().swap(entity_index_);
+        decltype(attr_index_)().swap(attr_index_);
+        decltype(bm25_index_)().swap(bm25_index_);
+        decltype(doc_lengths_)().swap(doc_lengths_);
+        decltype(compaction_log_)().swap(compaction_log_);
+        total_dl_ = avg_dl_ = 0.0;
+    }
+
+public:
 
     ~DB() {
         stop_compactor();

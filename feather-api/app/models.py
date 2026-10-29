@@ -462,4 +462,6 @@ class ContextChainResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     version: str
-    namespaces_loaded: int
+    namespaces_loaded: int                       # open in memory right now
+    namespaces_total: Optional[int] = None       # on disk, loaded or not
+    memory: Optional[Dict[str, int]] = None      # DBManager.memory_info()

@@ -140,15 +140,18 @@ async def health(request: Request):
 
 @app.get("/v1/namespaces")
 async def list_namespaces(request: Request):
-    names, errors = [], []
+    names, details, errors = [], [], []
     for i, r in await _fan_out(request, "/v1/namespaces"):
         if isinstance(r, httpx.Response) and r.status_code == 200:
             names.extend(r.json().get("namespaces", []))
+            details.extend(r.json().get("details", []))   # ?detail=true
         elif isinstance(r, httpx.Response) and r.status_code in (401, 403):
             return Response(r.content, status_code=r.status_code, media_type="application/json")
         else:
             errors.append(i)
     body = {"namespaces": sorted(set(names))}
+    if details:
+        body["details"] = sorted(details, key=lambda x: x.get("name", ""))
     if errors:
         body["unreachable_shards"] = errors
     return JSONResponse(body, status_code=200 if not errors else 206)
@@ -165,7 +168,7 @@ async def overview(request: Request):
     if not parts:
         return JSONResponse(status_code=502, content={"detail": "no shard answered"})
     top = sorted((ns for p in parts for ns in p.get("topNamespaces", [])),
-                 key=lambda x: x.get("records", 0), reverse=True)[:10]
+                 key=lambda x: x.get("records") or 0, reverse=True)[:10]   # None = not loaded yet
     return {"version": parts[0].get("version"), "uptime": min(p.get("uptime", 0) for p in parts),
             "dim": parts[0].get("dim"), "nsCount": sum(p.get("nsCount", 0) for p in parts),
             "totalRecords": sum(p.get("totalRecords", 0) for p in parts), "topNamespaces": top,
