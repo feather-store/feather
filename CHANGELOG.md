@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Cloud API opens namespaces on first use
+
+- **Startup no longer opens every namespace.** `DBManager` lists the
+  `.feather` files on disk and opens each on the first request that needs it,
+  so the API is ready in seconds regardless of data size. It used to open
+  every file one after another before answering anything, so one 3.4 GB
+  namespace held the whole server down while it loaded. A corrupt file is now
+  a `503` on that namespace (cached until the file changes) instead of a
+  skipped file at startup.
+- **One lock per namespace.** Opening, evicting, adopting and deleting take
+  only that namespace's lock. A slow open blocks requests to that database and
+  nothing else.
+- **Idle namespaces are closed under memory pressure.** With
+  `FEATHER_MEMORY_LIMIT_MB` set (default `0` = off), once the open namespaces'
+  on-disk footprint passes the limit, the least-recently-used ones idle for at
+  least `FEATHER_EVICT_IDLE_S` (default 60) are closed. They're checkpointed
+  first only if their WAL is non-empty. A namespace with a request in flight
+  (pinned by middleware) or a write in progress is never closed.
+- **`DB.close()` now frees the dataset.** The binding holds `DB` with
+  `py::nodelete`, so a closed handle used to keep every vector, graph and
+  metadata record in memory until process exit. Closing anything to bound RAM
+  freed nothing. Reads on a closed handle return empty; writes and `save()`
+  still raise.
+- `/health` adds `namespaces_total` and `memory`. `namespaces_loaded` now
+  means *open right now*. `/v1/admin/overview` and the new
+  `GET /v1/namespaces?detail=true` never open a namespace. Namespaces not in
+  memory report their last-seen stats, or `records: null` if never opened. The
+  dashboard's Namespaces page uses `detail=true` instead of one `/stats` call
+  per namespace.
+
 ### Fixed — post-merge review of the concurrency work
 
 Three defects found reviewing PR #8 and fixed on master directly after it

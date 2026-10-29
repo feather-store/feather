@@ -309,7 +309,7 @@
                   <template x-for="ns in server.topNamespaces || []" :key="ns.name">
                     <tr class="border-b border-slate-100 last:border-0 cursor-pointer" @click="openNamespace(ns.name)">
                       <td class="px-5 py-3 mono text-slate-900" x-text="ns.name"></td>
-                      <td class="px-5 py-3 text-right" x-text="(ns.records ?? 0).toLocaleString()"></td>
+                      <td class="px-5 py-3 text-right" x-text="ns.records == null ? '—' : ns.records.toLocaleString()" :title="ns.loaded === false ? 'not loaded yet — opens on first use' : ''"></td>
                       <td class="px-5 py-3 text-right text-slate-500" x-text="ns.dim"></td>
                       <td class="px-5 py-3 text-right pr-6 text-slate-500" x-text="(ns.modalities||[]).join(', ')"></td>
                     </tr>
@@ -389,7 +389,7 @@
                     <td class="px-5 py-3 mono text-slate-900">
                       <a href="#" @click.prevent="openNamespace(ns.name)" class="hover:text-lime-text" x-text="ns.name"></a>
                     </td>
-                    <td class="px-5 py-3 text-right" x-text="(ns.records ?? 0).toLocaleString()"></td>
+                    <td class="px-5 py-3 text-right" x-text="ns.records == null ? '—' : ns.records.toLocaleString()" :title="ns.loaded === false ? 'not loaded yet — opens on first use' : ''"></td>
                     <td class="px-5 py-3 text-right text-slate-500" x-text="ns.dim"></td>
                     <td class="px-5 py-3 text-right text-slate-500" x-text="(ns.modalities||[]).join(', ')"></td>
                     <td class="px-5 py-3 text-right pr-6">
@@ -1557,15 +1557,12 @@
         },
         async loadNamespaces() {
           try {
-            const d = await this.api('GET', '/v1/namespaces');
-            const detailed = [];
-            for (const name of d.namespaces) {
-              try {
-                const stats = await this.api('GET', `/v1/namespaces/${encodeURIComponent(name)}/stats`);
-                detailed.push({ name, dim: stats.dim, modalities: stats.modalities, records: stats.records ?? null });
-              } catch { detailed.push({ name, dim: null, modalities: [], records: null }); }
-            }
-            this.namespaces = detailed;
+            // detail=true: stats without opening anything. Per-namespace /stats
+            // calls would load every database just to render this list.
+            const d = await this.api('GET', '/v1/namespaces?detail=true');
+            this.namespaces = (d.details || d.namespaces.map(name => ({ name })))
+              .map(x => ({ name: x.name, dim: x.dim ?? null, modalities: x.modalities || [],
+                           records: x.records ?? null, loaded: x.loaded }));
           } catch (e) { this.toast(`Namespace list failed: ${e.message}`, 'error'); }
         },
         filteredNamespaces() {
