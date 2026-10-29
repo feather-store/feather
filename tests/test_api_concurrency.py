@@ -217,7 +217,7 @@ def test_shard_returns_421_for_foreign_namespace(tmp_path, monkeypatch):
         ok = c.post(f"/v1/{mine}/vectors", json={"id": 1, "vector": [0.1] * DIM})
         assert ok.status_code == 201
         r = c.post(f"/v1/{other}/vectors", json={"id": 1, "vector": [0.1] * DIM})
-        assert r.status_code == 421 and r.json()["owner_shard"] == 1
+        assert r.status_code == 421 and r.json()["owner_shard"] == "1"     # shard ids are strings
         assert not (tmp_path / f"{other}.feather").exists()
 
 

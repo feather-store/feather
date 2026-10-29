@@ -124,7 +124,10 @@ def stats(lat, seconds):
 
 def run_scenario(base, dim, n_records, loads, seconds, server_pid):
     """loads: {kind: n_clients}. Clients are spread over processes of <=8 threads."""
-    ctx = mp.get_context("fork")
+    # fork() of this process (it already runs the fake embedder's server
+    # thread) can leave a macOS child deadlocked on a lock that thread held:
+    # the run then hangs for seconds + 120 and fails. spawn starts clean.
+    ctx = mp.get_context("spawn" if sys.platform == "darwin" else "fork")
     q, go, procs, pidx = ctx.Queue(), ctx.Event(), [], 0
     for kind, clients in loads.items():
         while clients > 0:

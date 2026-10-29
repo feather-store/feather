@@ -74,7 +74,7 @@ Code, and a **LangGraph `BaseStore`** — cross-thread agent memory in one line,
 | **Parallel HNSW load** | v0.13.0 | Graph rebuilt across a thread pool on open — **~4.7× faster load** (7.6s→1.7s for 40k×128), identical recall. `FEATHER_LOAD_THREADS` to cap. Still used for old files / DBs with pending deletions. |
 | **Parallel batch ingest** | v0.13.0 | `DB.add_batch(ids, vecs, metas=None)` builds the graph in parallel with the GIL released — **~3.4× faster** bulk insert. |
 | **SIMD on x86** | v0.13.0 | SSE/AVX L2 kernels (runtime-dispatched) compiled on x86_64; arm64 uses `-O3` NEON. `FEATHER_SIMD=none\|sse\|avx\|avx512`. |
-| **In-RAM int8 quantization** | v0.15.0 | `set_int8_ram(modality, max_abs)` stores vectors as int8 **in memory** — **~1.7× less RAM** (227→129 MB at 60k×768), recall ~0.88. **File format v8.** |
+| **In-RAM int8 quantization** | v0.15.0 | `set_int8_ram(modality)` stores vectors as int8 **in memory** — **~1.7× less RAM** (227→129 MB at 60k×768). Since 0.22 the scale is trained from the data, and search re-ranks by float originals read from the file (`refine=2`), so recall matches float. |
 | **MCP connector for Claude** | v0.14.0 | `feather-serve` exposes Feather as a persona context engine to **Claude Desktop / Code** — local `.feather` *or* remote Cloud API (`--api-url`). |
 | **Real embedders** | v0.15.1 | `feather-serve --embed-provider gemini\|openai\|voyage\|cohere\|ollama` — semantic recall over a hosted instance (Gemini `text-embedding-004` = native 768). |
 
@@ -82,8 +82,9 @@ Code, and a **LangGraph `BaseStore`** — cross-thread agent memory in one line,
 # Bulk-ingest a persona's history fast (parallel HNSW build)
 db.add_batch(ids, vecs, metas)
 
-# Store vectors as int8 in RAM — ~1.7x less memory (opt-in, lossy)
-db.set_int8_ram("text", max_abs=1.0)
+# Store vectors as int8 in RAM — ~1.7x less memory. The scale is trained from
+# the data; search re-ranks by float originals kept in the file (refine=2).
+db.set_int8_ram("text")
 ```
 
 ```bash

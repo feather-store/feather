@@ -7,7 +7,7 @@ import binascii
 
 import numpy as np
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 from enum import IntEnum
 
 
@@ -54,6 +54,13 @@ class ContextTypeEnum(IntEnum):
     CONVERSATION = 3
 
 
+class EdgeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_id: int
+    rel_type: str = Field("related_to", max_length=255)
+    weight: float = 1.0
+
+
 class MetadataIn(BaseModel):
     # Reject unknown top-level keys rather than dropping them. Pydantic's default
     # ("ignore") accepted e.g. creative_hash / creative_url, returned 200, stored
@@ -64,14 +71,27 @@ class MetadataIn(BaseModel):
     # Custom fields belong in `attributes`, and the error says so.
     model_config = ConfigDict(extra="forbid")
 
-    timestamp: Optional[int] = None          # defaults to now
+    # Omitted (null) takes the API's default; any value given — 0 and ""
+    # included — is stored as given, exactly as embedded Feather stores it.
+    timestamp: Optional[int] = Field(None, description="Omitted: now. Given: as given (0 is 1970).")
     importance: float = 1.0
     type: ContextTypeEnum = ContextTypeEnum.FACT
     source: str = ""
     content: str = ""
     tags_json: str = ""
-    namespace_id: str = ""
+    namespace_id: Optional[str] = Field(
+        None, description="Omitted: the URL's namespace. Given (\"\" included): as given.")
     entity_id: str = ""
+    key: Optional[str] = Field(
+        None, description="Native key, unique within namespace_id. On PUT, omitted keeps the "
+                          "record's key; \"\" removes it.")
+    edges: Optional[List[EdgeIn]] = Field(
+        None, description="Typed edges. On PUT, omitted keeps the record's edges and a list "
+                          "replaces them; on POST /vectors, omitted or [] keeps them (add()'s rule).")
+    # Salience, as embedded add() takes it: a rewrite can carry the recall
+    # history forward instead of resetting it (Pocket.remember does).
+    recall_count: Optional[int] = Field(None, ge=0)
+    last_recalled_at: Optional[int] = Field(None, ge=0)
     attributes: Dict[str, str] = Field(default_factory=dict)
     # Both have been engine fields for a long time, both are persisted, and
     # neither was reachable over HTTP: `extra="forbid"` meant a POST carrying
@@ -92,9 +112,16 @@ class MetadataIn(BaseModel):
 
 
 class MetadataOut(MetadataIn):
+    namespace_id: str = ""
     recall_count: int = 0
     last_recalled_at: int = 0
     links: List[int] = Field(default_factory=list)
+    edges: List[EdgeIn] = Field(default_factory=list)
+    key: str = Field("", description="Native key (unique within namespace_id), if the "
+                     "record was written under one. Kept by PUT, like the edges.")
+    version: int = Field(0, description="Compare-and-set version: changes on every write "
+                         "to the record, never reused. Send it back as If-Match, or as a "
+                         "batch op's expected_version.")
 
 
 class AddVectorRequest(VectorInput):
@@ -131,6 +158,8 @@ class SearchRequest(VectorInput):
                           "and serialising every hit's metadata.")
     # Filters
     namespace_id: Optional[str] = None
+    types: Optional[List[int]] = Field(None, description="ContextType values to keep (0 fact, 1 preference, 2 event, 3 conversation).")
+    namespace_prefix: Optional[str] = Field(None, description="This namespace and every one below it ('.' separates levels: 'acme.u1' matches 'acme.u1.prefs', not 'acme.u10'). Ranked inside them, not filtered from a global top-k.")
     entity_id: Optional[str] = None
     attributes_match: Optional[Dict[str, str]] = None
     source: Optional[str] = None
@@ -172,6 +201,8 @@ class KeywordSearchRequest(BaseModel):
     include_metadata: bool = True
     # Filters (same as SearchRequest)
     namespace_id: Optional[str] = None
+    types: Optional[List[int]] = Field(None, description="ContextType values to keep (0 fact, 1 preference, 2 event, 3 conversation).")
+    namespace_prefix: Optional[str] = Field(None, description="This namespace and every one below it ('.' separates levels: 'acme.u1' matches 'acme.u1.prefs', not 'acme.u10'). Ranked inside them, not filtered from a global top-k.")
     entity_id: Optional[str] = None
     attributes_match: Optional[Dict[str, str]] = None
     source: Optional[str] = None
@@ -196,6 +227,8 @@ class HybridSearchRequest(VectorInput):
     include_metadata: bool = True
     # Filters
     namespace_id: Optional[str] = None
+    types: Optional[List[int]] = Field(None, description="ContextType values to keep (0 fact, 1 preference, 2 event, 3 conversation).")
+    namespace_prefix: Optional[str] = Field(None, description="This namespace and every one below it ('.' separates levels: 'acme.u1' matches 'acme.u1.prefs', not 'acme.u10'). Ranked inside them, not filtered from a global top-k.")
     entity_id: Optional[str] = None
     attributes_match: Optional[Dict[str, str]] = None
     source: Optional[str] = None
@@ -213,6 +246,10 @@ class HybridSearchRequest(VectorInput):
 
 class LinkRequest(BaseModel):
     to_id: int
+    # Sent by clients (mcp_remote) long before the route read it: unknown keys
+    # are ignored here, so the type was silently dropped.
+    rel_type: str = Field("related_to", max_length=255)
+    weight: float = 1.0
 
 
 class UpdateImportanceRequest(BaseModel):
@@ -225,6 +262,58 @@ class UpdateMetadataRequest(BaseModel):
 
 class PurgeRequest(BaseModel):
     namespace_id: str = Field(..., description="metadata.namespace_id to hard-delete (e.g. brand_id)")
+
+
+class BatchOpIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    op: Literal["put", "update", "link", "forget", "upsert"]
+    id: Optional[int] = Field(None, description="The record written (for link: the source). "
+                              "Or name it by `key` (+ `key_namespace`); upsert takes "
+                              "metadata.key instead.")
+    key: Optional[str] = None
+    key_namespace: str = ""
+    to_key: Optional[str] = Field(None, description="link: the target by key.")
+    to_key_namespace: str = ""
+    require_target: bool = Field(True, description="link: the target must be a live record "
+                                 "(false allows a forward reference, as POST /link does).")
+    vector: Optional[List[float]] = Field(None, description="put: the vector.")
+    modality: str = "text"
+    metadata: Optional[MetadataIn] = Field(None, description="put, update.")
+    to_id: Optional[int] = Field(None, description="link: the target.")
+    rel_type: str = Field("related_to", max_length=255)
+    weight: float = 1.0
+    expected_version: Optional[int] = Field(
+        None, ge=0, description="Compare-and-set: the record's version before the batch "
+                                "must be this (0 = the record must not exist).")
+
+
+class AutoLinkRequest(BaseModel):
+    modality: str = "text"
+    threshold: float = Field(0.80, ge=-1.0, le=1.0)
+    rel_type: str = Field("related_to", max_length=255)
+    candidates: int = Field(15, ge=1, le=1000)
+
+
+class PlacementUpdate(BaseModel):
+    epoch: int = Field(..., ge=1)
+    overrides: Dict[str, str] = Field(default_factory=dict,
+                                      description="namespace -> shard id, overriding the hash")
+
+
+class EngineSettings(BaseModel):
+    """Every knob embedded Feather has, settable over HTTP. Each is optional:
+    only what is given changes."""
+    model_config = ConfigDict(extra="forbid")
+    ef: Optional[int] = Field(None, ge=1)
+    ef_modality: str = ""
+    auto_compact: Optional[float] = Field(None, ge=0.0)
+    namespace_ann_min: Optional[int] = Field(None, ge=0)
+    quantized: Optional[Dict[str, bool]] = None              # modality -> on
+    int8_ram: Optional[Dict[str, Dict[str, Optional[float]]]] = None  # modality -> {max_abs, refine}
+
+
+class BatchWriteRequest(BaseModel):
+    ops: List[BatchOpIn] = Field(..., min_length=1, max_length=10_000)
 
 
 class BatchDeleteRequest(BaseModel):
@@ -443,6 +532,7 @@ class EdgesResponse(BaseModel):
 class ContextChainNode(BaseModel):
     id: int
     score: float
+    similarity: float = 0.0
     hop_distance: int
     metadata: Optional[MetadataOut] = None
 
@@ -462,4 +552,8 @@ class ContextChainResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     version: str
-    namespaces_loaded: int
+    namespaces_loaded: int                     # open now
+    namespaces_known: Optional[int] = None     # served by this shard, open or not
+    admission: Optional[Dict[str, Dict[str, int]]] = Field(
+        None, description="Per request class: requests in flight, the limit past which "
+                          "they get 429, and how many were refused so far.")

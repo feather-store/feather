@@ -20,10 +20,7 @@ import pytest
 
 pytest.importorskip("langgraph", reason="FeatherStore needs langgraph")
 
-from feather_db.integrations.langgraph_store import (  # noqa: E402
-    FeatherStore,
-    _ns_key,
-)
+from feather_db.integrations.langgraph_store import FeatherStore  # noqa: E402
 
 DIM = 128
 
@@ -184,7 +181,7 @@ def test_works_without_an_embedder(tmp_path):
 
 def _stored_ttl(store, key):
     """The ttl Feather actually persisted, in seconds (0 = never expires)."""
-    return store.db.get_metadata(_ns_key(NS, key)).ttl
+    return store.db.get_metadata(store.id_of(NS, key)).ttl
 
 
 def test_ttl_is_declared_and_enforced(store):
@@ -220,9 +217,7 @@ def test_a_sub_second_ttl_does_not_become_permanent(store):
     'never expires'. Truncating turned any ttl under a second into permanent —
     the worst possible direction for a field whose purpose is impermanence."""
     store.put(NS, "tiny", {"text": "x"}, ttl=0.0001)         # 6 ms
-    rid = store.db.get_metadata(
-        __import__("feather_db.integrations.langgraph_store", fromlist=["_ns_key"])
-        ._ns_key(NS, "tiny"))
+    rid = store.db.get_metadata(store.id_of(NS, "tiny"))
     assert rid.ttl >= 1, "a positive ttl was floored to 0, which means forever"
 
 

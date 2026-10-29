@@ -48,9 +48,10 @@ for t in test_secondary_index test_prefiltered_search test_auto_compact \
   else skp "$t (missing)"; fi
 done
 
-hdr "4. Data-integrity regressions (the four that could lose data)"
+hdr "4. Data-integrity regressions (the four that could lose data, and corrupt files)"
 for t in tests/test_wal_recovery.py tests/test_wal_durability.py \
-         tests/test_open_failure_safety.py tests/test_api_records.py; do
+         tests/test_open_failure_safety.py tests/test_api_records.py \
+         tests/test_corrupt_files.py; do
   out=$($PY -m pytest "$t" -q 2>/dev/null | tail -2)
   n=$(printf '%s' "$out" | grep -oE '[0-9]+ passed' | head -1)
   if [ -n "$n" ]; then ok "$(basename $t): $n"

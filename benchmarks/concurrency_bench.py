@@ -34,6 +34,8 @@ def stats(lat_ms, seconds):
     if not lat_ms:
         return {"ops": 0}
     a = np.asarray(lat_ms)
+    if a.size == 0:                    # a short window can complete nothing
+        return {"ops": 0, "ops_per_s": 0.0}
     return {
         "ops": int(a.size),
         "ops_per_s": round(a.size / seconds, 1),
@@ -220,7 +222,7 @@ def suite_contention(a):
         while time.perf_counter() < t_end:
             t = time.perf_counter(); db.save(); durs.append((time.perf_counter() - t) * 1e3)
         return {"saves": len(durs), "save_ms_mean": round(float(np.mean(durs)), 1),
-                "save_ms_max": round(float(np.max(durs)), 1)}
+                "save_ms_max": round(float(np.max(durs)), 1) if len(durs) else None}
     scenario("r8_plus_add_w2_during_save_loop", readers=8, writers=2, during=save_loop)
     R["final_size"] = db.size()
     db.save()

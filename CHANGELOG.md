@@ -9,6 +9,866 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deleted HNSW slots are no longer reused
+
+- **`add()` after `forget()` could make other records unfindable.** Reusing
+  a deleted slot ran hnswlib's `updatePoint`, which re-prunes every old
+  neighbour of the slot and could drop another record's last incoming link.
+  Under forget + add churn, 44 of 24,000 new and 30 of 16,000 untouched
+  records were unreachable even by their own vector at `ef=400`. A new
+  record now always takes a fresh slot, which brings that back to a clean
+  build's rate (~0.02%, inherent to HNSW pruning). Tombstones stay as
+  routing nodes until `compact()`; use `set_auto_compact()` to bound them.
+  Reverses 0.19's "Deleted HNSW slots are reused".
+
+### Cloud API
+
+- **A namespace move no longer answers 500 mid-handover.** A request that
+  reached the target shard while the source still held the file's write
+  lock got a 500 (a 502 through the gateway). It is now a retryable 503
+  `namespace_held` with Retry-After.
+- **A request whose handle is closed under it retries up to 5 times**, not
+  once. With a short `FEATHER_IDLE_CLOSE_S`, a loaded host could lose the
+  reopened handle as well.
+
+### Three slowdowns against 0.21 removed
+
+A full benchmark run of this branch against master (v0.21.0) on an M1
+(`benchmarks/runs/2026-10-28-m1-vs-master/`) found three things slower. All
+three are fixed.
+
+- **`export_graph_json(namespace)` was ~4× slower (7.6 → 29 ms at 100k records).**
+  It walked the whole store three times for one namespace. It now reads the
+  namespace / entity index, so the cost is O(matches): 4 ms. Forgotten records
+  are no longer exported (the "a forgotten record is gone" contract), and
+  nodes come out in id order.
+- **Several writers beside readers were slower than one.** The phase-fair lock
+  admitted one writer per reader phase, so every write paid a full round of
+  reader wake-ups. 8 readers + 4 `link()` writers did 2.6k writes/s, against
+  9.8k with a single writer. A writer phase now runs the writers already
+  queued back to back, for at most 100 µs, before the readers' turn:
+  6–13k writes/s. Reads in that mix drop ~20% and remain 3–4× master's, since
+  master's lock prefers writers. Expensive writes (`add()`, ~0.5 ms) still get
+  one phase each, so reader latency beside them is unchanged; a count bound
+  instead of a time bound cut those reads 9.8k → 0.7k/s.
+- **`GET /records?limit=100` was 4.9 → 7.1 ms.** Each record became a pydantic
+  model built from ~17 bound properties, more since rows carry their edges.
+  The route now uses `Metadata.to_dict()`, the C++ row the search fast path
+  already uses (same JSON). Now 5.0–5.9 ms against master's 5.4–6.5.
+
+Checked and not a regression: int8 search. The benchmark that showed it
+slower converted a float modality without saving. Set the same way on both
+builds (50k × 768, ef=50), master's int8 runs at 1.40 ms with recall@10 0.659,
+and the branch at 0.51 ms with 0.832.
+
+### Sharding: rendezvous hashing, live moves, lazy namespaces
+
+**Adding a shard moved ~80% of namespaces.** Ownership was `crc32(ns) % N`, so
+every namespace's remainder changed with N. It is now rendezvous hashing over
+stable shard ids (`FEATHER_SHARD_IDS` / `FEATHER_SHARD_ID`; the old
+`FEATHER_SHARD_COUNT` / `FEATHER_SHARD_INDEX` mean ids `"0".."N-1"`).
+- Adding a fifth shard to four moves 20% of 20,000 test namespaces, all to the
+  new shard, against 80% before.
+- Load stays within 10% across shards.
+- Upgrading moves ~N/(N+1) namespaces once. With a shared volume that is a
+  clean restart; `FEATHER_SHARD_HASH=modulo` keeps the old rule meanwhile.
+- Shard ids are strings: `owner_shard` in a 421 is now `"1"`, not `1`.
+
+**A placement table overrides the hash**, so one hot namespace can move alone,
+with no restart: `POST /v1/admin/placement/move` on the gateway.
+- **Each shard keeps the table** under an epoch and persists it in its data
+  dir. It adopts only a newer epoch, from `PUT /v1/admin/placement`.
+- **The move.** The target takes the table first. The source takes it next:
+  it drains in-flight writes, checkpoints and closes the namespace, which
+  releases the file. The gateway then routes to the target, and requests in
+  the gap are 421-redirected there.
+- **Tested** with a writer hammering the namespace throughout: every write
+  landed exactly once, then the namespace moved back and its override was
+  removed.
+- **Needs a data volume both shards see**: a target that cannot see the file
+  is refused (409).
+
+**Every namespace opened at startup and stayed open.** A shard is limited by
+memory, and that memory was the sum of every tenant it had ever held.
+- Namespaces now open on their first request and close after
+  `FEATHER_IDLE_CLOSE_S` idle (default 900). Past `FEATHER_MAX_OPEN` (default
+  unlimited), the least recently used close first.
+- Measured (`benchmarks/idle_namespaces.py`, 40 tenants × 5k × 256): 564 MB
+  with all of them open, 77 MB idle, 116 MB with 4 hot. That is 73 → 354
+  tenants per GB, at 27 ms per reopen.
+- `/health` reports `namespaces_loaded` (open now) and `namespaces_known`.
+  `/v1/admin/overview` counts closed namespaces from the stats they had when
+  they closed (`_namespace_stats.json`), without opening them.
+- **A request racing a close** (it took the handle just before) is run once
+  more on a fresh handle. The engine now raises `feather_db.ClosedError`,
+  before the call does anything, and the closer holds the namespace's write
+  lock.
+- **A bug the race test found on the way:** the write paths raised a plain
+  `RuntimeError` for a closed handle, so a write racing a close returned a 500
+  instead of being re-run.
+
+### The contracts, stated and tested (CONTRACTS.md)
+
+Four promises, each with its limits and the tests that enforce it.
+
+- **Exact results by default.** Namespace graphs, added in this release, are
+  now opt-in (`FEATHER_NS_ANN_MIN` / `set_namespace_ann_min`). Filtered
+  search is an exact scan again unless asked otherwise. Unfiltered vector
+  search is the one approximate query by design.
+- **One writer, many readers**, as since 0.20, now with a contract test that
+  uses real processes.
+- **Read-only means a consistent snapshot. This was false.** Under a writer
+  saving every 7 adds, 187 of 7,395 read-only opens saw a torn view: the old
+  base plus later WAL records, missing the writes in between. A commit could
+  finish, and delete `<wal>.old`, between the reader's read of the base and its
+  read of the WALs.
+  - Every WAL file now starts with a `WALGEN` record (the base generation its
+    writes follow), written in the same `write()` as the header.
+  - A reader checks that base → `<wal>.old` → `<wal>` is unbroken and retries
+    with backoff when it is not.
+  - A broken chain that does not change between two attempts is the files as
+    they are (a crash), and is loaded.
+  - Old builds skip the new record.
+  - Result: 0 torn opens in 13,000.
+- **One feature set in every mode.** `feather_db.RemoteDB` is the embedded `DB`
+  over the Cloud API: same methods, arguments, return attributes and
+  exceptions.
+  - `feather_db.remote.PARITY` maps every public `DB` method to its route.
+    `tests/test_parity.py` fails on a method without one, a missing route, or
+    different arguments.
+  - `tests/test_contracts.py` runs the same tests against both modes (36 in
+    all).
+  - New routes:
+    - `GET /by_key`, `GET /newest`, `GET /ids` and `GET /metadata_namespaces`;
+    - `POST /records/{id}/touch`, `POST /forget_expired`, `POST /auto_link`
+      and `POST /vacuum`;
+    - `GET /admin/engine` (every engine statistic and setting);
+    - `PUT /admin/settings` (ef, auto-compaction, namespace graphs, on-disk
+      and in-RAM int8).
+  - `/batch` gains `upsert`, records named by key (`key`, `to_key`) and
+    `require_target`.
+  - Search bodies take `types`.
+  - Metadata carries `key`, `edges`, `recall_count` and `last_recalled_at` in
+    both directions.
+
+**Behaviour changes, from making the modes agree:**
+
+- `DB.get_metadata()` returns `None` for a forgotten record. It used to return
+  a `"_forgotten"` shell until the next save, so the answer changed across a
+  reopen and disagreed with the API's 404. `get_metadata(id, include_dead=True)`
+  shows the tombstone.
+- `DB.link()` returns whether it linked: `False` when the source does not
+  exist, where it used to return nothing and do nothing. The API's single-edge
+  route now matches it: a forward-referenced target is allowed again, and a
+  missing source is a 404.
+- API metadata: an omitted (null) `timestamp` or `namespace_id` takes the
+  default, now or the URL namespace. A given `0` or `""` is stored as given,
+  as embedded stores it. It used to be read as "omitted". Import follows the
+  same rule and now also takes `key`, `confidence` and `ttl`.
+- `PUT /records/{id}` replaces edges and key when the body gives them, and
+  keeps them when it omits them.
+- `DELETE /records/{id}?cascade=false` forgets without pruning edges into the
+  record, as embedded `forget()` does. The default still prunes.
+- `purge()` stamps the records whose edges it prunes in id order, from a base
+  the PURGE WAL record now carries. A crash used to recover them at different
+  versions than they had.
+
+### `newest()` walks a time index; packet manifests record real versions
+
+**`FeatherStore.newest()` read and sorted the whole namespace.** Asking for
+the 10 most recent items took time linear in the namespace: 12 ms at 10k items
+and 152 ms at 100k.
+- The engine now keeps each namespace's live records in a `(timestamp, id)`
+  ordered index, maintained wherever the secondary indexes are and rebuilt on
+  load.
+- `db.newest(namespace, limit, prefix=False, before=None)` walks it from the
+  end and returns ids newest first. With `prefix` it does a k-way merge over
+  every namespace below. `before` pages by a timestamp or by the
+  `(timestamp, id)` of the previous page's last record.
+- `FeatherStore.newest()` uses it and skips expired items as it pages:
+  0.04 ms for the 10 newest at 1k, 10k or 100k items (3,879× faster at 100k).
+  A custom `key=` (episodes order by event time) cannot use the index and
+  still scans.
+- Ties within one second fall back to id order, which follows write order for
+  records written since native keys landed.
+
+**Packet manifests recorded `recall_count` as each ref's "version".** Every
+search moved it and an edit of the rule did not, so a stored manifest could
+neither show that a rule was unchanged nor that it had changed.
+- Refs now carry the record's version (`Metadata.version`, `PocketItem.version`).
+  It moves on every write to the record, never on a read, and is never reused.
+  The values are increasing stamps from the DB's clock, not 1, 2, 3.
+- The manifest also lists the refs as structured data (`"refs"`).
+- `PacketBuilder.revalidate(manifest)` replays one. It reports each ref that is
+  missing or now at another version (`was`, `now`), and returns
+  `may_mutate=False` when a required ref is stale.
+- Required refs from a `resolve_required` store are checked against that
+  store's versions. A rule returned without one is listed as `unverified`.
+
+### Multi-tenant search: a namespace-prefix index and per-namespace ANN
+
+`FeatherStore.search(("org", "user42"), query=...)` ranked the whole file,
+took the top `max(8 × limit, 50)`, and kept whatever was under the prefix. With
+enough other tenants, every hit belonged to someone else and the user's own
+search came back `[]`. `AgentMemory.recall(kinds=...)` did the same one level
+down: it fetched `4 × limit` and discarded the other kinds. Filtered search
+inside one namespace was exact but scanned every record in it: 4.8 ms for a
+50k-record tenant, against 0.22 ms for an unfiltered search (100k × 384).
+
+- **`SearchFilter.namespace_prefix`** (`FilterBuilder().namespace_prefix(p)`):
+  `p` and every namespace below it, with `.` separating levels. `acme.u1`
+  matches `acme.u1.prefs` but not `acme.u10`. It is indexed like
+  `namespace_id`: a sorted set of namespace names turns the prefix into a
+  range, so a search ranks inside those namespaces. It works for vector,
+  keyword and hybrid search, and in the Cloud API's search bodies.
+- **`FeatherStore` searches inside the prefix** in one engine call. It grows
+  `k` only for what the engine cannot filter: expired items, unindexed items
+  and LangGraph value filters. `AgentMemory.recall(kinds=...)` searches each
+  kind's namespace and merges the results. Measured with 200 tenants of five
+  items each: five of the user's own hits.
+- **Per-namespace ANN.** A namespace with at least `FEATHER_NS_ANN_MIN` (4096)
+  records in a modality gets its own HNSW graph.
+  - **No vector copies.** Its nodes are 8-byte references to the modality's
+    own slots (`SlotRefSpace`), about 160 B a node, scored by the modality's
+    kernel on the same bytes, int8 included.
+  - **Built lazily.** The first filtered search that needs a graph queues a
+    background build; that search, and any others until the build finishes,
+    scan as before. The build runs in chunks under the shared lock, so it
+    holds up no writer, and is not persisted: a reopen rebuilds it on demand.
+  - **Kept current by writes.** A record that is added, moved in or given a
+    new vector is linked in. One that dies or moves out is marked, so a
+    graph's live nodes are exactly its namespace's records, and a
+    namespace-only search walks it with no filter callback. Other predicates
+    filter the walk. Compaction and int8 conversion renumber slots, so they
+    drop the graphs, which then rebuild on demand.
+  - **A prefix mixes both.** A search over several namespaces walks the ones
+    that have a graph, scans the rest, and merges.
+
+  Measured on 100k × 384 embedding-shaped data, k=10
+  (`benchmarks/namespace_search.py`):
+
+  | namespace | records | scan | graph | recall@10 |
+  |---|---|---|---|---|
+  | half the file | 50,000 | 4.88 ms | 0.34 ms (14.6×) | 1.000 |
+  | a tenth | 10,000 | 0.73 ms | 0.17 ms (4.4×) | 1.000 |
+  | a hundredth | 1,000 | 0.08 ms | (scanned) | 1.000 |
+
+  A 50k-record graph builds in about 6 s in the background. The graph walk
+  uses twice the modality's `ef`: it replaces an exact scan, so it buys recall
+  back. On hard 32-d Gaussian data that took recall from 0.93 to 0.995.
+
+**Behaviour change: filtered search in a large namespace is approximate.** It
+used to be an exact scan of every candidate. Below `FEATHER_NS_ANN_MIN`
+records, and for filters that do not confine to namespaces, it still is. It
+remains complete: a walk that comes back short of k falls back to the scan.
+To get exact everywhere, use `FEATHER_PREFILTER_MODE=exact` (now also turns
+the graphs off), `FEATHER_NS_ANN_MIN=0`, or `db.set_namespace_ann_min(0)` per
+handle. `db.namespace_ann_info()` and `db.wait_for_namespace_graphs()` report
+on and wait for the builds.
+
+### Native string keys: no more ids hashed from a key
+
+`Pocket`, the packet builder and `FeatherStore` (so `AgentMemory` and
+`feather-agent` too) placed each record at a 53-bit SHA-1 of (namespace, key).
+Two keys that hashed alike shared one record. The second write silently
+overwrote the first, and both keys then read back the second memory. The
+packet builder never checked the record it found, so a required compliance
+rule could resolve to whatever the colliding key had stored. A key also could
+not be searched: BM25 indexed only the content, so the memory stored under
+`allergy` was not found by searching "allergy".
+
+- **`Metadata.key`.** A key is unique among the live records of its
+  `namespace_id`, and the engine refuses a second record with the same one
+  (`DuplicateKeyError`).
+  - `db.upsert(meta, vec=None)` writes the record keyed
+    `(meta.namespace_id, meta.key)` and returns `(id, version)`.
+  - `db.id_for(key, namespace)` and `db.get_by_key(key, namespace)` read it.
+  - In a `WriteBatch`, `upsert` writes one, and `update` / `forget` / `link`
+    accept a key (`"k"` or `(namespace, "k")`) wherever they took an id. Each
+    op sees the keys the ops before it bind and free.
+- **Ids are allocated, not hashed.** They come from the version clock, offset
+  by 2^52, so an id is never handed out twice. That holds even after a delete
+  and a reload, so an edge left pointing at a deleted id never starts pointing
+  at a stranger. Ids stay below 2^53, exact in JSON. Eight threads upserting
+  one new key make one record.
+- **BM25 indexes the key** with the content: "allergy" and "allergies" now
+  find the memory stored under `allergy`. The `feather-agent` persona test that
+  pinned the old behaviour was updated, as its docstring asked.
+- **No format change.** The key is serialized as a reserved attribute (`"\0key"`),
+  so v9, v10 and the WAL carry it unchanged, and a build without keys keeps it
+  as an ordinary attribute and writes it back intact. Tests cover crash replay,
+  save, vacuum, compaction and `FEATHER_FORMAT=9`.
+- **Existing files.** `feather_db.keys` is the single place that addresses
+  records by key.
+  - `resolve()` still finds a record written at its hashed id, but only if the
+    record says it is that key. Under a collision the hashed id holds another
+    key's record, which the old code returned.
+  - A legacy record is adopted under the id it already has the first time it
+    is written, so edges into it stay valid.
+  - `FeatherStore` adopts all of a file's legacy records when it opens it, and
+    a `Pocket` adopts those of its own scope, which makes their keys
+    searchable. `keys.migrate(db)` does it on demand.
+- **Cloud API.** `PUT /records/{id}` keeps the record's key, as it keeps its
+  edges, and records show `key`. A PUT without `namespace_id` no longer moves
+  the record out of its namespace: it defaults to the URL's, as
+  `POST /vectors` always did. Before, such a PUT dropped the record from every
+  filtered search and listing of the namespace.
+- `pocket.scoped_id()` still exists and returns the legacy hash, but nothing
+  places records with it any more.
+
+### Cloud API: typed errors, 429 backpressure, nothing blocking the event loop
+
+A client used to get the same kind of answer whether it should retry, go to
+another shard, or stop. `ingest_text` answered `400` ("your fault") when the
+embedding provider was rate-limited. The write pool's queue had no bound, so
+under overload a request waited until the client timed out, and the client's
+retry landed on top of the backlog. That is how a slow minute turns into an
+outage. An upload copied its file and loaded the database on the event loop,
+so every other request on that worker waited for the whole load.
+
+- **Every error says what to do.** The body is `{"detail", "error",
+  "retryable", ...}`; `detail` is unchanged.
+  - Retry: `429 overloaded`, `503 unavailable` / `write_failed` /
+    `namespace_loading` / `upstream_unavailable`, with `Retry-After`.
+  - Go elsewhere: `421 wrong_shard`, which names `owner_shard`.
+  - Fix the request: every other 4xx (`not_found`, `invalid_request`,
+    `version_conflict`, ...).
+  - Server failure: `500 internal`, `502 upstream_error`. These are not
+    retryable: repeating a request that broke the server is how one bad
+    request becomes a storm.
+- **Backpressure.** Past a limit on requests in flight, a request is refused at
+  once with `429` and `Retry-After`. Reads, writes and uploads are counted
+  separately (`FEATHER_MAX_INFLIGHT_READS` / `_WRITES` / `_UPLOADS`, default
+  256 / 64 / 2), so a write burst never refuses searches. `/health` reports
+  the in-flight count, the limit and the rejections per class. Measured with a
+  limit of 2: four slow ingests got two `200`s and two `429`s, while a search
+  in the middle got `200`.
+- **Embedding-provider failures.** A rate-limited or unreachable provider is
+  a `503 upstream_unavailable`, which is retryable. A provider that refuses the
+  key or the model is a `502 upstream_error`. Neither is a `400` any more.
+- **Off the event loop:**
+  - the upload's copy, its database load and its record count;
+  - the checkpointer pass, including saves, reopens and WAL stats;
+  - opening every namespace at startup, and closing them all at shutdown;
+  - decoding bodies over 256 KiB;
+  - hashing bodies over 1 MiB for Idempotency-Key.
+
+  With a 1.5 s load, `/health`, a read of another namespace and the creation
+  of a new namespace each answered in under 0.5 s during the upload. Before,
+  they all waited for the whole load.
+- **The load is also outside `DBManager`'s global lock.** That lock serialised
+  every namespace's open, recovery and delete behind a large load, even with
+  the loop free. The namespace being adopted is reserved meanwhile: its file
+  inode is claimed, so an alias is still refused. Requests to it get
+  `503 namespace_loading`.
+- **The gateway follows a 421 once** to the shard it names. That happens
+  mid-reshard, when the gateway's `FEATHER_SHARDS` disagrees with the shards'
+  count. A 421 is refused before any work, so this is safe for every method.
+  Its own failures are typed too:
+  - an unreachable shard is a retryable `503 shard_unreachable`, since the
+    request was never sent;
+  - a shard that took the request and never answered is a `504 timeout`,
+    not retryable, since it may have been applied.
+- **`mcp_remote` retries only what is safe to repeat.** It retries 429/503
+  responses to GETs, read-only POSTs (searches) and writes carrying an
+  `Idempotency-Key`, which ingest and link now send, reusing the same key on
+  every attempt. It also retries a request that never reached the server.
+  Retries are bounded (3), with exponential backoff and jitter, and honour
+  `Retry-After`. The errors are typed: `OverloadedError`, `UnavailableError`,
+  `WrongShardError` (`.owner_shard`), `RequestError`, `ServerError`, and
+  `ConnectionFailed` (`.sent`). Tool results carry `error_type` and
+  `retryable`. A server too old for keys gets the write once without one.
+
+**Fixed along the way.**
+- **An overwriting upload that failed to load lost the old namespace's latest
+  writes.** The old handle was closed without a checkpoint and its WAL
+  deleted, so the rollback restored a backup without them. The WAL now moves
+  with the `.bak` and comes back on rollback.
+- **`POST /records/{id}/link` ignored `rel_type` and `weight`.** `mcp_remote`
+  had been sending `rel_type` all along; it was silently dropped.
+
+### Compare-and-set versions, atomic write batches, idempotency keys
+
+Two agents updating one memory overwrote each other silently: each read the
+record, changed it, and wrote it back, and the second write erased the first.
+Several records that belong together, such as an extracted fact with its entity
+links and its provenance, were written one call at a time. A reader could see
+the fact before its links, and a crash between the calls left half a graph
+behind. A retried request was applied twice. `ingest_text` mints a random id,
+so each retry of it created another record.
+
+- **Every record has a `version`** (`Metadata.version`, `DB.version(id)`). Every
+  write to the record changes it. Versions come from one clock per DB, so a
+  version is never reused, not even by a record re-created after a delete.
+  Searches don't change it. A missing or forgotten record is `0`.
+- **`DB.put_if(id, meta, expected_version, vec=None)`** replaces the record only
+  if its version is still the one that was read. `0` means the record must not
+  exist yet. Otherwise it raises `VersionConflictError`, whose `.id`,
+  `.expected` and `.actual` attributes let the caller re-read and retry. Eight
+  threads × 50 read-modify-write increments of one counter end at exactly 400.
+- **`DB.write(WriteBatch)`** applies `put` / `update` / `link` / `forget` ops as
+  one unit. Every check runs first, against the state before the batch: every
+  `expected_version`, the dims, and that both ends of each link exist once the
+  ops before it are applied. A failed check writes nothing, not even to the
+  WAL. The batch is logged as one WAL group in one write (`BEGIN` … `COMMIT`)
+  and applied under one exclusive lock. A reader never sees part of a batch:
+  without one, a reader polling while facts were added and then linked saw
+  184 facts with no link out of 200. A crash part-way through the write drops
+  the group whole: the test cuts the WAL at 12 points inside a batch.
+- **`DB.write(batch, idempotency_key=…, fingerprint=…, note=…)`**: a repeat of
+  the same key returns the first `BatchResult` (`replayed=True`, with the
+  stored `note`) and applies nothing. The same key with another fingerprint
+  raises `IdempotencyKeyReusedError`. The key is written in the same WAL group
+  as its batch, so a retry after a crash is recognised too. Keys expire after
+  `FEATHER_IDEMPOTENCY_TTL_S` (default 24 h). Past `FEATHER_IDEMPOTENCY_MAX`
+  keys (default 100,000) the oldest are dropped, and a retry of a dropped key
+  is applied again. `DB.idempotent_result(key, fingerprint)` looks a key up
+  without writing.
+- **Cloud API.**
+  - `GET /records/{id}` returns `version` and an `ETag`.
+  - `PUT /records/{id}` and `PUT /records/{id}/importance` take `If-Match` and
+    answer `412` (with the current `ETag`) instead of overwriting a change the
+    caller never saw.
+  - `POST /v1/{ns}/batch` is the atomic batch over HTTP. A conflict is a `409`
+    that names the record and both versions.
+  - `Idempotency-Key` works on every record write: `POST /vectors`,
+    `ingest_text`, `PUT /records/{id}` and `/importance`, `POST` and `DELETE`
+    `/link`, `DELETE /records/{id}`, `batch_delete` and `/batch`. A retry gets
+    the first response, with `Idempotent-Replayed: true`. That includes a
+    DELETE retried after it succeeded, which used to answer `404`. Reusing a
+    key with a different request is a `422`.
+  - `import`, `seed`, `upload` and namespace create/delete refuse a key with
+    `400` rather than ignore it. Routes that are idempotent by nature, such as
+    purge, compact and save, accept a key and ignore it.
+  - `DELETE /records/{id}` and `batch_delete` now forget and prune edges in one
+    atomic batch, so a crash can no longer leave the pruning half done.
+  - `DELETE /link` reads the record under the namespace lock: a link added
+    between its read and its write-back used to be overwritten.
+  - On a `feather-db` wheel older than this, both headers get a `501`; nothing
+    ignores them silently.
+
+**Behaviour changes.** `POST /records/{id}/link` answers `404` when either
+record is missing. It used to answer `200 "linked"` and either link nothing
+(missing source) or leave a dangling edge (missing target).
+`PUT /records/{id}/importance` on a missing record is a `404` instead of a
+`200` that did nothing.
+
+**Format.** v10 gains two optional sections: `VERSIONS` (7), which holds each
+written record's version and the clock, and `IDEMPOTENCY` (8). The WAL gains
+`STAMP`, `BEGIN` and `COMMIT` records, written in the same `fwrite` as the
+change they belong to. Neither the file format nor the WAL version changes.
+- **Downgrading.** A build without these records skips the new sections and WAL
+  ops but still replays every data record, so downgrading loses versions, keys
+  and all-or-nothing, never data.
+- **No versions on disk.** A file written by v3–v9, or with `FEATHER_FORMAT=9`,
+  carries no versions. Its clock restarts at `time << 20`, which stays above
+  any version handed out before, so a stale `expected_version` still conflicts.
+- **Overhead.** Each WAL write costs 25 more bytes, and each commit 16 bytes
+  per changed record.
+
+### Cloud API: namespace names are validated, never rewritten
+
+`DBManager` built a namespace's file name by stripping every character except
+letters, digits, `-` and `_`, but kept its handles under the name as given. So
+`ni.ke`, `n.i.k.e` and `nike` were separate namespaces, each with its own
+handle, on **one file**. Every checkpoint wrote its own handle's view over the
+others'. Reproduced: three writes acknowledged with a `201` (`nike`, `ni.ke`,
+`nike`), and two left on disk. `DELETE /v1/namespaces/ni.ke` deleted `nike`'s
+data. A name that stripped to nothing was an unhandled `ValueError`, so a `500`.
+
+- **A name is either valid or a `400`.** Nothing is opened or created for an
+  invalid name, and the error names the offending characters. The allowed set
+  is unchanged (as `str.isalnum()` decides, plus `-` and `_`), so every name the
+  old code left alone, and every file it ever created, works exactly as before.
+- **Clients that sent such a name** (a dotted name, say) now get a `400`. Their
+  data was never under that name: it is in the namespace with those characters
+  removed (`ni.ke` → `nike`), together with that namespace's own records.
+- **A valid name that the filesystem folds onto another open namespace's file**
+  is a `409` that names the other namespace. That happens with case on macOS
+  and Windows (`NIKE` and `nike`) and with Unicode normalisation on APFS.
+  Before, it was the same silent shared file. Names are compared by the file
+  they open, not by a guessed normalisation, so on Linux `Nike` and `nike`
+  remain two namespaces, as they always were.
+- **Names too long for `<ns>.feather.wal.old`** (over 239 bytes) are refused.
+  Before, the namespace opened, and every checkpoint failed when the WAL was
+  rotated.
+- **A `.feather` file in the data dir whose name is not valid** (only possible
+  by copying it in by hand) is skipped at startup with a log line. Before, it
+  was listed under its own name while the API served a different, empty file
+  from the stripped name.
+
+### `DB.open` and every blocking call release the GIL
+
+A slow open, a read queued behind a writer on the data lock, or `storage_stats()`
+waiting out a save used to hold the Python GIL the whole time, freezing every
+Python thread in the process: an API event loop, a heartbeat. Measured: a 88 ms
+open stalled other threads 89 ms; a read waiting behind `add_batch` 324 ms →
+328 ms; dropping a writer during a compaction 1121 ms → 1122 ms. All three now
+stall other threads for no longer than a scheduler tick.
+
+- **Released:** `open`, `touch`, `get_metadata`, `get_edges`, `get_incoming`,
+  `get_vector`, `all_ids`, `modality_names`, `ids_in_namespace`,
+  `ids_for_entity`, `ids_with_attribute`, `namespace_size`, `list_namespaces`,
+  `set/get_auto_compact`, `set_quantized`, `is_quantized`, `set_int8_ram`,
+  `is_int8_ram`, `storage_stats`, `wal_size`, `wal_fsync_count`,
+  `is_compacting`, `size`, `dim`, `set_ef`, `get_ef` (the writes, searches,
+  `save`, `close` and `compact` already were).
+- **Dropping the last reference** (`~DB`: joins a running compaction, then
+  checkpoints) runs without the GIL when built with pybind11 ≥ 3. Older pybind11
+  has no way to ask for it, and still builds, with the previous behaviour.
+- **Opens of one file stay serialised.** The GIL used to do that by accident.
+  Without it, two threads opening one path for writing could both miss the
+  in-process lock registry; the loser was refused as "another process (pid
+  unknown)", or both loads cut the WAL tail at once. The engine now does it
+  itself: writer opens take turns per path, and the registry lookup, `flock` and
+  insert are one critical section. A close racing an open now releases the
+  `flock` before the registry entry disappears; before, the open could admit
+  itself against a lock nobody held. Read-only opens never wait.
+- No API change; results are identical.
+
+### In-RAM int8 stops costing recall: a trained scale, and a float re-rank from disk
+
+`set_int8_ram()` stored vectors under a fixed scale `max_abs / 127`, default
+`max_abs = 1.0`. Unit-norm embeddings rarely have a component above 0.25, so most
+of the 255 levels went unused, and recall dropped to 0.936 on embedding-shaped
+data (384-d). Now:
+
+- **The scale is trained from the data.** `set_int8_ram(modality)` with no
+  `max_abs` picks the clip that minimises mean squared quantization error over a
+  sample of the vectors. A larger clip costs rounding error on every
+  component; a smaller one clamps the few beyond it, so outlier dimensions get
+  clamped instead of fitted. A modality holding ≥ 1000 live vectors
+  (`FEATHER_INT8_TRAIN_MIN`) converts at once. One with fewer stays float32
+  until it reaches that, and converts on that write; `add_batch` converts inside the chunk
+  that crosses the threshold. Exact scan, recall@10 at 384-d: 0.906 (clip 1.0)
+  → 0.978 (trained); with outlier dimensions 0.941 → 0.956.
+- **Search re-ranks by the float32 originals, read from the file.** This
+  covers `search`, `hybrid_search` and `context_chain`. With `refine=2` (the
+  default), the graph returns the top `k × 2` by int8 distance.
+  Each one is then re-scored by exact float L2 against its original. The
+  originals are not held in RAM: they are written to the file as a new
+  optional section, `FULLVEC` (type 6), and read back with one positioned
+  read per candidate. Before a save, they are read from the WAL record that
+  logged the write, so a bulk load holds no float copies either. Scores are
+  the float scores, and `get_vector()` returns the original rather than the
+  dequantized copy. `refine=0` keeps no originals: smallest file, int8 recall.
+- **Converting keeps the graph.** `set_int8_ram()` on a non-empty float
+  modality now converts it in place (it used to raise). Links, levels, labels
+  and delete marks are copied slot for slot, and only the vectors are
+  re-encoded. Its originals stay in RAM until the next `save()`. An int8
+  modality's scale is fixed: calling again only changes `refine`.
+- **`db.int8_info(modality)`** reports whether a modality is int8 or still
+  waiting to train, its clip, the refine factor, and where its originals are:
+  in the file, still in the WAL, or copied in RAM.
+- **The re-rank widens the beam too.** A refine query walks the graph with
+  `ef × refine`. Re-ranking alone plateaued at recall 0.980–0.985 for refine
+  2–8 at 100k, because int8 distances misjudge which neighbour to expand, and true
+  neighbours never entered a float-width beam. A float-built graph walked in
+  int8 lost the same, so the fault is in the walk, not the graph.
+- **Measured** (`benchmarks/int8_refine.py`, 100k × 384, embedding-shaped,
+  1000 queries, ef 50, warm page cache; memory is the physical footprint):
+
+  | | recall@10 | p50 / p99 ms | memory after open | build peak | file |
+  |---|---|---|---|---|---|
+  | float32 | 0.9988 | 0.128 / 0.337 | 217 MB | 279 MB | 167 MB |
+  | int8, clip 1.0 (old default) | 0.9390 | 0.071 / 0.143 | 108 MB | 179 MB | 58 MB |
+  | int8, trained, refine 0 | 0.9534 | 0.071 / 0.149 | 108 MB | 176 MB | 58 MB |
+  | **int8, trained, refine 2** | **1.0000** | 0.142 / 0.255 | **108 MB** | 186 MB | 204 MB |
+
+  The re-rank costs latency (about float's) and disk (the originals), not RAM.
+  On a cold page cache each re-ranked candidate is a disk read: 20 per k=10
+  query.
+- **Format.** FULLVEC is flagged optional, so a v10 build without it opens the
+  file and uses the int8 index alone. If such a build later changes a slot,
+  its GRAPH record voids that slot's earlier FULLVEC on load, so a stale
+  original is never used. The MODALITY section gains two trailing fields
+  (`refine`, waiting-to-train) that older builds skip. `FEATHER_FORMAT=9`
+  writes no originals.
+- **Behaviour change:** `set_int8_ram("m")` with no `max_abs` used to mean a
+  clip of 1.0. It now means "trained", and the modality stays float32 until it
+  holds 1000 vectors. Pass `max_abs=1.0` for the old behaviour.
+
+### A failed WAL write or fsync is fatal to the handle
+
+Every one of these used to be ignored, so the write was reported as saved:
+`wal_append()` never looked at `fwrite`/`fflush`; a WAL that could not be
+opened made the mutation go ahead with **no record at all**; and `fsync`'s
+return code was dropped for the WAL and the checkpoint data file alike.
+
+- **The first failure poisons the handle**, as PostgreSQL PANICs on an fsync
+  error. That call raises `RuntimeError`, and so does every later write and
+  `save()`, until the file is reopened. Reads keep working. Retrying is what
+  loses data: a record appended after a torn one never replays, and an fsync
+  retried after a failure can succeed without the pages that failed
+  ("fsyncgate"). `db.write_error()` returns the cause (`None` while healthy).
+- **Group commit tells every writer.** When a leader's fsync fails, every
+  writer it covered raises. None of them returns as if its write were durable.
+- **`close()` on a poisoned handle releases it without a checkpoint** and does
+  not raise (it runs from `__exit__` while the original error propagates).
+  The WAL stays; the reopen replays it and cuts a torn tail.
+- **WAL appends are unbuffered, one `fwrite` per record.** With stdio
+  buffering, a failed append left the unwritten tail in the buffer, and
+  `fclose()` later completed the record that had been reported as failed.
+- **`add_batch` logs a whole chunk before applying any of it**, so a failed
+  append leaves none of that chunk in memory (it used to leave metadata
+  without vectors).
+- **Only a failure that lost bytes poisons.** An fsync that ran and failed,
+  or a WAL write that failed partway. Not being able to open the WAL (for
+  example EMFILE) refuses that one write and applies nothing; the next write
+  tries again. A filesystem that cannot fsync at all (`EINVAL`, `ENOTSUP`,
+  `ENOSYS`: some FUSE and network mounts) is treated as synced, exactly as
+  before, so a service on such a mount keeps running. A directory that cannot
+  be opened is still skipped, and `EBADF` from a directory fsync is
+  tolerated, as in PostgreSQL. EINTR is retried. The load-time header
+  repair stays best-effort, so a file that opened before still opens.
+- A write that raised can still be on disk after the reopen, if its bytes
+  reached the disk before the fsync failed. It is never the other way round:
+  a write that returned is durable.
+- **`feather_db.WriteFailedError`** (a `RuntimeError`, C++ `feather::WriteFailed`)
+  is what the failing call and every later refusal raise, so a caller can tell
+  "reopen and retry" from any other error without matching messages.
+- **Cloud API recovers on its own.** The failed write is a `503` with
+  `Retry-After` and `"retryable": true`, not a `500`. `DBManager.get()` and
+  the background checkpointer reopen the namespace, which replays its WAL.
+  The new handle is opened before the old one is retired, and the old one
+  is never `close()`d, so requests already reading from it finish normally.
+  If the reopen fails (the disk is still broken), reads keep being served
+  from the old handle. On an engine wheel without `WriteFailedError` the app
+  still starts and behaves as before. Retries are throttled to one per `FEATHER_RECOVER_RETRY_S` (default
+  5 s), not one per request. `save_all()` no longer stops at the first
+  namespace that raises; it returns `{namespace: error}`.
+- **Cloud API accepts v10 uploads.** `/v1/admin/upload` checked the header
+  against `MAX_FORMAT_VERSION = 9`, so every file this build writes was
+  rejected with a 400.
+- **No C++ exception crosses the C ABI.** `src/feather_core.cpp` had no
+  try/catch, so any engine error in the Rust CLI (a dimension mismatch, a
+  WAL failure) aborted the process with SIGABRT. Every entry point now
+  catches it and returns `-1` (`nullptr` from `feather_open`), with the
+  message in `feather_last_error()`. The CLI exits 1 and prints the reason,
+  including why an open was refused (e.g. the file lock). The return type
+  went from `void` to `int`, which is binary-compatible with callers built
+  against the old declarations.
+- **The `feather-db-cli` library API is unchanged.** `DB::open` still returns
+  `Option`, and `add`/`link`/`touch`/`save`/`search` keep their signatures.
+  On an engine error they now panic with the message, where they used to
+  abort the process. New `try_*` forms return `Result`, and the CLI uses
+  them. The pre-change `main.rs` builds unmodified against this crate.
+- `feather_db.merge` no longer swallows `WriteFailedError` while copying
+  edges, so a merge into a failed target is never reported as complete.
+
+### A corrupt file is an error, never a crash
+
+18 of 300 single-byte corruptions of a v9 file used to kill the process
+(SIGBUS), read-only opens included. In 60,000 fuzzed opens across v9 (saved
+graph and rebuild path), v10 and the WAL — with v10 checksums and WAL CRCs
+recomputed so the corruption reaches the parsers — none now crashes, hangs or
+exhausts memory; each opens or raises `RuntimeError`.
+
+- **v9 graph loader** (`loadIndexStream`): the whole header is validated
+  before it sizes anything. `count × slot_size` was checked before
+  `slot_size` was, so a forged count could wrap the product under the
+  remaining-bytes guard, allocate the base layer at the wrapped size and fill
+  it at the real one. HNSW parameters must match what the constructor derives
+  from `M`; every link list is bounded by the bytes left; every read is
+  checked.
+- **Graphs are validated before search follows them**, in v9 and v10 alike:
+  a link to a missing node, a link into a layer its target does not have, or
+  a node above the entry point is corruption.
+- **Metadata strings grow as their bytes arrive**, so a corrupt 32-bit
+  length no longer zero-fills a 4 GB string before the read fails; a record
+  cut short is an error instead of a half-filled field.
+- **The v2–v9 reader checks every read** (short reads used to leave `dim`
+  and `element_count` holding stack garbage), bounds the modality count and
+  the v2 `dim`.
+- **WAL records that pass their CRC but do not decode are refused** instead
+  of applied; an ADD's `dim` is bounded by its own payload.
+- **Slot counts are 32-bit.** v10's GRAPH and VECTORS sections store them as
+  u32, like the internal ids they count. *v10 files written by earlier
+  builds of this unreleased branch do not open.*
+- `tests/test_corrupt_files.py`: a seeded fuzz in the suite, plus a deeper
+  run on a rotating seed in CI (`FEATHER_FUZZ_SEED` reproduces a failure,
+  `FEATHER_FUZZ_CASES` scales it).
+
+### File format v10: append-only commits
+
+A save now writes what changed since the last save instead of rewriting the
+whole file. The file is two checksummed header slots followed by typed,
+length-prefixed, checksummed sections. Each commit appends its sections,
+makes them durable, then switches the header. Layout: CLAUDE.md §3.2 and
+`include/format_v10.h`.
+
+Measured at 100k × 384 (`benchmarks/save_cost.py`, save after 100 adds and
+100 importance updates):
+
+| | v9 | v10 |
+|---|---|---|
+| bytes written per save | 176.5 MB | 0.42 MB |
+| save time | 105 ms | 0.9 ms |
+| `add()` stall while a save runs (max) | 117 ms | 8 ms (3 ms without fsync contention) |
+
+- **No torn or orphaned files.** An incremental commit never rewrites a byte
+  that a valid header covers. A crash at any point leaves at least one valid
+  header whose sections are all on disk. A torn header fails its XXH64
+  checksum and the other slot is used. A torn commit is cut back by the next
+  writer, which also retires the abandoned header. Every crash state is
+  rebuilt byte-for-byte in `tests/test_format_v10.py`.
+- **Corruption is refused, not misread.** If the newest commit fails its
+  checksum and `<wal>.old` is present (a crash mid-commit), the load falls
+  back to the previous commit and the WAL redoes the torn one. With no
+  `<wal>.old`, the bytes went bad after the commit succeeded. Falling back
+  would silently drop committed records, so the open raises and leaves the
+  file untouched; `FEATHER_RECOVER_OLDER=1` opens the previous commit
+  deliberately. An unknown mandatory section type or a newer version also
+  raises. Every count read off disk is bounded by the bytes
+  behind it, and every graph link is checked against the slot count.
+- **What changed is tracked at the source.** hnswlib marks every slot it
+  writes, and an insert's ~M rewired neighbours cost ~140 B each (links
+  only). Every metadata mutation marks its record. A search hit costs a
+  20-byte salience record, not the whole record.
+- **New:** `db.vacuum()` rewrites the file now. `db.storage_stats()` reports
+  format, generation, committed bytes, live estimate and the last commit's
+  size.
+
+### close() frees memory; Python owns the DB object
+
+The binding held `DB` with `py::nodelete`, so nothing a handle allocated was
+ever freed. That was ~50 MB per open/close of a 39 MB file (10 cycles:
++493 MB), which is how the API and MCP servers slowly ran out of memory.
+
+- **`close()` frees** the graphs (or their mappings), metadata and every
+  index immediately. Measured over 40 open/close cycles: memory stays flat at
+  about one handle's worth (the allocator keeping freed pages for reuse)
+  instead of growing ~50 MB a cycle.
+- **Any call on a closed handle raises** `RuntimeError` ("DB is closed").
+  Writes already did; reads used to answer from memory that is now freed.
+- **Dropping the last reference destroys the object.** A writer that was
+  never closed is checkpointed and its lock released at that point, as
+  `~DB()` always did in C++; a reader never writes. Before, `del db` released
+  nothing until the process exited. Prefer `close()`: it happens when you
+  choose, not at garbage collection, and not with the GIL held.
+- **Behaviour change for tests and scripts:** a writer handle discarded
+  without `close()` now checkpoints, so its WAL disappears. Four tests relied
+  on the leak to keep it; they now say what they mean (`close(save=False)`,
+  or `os._exit(0)` in a child process).
+
+### The graph is saved even when records are deleted
+
+One `forget()` used to make the v9 writer drop the HNSW graph from the file
+and store bare vectors, so every later open rebuilt the graph. Measured at
+100k × 384 after a single `forget()`:
+
+| | before | after |
+|---|---|---|
+| v9 file (`FEATHER_FORMAT=9`), writer open | 53 s | 0.10 s |
+| v9 file, read-only open | 63 s | 0.17 s |
+| v10 file (default) | 0.16 s | 0.16 s (v10 already kept the graph) |
+
+The graph is now saved with its delete marks, which the loader has always
+restored. Only an on-disk-quantized modality still stores bare vectors.
+
+- **Fixed: `_deleted` records were searchable, and v10 turned them into
+  ghosts.** Killing a record with the `_deleted` attribute (through
+  `update_metadata`, `add` or `add_batch`, as the Cloud API and
+  `FeatherStore` do) left its vector live: unfiltered vector search returned
+  it. A save dropped the record but v10 kept the node, so after a reload it
+  came back as a hit with empty metadata. A dead record's vectors are now
+  marked deleted on every path, including WAL replay, exactly as
+  `forget()` does. Re-adding the id with a vector revives it.
+- **Repaired on open:** a live graph node whose record is missing or dead is
+  marked deleted when the file is opened (5–13 ms at 100k), so files written
+  before this fix lose their ghosts. A writer commits the repair at the next
+  save.
+
+### Read-only handles share one copy of the vectors (mmap)
+
+A full rewrite now stores each modality's vectors as one contiguous `VECTORS`
+section on a 64 KiB boundary. `DB.open(..., read_only=True)` maps it
+copy-on-write instead of copying it, so reader processes share one copy
+through the page cache. Measured at 100k × 384 with 10 concurrent readers
+(`benchmarks/readers_memory.py`):
+
+| | per reader | 10 readers |
+|---|---|---|
+| vectors-only DB | 227 → 74 MB | 2,268 → 891 MB (incl. 154 MB shared once) |
+| ~300-char agent text per record | 355 → 213 MB | 3,547 → 2,283 MB |
+
+What mapping cannot reach is heap built at open: metadata, BM25 postings
+(rebuilt from content on every open), secondary indexes. So the saving is
+1.5–2.5×, not 10×; getting further needs those in mappable form too.
+
+- **Open time.** BM25 rebuild now stems each distinct word once per open
+  instead of every occurrence: 2.1 s → 0.72 s at 100k records with text
+  (synthetic text with a small vocabulary; real text gains less). A
+  vectors-only DB opens in ~75 ms instead of 170 ms.
+- **hnswlib's slot layout was split.** Level 0 now holds `[links][label]`,
+  and vectors live in their own array. Search results are identical and
+  throughput rose ~10% (denser link lists). v9 streams are converted on
+  write and read, so v9 files stay byte-identical.
+- Writers still load into the heap (a long-lived writer must not pin a
+  vacuumed inode). `FEATHER_MMAP=0` turns mapping off; Windows reads as
+  before. `storage_stats()["mapped_bytes"]`.
+- A save also rewrites the file once vectors appended since the last image
+  exceed it (`FEATHER_IMAGE_RATIO`, default 1). Those are private to every
+  reader; doubling keeps the rewrite cost O(1) per vector.
+- **Do not overwrite a `.feather` in place** (`cp` onto it, `truncate`)
+  while readers have it open: a mapped reader gets SIGBUS. Feather never
+  does this itself; replace files by rename.
+
+### Breaking / behaviour changes (format v10)
+- **Older builds cannot read a v10 file.** The first `save()` (including
+  `close()`) after opening a v3–v9 file rewrites it as v10. Older builds
+  refuse it cleanly: offset 8 holds `0xFFFFFFFF`, which they read as the
+  metadata count and reject against the file size. `FEATHER_FORMAT=9` keeps
+  writing v9 snapshots for a fleet that still runs pre-v10 readers.
+- **Superseded bytes stay until a vacuum.** Earlier versions of updated or
+  forgotten records stay in the file until it is vacuumed. Vacuum runs
+  automatically when the file exceeds `FEATHER_VACUUM_RATIO` (default 2) ×
+  live data + `FEATHER_VACUUM_MIN_BYTES` (default 4 MiB). It also runs at the
+  next save after `purge()`, `compact()` or a `set_quantized()` change, and on
+  `vacuum()`. `purge()` + `save()` still erases the purged records' metadata
+  from the file. Vectors of forgotten records remain as deleted graph nodes
+  until `compact()`, as they do in memory.
+- **Cold load is ~30% slower** (75 → 99 ms at 50k × 384), because every byte
+  is checksummed and every graph link validated.
+- **On-disk-quantized files are ~2× smaller than float at 128-d, not >2.5×.**
+  v10 also persists their graph links, so they load without the rebuild that
+  v9 needed (the gap shrinks with dim: links are ~132 B per node).
+
+### Fixed (found while verifying v10; also present in v9)
+- **WAL replay of `update_metadata()` kept the old edges.** In memory,
+  `update_metadata()` replaces the record, edges included. Replay used the
+  add rule ("no edges given → keep the existing ones"), so after a crash an
+  edge the caller had removed came back.
+  `tests/test_wal_recovery.py` now kills a writer after three updates (drop
+  every edge, keep a subset, add one) and checks that the reopened graph
+  matches the one the process was serving.
+- **`PUT /v1/{ns}/records/{id}` dropped every edge of the record.** The
+  request model has no edges field, and `update_metadata()` replaces the
+  whole record, so a PUT that changed one attribute unlinked the record from
+  everything. The route now carries the stored edges over, read under the
+  namespace lock. Edges are changed through `/link` and `DELETE /link`, which
+  still remove them, the last one included. The engine keeps its replace rule
+  because unlink and the delete cascade depend on it.
+- **Forgotten records behaved differently in memory than after a reload.**
+  Every save drops dead records, but in memory `link()` still added edges
+  from a forgotten record, and re-adding a forgotten id inherited the dead
+  shell's edges. After a reload or crash replay those edges were gone. Now
+  `link()` from a forgotten record is a no-op (as `auto_link` already was),
+  and a re-added id starts fresh.
+- **The Rust CLI never rebuilt after a C++ change.** The `cc` crate prints
+  `rerun-if-env-changed`, and once a build script prints any `rerun-if-*`
+  line Cargo stops watching sources. After `scripts/sync-cpp.sh`, a
+  `cargo build` linked the old engine. `build.rs` now declares
+  `rerun-if-changed=cpp`.
+- **The CLI is tested end to end** (`tests/test_cli_v10.py`, skipped unless
+  the binary is built). The Rust binary and the Python binding read and write
+  the same v10 files in both directions. Also covered: lock refusal, WAL
+  recovery across the two, the v9 upgrade, torn-tail repair and refusal of
+  damaged data.
+- Known, not fixed: after a crash, the WAL's `PURGE` does not prune edges
+  pointing at records forgotten *before* the last save. Memory counts their
+  shells as namespace members; the file has no shells. The edge left behind
+  dangles. A fix needs the purged id list in the WAL record.
 ### Fixed — post-merge review of the concurrency work
 
 Three defects found reviewing PR #8 and fixed on master directly after it
@@ -37,6 +897,7 @@ merged. Each has a regression test.
   consecutive lines claimed ties go to the smaller id and to the higher id.
   The code does the latter; `search()` does the former. Behaviour is
   unchanged — the comment now says so, and says why the two are not unified.
+
 
 ### Concurrency, compaction and search-path optimizations
 

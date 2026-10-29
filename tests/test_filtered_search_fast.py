@@ -117,12 +117,28 @@ def test_large_candidate_set_uses_graph_with_good_recall():
 
 def test_default_route_is_exact():
     """An indexed filter means an exact, complete top-k unless the caller opts
-    in to the approximate route — the guarantee filtered search always gave."""
-    env = {k: v for k, v in os.environ.items() if k != "FEATHER_PREFILTER_MODE"}
-    r = subprocess.run([sys.executable, "-c", _LARGE], capture_output=True, text=True,
+    in to an approximate route — the contract (CONTRACTS.md, "Exact results by
+    default"). Namespace graphs are one of those opt-ins."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("FEATHER_PREFILTER_MODE", "FEATHER_NS_ANN_MIN")}
+    code = f"import sys; sys.path.insert(0, {REPO!r})\n" + _LARGE.replace(
+        "rb = rt = 0;", "db.search(V[0], k=10, filter=FilterBuilder().namespace('big').build())\n"
+                       "db.wait_for_namespace_graphs(120)\nrb = rt = 0;")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                        timeout=600, env=env)
     out = r.stdout.split()
-    assert float(out[1]) == 1.0 and float(out[3]) == 1.0, r.stdout + r.stderr
+    assert float(out[1]) == 1.0 and float(out[3]) == 1.0 and out[5] == "True", r.stdout + r.stderr
+
+
+def test_opted_in_namespace_graphs_are_complete_and_close():
+    """FEATHER_NS_ANN_MIN=4096: a namespace that large is walked through its
+    own graph once built. Approximate, like unfiltered search; never short."""
+    code = _LARGE.replace(
+        "rb = rt = 0;", "db.search(V[0], k=10, filter=FilterBuilder().namespace('big').build())\n"
+                       "db.wait_for_namespace_graphs(120)\nrb = rt = 0;")
+    out = _run(code, FEATHER_NS_ANN_MIN="4096").split()
+    assert out[5] == "True"
+    assert float(out[1]) >= 0.95 and float(out[3]) == 1.0
 
 
 def test_forced_exact_route_is_exact():

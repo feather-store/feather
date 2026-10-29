@@ -15,7 +15,6 @@ an agent remembers into*. Same engine, different position in the stack.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from typing import Any, Callable, Iterable, Optional
@@ -35,7 +34,7 @@ except ImportError:                                           # pragma: no cover
     GetOp = PutOp = SearchOp = ListNamespacesOp = Item = SearchItem = None  # type: ignore
 
 import feather_db
-from feather_db import DB
+from feather_db import DB, keys
 from feather_db.filter import FilterBuilder
 
 # LangGraph forbids "." inside a namespace element, which makes it the one
@@ -82,19 +81,6 @@ def _require_langgraph() -> None:
         raise ImportError(
             "FeatherStore needs langgraph. Install with: pip install langgraph"
         )
-
-
-def _ns_key(namespace: tuple[str, ...], key: str) -> int:
-    """Deterministic uint64 id for (namespace, key).
-
-    Deterministic on purpose: `put()` on the same (namespace, key) must overwrite
-    in place, and Feather's `id` is a true upsert key. A time-seeded id — which
-    is what the MCP helper uses — would create a new record per write and the
-    store would grow without ever updating anything.
-    """
-    raw = NS_SEP.join(namespace) + "\x00" + key
-    h = hashlib.sha1(raw.encode("utf-8")).hexdigest()
-    return int(h[:14], 16) & ((1 << 53) - 1)      # 53-bit: survives JSON/JS
 
 
 def _indexed_text(value: dict, fields: Optional[list[str]]) -> str:
@@ -175,6 +161,15 @@ class FeatherStore(BaseStore):
         self._embed = embed
         self._index_fields = index_fields
         self._auto_save = auto_save
+        # Items are addressed by native key. Before 0.22 an item's id was a
+        # 53-bit SHA-1 of (namespace, key), and two keys that collided shared
+        # one record. Items written then get their key now, which also makes
+        # them findable by keyword search on it.
+        keys.migrate(self.db)
+
+    def id_of(self, namespace: tuple[str, ...], key: str) -> Optional[int]:
+        """The record id of the item at (namespace, key), or None."""
+        return keys.resolve(self.db, NS_SEP.join(namespace), key)
 
     # ── the two abstract methods ─────────────────────────────────────────
 
@@ -206,19 +201,20 @@ class FeatherStore(BaseStore):
     # ── operations ───────────────────────────────────────────────────────
 
     def _get(self, op: Any) -> Optional[Any]:
-        meta = self.db.get_metadata(_ns_key(op.namespace, op.key))
+        _, meta = keys.get(self.db, NS_SEP.join(op.namespace), op.key)
         if _is_dead(meta):
             return None
         return self._to_item(op.namespace, op.key, meta)
 
     def _put(self, op: Any) -> None:
-        rid = _ns_key(op.namespace, op.key)
+        flat = NS_SEP.join(op.namespace)
+        rid, prev = keys.get(self.db, flat, op.key)
 
         if op.value is None:                       # delete
-            self.db.forget(rid)
+            if rid is not None:
+                self.db.forget(rid)
             return
 
-        prev = self.db.get_metadata(rid)
         created = (prev.get_attribute(_CREATED_ATTR) if prev else "") or str(int(time.time()))
 
         meta = feather_db.Metadata()
@@ -257,7 +253,7 @@ class FeatherStore(BaseStore):
             vec = np.zeros(self.dim, dtype=np.float32)
             vec[0] = 1.0        # a valid unit vector; never a zero-norm query target
 
-        self.db.add(rid, vec, meta)
+        keys.write(self.db, flat, op.key, meta, vec)
 
     def _ids_under(self, prefix: tuple[str, ...]) -> list[int]:
         """Every id whose namespace starts with `prefix`.
@@ -279,15 +275,9 @@ class FeatherStore(BaseStore):
         return ids
 
     def _search(self, op: Any) -> list[Any]:
-        if op.query and self._embed is not None:
-            # Rank semantically over everything, then keep what is under the
-            # prefix. Over-fetch because the prefix filter is applied after —
-            # a namespace-prefix filter does not exist in the engine yet.
-            q = np.asarray(self._embed(op.query), dtype=np.float32)
-            want = (op.limit + op.offset)
-            hits = self.db.search(q, k=max(want * 8, 50), record_salience=False)
-            cand = [(h.id, h.score, h.metadata) for h in hits]
-        else:
+        want = op.limit + op.offset
+        semantic = bool(op.query and self._embed is not None)
+        if not semantic:
             ids = (self._ids_under(op.namespace_prefix) if op.namespace_prefix
                    else self.db.get_all_ids("text"))
             cand = []
@@ -295,9 +285,27 @@ class FeatherStore(BaseStore):
                 m = self.db.get_metadata(i)
                 if m is not None:
                     cand.append((i, None, m))
+            return self._select(cand, op, semantic)[op.offset: op.offset + op.limit]
 
+        # Ranked WITHIN the prefix by the engine (an indexed namespace_prefix
+        # filter). It used to rank everything and keep what was under the
+        # prefix afterwards: with enough other tenants, all k hits belonged to
+        # them and a user's own search came back empty. Only what the engine
+        # cannot filter — expired and unindexed items, value filters — is
+        # dropped here, and k grows until enough survive or the prefix runs out.
+        q = np.asarray(self._embed(op.query), dtype=np.float32)
+        flt = (FilterBuilder().namespace_prefix(NS_SEP.join(op.namespace_prefix)).build()
+               if op.namespace_prefix else None)
+        k = max(want, 10)
+        while True:
+            hits = self.db.search(q, k=k, filter=flt, record_salience=False)
+            results = self._select([(h.id, h.score, h.metadata) for h in hits], op, semantic)
+            if len(results) >= want or len(hits) < k:
+                return results[op.offset: op.offset + op.limit]
+            k *= 4
+
+    def _select(self, cand, op: Any, semantic: bool) -> list[Any]:
         results = []
-        semantic = bool(op.query and self._embed is not None)
         for rid, score, meta in cand:
             if _is_dead(meta):
                 continue
@@ -311,9 +319,8 @@ class FeatherStore(BaseStore):
             value = self._value_of(meta)
             if not _matches(value, op.filter):
                 continue
-            results.append(self._to_item(ns, meta.entity_id, meta, score=score))
-
-        return results[op.offset: op.offset + op.limit]
+            results.append(self._to_item(ns, meta.key or meta.entity_id, meta, score=score))
+        return results
 
     @staticmethod
     def _matches_condition(ns: tuple[str, ...], cond: Any) -> bool:
@@ -407,16 +414,39 @@ class FeatherStore(BaseStore):
         wrong set — at 300 episodes, asking for the 5 newest returned events
         299, 298, 296, 295, 293, silently skipping two.
 
-        `key(meta)` picks the sort field, defaulting to the engine timestamp
-        (updated_at). Only the surviving `limit` rows get their value parsed.
+        By the engine timestamp (updated_at), it walks the engine's
+        (timestamp, id) index from the end: O(log n + limit), where it used to
+        read and sort the whole namespace. Items that expired are skipped and
+        the walk pages on. A custom `key(meta)` cannot use that index, so it
+        still scans the namespace and sorts.
         """
-        rows = self.scan(namespace, prefix=prefix)
-        getter = key or (lambda m: m.timestamp)
-        rows.sort(key=lambda r: getter(r[1]), reverse=True)
-        return [self._to_item(
-                    tuple(m.namespace_id.split(NS_SEP)) if m.namespace_id else (),
-                    m.entity_id, m)
-                for _, m in rows[:limit]]
+        if key is not None:
+            rows = self.scan(namespace, prefix=prefix)
+            rows.sort(key=lambda r: key(r[1]), reverse=True)
+            return [self._item_of(m) for _, m in rows[:limit]]
+        flat, out, before = NS_SEP.join(namespace), [], None
+        now = time.time()
+        while len(out) < limit:
+            want = limit - len(out)
+            ids = self.db.newest(flat, want, prefix=prefix, before=before)
+            cursor = before
+            for rid in ids:
+                meta = self.db.get_metadata(rid)
+                if meta is None:              # removed since: nothing to show
+                    continue
+                cursor = (meta.timestamp, rid)
+                if not _is_dead(meta, now):
+                    out.append(self._item_of(meta))
+            # A short page is the end; a page the cursor cannot move past (all
+            # of it removed meanwhile) would repeat forever.
+            if len(ids) < want or cursor == before:
+                break
+            before = cursor
+        return out
+
+    def _item_of(self, m):
+        return self._to_item(tuple(m.namespace_id.split(NS_SEP)) if m.namespace_id else (),
+                             m.key or m.entity_id, m)
 
     def close(self) -> None:
         self.db.save()

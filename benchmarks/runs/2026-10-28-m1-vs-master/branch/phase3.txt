@@ -1,0 +1,18 @@
+=== ⚡️ Feather DB: Phase 3 Performance Benchmark ===
+Config: 10000 Items (Multimodal), 20000 Graph Links, Dim=128
+
+[1] Benchmarking Ingestion...
+   -> Ingested 10000 multimodal records in 2.5503s
+   -> Rate: 3921 vectors/sec
+
+[2] Benchmarking Graph Construction...
+   -> Created 20000 links in 0.8522s
+   -> Rate: 23469 links/sec
+
+[3] Benchmarking 'Search + Graph Walk'...
+   -> Ran 100 'Search+Traverse' queries in 0.0065s
+   -> Avg Latency: 0.06 ms
+   -> Total Graph Nodes Visited: 1300
+
+[4] Benchmarking Scorer Overhead (Adaptive Decay)...
+   -> (Note: The 0.06 ms latency INCLUDES the real-time Adaptive Decay calculation)

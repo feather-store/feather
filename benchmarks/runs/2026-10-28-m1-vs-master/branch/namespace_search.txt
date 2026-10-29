@@ -1,0 +1,9 @@
+100000 x 384: built in 29 s
+
+unfiltered: 0.248 ms
+
+namespace       records  scan ms  graph ms  speedup  recall  graph build s
+half              50000    4.936     0.459    10.8x   1.000            7.9
+tenth             10000    0.966     0.357     2.7x   1.000            0.6
+hundredth          1000    0.078     0.076     1.0x   1.000            0.0   (below 4096: still scanned)
+one of 1000          39    0.009     0.009     1.0x   1.000            0.0   (below 4096: still scanned)

@@ -83,7 +83,7 @@ On top of the engine sits a Python layer. It can turn raw text into facts, entit
 ┌──────────────▼─────────────────────────────────────────────────────────────┐
 │ C++17 engine — include/feather.h  (class feather::DB)                      │
 │  HNSW per modality · metadata store · reverse edge index                   │
-│  secondary indexes (ns/entity/attr) · BM25 index · WAL · .feather v9       │
+│  secondary indexes (ns/entity/attr) · BM25 index · WAL · .feather v10      │
 └──────────────▲─────────────────────────────────────────────────────────────┘
                │ extern "C" ABI (src/feather_core.cpp)
         ┌──────┴───────┐
@@ -193,7 +193,10 @@ open(path)
  │                                  → a second open() anywhere fails here, before any read
  └─ load_vectors()
      ├─ read_base_file()            parse .feather (if it exists)
-     │   ├─ check magic "FEAT", read version (2 … 9 supported)
+     │   ├─ v10: pick the newest valid header of two; replay its sections
+     │   │     (torn newest commit → previous header; writer cuts the tail)
+     │   │     read-only: mmap the VECTORS image (shared by every reader)
+     │   ├─ else check magic "FEAT", read version (2 … 9 supported)
      │   ├─ metadata section → metadata_store_
      │   │     (meta_count bounded by remaining bytes → corrupt file = error, not hang)
      │   └─ for each modality:
@@ -214,7 +217,7 @@ Key properties:
 - **The WAL is replayed even when no base file exists.** A namespace that has never been saved can hold all of its data in the WAL.
 - **Nothing is written back after a failed load.** If loading throws, `load_complete_` stays false, so the destructor skips its checkpoint and `write_snapshot()` refuses to run. The alternative would be writing a half-parsed fragment over the original file and deleting the WAL that could rebuild it. See `~DB()` and `tests/test_open_failure_safety.py`.
 - **`open()` creates no index.** The `"text"` index is created on the first `add`. That lets `set_int8_ram()` take effect beforehand, and avoids allocating RAM for an empty index. `dim()` reports `default_dim_` until an index exists.
-- **One writer process per file (0.20).** A second *process* opening the same path for writing is refused with the holder's pid; `DB.open(p, read_only=True)` takes a shared lock so many reader processes coexist. The lock is reentrant within one process, so a second `open()` in the same process is admitted (and remains a footgun: use one handle). Release a handle with `db.close()` or a `with DB.open(...) as db:` block. Because Python never destroys a `DB` (`py::nodelete`), dropping the reference does *not* release it. The OS drops the lock if the process dies. Set `FEATHER_LOCK=0` to disable it, e.g. on NFS where `flock` is unreliable.
+- **One writer process per file (0.20).** A second *process* opening the same path for writing is refused with the holder's pid; `DB.open(p, read_only=True)` takes a shared lock so many reader processes coexist. The lock is reentrant within one process, so a second `open()` in the same process is admitted (and remains a footgun: use one handle). Release a handle with `db.close()` or a `with DB.open(...) as db:` block. Dropping the last reference also releases it (Python owns the `DB` object since 0.22; it used to be `py::nodelete` and leaked). The OS drops the lock if the process dies. Set `FEATHER_LOCK=0` to disable it, e.g. on NFS where `flock` is unreliable.
 
 ### 5.2 The write path — `add()`
 
@@ -402,25 +405,50 @@ Before 0.19 the whole rebuild ran under the exclusive lock: 40 s at 100k×128 an
 
 #### `save()`
 
+Format v10 commits are append-only: a save writes what changed since the
+previous one, not the DB.
+
 ```
 lock save_mutex_ (one saver at a time)
   mutex_ SHARED (queries keep running; writers wait only for this part)
-    write_snapshot(path + ".tmp")  refuse if !load_complete_; throw on any write error
+    commit_begin()                 refuse if !load_complete_
+      full rewrite?  → write_full_v10(path + ".tmp")     (v3-v9 file, purge/compact/
+                                                           set_quantized, vacuum due)
+      else           → append dirty graph slots, dirty records, salience
+                       past the committed end (no fsync)
+      clear the dirty sets
     wal_rotate()                   fsync + close the WAL, rename <wal> → <wal>.old
   release mutex_                   ← writers continue into a fresh <wal>
-  fsync(.tmp) → atomic replace(.tmp → path) → fsync(dir)
-  delete <wal>.old                 ← its records are now in the durable base file
+  commit_finish()
+      append:  fsync(file) → write header (generation+1) into the other slot → fsync
+      full:    fsync(.tmp) → atomic replace(.tmp → path) → fsync(dir)
+  delete <wal>.old                 ← its records are now in the durable file
 ```
 
-Recovery handles a crash at any step. The old base file plus `<wal>.old` plus `<wal>` replays to the right state, and replay is idempotent, so a crash after the rename but before the delete is also fine. If a previous checkpoint left `<wal>.old` behind, `save()` falls back to a fully synchronous checkpoint and removes both WAL files.
+Recovery handles a crash at any step. Until the header switch, the appended
+bytes lie past every valid header's end: the old commit plus `<wal>.old` plus
+`<wal>` replays to the right state, and the writer cuts the tail on open. A
+torn header fails its checksum and the other slot is used. A crash after the
+switch but before the delete replays `<wal>.old` over a file that already has
+it — replay is idempotent. If a previous checkpoint left `<wal>.old` behind,
+`save()` finishes synchronously and removes both WAL files.
 
-Two bugs in this path were fixed in 0.19:
+Measured at 100k×384 (`benchmarks/save_cost.py`): 176.5 MB → 0.42 MB written
+per save after 100 adds + 100 updates; writer stall during a save 117 ms → 8 ms.
+
+Two bugs in the pre-v10 path were fixed in 0.19:
 - The new file used to be **renamed into place without an fsync** and the WAL deleted straight after. A power loss could leave an empty base file and no WAL.
 - A write error such as a full disk was never checked. A truncated snapshot could be renamed over the good file, and the WAL then deleted.
 
-**`close(save=True)`** checkpoints, closes the WAL, releases the file lock and makes the handle unusable. `with DB.open(p) as db:` calls it for you. The destructor `~DB()` also checkpoints, but only if the load completed. In Python the `DB` object is bound with `py::nodelete`, so **the destructor never runs from Python**. Use `close()`, and rely on the WAL for crash safety in between.
+**`close(save=True)`** checkpoints, closes the WAL, releases the file lock and makes the handle unusable. `with DB.open(p) as db:` calls it for you. The destructor `~DB()` also checkpoints, but only if the load completed. `close()` also frees the handle's memory; any later call raises. In Python the destructor runs when the last reference goes (it never did before 0.22, `py::nodelete`), so a writer that was never closed is checkpointed then. Prefer `close()`: it happens when you choose, not at GC.
 
-#### The `.feather` file, format v9
+#### The `.feather` file, format v10
+
+Two 4 KiB header slots, then typed sections appended by successive commits.
+The full layout, section types and invariants are in CLAUDE.md §3.2 and
+`include/format_v10.h`. v3–v9 files are still read, and the v9 layout follows.
+
+#### The `.feather` file, format v9 (read; written only with `FEATHER_FORMAT=9`)
 
 ```
 [magic "FEAT" 0x46454154 : u32] [version = 9 : u32]
@@ -510,7 +538,7 @@ The WAL obeys these rules:
 |---|---|
 | `set_ef(ef, modality="")` | HNSW search beam width. The default is **50**, which gives ~0.97–0.99 recall@10. The hnswlib default of 10 gave only ~0.2 at 50k+ vectors. |
 | `set_quantized(modality, True)` | On-disk int8 with a per-vector scale (format v7). The file is ~3× smaller. Vectors are dequantized on load, so RAM use is unchanged. |
-| `set_int8_ram(modality, max_abs)` | In-RAM int8 under one global scale, `max_abs/127`, using `Int8L2Space`. RAM drops ~1.7×. It is lossy and **must be called before the first add** to that modality. |
+| `set_int8_ram(modality, max_abs=None, refine=2)` | In-RAM int8 under one global scale, `clip/127`, using `Int8L2Space`. RAM drops ~1.7×. With no `max_abs` the clip is trained from the data (the MSE-optimal one). The modality converts once it holds `FEATHER_INT8_TRAIN_MIN` (1000) vectors, keeping its graph. `refine` keeps float32 originals in the file and re-ranks the top `k × refine` by exact distance, read with a `pread` each, so recall matches float. `refine=0` keeps none. `db.int8_info(m)` shows the state. |
 | `FEATHER_LOAD_THREADS` | Caps the thread pool used for parallel graph builds (load, `add_batch`, `compact`). |
 | `FEATHER_BATCH_CHUNK` | `add_batch` chunk size between lock releases. Default `max(64, 2 × cores)`. |
 | `FEATHER_WAL_STRICT` | `1` = fsync inside the exclusive lock, so no read ever sees a not-yet-durable record. Slower under mixed load. |
@@ -529,7 +557,7 @@ The WAL obeys these rules:
 This module exposes `DB`, `Metadata`, `ContextType`, `Edge`, `IncomingEdge`, `ScoringConfig`, `SearchFilter`, `SearchResult` and the `ContextChain*` types.
 
 - NumPy arrays are copied into `std::vector<float>`, forced to C-contiguous float32 so strided views are read correctly. `add_batch` takes an N×dim array.
-- `DB` is held with `py::nodelete`: Python garbage collection never destroys it, so the destructor's auto-save never runs. **Call `close()`**, which checkpoints and releases the inter-process file lock, or use `with DB.open(p) as db:`.
+- `DB` is owned by Python: dropping the last reference runs the destructor (checkpoint for a writer, unlock, free). **Call `close()`** anyway to choose the moment, or use `with DB.open(p) as db:`.
 - New in 0.19:
   - `close(save=True)`, `closed`, context-manager support
   - `wait_for_compaction(timeout)` and `is_compacting()`
@@ -842,7 +870,7 @@ hits = db.search(embed("theme settings"), k=5, filter=f,
 db = fdb.DB.open("ctx.feather", dim=768)
 #   → no base file → replay WAL: ADD 1, LINK 1→2 → rebuild indexes → record 1 is back
 #     (its recall_count from the search is lost: salience isn't WAL-logged)
-db.save()                                         # write .tmp → rename → delete WAL
+db.save()                                         # append the change → switch header → delete WAL
 ```
 
 ### Trace B — Agent: Claude → MCP → Phase 9 pipeline → recall

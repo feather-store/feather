@@ -1,10 +1,12 @@
-"""Test: load paths — persisted graph (v9 fast path) + parallel rebuild fallback.
+"""Test: load paths — persisted graph (v10) + parallel rebuild fallback.
 
-A clean DB now persists its prebuilt HNSW graph (format v9), so reload restores
-it verbatim (no rebuild, FEATHER_LOAD_THREADS irrelevant) and keeps the
-serial-build recall. The parallel *rebuild* still runs for old files / DBs with
-pending deletions; we force that fallback by forgetting a record and check the
-threaded rebuild is faster than serial and still high-recall.
+A DB persists its prebuilt HNSW graph (format v10; v9 when clean), so reload
+restores it verbatim (no rebuild, FEATHER_LOAD_THREADS irrelevant) and keeps
+the serial-build recall. The parallel *rebuild* still runs where no graph is
+persisted — a v9 file whose modality is on-disk-quantized (a v9 file with
+pending deletions used to be one too; it now keeps its graph). We write one
+with FEATHER_FORMAT=9 + set_quantized and check the threaded rebuild is faster
+than serial and still high-recall.
 """
 import os, sys, glob, time, tempfile, importlib.util, numpy as np
 
@@ -56,7 +58,7 @@ qs = (centers[rng.integers(0, K, size=80)]
 # ── 1) persisted-graph fast path ────────────────────────────────────────
 with open(path, "rb") as fh:
     fh.read(4); ver = int.from_bytes(fh.read(4), "little")
-check("file format v9 (persisted graph)", ver == 9, f"got v{ver}")
+check("file format v10 (persisted graph)", ver == 10, f"got v{ver}")
 print("persisted-graph reload ...")
 dbp, t_persist = timed_load(1)
 print(f"  persisted load: {t_persist*1000:8.1f} ms")
@@ -66,23 +68,28 @@ print(f"  recall@10 (persisted, == serial-build quality) = {rp:.3f}")
 check("persisted recall@10 >= 0.88", rp >= 0.88, f"{rp:.3f}")
 dbp.close(save=False)
 
-# ── 2) parallel rebuild fallback (forget one id => graph not persisted) ──
-print("forcing rebuild fallback (forget 1 id) ...")
-d = fc.DB.open(path, dim=DIM); d.forget(id=0); d.save(); d.close(save=False)
+# ── 2) parallel rebuild fallback (v9 + on-disk int8 => graph not persisted) ──
+print("forcing rebuild fallback (v9, quantized on disk) ...")
+os.environ["FEATHER_FORMAT"] = "9"      # only a v9 file still takes the rebuild path
+d = fc.DB.open(path, dim=DIM); d.set_quantized("text", True); d.save(); d.close(save=False)
+del os.environ["FEATHER_FORMAT"]
 with open(path, "rb") as fh:
     fh.read(4); ver2 = int.from_bytes(fh.read(4), "little")
-print(f"  re-saved (v{ver2}, rebuild path: live<total)")
+print(f"  re-saved (v{ver2}, rebuild path: quantized on disk)")
 db1, t_serial = timed_load(1)
 r1 = recall(db1, qs)
 db1.close(save=False)          # single owner: release before the second load
 db8, t_par = timed_load(8)
 print(f"  serial rebuild:   {t_serial*1000:8.1f} ms")
 print(f"  parallel rebuild: {t_par*1000:8.1f} ms   ({t_serial/t_par:.2f}x faster)")
-check("rebuild loaded all (N-1)", db8.size() == N - 1, f"got {db8.size()}")
+check("rebuild loaded all N", db8.size() == N, f"got {db8.size()}")
 r8 = recall(db8, qs)
 print(f"  recall@10 — serial={r1:.3f}  parallel={r8:.3f}")
-check("serial rebuild recall@10 >= 0.88", r1 >= 0.88, f"{r1:.3f}")
-check("parallel rebuild recall@10 >= 0.88", r8 >= 0.88, f"{r8:.3f}")
+# Ground truth is the float vectors; the rebuilt ones went through int8 on
+# disk, which costs a few points. What matters is parallel == serial quality.
+check("serial rebuild recall@10 >= 0.85 (int8 on disk)", r1 >= 0.85, f"{r1:.3f}")
+check("parallel rebuild recall@10 >= 0.85 (int8 on disk)", r8 >= 0.85, f"{r8:.3f}")
+check("parallel rebuild recall within 0.03 of serial", abs(r8 - r1) <= 0.03, f"{r8:.3f} vs {r1:.3f}")
 check("parallel rebuild faster than serial", t_par < t_serial, f"{t_serial/t_par:.2f}x")
 
 for x in (path, path + ".wal", path + ".tmp"):

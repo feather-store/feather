@@ -73,9 +73,10 @@ check("default not int8", dbi.is_int8_ram("text") is False)
 dbi.set_int8_ram("text", max_abs=MAXABS)
 check("is_int8_ram after set", dbi.is_int8_ram("text") is True)
 try:
-    dbi.add(id=0, vec=V[0]); dbi.set_int8_ram("text"); check("set after add raises", False)
+    dbi.add(id=0, vec=V[0]); dbi.set_int8_ram("text", max_abs=MAXABS * 2)
+    check("a different clip after the first add raises", False)
 except Exception:
-    check("set_int8_ram after first add raises", True)
+    check("a different clip after the first add raises", True)
 
 print("1) build float + int8, compare recall")
 dbf.add_batch(list(range(N)), V)
@@ -87,7 +88,7 @@ check("int8 recall@10 >= 0.85", ri >= 0.85, f"{ri:.3f}")
 # trade for ~1.6x less RAM; require it to stay within 0.15 of the float baseline.
 check("int8 recall within 0.15 of float", abs(rf - ri) < 0.15, f"|{rf:.3f}-{ri:.3f}|")
 
-print("2) get_vector dequantizes (~ original)")
+print("2) get_vector returns the float original (refine keeps it)")
 rec = np.array(dbi.get_vector(100)); orig = V[100]
 relerr = float(np.max(np.abs(rec - orig)) / (np.max(np.abs(orig)) + 1e-9))
 check("get_vector rel error < 5%", relerr < 0.05, f"{relerr:.4f}")

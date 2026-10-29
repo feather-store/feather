@@ -1,0 +1,8 @@
+40 tenants x 5000 x 256 (269 MB on disk)
+
+  shard started (nothing opened):           0 MB
+  every tenant open (0.21 startup):       561 MB   (1.0 s to open them)
+  all idle, closed by the sweep:           78 MB
+  4 hot tenants reopened:               101 MB   (14 ms per reopen)
+
+  tenants per GB, all open: 73; with 4 hot: 405

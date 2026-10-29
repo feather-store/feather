@@ -1,5 +1,7 @@
 from .core import (DB, ContextType, Metadata, ScoringConfig,
-                   Edge, IncomingEdge,
+                   Edge, IncomingEdge, WriteFailedError,
+                   WriteBatch, BatchResult, VersionConflictError, IdempotencyKeyReusedError,
+                   DuplicateKeyError, ClosedError,
                    ContextNode, ContextEdge, ContextChainResult)
 from .filter import FilterBuilder
 from .domain_profiles import DomainProfile, MarketingProfile
@@ -34,7 +36,9 @@ __all__ = [
     "PacketBuilder", "ContextPacket", "Ref", "Omission",
     "RequiredRule", "RequiredContextUnavailable",
     "DB", "ContextType", "Metadata", "ScoringConfig",
-    "Edge", "IncomingEdge",
+    "Edge", "IncomingEdge", "WriteFailedError",
+    "WriteBatch", "BatchResult", "VersionConflictError", "IdempotencyKeyReusedError",
+    "DuplicateKeyError", "ClosedError",
     "ContextNode", "ContextEdge", "ContextChainResult",
     "FilterBuilder",
     "DomainProfile", "MarketingProfile",
@@ -67,4 +71,6 @@ def __getattr__(name):
         return getattr(importlib.import_module("feather_db.packet"), name)
     if name == "scoped_id":
         return getattr(importlib.import_module("feather_db.pocket"), name)
+    if name == "RemoteDB":       # embedded Feather's DB, served by the Cloud API
+        return importlib.import_module("feather_db.remote").RemoteDB
     raise AttributeError(f"module 'feather_db' has no attribute {name!r}")

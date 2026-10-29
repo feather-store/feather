@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from . import core
+
 
 def merge(
     target_db,
@@ -129,6 +131,8 @@ def merge(
                         target_db.link(from_id=sid, to_id=edge.target_id,
                                        rel_type=edge.rel_type, weight=edge.weight)
                         stats["edges_added"] += 1
+                    except getattr(core, "WriteFailedError", ()):
+                        raise   # the target refuses writes: never report a partial merge as done
                     except Exception:
                         pass
 

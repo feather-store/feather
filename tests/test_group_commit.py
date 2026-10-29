@@ -134,7 +134,8 @@ def test_recovery_replays_old_then_current_wal(tmp_path):
     assert os.path.exists(p + ".wal.old") and os.path.exists(p + ".wal")
     db = DB.open(p, dim=16)
     assert db.get_metadata(2) is not None
-    assert db.get_metadata(1).source == "_forgotten", ".wal must replay AFTER .wal.old"
+    assert db.get_metadata(1) is None, ".wal must replay AFTER .wal.old"
+    assert db.get_metadata(1, include_dead=True).source == "_forgotten"
     db.save()                                       # synchronous path merges them away
     assert not os.path.exists(p + ".wal.old")
     db.close()

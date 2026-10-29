@@ -1,0 +1,35 @@
+  [ 25/500] running recall@5=1.000  (1s, 0 embeds)
+  [ 50/500] running recall@5=0.980  (2s, 0 embeds)
+  [ 75/500] running recall@5=0.987  (3s, 0 embeds)
+  [100/500] running recall@5=0.980  (4s, 0 embeds)
+  [125/500] running recall@5=0.984  (4s, 0 embeds)
+  [150/500] running recall@5=0.960  (5s, 0 embeds)
+  [175/500] running recall@5=0.960  (6s, 0 embeds)
+  [200/500] running recall@5=0.960  (7s, 0 embeds)
+  [225/500] running recall@5=0.960  (7s, 0 embeds)
+  [250/500] running recall@5=0.964  (8s, 0 embeds)
+  [275/500] running recall@5=0.964  (9s, 0 embeds)
+  [300/500] running recall@5=0.957  (10s, 0 embeds)
+  [325/500] running recall@5=0.954  (11s, 0 embeds)
+  [350/500] running recall@5=0.957  (12s, 0 embeds)
+  [375/500] running recall@5=0.960  (13s, 0 embeds)
+  [400/500] running recall@5=0.963  (13s, 0 embeds)
+  [425/500] running recall@5=0.965  (14s, 0 embeds)
+  [450/500] running recall@5=0.967  (15s, 0 embeds)
+  [475/500] running recall@5=0.968  (16s, 0 embeds)
+  [500/500] running recall@5=0.970  (16s, 0 embeds)
+
+=== Feather LongMemEval — mode=keyword  n=500  17s ===
+Overall recall@k:
+  recall@1   = 0.870
+  recall@3   = 0.952
+  recall@5   = 0.970
+  recall@10  = 0.988
+
+By question type (recall@10):
+  knowledge-update             n= 78  recall@10=1.000
+  multi-session                n=133  recall@10=0.992
+  single-session-assistant     n= 56  recall@10=1.000
+  single-session-preference    n= 30  recall@10=0.933
+  single-session-user          n= 70  recall@10=1.000
+  temporal-reasoning           n=133  recall@10=0.977

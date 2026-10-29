@@ -29,24 +29,23 @@ Usage
     python benchmarks/longmemeval.py --data /tmp/lme_s.json --mode dense \
         --embed-provider hash --limit 20
 """
-import os, sys, glob, json, time, argparse, importlib.util
+import os, sys, json, time, argparse, tempfile
 from collections import defaultdict
 import numpy as np
 
-# ── load the compiled core directly (no install needed) ─────────────────────
+# The repo's feather_db, built in place (no install needed). Imported as the
+# package, not by loading core*.so under another name: the embedders and LLM
+# clients import feather_db too, and a second load of the extension fails
+# ("type ... is already registered"), so every dense, hybrid or LLM run died.
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_tag = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
-_cands = [p for p in glob.glob(os.path.join(_HERE, "feather_db/core*.so")) if _tag in p]
-_so = (_cands or sorted(glob.glob(os.path.join(_HERE, "feather_db/core*.so"))))[0]
-_spec = importlib.util.spec_from_file_location("core", _so)
-fc = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(fc)
+sys.path.insert(0, _HERE)
+import feather_db as fc  # noqa: E402
 
 
 def get_embedder(provider, model, key, dim):
     """Reuse the MCP client-side embedders; 'hash' is deterministic & key-free."""
     if provider in (None, "", "none", "keyword"):
         return None, dim
-    sys.path.insert(0, _HERE)
     from feather_db.integrations.embedders import make_embedder
     embed = make_embedder(provider, model=model, api_key=key, dim=dim)
     return embed, dim
@@ -65,11 +64,12 @@ def run(args):
     embed, dim = get_embedder(args.embed_provider, args.embed_model,
                               args.embed_key or os.getenv("GOOGLE_API_KEY")
                               or os.getenv("OPENAI_API_KEY"), args.dim)
-    keyword_only = embed is None and args.mode == "keyword"
     if embed is None and args.mode != "keyword":
         sys.exit(f"mode={args.mode} needs an embedder (set --embed-provider)")
     vdim = dim if embed else 8   # keyword mode: tiny dummy vectors just to register records
 
+    if not data:
+        sys.exit(f"{args.data}: no questions")
     ks = sorted(args.ks)
     maxk = max(ks)
     hit = {k: 0 for k in ks}                       # overall recall@k numerator
@@ -78,6 +78,10 @@ def run(args):
     n = len(data)
     n_embed_calls = 0
     t0 = time.time()
+    # One throwaway file per question, in a directory of this run's own:
+    # fixed /tmp paths collided between concurrent runs (the second could not
+    # take the file lock) and were left behind.
+    tmp = tempfile.TemporaryDirectory(prefix="lme_")
 
     for qi, item in enumerate(data):
         sessions = item["haystack_sessions"]
@@ -85,10 +89,7 @@ def run(args):
         gold = set(item["answer_session_ids"])
         qtype = item.get("question_type", "?")
 
-        path = f"/tmp/lme_q{qi}.feather"
-        for ext in ("", ".wal", ".tmp"):
-            if os.path.exists(path + ext): os.remove(path + ext)
-        db = fc.DB.open(path, dim=vdim)
+        db = fc.DB.open(os.path.join(tmp.name, f"q{qi}.feather"), dim=vdim)
 
         # ingest each session as one record (id == session index)
         for si, sess in enumerate(sessions):
@@ -102,11 +103,12 @@ def run(args):
 
         # retrieve
         q = item["question"]
+        # A measurement must not move what it measures: no salience writes.
         if args.mode == "keyword":
             res = db.keyword_search(q, k=maxk)
         elif args.mode == "dense":
             qv = np.asarray(embed(q), dtype=np.float32); n_embed_calls += 1
-            res = db.search(qv, k=maxk)
+            res = db.search(qv, k=maxk, record_salience=False)
         else:  # hybrid
             qv = np.asarray(embed(q), dtype=np.float32); n_embed_calls += 1
             res = db.hybrid_search(qv, q, k=maxk)
@@ -117,13 +119,15 @@ def run(args):
             if gold & set(ranked_sids[:k]):
                 hit[k] += 1; by_type[qtype][k] += 1
 
-        for ext in ("", ".wal", ".tmp"):
-            if os.path.exists(path + ext): os.remove(path + ext)
+        # Closed, not just dropped: a handle left to the garbage collector
+        # checkpoints whenever it goes, writing the file back after a delete.
+        db.close(save=False)
         if (qi + 1) % 25 == 0 or qi + 1 == n:
             r = hit[ks[len(ks)//2]] / (qi + 1)
             print(f"  [{qi+1:3d}/{n}] running recall@{ks[len(ks)//2]}={r:.3f}  "
                   f"({(time.time()-t0):.0f}s, {n_embed_calls} embeds)")
 
+    tmp.cleanup()
     dt = time.time() - t0
     print(f"\n=== Feather LongMemEval — mode={args.mode}"
           f"{'' if embed is None else ' / '+args.embed_provider}  "

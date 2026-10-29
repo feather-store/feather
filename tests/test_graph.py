@@ -104,6 +104,35 @@ class TestGraphJson:
         assert all(n["namespace_id"] == "infra" for n in data["nodes"])
         assert len(data["nodes"]) == 1  # only node 5 is "infra"
 
+    def test_export_filters_through_the_indexes(self, tmp_path):
+        """A namespace / entity filter reads the index, not the whole store:
+        the same nodes and edges as filtering every record, forgotten ones
+        excluded, an unknown name empty."""
+        import json
+        import numpy as np
+        db = DB.open(str(tmp_path / "x.feather"), dim=4)
+        for i in range(40):
+            m = feather_db.Metadata()
+            m.namespace_id, m.entity_id, m.content = f"ns{i % 3}", f"e{i % 5}", f"r{i}"
+            db.add(i, np.full(4, i, np.float32), m)
+        for i in range(39):
+            db.link(i, i + 1, "next", 0.5)
+        db.forget(3)
+
+        def expect(ns, eid):
+            live = [i for i in range(40) if i != 3
+                    and (not ns or f"ns{i % 3}" == ns) and (not eid or f"e{i % 5}" == eid)]
+            edges = [(i, i + 1) for i in live if i + 1 in live]
+            return live, edges
+
+        for ns, eid in [("ns0", ""), ("", "e3"), ("ns1", "e1"), ("ns2", "e0"), ("", ""),
+                        ("nope", ""), ("ns0", "nope")]:
+            data = json.loads(db.export_graph_json(ns, eid))
+            got_nodes = sorted(n["id"] for n in data["nodes"])
+            got_edges = sorted((e["source"], e["target"]) for e in data["edges"])
+            assert (got_nodes, got_edges) == expect(ns, eid), (ns, eid)
+        db.close()
+
     def test_visualize_produces_html(self, populated_db, tmp_path):
         from feather_db.graph import visualize
         out = str(tmp_path / "graph.html")

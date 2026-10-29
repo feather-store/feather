@@ -1,9 +1,10 @@
-"""Compaction without freezing the DB, slot reuse, and exclusive-section fixes (0.19).
+"""Compaction without freezing the DB, deleted slots, and exclusive-section fixes (0.19).
 
 * compact() builds the new indexes WITHOUT holding the data lock and replays
   writes made meanwhile before swapping; auto-compaction runs on a background
   thread instead of inside the forget() that crossed the threshold.
-* Indexes reuse the slots of deleted vectors, so tombstones stop accumulating.
+* Deleted slots are NOT reused (0.22): hnswlib's replace path orphaned
+  ~0.2% of records under forget + add churn. compact() reclaims them.
 * update_metadata() retires reverse-index entries in O(edges of the record).
 """
 import threading
@@ -76,15 +77,25 @@ def test_writes_during_compaction_are_kept(tmp_path):
         assert stored is not None and len(stored) == 32, f"record {rid} lost its vector"
         assert np.allclose(stored, v), f"record {rid} came back with the wrong vector"
 
-    # And it must still be retrievable through the graph at a beam wide enough
-    # for an exact self-match, which is what "searchable" can honestly mean.
+    # Searchable: an exact (scan) search over its namespace finds every one.
+    db.set_namespace_ann_min(0)
+    f = feather_db.FilterBuilder().namespace("n").build()
+    for rid, v in added:
+        hits = [r.id for r in db.search(v, k=1, filter=f, record_salience=False)]
+        assert hits == [rid], f"record {rid} is kept but exact search misses it"
+
+    # Through the graph, recall is what HNSW gives, not 100%: even a clean
+    # build with no deletes leaves ~0.02% of nodes with no incoming link
+    # (16 of 72,000 at 32-d, unreachable at any ef). Requiring every record
+    # here failed CI on 100475, which the rebuilt graph orphans like that.
+    # Slot reuse made it ~0.2%; this bound catches a regression of that size.
     db.set_ef(400)
     try:
-        for rid, v in added:
-            hits = [r.id for r in db.search(v, k=50, record_salience=False)]
-            assert rid in hits, f"record {rid} is in the index but unreachable"
+        lost = [rid for rid, v in added
+                if rid not in [r.id for r in db.search(v, k=50, record_salience=False)]]
     finally:
         db.set_ef(10)
+    assert len(lost) <= max(2, len(added) // 1000), f"{len(lost)} of {len(added)} unreachable: {lost[:10]}"
 
     assert not ids & set(forgotten), "a record forgotten during compaction came back"
     db.close()
@@ -130,7 +141,7 @@ def test_auto_compaction_does_not_block_forget(tmp_path):
         worst = max(worst, time.perf_counter() - t0)
     assert db.wait_for_compaction(timeout=120)
     assert worst < 0.5, f"a forget() blocked {worst:.2f}s (compaction ran inline?)"
-    assert db.get_metadata(0) is None, "auto-compaction never ran"
+    assert db.get_metadata(0, include_dead=True) is None, "auto-compaction never ran"
     db.close()
 
 
@@ -149,19 +160,27 @@ def test_close_during_background_compaction(tmp_path):
     db2.close()
 
 
-def test_deleted_slots_are_reused(tmp_path):
-    db = DB.open(str(tmp_path / "s.feather"), dim=16)
-    n = 2000
-    db.add_batch(list(range(n)), _vecs(n, 16), [])
-    for i in range(n // 2):
+def test_forget_then_add_keeps_records_reachable(tmp_path):
+    """forget + add churn reused deleted slots through hnswlib's updatePoint,
+    which re-prunes the slot's old neighbours and orphaned other records:
+    44 of 24,000 new and 30 of 16,000 untouched ones, unreachable at ef=400.
+    Fresh slots are back to a clean build's rate (~0.02%)."""
+    db = DB.open(str(tmp_path / "s.feather"), dim=32)
+    n = 6000
+    V = _vecs(n, 32, seed=100)
+    db.add_batch(list(range(n)), V, [])
+    for i in range(0, n, 3):
         db.forget(i)
-    V = _vecs(n // 2, 16, seed=9)
-    for k in range(n // 2):
-        db.add(10_000 + k, V[k], _m())
-    # every new record took a freed slot: the index did not grow
-    assert len(db.get_all_ids()) == n
-    for k in (0, 17, n // 2 - 1):
-        assert [r.id for r in db.search(V[k], k=1, record_salience=False)] == [10_000 + k]
+    W = _vecs(3000, 32, seed=101)
+    for k in range(3000):
+        db.add(100_000 + k, W[k], _m())
+        if 1 + 3 * k < n:
+            db.forget(1 + 3 * k)
+    db.set_ef(400)
+    probe = [(100_000 + k, W[k]) for k in range(3000)] + [(i, V[i]) for i in range(2, n, 3)]
+    lost = [rid for rid, v in probe
+            if rid not in [r.id for r in db.search(v, k=50, record_salience=False)]]
+    assert len(lost) <= 5, f"{len(lost)} of {len(probe)} unreachable: {lost[:10]}"
     db.close()
 
 

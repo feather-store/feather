@@ -5,6 +5,34 @@
 
 namespace py = pybind11;
 
+namespace {
+// The ops of DB.write(), collected in Python. Vectors are copied in here, so
+// the write itself runs without the GIL.
+struct WriteBatch {
+    std::vector<feather::BatchOp> ops;
+};
+
+std::vector<float> to_vec(py::array_t<float, py::array::c_style | py::array::forcecast> a) {
+    auto buf = a.request();
+    const float* p = static_cast<const float*>(buf.ptr);
+    return std::vector<float>(p, p + buf.size);
+}
+
+// A record named in a WriteBatch op: an int id, a key (str, in namespace ""),
+// or a (namespace, key) tuple.
+void set_target(const py::handle& h, uint64_t& id, std::optional<feather::KeyRef>& ref) {
+    if (py::isinstance<py::str>(h)) {
+        ref = feather::KeyRef{"", h.cast<std::string>()};
+    } else if (py::isinstance<py::tuple>(h)) {
+        auto t = h.cast<py::tuple>();
+        if (t.size() != 2) throw py::value_error("a key reference is (namespace, key)");
+        ref = feather::KeyRef{t[0].cast<std::string>(), t[1].cast<std::string>()};
+    } else {
+        id = h.cast<uint64_t>();
+    }
+}
+} // namespace
+
 // Build the API's JSON-ready dict for a Metadata straight from C++. The Cloud
 // API used to go Metadata -> pydantic model -> dict per hit; this is one pass.
 static py::dict metadata_to_dict(const feather::Metadata& m) {
@@ -22,11 +50,21 @@ static py::dict metadata_to_dict(const feather::Metadata& m) {
     d["attributes"]       = attrs;
     d["recall_count"]     = m.recalls();
     d["last_recalled_at"] = m.recalled_at();
-    py::list links;
-    for (const auto& e : m.edges) links.append(e.target_id);
+    py::list links, edges;
+    for (const auto& e : m.edges) {
+        links.append(e.target_id);
+        py::dict ed;
+        ed["target_id"] = e.target_id;
+        ed["rel_type"]  = e.rel_type;
+        ed["weight"]    = e.weight;
+        edges.append(ed);
+    }
     d["links"]            = links;
+    d["edges"]            = edges;     // typed: what `links` drops (rel_type, weight)
     d["ttl"]              = m.ttl;
     d["confidence"]       = m.confidence;
+    d["key"]              = m.key;
+    d["version"]          = m.version;
     return d;
 }
 
@@ -52,6 +90,152 @@ PYBIND11_MODULE(core, m) {
         if (det >= feather_simd::AVX512) out.push_back("avx512f");
         return out;
     });
+
+    py::register_exception<feather::WriteFailed>(m, "WriteFailedError", PyExc_RuntimeError);
+    py::register_exception<feather::IdempotencyKeyReused>(m, "IdempotencyKeyReusedError", PyExc_ValueError);
+    py::register_exception<feather::DuplicateKey>(m, "DuplicateKeyError", PyExc_ValueError);
+    py::register_exception<feather::HandleClosed>(m, "ClosedError", PyExc_RuntimeError);
+    // VersionConflictError carries .id, .expected and .actual, so a caller can
+    // re-read and retry without parsing the message.
+    static PyObject* version_conflict =
+        py::register_exception<feather::VersionConflict>(m, "VersionConflictError", PyExc_RuntimeError).ptr();
+    py::register_exception_translator([](std::exception_ptr p) {
+        try {
+            if (p) std::rethrow_exception(p);
+        } catch (const feather::VersionConflict& e) {
+            py::object err = py::reinterpret_borrow<py::object>(version_conflict)(e.what());
+            err.attr("id")       = e.id;
+            err.attr("expected") = e.expected;
+            err.attr("actual")   = e.actual;
+            PyErr_SetObject(version_conflict, err.ptr());
+        }
+    });
+
+    py::class_<feather::BatchResult>(m, "BatchResult")
+        .def_readonly("ids",      &feather::BatchResult::ids,
+             "Per op, the record it wrote.")
+        .def_readonly("versions", &feather::BatchResult::versions,
+             "Per op, that record's version after the op.")
+        .def_readonly("note",     &feather::BatchResult::note,
+             "The note stored with the idempotency key by the first attempt.")
+        .def_readonly("replayed", &feather::BatchResult::replayed,
+             "True when the idempotency key had been seen: this is the first attempt's "
+             "result, and nothing was applied this time.")
+        .def("__repr__", [](const feather::BatchResult& r) {
+            return "<BatchResult ops=" + std::to_string(r.ids.size()) +
+                   (r.replayed ? " replayed>" : ">");
+        });
+
+    py::class_<WriteBatch>(m, "WriteBatch",
+        "Records to write in one atomic DB.write(): every op is applied, or none. "
+        "Each op takes expected_version= for compare-and-set (0 = the record must "
+        "not exist yet); every check runs before anything is written.")
+        .def(py::init<>())
+        .def("put", [](WriteBatch& b, uint64_t id,
+                       py::array_t<float, py::array::c_style | py::array::forcecast> vec,
+                       const std::optional<feather::Metadata>& meta, const std::string& modality,
+                       std::optional<uint64_t> expected_version) -> WriteBatch& {
+                 feather::BatchOp op;
+                 op.kind = feather::BatchOp::PUT;
+                 op.id = id;
+                 op.vec = to_vec(vec);
+                 if (meta) op.meta = *meta;
+                 op.modality = modality;
+                 op.expected = expected_version;
+                 b.ops.push_back(std::move(op));
+                 return b;
+             }, py::arg("id"), py::arg("vec"), py::arg("meta") = std::nullopt,
+             py::arg("modality") = "text", py::arg("expected_version") = std::nullopt,
+             py::return_value_policy::reference_internal,
+             "As DB.add(): vector + metadata; metadata without edges keeps the record's edges.")
+        .def("upsert", [](WriteBatch& b, const feather::Metadata& meta,
+                          std::optional<py::array_t<float, py::array::c_style | py::array::forcecast>> vec,
+                          const std::string& modality, std::optional<uint64_t> expected_version) -> WriteBatch& {
+                 feather::BatchOp op;
+                 op.kind = feather::BatchOp::UPSERT;
+                 op.meta = meta;
+                 if (vec) op.vec = to_vec(*vec);
+                 op.modality = modality;
+                 op.expected = expected_version;
+                 b.ops.push_back(std::move(op));
+                 return b;
+             }, py::arg("meta"), py::arg("vec") = std::nullopt, py::arg("modality") = "text",
+             py::arg("expected_version") = std::nullopt,
+             py::return_value_policy::reference_internal,
+             "The record keyed (meta.namespace_id, meta.key), created with a fresh id if "
+             "there is none. Ops after it can name it by that key.")
+        .def("update", [](WriteBatch& b, py::object target, const feather::Metadata& meta,
+                          std::optional<uint64_t> expected_version) -> WriteBatch& {
+                 feather::BatchOp op;
+                 op.kind = feather::BatchOp::UPDATE;
+                 set_target(target, op.id, op.ref);
+                 op.meta = meta;
+                 op.expected = expected_version;
+                 b.ops.push_back(std::move(op));
+                 return b;
+             }, py::arg("id"), py::arg("meta"), py::arg("expected_version") = std::nullopt,
+             py::return_value_policy::reference_internal,
+             "As DB.update_metadata(): replaces the record, edges included. `id` may be a "
+             "key: a str, or a (namespace, key) tuple.")
+        .def("link", [](WriteBatch& b, py::object from_id, py::object to_id, const std::string& rel_type,
+                        float weight, std::optional<uint64_t> expected_version,
+                        bool require_target) -> WriteBatch& {
+                 feather::BatchOp op;
+                 op.kind = feather::BatchOp::LINK;
+                 op.require_target = require_target;
+                 set_target(from_id, op.id, op.ref);
+                 set_target(to_id, op.to_id, op.to_ref);
+                 op.rel_type = rel_type;
+                 op.weight = weight;
+                 op.expected = expected_version;
+                 b.ops.push_back(std::move(op));
+                 return b;
+             }, py::arg("from_id"), py::arg("to_id"), py::arg("rel_type") = "related_to",
+             py::arg("weight") = 1.0f, py::arg("expected_version") = std::nullopt,
+             py::arg("require_target") = true,
+             py::return_value_policy::reference_internal,
+             "As DB.link(), but both ends must be live records once the ops before it "
+             "are applied: a batch never leaves an edge to nothing. Either end may be a "
+             "key: a str, or a (namespace, key) tuple.")
+        .def("forget", [](WriteBatch& b, py::object id, std::optional<uint64_t> expected_version) -> WriteBatch& {
+                 feather::BatchOp op;
+                 op.kind = feather::BatchOp::FORGET;
+                 set_target(id, op.id, op.ref);
+                 op.expected = expected_version;
+                 b.ops.push_back(std::move(op));
+                 return b;
+             }, py::arg("id"), py::arg("expected_version") = std::nullopt,
+             py::return_value_policy::reference_internal)
+        .def("__len__", [](const WriteBatch& b) { return b.ops.size(); })
+        .def("ops", [](const WriteBatch& b) {
+                 static const char* kinds[] = {"", "put", "update", "link", "forget", "upsert"};
+                 py::list out;
+                 for (const auto& op : b.ops) {
+                     py::dict d;
+                     d["kind"] = kinds[op.kind];
+                     d["id"] = op.id;
+                     d["ref"] = op.ref ? py::object(py::make_tuple(op.ref->ns, op.ref->key)) : py::object(py::none());
+                     d["to_id"] = op.to_id;
+                     d["to_ref"] = op.to_ref ? py::object(py::make_tuple(op.to_ref->ns, op.to_ref->key)) : py::object(py::none());
+                     d["expected"] = op.expected ? py::object(py::int_(*op.expected)) : py::object(py::none());
+                     d["meta"] = op.meta;
+                     d["vec"] = op.vec.empty() ? py::object(py::none())
+                                               : py::object(py::array_t<float>(op.vec.size(), op.vec.data()));
+                     d["modality"] = op.modality;
+                     d["rel_type"] = op.rel_type;
+                     d["weight"] = op.weight;
+                     d["require_target"] = op.require_target;
+                     out.append(d);
+                 }
+                 return out;
+             }, "The ops, as dicts — for a client that sends the batch elsewhere (RemoteDB).");
+
+    // Fault injection for the write-failure tests: let `n` more fsyncs
+    // succeed, then fail every one with `errno` until reset with -1.
+    m.def("_fail_fsyncs_after", [](long n, int err) {
+              feather::fsio::sync_fault_errno().store(err);
+              feather::fsio::sync_faults_after().store(n);
+          }, py::arg("n"), py::arg("errno") = EIO);
 
     auto level_from = [](const std::string& name) -> int {
         const int det = feather_simd::detected_level();
@@ -133,6 +317,14 @@ PYBIND11_MODULE(core, m) {
     // ── Metadata ─────────────────────────────────────────────────────
     py::class_<feather::Metadata>(m, "Metadata")
         .def(py::init<>())
+        .def_readwrite("key",             &feather::Metadata::key,
+             "Native key: unique among the live records of this namespace_id. Write "
+             "with DB.upsert() / WriteBatch.upsert(), read with DB.get_by_key(). "
+             "BM25 indexes it with the content.")
+        .def_readwrite("version",         &feather::Metadata::version,
+             "Compare-and-set version: changes on every write to the record and is "
+             "never reused. Pass it to DB.put_if() or a WriteBatch op's expected_version. "
+             "Set by the DB: a value assigned here is ignored when the record is written.")
         .def_readwrite("timestamp",       &feather::Metadata::timestamp)
         .def_readwrite("importance",      &feather::Metadata::importance)
         .def_readwrite("type",            &feather::Metadata::type)
@@ -202,6 +394,7 @@ PYBIND11_MODULE(core, m) {
         .def_readwrite("confidence_gte",   &feather::SearchFilter::confidence_gte)
         .def_readwrite("tags_contains",    &feather::SearchFilter::tags_contains)
         .def_readwrite("namespace_id",     &feather::SearchFilter::namespace_id)
+        .def_readwrite("namespace_prefix", &feather::SearchFilter::namespace_prefix)
         .def_readwrite("entity_id",        &feather::SearchFilter::entity_id)
         .def_readwrite("attributes_match", &feather::SearchFilter::attributes_match);
 
@@ -242,10 +435,25 @@ PYBIND11_MODULE(core, m) {
         .def_readonly("edges", &feather::DB::ContextChainResult::edges);
 
     // ── DB ───────────────────────────────────────────────────────────
-    py::class_<feather::DB, std::unique_ptr<feather::DB, py::nodelete>>(m, "DB")
+    // Owned by Python: when the last reference goes, ~DB() runs — checkpoint
+    // (a writer that was never closed), release the lock, free the memory.
+    // This used to be py::nodelete, so nothing a DB held was ever freed: every
+    // open of a 39 MB file cost ~50 MB until the process exited.
+    //
+    // The GIL is released around everything that can block: the open (a load
+    // can take seconds), every call that waits on the data lock — a reader
+    // queues behind a writer, and the lock is phase-fair — and, on pybind11 3,
+    // the destructor's checkpoint. Holding it there froze every Python thread
+    // in the process for the duration. Nothing released touches a Python
+    // object: arguments are converted before, results after.
+    py::class_<feather::DB, std::unique_ptr<feather::DB>>(m, "DB"
+#if PYBIND11_VERSION_MAJOR >= 3
+        , py::release_gil_before_calling_cpp_dtor()
+#endif
+        )
         .def_static("open", &feather::DB::open,
                     py::arg("path"), py::arg("dim") = 768,
-                    py::arg("read_only") = false,
+                    py::arg("read_only") = false, py::call_guard<py::gil_scoped_release>(),
                     "Open a .feather file.\n\n"
                     "Takes an exclusive inter-process write lock; a second "
                     "writer is refused with the holder's pid. read_only=True "
@@ -326,8 +534,8 @@ PYBIND11_MODULE(core, m) {
              py::arg("rel_type") = "related_to",
              py::arg("weight") = 1.0f, py::call_guard<py::gil_scoped_release>())
 
-        .def("get_edges",    &feather::DB::get_edges,    py::arg("id"))
-        .def("get_incoming", &feather::DB::get_incoming, py::arg("id"))
+        .def("get_edges",    &feather::DB::get_edges,    py::arg("id"), py::call_guard<py::gil_scoped_release>())
+        .def("get_incoming", &feather::DB::get_incoming, py::arg("id"), py::call_guard<py::gil_scoped_release>())
 
         .def("auto_link", &feather::DB::auto_link,
              py::arg("modality")   = "text",
@@ -355,32 +563,130 @@ PYBIND11_MODULE(core, m) {
              py::call_guard<py::gil_scoped_release>())
 
         // -- Metadata --
-        .def("touch",             &feather::DB::touch,             py::arg("id"))
-        .def("get_metadata",      &feather::DB::get_metadata,      py::arg("id"))
+        .def("touch",             &feather::DB::touch,             py::arg("id"), py::call_guard<py::gil_scoped_release>())
+        .def("get_metadata",      &feather::DB::get_metadata,      py::arg("id"), py::arg("include_dead") = false,
+             py::call_guard<py::gil_scoped_release>(),
+             "The record's metadata, or None if it does not exist or was forgotten "
+             "(include_dead=True returns a forgotten record's tombstone until the next save).")
         .def("update_metadata",   &feather::DB::update_metadata,   py::arg("id"), py::arg("meta"), py::call_guard<py::gil_scoped_release>())
         .def("update_importance", &feather::DB::update_importance, py::arg("id"), py::arg("importance"), py::call_guard<py::gil_scoped_release>())
+        .def("id_for", &feather::DB::id_for, py::arg("key"), py::arg("namespace") = "",
+             py::call_guard<py::gil_scoped_release>(),
+             "The id of the live record holding `key` in `namespace`, or None.")
+        .def("get_by_key", &feather::DB::get_by_key, py::arg("key"), py::arg("namespace") = "",
+             py::call_guard<py::gil_scoped_release>(),
+             "The metadata of the live record holding `key` in `namespace`, or None.")
+        .def("upsert", [](feather::DB& db, const feather::Metadata& meta,
+                          std::optional<py::array_t<float, py::array::c_style | py::array::forcecast>> vec,
+                          const std::string& modality, std::optional<uint64_t> expected_version) {
+                 std::vector<float> v;
+                 if (vec) v = to_vec(*vec);
+                 py::gil_scoped_release rel;
+                 return db.upsert(meta, v, modality, expected_version);
+             }, py::arg("meta"), py::arg("vec") = std::nullopt, py::arg("modality") = "text",
+             py::arg("expected_version") = std::nullopt,
+             "Write the record keyed (meta.namespace_id, meta.key): the existing one, or a "
+             "new one with a fresh id — never a hash of the key, so two keys never share a "
+             "record. With vec as add(); without, the metadata replaces the record's, "
+             "keeping its edges when meta has none. Returns (id, version).")
+        .def("newest", [](const feather::DB& db, const std::string& ns, size_t limit, bool prefix,
+                          py::object before) {
+                 std::optional<std::pair<int64_t, uint64_t>> cursor;
+                 if (py::isinstance<py::tuple>(before)) {
+                     auto t = before.cast<py::tuple>();
+                     cursor = std::make_pair(t[0].cast<int64_t>(), t[1].cast<uint64_t>());
+                 } else if (!before.is_none()) {
+                     cursor = std::make_pair(before.cast<int64_t>(), uint64_t{0});   // older than ts
+                 }
+                 py::gil_scoped_release rel;
+                 return db.newest(ns, limit, prefix, cursor);
+             }, py::arg("namespace") = "", py::arg("limit") = 10, py::arg("prefix") = false,
+             py::arg("before") = py::none(),
+             "Ids of the `limit` newest live records in `namespace` (prefix=True: and every "
+             "namespace below it), newest first by (timestamp, id). `before` pages: a "
+             "timestamp, or the (timestamp, id) of the last record of the previous page. "
+             "An ordered index walk, not a scan and sort.")
+        .def("namespace_ann_info", [](const feather::DB& db) {
+                 feather::DB::NsAnnInfo i;
+                 { py::gil_scoped_release rel; i = db.namespace_ann_info(); }
+                 py::dict d;
+                 d["graphs"] = i.graphs; d["nodes"] = i.nodes; d["pending"] = i.pending;
+                 d["min_records"] = i.min_records;
+                 return d;
+             }, "Per-namespace ANN graphs: how many are built, their nodes, how many are "
+                "queued, and the namespace size (FEATHER_NS_ANN_MIN) that gets one.")
+        .def("set_namespace_ann_min", &feather::DB::set_namespace_ann_min, py::arg("n"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Namespaces with at least n records (in a modality) get their own ANN graph, "
+             "so a filtered search inside them walks it instead of scanning every record. "
+             "0 turns it off: every filtered search is an exact scan.")
+        .def("wait_for_namespace_graphs", &feather::DB::wait_for_namespace_graphs,
+             py::arg("timeout") = 0.0, py::call_guard<py::gil_scoped_release>(),
+             "Block until no namespace graph is queued or building (timeout seconds, 0 = none).")
+        .def("version", &feather::DB::version, py::arg("id"), py::call_guard<py::gil_scoped_release>(),
+             "The record's compare-and-set version; 0 if it does not exist or was forgotten.")
+        .def("put_if", [](feather::DB& db, uint64_t id, const feather::Metadata& meta,
+                          uint64_t expected_version,
+                          std::optional<py::array_t<float, py::array::c_style | py::array::forcecast>> vec,
+                          const std::string& modality) {
+                 std::vector<float> v;
+                 if (vec) v = to_vec(*vec);
+                 py::gil_scoped_release rel;
+                 return db.put_if(id, meta, expected_version, v, modality);
+             }, py::arg("id"), py::arg("meta"), py::arg("expected_version"),
+             py::arg("vec") = std::nullopt, py::arg("modality") = "text",
+             "Replace the record (edges included) only if its version is still "
+             "expected_version (0 = it must not exist). With vec, the vector too, atomically. "
+             "Returns the new version; raises VersionConflictError.")
+        .def("write", [](feather::DB& db, const WriteBatch& b,
+                         std::optional<std::string> idempotency_key, const std::string& fingerprint,
+                         const std::string& note) {
+                 py::gil_scoped_release rel;
+                 return db.write_batch(b.ops, idempotency_key.value_or(""), fingerprint, note);
+             }, py::arg("batch"), py::arg("idempotency_key") = std::nullopt, py::arg("fingerprint") = "",
+             py::arg("note") = "",
+             "Apply a WriteBatch atomically: every op or none, one WAL write, one lock. "
+             "With idempotency_key, a repeat returns the first result (replayed=True, with "
+             "the `note` the first attempt stored, up to 64 KiB) instead of applying again; "
+             "a different fingerprint under the same key raises IdempotencyKeyReusedError.")
+        .def("idempotent_result", &feather::DB::idempotent_result, py::arg("key"), py::arg("fingerprint") = "",
+             py::call_guard<py::gil_scoped_release>(),
+             "The stored BatchResult of an earlier write with this key, or None. For a caller "
+             "whose own checks would answer a retry differently (a delete retried after it "
+             "succeeded finds no record); write() checks again atomically either way.")
         .def("get_vector", [](feather::DB& db, uint64_t id, const std::string& modality) {
-            auto vec = db.get_vector(id, modality);
+            std::vector<float> vec;
+            {
+                py::gil_scoped_release rel;
+                vec = db.get_vector(id, modality);
+            }
             return py::array_t<float>(vec.size(), vec.data());
         }, py::arg("id"), py::arg("modality") = "text")
         .def("get_all_ids", &feather::DB::get_all_ids, py::arg("modality") = "text", py::call_guard<py::gil_scoped_release>())
         .def("all_ids", &feather::DB::all_ids,
-             "Every id that has metadata, across all modalities.")
+             "Every id that has metadata, across all modalities.",
+             py::call_guard<py::gil_scoped_release>())
         .def("modality_names", &feather::DB::modality_names,
-             "Names of the modality indices present in this DB.")
+             "Names of the modality indices present in this DB.",
+             py::call_guard<py::gil_scoped_release>())
 
         // -- Secondary metadata indexes (O(matches) lookups) --
         .def("ids_in_namespace", &feather::DB::ids_in_namespace, py::arg("namespace_id"),
-             "Live record ids in a namespace (O(matches) via secondary index).")
+             "Live record ids in a namespace (O(matches) via secondary index).",
+             py::call_guard<py::gil_scoped_release>())
         .def("ids_for_entity", &feather::DB::ids_for_entity, py::arg("entity_id"),
-             "Live record ids for an entity (O(matches) via secondary index).")
+             "Live record ids for an entity (O(matches) via secondary index).",
+             py::call_guard<py::gil_scoped_release>())
         .def("ids_with_attribute", &feather::DB::ids_with_attribute,
              py::arg("key"), py::arg("value"),
-             "Live record ids carrying attribute key=value (O(matches)).")
+             "Live record ids carrying attribute key=value (O(matches)).",
+             py::call_guard<py::gil_scoped_release>())
         .def("namespace_size", &feather::DB::namespace_size, py::arg("namespace_id"),
-             "Live record count in a namespace (O(1)).")
+             "Live record count in a namespace (O(1)).",
+             py::call_guard<py::gil_scoped_release>())
         .def("list_namespaces", &feather::DB::list_namespaces,
-             "All namespace ids that currently have at least one live record.")
+             "All namespace ids that currently have at least one live record.",
+             py::call_guard<py::gil_scoped_release>())
 
         // -- BM25 keyword search --
         .def("keyword_search", [](feather::DB& db, const std::string& query, size_t k,
@@ -414,26 +720,63 @@ PYBIND11_MODULE(core, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("set_auto_compact", &feather::DB::set_auto_compact, py::arg("ratio"),
              "Auto-rebuild a modality index when its deleted/total ratio crosses "
-             "`ratio` after forget/purge/expire. 0 disables (default).")
+             "`ratio` after forget/purge/expire. 0 disables (default).",
+             py::call_guard<py::gil_scoped_release>())
         .def("get_auto_compact", &feather::DB::get_auto_compact,
-             "Current auto-compaction threshold (0 = disabled).")
+             "Current auto-compaction threshold (0 = disabled).",
+             py::call_guard<py::gil_scoped_release>())
 
         // -- On-disk int8 quantization (file format v7) --
         .def("set_quantized", &feather::DB::set_quantized,
              py::arg("modality"), py::arg("on") = true,
              "Persist a modality's vectors as int8 + per-vector scale (~4x "
-             "smaller on disk). Takes effect on next save(); dequantized on load.")
+             "smaller on disk). Takes effect on next save(); dequantized on load.",
+             py::call_guard<py::gil_scoped_release>())
         .def("is_quantized", &feather::DB::is_quantized, py::arg("modality"),
-             "Whether a modality is persisted with int8 quantization.")
+             "Whether a modality is persisted with int8 quantization.",
+             py::call_guard<py::gil_scoped_release>())
 
         // -- In-RAM int8 quantization (4x less memory) --
-        .def("set_int8_ram", &feather::DB::set_int8_ram,
-             py::arg("modality"), py::arg("max_abs") = 1.0f,
-             "Store this modality's vectors as int8 IN MEMORY (~4x less RAM) "
-             "using a global scale = max_abs/127. Must be called BEFORE the first "
-             "add to that modality. Components beyond max_abs are clamped.")
+        .def("set_int8_ram", [](feather::DB& db, const std::string& modality,
+                                py::object max_abs, uint32_t refine) {
+                 const float clip = max_abs.is_none() ? 0.0f : max_abs.cast<float>();
+                 py::gil_scoped_release rel;
+                 db.set_int8_ram(modality, clip, refine);
+             },
+             py::arg("modality"), py::arg("max_abs") = py::none(), py::arg("refine") = 2,
+             "Store this modality's vectors as int8 IN MEMORY (~4x less RAM) under "
+             "one global scale = clip/127. max_abs=None (default) trains the clip "
+             "from the data: now if the modality holds >= 1000 vectors "
+             "(FEATHER_INT8_TRAIN_MIN), else once it does — float until then. "
+             "A number fixes the clip; components beyond it are clamped. "
+             "refine > 0 keeps float32 originals in the file (read from disk, not "
+             "RAM, once saved) and re-ranks the top k*refine int8 candidates by "
+             "exact distance; 0 keeps none. Converting a non-empty float modality "
+             "keeps its graph. Once int8, calling again only changes refine.")
         .def("is_int8_ram", &feather::DB::is_int8_ram, py::arg("modality"),
-             "Whether a modality's in-memory index stores int8 vectors.")
+             "Whether a modality's in-memory index stores int8 vectors.",
+             py::call_guard<py::gil_scoped_release>())
+        .def("int8_info", [](const feather::DB& db, const std::string& modality) {
+            feather::DB::Int8Info i;
+            {
+                py::gil_scoped_release rel;
+                i = db.int8_info(modality);
+            }
+            py::dict d;
+            d["int8"]              = i.int8;
+            d["training"]          = i.training;
+            d["clip"]              = i.clip;
+            d["refine"]            = i.refine;
+            d["originals_on_disk"] = i.originals_on_disk;
+            d["originals_in_wal"]  = i.originals_in_wal;
+            d["originals_in_ram"]  = i.originals_in_ram;
+            d["train_min"]         = i.train_min;
+            return d;
+        }, py::arg("modality"),
+           "In-RAM int8 state of a modality: whether it is int8 or still waiting "
+           "to train, its clip (scale x 127), the refine factor, and where its float "
+           "originals are: in the file, still only in the WAL, or copied in RAM "
+           "(after converting a float modality) until the next save().")
 
         // -- Memory lifecycle --
         .def("forget",         &feather::DB::forget,         py::arg("id"),
@@ -447,15 +790,46 @@ PYBIND11_MODULE(core, m) {
              py::call_guard<py::gil_scoped_release>())
 
         // -- Persistence & info --
-        .def("save", &feather::DB::save, py::call_guard<py::gil_scoped_release>())
+        .def("save", &feather::DB::save, py::call_guard<py::gil_scoped_release>(),
+             "Commit what changed since the last save. File format v10 appends "
+             "only the change; the whole file is rewritten only when it is still "
+             "v3-v9, after purge()/compact()/set_quantized(), or once superseded "
+             "records outweigh live data.")
+        .def("vacuum", &feather::DB::vacuum, py::call_guard<py::gil_scoped_release>(),
+             "Rewrite the file now, dropping every superseded record (including "
+             "earlier versions of updated and forgotten records).")
+        .def("storage_stats", [](const feather::DB& db) {
+            feather::DB::StorageStats s;
+            {
+                py::gil_scoped_release rel;   // waits out a save in progress
+                s = db.storage_stats();
+            }
+            py::dict d;
+            d["format"]              = s.format;
+            d["generation"]          = s.generation;
+            d["file_bytes"]          = s.file_bytes;
+            d["live_bytes_estimate"] = s.live_bytes_estimate;
+            d["last_commit_bytes"]   = s.last_commit_bytes;
+            d["last_commit_full"]    = s.last_commit_full;
+            d["commits"]             = s.commits;
+            d["vacuums"]             = s.vacuums;
+            d["mapped_bytes"]        = s.mapped_bytes;
+            return d;
+        }, "On-disk format, commit generation, committed bytes, and what the last save wrote.")
         .def("close", &feather::DB::close, py::arg("save") = true,
              "Checkpoint (unless save=False), release the WAL and the inter-process "
-             "file lock. Needed because this binding uses py::nodelete, so the C++ "
-             "destructor never runs from Python — without close() the lock lives "
-             "until the process exits and the file cannot be reopened. Idempotent.",
+             "file lock, and free the handle's memory. Any later call on it raises. "
+             "Dropping the last reference does the same (with a checkpoint), but "
+             "close() does it at a moment you choose. Idempotent.",
              py::call_guard<py::gil_scoped_release>())
         .def("is_read_only", &feather::DB::is_read_only)
         .def("is_closed",    &feather::DB::is_closed)
+        .def("write_error", [](const feather::DB& db) -> py::object {
+            std::string e = db.write_error();
+            return e.empty() ? py::object(py::none()) : py::object(py::str(e));
+        }, "None while the handle accepts writes. After a WAL write or fsync "
+           "failure: the cause. Every later write and save then raises until "
+           "the file is reopened; close() releases it without a checkpoint.")
         .def_property_readonly("closed", &feather::DB::is_closed)
         .def("__enter__", [](feather::DB& db) -> feather::DB& { return db; },
              py::return_value_policy::reference)
@@ -465,26 +839,31 @@ PYBIND11_MODULE(core, m) {
         })
         .def("wal_size", &feather::DB::wal_size,
              "Bytes currently in the WAL (+ <wal>.old). Use it to checkpoint on "
-             "WAL size instead of saving after every mutation.")
+             "WAL size instead of saving after every mutation.",
+             py::call_guard<py::gil_scoped_release>())
         .def("wal_fsync_count", &feather::DB::wal_fsync_count,
-             "WAL fsyncs issued so far (group commit shares one across writers).")
+             "WAL fsyncs issued so far (group commit shares one across writers).",
+             py::call_guard<py::gil_scoped_release>())
         .def("is_compacting", &feather::DB::is_compacting,
-             "True while a compaction is building its new indexes.")
+             "True while a compaction is building its new indexes.",
+             py::call_guard<py::gil_scoped_release>())
         .def("wait_for_compaction", &feather::DB::wait_for_compaction,
              py::arg("timeout") = 0.0,
              "Block until background auto-compaction is idle. timeout<=0 waits "
              "forever; returns False if the timeout elapsed first.",
              py::call_guard<py::gil_scoped_release>())
-        .def("size", &feather::DB::size)
-        .def("dim",  &feather::DB::dim, py::arg("modality") = "text")
+        .def("size", &feather::DB::size, py::call_guard<py::gil_scoped_release>())
+        .def("dim",  &feather::DB::dim, py::arg("modality") = "text", py::call_guard<py::gil_scoped_release>())
 
         // -- HNSW tuning --
         .def("set_ef", &feather::DB::set_ef,
              py::arg("ef"), py::arg("modality") = "",
              "Set HNSW search beam width. Higher ef -> better recall, "
              "slower search. Default is 50. Pass modality=\"\" to apply "
-             "to all modalities.")
+             "to all modalities.",
+             py::call_guard<py::gil_scoped_release>())
         .def("get_ef", &feather::DB::get_ef,
              py::arg("modality") = "text",
-             "Current HNSW search beam width for the given modality.");
+             "Current HNSW search beam width for the given modality.",
+             py::call_guard<py::gil_scoped_release>());
 }
