@@ -146,5 +146,10 @@ sys.exit(1 if bad else 0)
 PY
 else skp "API contract checks (quick mode)"; fi
 
+hdr "10. Performance gate (counts and same-run ratios, ~10 s)"
+if $PY benchmarks/perf_gate.py >/tmp/_perf.log 2>&1; then
+  ok "$(tail -1 /tmp/_perf.log)"
+else bad "performance regressed"; grep FAIL /tmp/_perf.log; fi
+
 printf "\n\033[1m%d passed, %d failed, %d skipped\033[0m\n" "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ] || exit 1

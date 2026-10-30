@@ -82,6 +82,13 @@ jobs:
     - name: Run pytest suite
       run: pytest tests -q --deselect tests/test_engine.py::TestProviderInterface::test_provider_str
 
+    # Counts and ratios measured in the same run, so runner speed cancels out:
+    # a repeated embed never reaches the provider, an open with text costs
+    # about what one without does, RemoteDB keeps one connection.
+    - name: Performance gate
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+      run: python benchmarks/perf_gate.py --json perf_gate.json
+
     # The suite above runs the corruption fuzz on a fixed seed. This runs it
     # deeper on a seed that changes every run, so CI keeps exploring new
     # cases; a failure prints FEATHER_FUZZ_SEED, which reproduces it locally.
