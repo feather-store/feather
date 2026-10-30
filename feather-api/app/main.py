@@ -1806,14 +1806,14 @@ def _hybrid_search_impl(namespace: str, req, q=None):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
+    """With no `vector`, the server embeds `query` with the configured
+    provider: the same model that embedded /ingest_text and /ingest_file
+    records, so a client needs no embedding model of its own to search them."""
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
     sf = _build_filter(req)
     sc = _build_scoring(req)
     q = req.vector_array() if q is None else np.asarray(q, dtype=np.float32)
-    """With no `vector`, the server embeds `query` with the configured
-    provider: the same model that embedded /ingest_text and /ingest_file
-    records, so a client needs no embedding model of its own to search them."""
     _check_query_dim(db, q, req.modality)
     raw = db.hybrid_search(q, req.query, k=req.k,
                             rrf_k=req.rrf_k, filter=sf, scoring=sc,
@@ -2171,14 +2171,14 @@ def _upstream_error(e: UpstreamError) -> HTTPException:
     # a retry (503); refused (bad key or model) is our misconfiguration
     # (502), and retrying it only adds load.
     if e.transient:
-        return errors.APIError(503, str(e), "upstream_unavailable", headers={"Retry-After": "1"})
-    return errors.APIError(502, str(e), "upstream_error")
     vec = await _embed_or_raise(req.text)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_WRITE_POOL, _store_ingested, namespace, req, vec, idem, response)
 
 
 async def _embed_or_raise(text: str):
+        return errors.APIError(503, str(e), "upstream_unavailable", headers={"Retry-After": "1"})
+    return errors.APIError(502, str(e), "upstream_error")
 
 
 def _store_ingested(namespace: str, req: IngestTextRequest, vec, idem: Idem = Idem(),
@@ -2212,19 +2212,6 @@ def _store_ingested(namespace: str, req: IngestTextRequest, vec, idem: Idem = Id
         r = writes.prior(db, idem) or writes.apply(
             db, [Op("put", rec_id, meta, np.asarray(vec, dtype=np.float32), req.modality)], idem, body)
     return _with_version(response, body, r)
-
-
-@app.post("/v1/{namespace}/import", response_model=ImportResponse, tags=["records"],
-          dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(ImportRequest))
-async def bulk_import(namespace: str, request: Request):
-    req = await parse_body(request, ImportBody)
-    # Items without a vector are embedded inside the call, at provider latency.
-    # On the 8-thread write pool a few of those imports held every write slot
-    # and stalled all writes server-wide (measured 2.7 s for an unrelated add);
-    # they run on the shared pool, as before the write pool existed.
-    if any(not isinstance(it, dict) or not it.get("vector") for it in req.items):
-        return await run_in_threadpool(_bulk_import_impl, namespace, req)
-    return await _in_write_pool(_bulk_import_impl, namespace, req)
 
 
 MAX_INGEST_FILE_BYTES = int(os.getenv("FEATHER_MAX_INGEST_FILE_MB", "512")) * 1024 * 1024
@@ -2437,6 +2424,19 @@ def _bulk_import_impl(namespace: str, req):
     skipped = 0
     embedded = 0
     errors: List[str] = []
+@app.post("/v1/{namespace}/import", response_model=ImportResponse, tags=["records"],
+          dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(ImportRequest))
+async def bulk_import(namespace: str, request: Request):
+    req = await parse_body(request, ImportBody)
+    # Items without a vector are embedded inside the call, at provider latency.
+    # On the 8-thread write pool a few of those imports held every write slot
+    # and stalled all writes server-wide (measured 2.7 s for an unrelated add);
+    # they run on the shared pool, as before the write pool existed.
+    if any(not isinstance(it, dict) or not it.get("vector") for it in req.items):
+        return await run_in_threadpool(_bulk_import_impl, namespace, req)
+    return await _in_write_pool(_bulk_import_impl, namespace, req)
+
+
 
     def _err(i, msg):
         nonlocal skipped

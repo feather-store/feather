@@ -226,6 +226,9 @@ class HybridSearchRequest(VectorInput):
     modality: str = "text"
     include_metadata: bool = True
     # Filters
+    """BM25 over content fused with vector search. Omit `vector` and the server
+    embeds `query` with the configured embedding provider."""
+    VECTOR_REQUIRED: ClassVar[bool] = False
     namespace_id: Optional[str] = None
     types: Optional[List[int]] = Field(None, description="ContextType values to keep (0 fact, 1 preference, 2 event, 3 conversation).")
     namespace_prefix: Optional[str] = Field(None, description="This namespace and every one below it ('.' separates levels: 'acme.u1' matches 'acme.u1.prefs', not 'acme.u10'). Ranked inside them, not filtered from a global top-k.")

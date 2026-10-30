@@ -87,6 +87,7 @@ class SearchBody(_VectorMixin, msgspec.Struct, kw_only=True):
 class HybridBody(_VectorMixin, msgspec.Struct, kw_only=True):
     query: str
     vector: Optional[List[float]] = None
+    VECTOR_REQUIRED = False         # the route embeds `query` instead
     vector_b64: Optional[str] = None
     k: K = 10
     rrf_k: RRF_K = 60
