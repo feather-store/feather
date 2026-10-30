@@ -1,0 +1,140 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "s",
+  "n": 500,
+  "dim": 3072,
+  "feather_version": "0.21.0",
+  "python_version": "3.12.15",
+  "platform": "Darwin arm64",
+  "commit": "1ab37d8",
+  "started_at": 1793352097.6686,
+  "wall_seconds": 2202.708382844925,
+  "metrics": {
+    "n_scored": 500,
+    "overall_official": 0.794,
+    "by_question_type_official": {
+      "knowledge-update": 0.9359,
+      "multi-session": 0.6842,
+      "single-session-assistant": 0.5714,
+      "single-session-preference": 0.6667,
+      "single-session-user": 0.8714,
+      "temporal-reasoning": 0.9023
+    },
+    "task_averaged_official": 0.772,
+    "abstention_official": 1.0,
+    "overall_lenient": 0.776,
+    "by_question_type_lenient": {
+      "knowledge-update": 0.7821,
+      "multi-session": 0.6842,
+      "single-session-assistant": 0.5893,
+      "single-session-preference": 0.9333,
+      "single-session-user": 0.8571,
+      "temporal-reasoning": 0.8647
+    },
+    "task_averaged_lenient": 0.7851,
+    "abstention_lenient": 1.0,
+    "judge_agreement": 0.934,
+    "official_only_correct": 21,
+    "lenient_only_correct": 12,
+    "evidence_fully_in_context": 0.9936,
+    "evidence_shortened": 0.3603,
+    "evidence_fully_retrieved": 0.9979,
+    "multi_round_questions": 244,
+    "multi_round_evidence_round1": 0.991,
+    "multi_round_evidence_final": 0.9955,
+    "count_map_questions": 132,
+    "count_map_fallbacks": 0,
+    "failure_buckets": {
+      "judge_disagreement": 12,
+      "reader_wrong": 89,
+      "retrieval_miss": 1,
+      "packing_miss": 1
+    },
+    "failure_buckets_by_type": {
+      "knowledge-update": {
+        "reader_wrong": 5
+      },
+      "multi-session": {
+        "retrieval_miss": 1,
+        "reader_wrong": 40,
+        "judge_disagreement": 1
+      },
+      "single-session-assistant": {
+        "reader_wrong": 23,
+        "judge_disagreement": 1
+      },
+      "single-session-preference": {
+        "judge_disagreement": 8,
+        "reader_wrong": 2
+      },
+      "single-session-user": {
+        "judge_disagreement": 1,
+        "reader_wrong": 8
+      },
+      "temporal-reasoning": {
+        "reader_wrong": 11,
+        "judge_disagreement": 1,
+        "packing_miss": 1
+      }
+    },
+    "questions_file": "/Users/apple/OpenSource/memory/feather/bench/results/longmemeval__s__20261030_145133__questions.jsonl",
+    "overall": 0.794,
+    "headline_judge": "official",
+    "by_axis": {
+      "abstention": 1.0,
+      "information-extraction": 0.7133,
+      "knowledge-updates": 0.9306,
+      "multi-session-reasoning": 0.6529,
+      "temporal-reasoning": 0.8976
+    },
+    "per_q_seconds_p50": 32.0285,
+    "per_q_seconds_mean": 34.895394,
+    "n_questions": 500,
+    "n_failures": 0,
+    "failures_sample": [],
+    "history_turns_total": 246738,
+    "embeddings_emitted": 247784,
+    "embedder": "gemini_gemini-embedding-001_d3072",
+    "judge": "llm_judge=gemini-text/gemini-2.5-flash_ans=gemini-text/gemini-2.5-flash",
+    "official_judge": "official=openrouter/openai/gpt-4o-2024-08-06",
+    "top_k": 20,
+    "unit": "session",
+    "context_chars": 160000,
+    "context_tokens": null,
+    "multi_round": "auto",
+    "count_map": "retrieved",
+    "reader": "routed",
+    "workers": 8,
+    "facts": "off",
+    "decay_engaged": false,
+    "decay_half_life_days": null,
+    "decay_time_weight": null,
+    "peak_rss_mb": 2048.0625
+  },
+  "params": {
+    "k": 20,
+    "ef": null,
+    "embedder": "gemini_gemini-embedding-001_d3072",
+    "judge": "llm_judge=gemini-text/gemini-2.5-flash_ans=gemini-text/gemini-2.5-flash",
+    "variant": "s",
+    "unit": "session",
+    "multi_round": "auto",
+    "facts": "off",
+    "count_map": "retrieved",
+    "split": "all",
+    "reader": "routed",
+    "context_tokens": null,
+    "tokenizer_model": null,
+    "count_votes": 1,
+    "context_chars_budget": 160000,
+    "system_provider": null,
+    "system_model": null,
+    "official_judge": "official=openrouter/openai/gpt-4o-2024-08-06",
+    "context_chars": 160000,
+    "decay_half_life": null,
+    "decay_time_weight": null
+  },
+  "notes": "",
+  "command": "python -m bench run longmemeval --dataset s --k 20 --embedder gemini --judge llm --judge-provider gemini-text --judge-model gemini-2.5-flash --official-judge-provider openrouter --official-judge-model openai/gpt-4o-2024-08-06 --workers 8 --limit 0 --split all --reader routed --count-map retrieved",
+  "dirty": true
+}
