@@ -9,12 +9,12 @@ Claude / OpenAI / Gemini / Ollama just by swapping the provider object.
 """
 from __future__ import annotations
 import os
-import re
 import random
 import time
 from typing import Optional, Callable
 
 from .judges import Judge, JudgeResult
+from . import lme_answer, lme_eval
 
 
 def _retry(fn: Callable, *, attempts: int = 6, base_delay: float = 2.0,
@@ -36,39 +36,10 @@ def _retry(fn: Callable, *, attempts: int = 6, base_delay: float = 2.0,
 
 # ---------------- Prompts ----------------
 
-ANSWER_SYSTEM = (
-    "You are a helpful assistant answering questions about a user's past "
-    "conversations. Use the memory context to answer the question. The "
-    "answer may require combining facts across multiple snippets, doing "
-    "arithmetic, or making reasonable inferences from what was said. "
-    "Think step by step before answering when the question requires "
-    "synthesis. Only reply 'I don't know' if the relevant facts are "
-    "genuinely absent from the context. Keep the final answer concise "
-    "(1–2 sentences) and put it on the last line."
-)
-
-ANSWER_USER_TMPL = (
-    "Memory context (snippets retrieved from past conversations, separated "
-    "by '---'):\n\n{context}\n\n"
-    "Question: {question}\n\n"
-    "Reason briefly, then give the final answer on the last line:"
-)
-
-# Modeled after the LongMemEval rubric (Xu et al., 2024). Binary judgment.
-JUDGE_SYSTEM = (
-    "You are an expert evaluator for chat-assistant memory benchmarks. "
-    "Determine whether the assistant's answer correctly addresses the "
-    "user's question, given a reference answer. Be lenient about phrasing "
-    "but strict about facts. Output a JSON object: "
-    '{"correct": true|false, "reason": "short rationale"}.'
-)
-
-JUDGE_USER_TMPL = (
-    "Question: {question}\n"
-    "Reference answer: {gold}\n"
-    "Assistant answer: {predicted}\n\n"
-    "Is the assistant answer correct?"
-)
+# The answer prompt (procedures per question category + the DAYS_BETWEEN
+# tool) is in lme_answer; both judge prompts, the official LongMemEval one
+# and the lenient one used here, are in lme_eval. All shared with
+# benchmarks/longmemeval_qa.py.
 
 
 def _provider_from_name(name: str, model: Optional[str] = None):
@@ -86,6 +57,12 @@ def _provider_from_name(name: str, model: Optional[str] = None):
     if name == "ollama":
         from feather_db.providers import OllamaProvider
         return OllamaProvider(model=model or "llama3.1:8b")
+    if name == "gemini-text":
+        from .providers_extra import GeminiTextProvider
+        return GeminiTextProvider(model=model)
+    if name == "openrouter":
+        from .providers_extra import OpenRouterProvider
+        return OpenRouterProvider(model=model)
     if name in ("azure", "azure-openai"):
         from .providers_azure import AzureChatProvider
         return AzureChatProvider(model=model)
@@ -108,89 +85,127 @@ class LLMJudge(Judge):
                  answerer_provider: Optional[str] = None,
                  model: Optional[str] = None,
                  answerer_model: Optional[str] = None,
-                 max_context_chars: int = 12_000,
-                 answer_max_tokens: int = 1024,
-                 judge_max_tokens: int = 256):
+                 max_context_chars: int = 160_000,
+                 answer_max_tokens: int = 2048,
+                 judge_max_tokens: int = 256,
+                 count_votes: int = 1,
+                 map_provider: Optional[str] = None,
+                 map_model: Optional[str] = None):
         self._judge_llm = _provider_from_name(provider, model)
         self._answer_llm = (_provider_from_name(answerer_provider, answerer_model)
                             if answerer_provider else self._judge_llm)
+        # The count map step: ~22 short calls per count question. A strong
+        # answerer need not make them; default is the answerer.
+        self._map_llm = (_provider_from_name(
+            map_provider or answerer_provider or provider, map_model)
+            if (map_provider or map_model) else self._answer_llm)
         self._max_context_chars = max_context_chars
         # 2.5-tier reasoning models (thinking mode) burn many tokens before
-        # producing the final answer; 200 is not enough. 1024 covers
-        # chain-of-thought + a concise final answer comfortably.
+        # producing the final answer; 200 is not enough. 2048 covers the
+        # counting procedure's one-line-per-instance list + a final answer.
         self._answer_max_tokens = answer_max_tokens
         self._judge_max_tokens = judge_max_tokens
+        # >1: count questions are answered this many times, majority wins.
+        self._count_votes = count_votes
         self.name = (f"llm_judge={provider}/{model or 'default'}"
                      f"_ans={answerer_provider or provider}"
-                     f"/{answerer_model or model or 'default'}")
+                     f"/{answerer_model or model or 'default'}"
+                     + (f"_map={map_provider or answerer_provider or provider}"
+                        f"/{map_model or 'default'}"
+                        if (map_provider or map_model) else ""))
+
+    def _chat(self, llm, max_tokens: int, label: str,
+              temperature: float = 0.0) -> lme_eval.Chat:
+        def chat(system: str, user: str) -> str:
+            messages = ([{"role": "system", "content": system}] if system
+                        else []) + [{"role": "user", "content": user}]
+            return _retry(lambda: llm.complete(
+                messages, max_tokens=max_tokens,
+                temperature=temperature).strip(),
+                label=label)
+        return chat
 
     # ---------------- Answer step ----------------
 
-    def answer(self, question: str, context: str) -> str:
-        # Trim context to keep token bills bounded.
+    def answer_full(self, question: str, context: str,
+                    question_date: str = "") -> tuple[str, str]:
+        """(final answer, the model's whole last reply)."""
+        # The scenarios budget their own context; this is only a backstop.
         ctx = (context or "")[: self._max_context_chars]
-        messages = [
-            {"role": "system", "content": ANSWER_SYSTEM},
-            {"role": "user",   "content": ANSWER_USER_TMPL.format(
-                context=ctx, question=question)},
-        ]
+        if self._count_votes > 1 and lme_answer.is_count_question(question):
+            # One greedy reading plus sampled ones; majority wins.
+            chats = [self._chat(self._answer_llm, self._answer_max_tokens,
+                                "answerer", 0.0 if i == 0 else 0.7)
+                     for i in range(self._count_votes)]
+            final, transcript = lme_answer.answer_vote(chats, question, ctx,
+                                                       question_date)
+            if not transcript:
+                return "[answerer error: every reading failed]", ""
+            return final, transcript
         try:
-            return _retry(
-                lambda: self._answer_llm.complete(
-                    messages, max_tokens=self._answer_max_tokens, temperature=0.0
-                ).strip(),
-                label="answerer",
-            )
+            reply = lme_answer.answer(
+                self._chat(self._answer_llm, self._answer_max_tokens,
+                           "answerer"), question, ctx, question_date)
         except Exception as e:
-            return f"[answerer error: {e}]"
+            return f"[answerer error: {e}]", ""
+        return lme_answer.final_answer(reply), reply
 
-    # ---------------- Judge step ----------------
+    def answer(self, question: str, context: str,
+               question_date: str = "") -> str:
+        """The model's FINAL ANSWER line (reasoning stripped, so the judge
+        grades the answer, not the working)."""
+        return self.answer_full(question, context, question_date)[0]
+
+    def answer_chat(self) -> lme_eval.Chat:
+        """The answer model as configured for answering (count reduce)."""
+        return self._chat(self._answer_llm, self._answer_max_tokens, "reducer")
+
+    def map_chat(self) -> lme_eval.Chat:
+        """The answer model, short and without thinking: one per session
+        in a count's map step."""
+        return self._chat(self._map_llm, 512, "mapper")
+
+    def planner_chat(self) -> lme_eval.Chat:
+        """The answer model, for lme_retrieve's follow-up queries."""
+        return self._chat(self._answer_llm, 512, "planner")
+
+    # ---------------- Judge step (lenient) ----------------
+
+    def verdict(self, question: str, gold: str, predicted: str) -> dict:
+        try:
+            return lme_eval.lenient_verdict(
+                self._chat(self._judge_llm, self._judge_max_tokens, "judge"),
+                question, str(gold or "").strip(), str(predicted or "").strip())
+        except Exception as e:
+            return {"correct": False, "raw": "", "error": str(e)}
 
     def score(self, predicted, gold, question: str = "") -> JudgeResult:
-        p = str(predicted or "").strip()
-        g = str(gold if gold is not None else "").strip()
-        if not g:
+        if not str(gold if gold is not None else "").strip():
             return JudgeResult(0.0, "empty gold")
+        v = self.verdict(question, gold, predicted)
+        if v.get("error"):
+            return JudgeResult(0.0, f"judge call failed: {v['error']}")
+        return JudgeResult(1.0 if v["correct"] else 0.0, v["raw"])
 
-        messages = [
-            {"role": "system", "content": JUDGE_SYSTEM},
-            {"role": "user",   "content": JUDGE_USER_TMPL.format(
-                question=question, gold=g, predicted=p)},
-        ]
+
+class OfficialJudge:
+    """LongMemEval's official per-type judge (lme_eval). Run it on
+    gpt-4o-2024-08-06 for numbers comparable with published ones."""
+
+    def __init__(self, provider: str = "openai",
+                 model: str = lme_eval.OFFICIAL_JUDGE_MODEL):
+        self._llm = _provider_from_name(provider, model)
+        self.name = f"official={provider}/{model}"
+
+    def verdict(self, qtype: str, question: str, gold: str, predicted: str,
+                abstention: bool) -> dict:
+        def chat(system: str, user: str) -> str:
+            # The official call: one user message, temperature 0, 10 tokens.
+            return _retry(lambda: self._llm.complete(
+                [{"role": "user", "content": user}], max_tokens=10,
+                temperature=0.0), label="official judge")
         try:
-            raw = _retry(
-                lambda: self._judge_llm.complete(
-                    messages, max_tokens=self._judge_max_tokens, temperature=0.0
-                ),
-                label="judge",
-            )
+            return lme_eval.official_verdict(chat, qtype, question, gold,
+                                             predicted, abstention)
         except Exception as e:
-            return JudgeResult(0.0, f"judge call failed: {e}")
-
-        # Robust JSON extraction — tolerate markdown fences, prose, etc.
-        score_val, reason = _parse_judge_output(raw)
-        return JudgeResult(score_val, reason)
-
-
-_JSON_BOOL_RE = re.compile(r'"correct"\s*:\s*(true|false)', re.IGNORECASE)
-
-
-def _parse_judge_output(raw: str) -> tuple[float, str]:
-    if not raw:
-        return 0.0, "empty judge response"
-    m = _JSON_BOOL_RE.search(raw)
-    if m:
-        is_correct = m.group(1).lower() == "true"
-        # try to grab reason
-        reason = ""
-        m2 = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
-        if m2:
-            reason = m2.group(1)
-        return (1.0 if is_correct else 0.0), reason or raw[:120]
-    # Fallback: scan for keywords.
-    low = raw.lower()
-    if "correct: true" in low or "is correct" in low or "correct." in low.replace("incorrect", ""):
-        return 1.0, raw[:120]
-    if "incorrect" in low or "wrong" in low or "false" in low:
-        return 0.0, raw[:120]
-    return 0.0, f"unparseable: {raw[:120]}"
+            return {"correct": False, "raw": "", "error": str(e)}
