@@ -48,6 +48,10 @@ dev = [
 examples = [
     "sentence-transformers>=2.0",
 ]
+# FEATHER_EMBED_PROVIDER=local: a CPU embedder, ~5 ms a text, no API key.
+local = [
+    "fastembed>=0.4",
+]
 # bench/: --context-tokens counts with Gemini's local tokenizer
 # (google.genai.local_tokenizer; verified on google-genai 2.34).
 bench = [

@@ -274,7 +274,7 @@ def main():
     )
     parser.add_argument(
         "--embed-provider", default=os.getenv("FEATHER_EMBED_PROVIDER"),
-        choices=["gemini", "openai", "voyage", "cohere", "ollama", "hash"],
+        choices=["gemini", "openai", "voyage", "cohere", "ollama", "local", "hash"],
         help="Real embedder for the persona engine: gemini (text-embedding-004, "
              "native 768) / openai / voyage / cohere / ollama / hash. Key from "
              "--embed-key or FEATHER_EMBED_API_KEY / GOOGLE_API_KEY / OPENAI_API_KEY. "

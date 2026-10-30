@@ -242,7 +242,7 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=4000,
                     help="token budget for the working set")
     ap.add_argument("--embed-provider", default=os.getenv("FEATHER_EMBED_PROVIDER"),
-                    choices=["gemini", "openai", "voyage", "cohere", "ollama"],
+                    choices=["gemini", "openai", "voyage", "cohere", "ollama", "local"],
                     help="real embeddings for semantic recall; without one, "
                          "recall falls back to BM25 keyword search")
     args = ap.parse_args()

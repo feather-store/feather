@@ -56,3 +56,15 @@ def test_zero_disables(counting, monkeypatch):
     embed("t"); embed("t")
     assert counting == ["t", "t"]
     assert not hasattr(embed, "stats")
+
+
+def test_local_provider_embeds_offline():
+    pytest.importorskip("fastembed")
+    embed = embedders.make_embedder("local", dim=384)
+    a, b, c = (embed(t) for t in ("the user prefers email",
+                                  "contact the user by email",
+                                  "quarterly revenue grew"))
+    assert len(a) == 384
+    dot = lambda x, y: sum(p * q for p, q in zip(x, y))
+    assert dot(a, b) > dot(a, c)       # paraphrase is nearer than an unrelated text
+    assert embed.stats["calls"] == 3

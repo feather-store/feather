@@ -22,7 +22,10 @@ A Cloud API namespace is a file: `RemoteDB(url, "acme")` is
 from __future__ import annotations
 
 import base64
+import http.client
 import json
+import select
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -164,11 +167,37 @@ class _Response:
         return json.loads(self._body) if self._body else None
 
 
-class _UrllibSession:
-    """The client's default transport: the standard library, no dependency."""
+class _StdlibSession:
+    """The client's default transport: the standard library, no dependency.
+
+    Keeps one connection per thread open between calls. A fresh connection
+    per request (what urlopen does) pays a TCP handshake, and a TLS one over
+    https, on every call: several round trips for a search that takes 0.1 ms.
+    An idle connection the server has closed is noticed before reuse and
+    replaced. The server can still close it between that check and the send;
+    then an idempotent request is sent once more on a fresh connection, as
+    urllib3 does, and a POST raises, since it may have been applied. Behind a
+    proxy from the environment it falls back to urlopen, which honours it."""
+
+    _IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
 
     def __init__(self, timeout: float):
         self.timeout = timeout
+        self._local = threading.local()
+        self._all: list = []
+        self._lock = threading.Lock()
+
+    def _conn(self, scheme: str, netloc: str):
+        conns = self._local.__dict__.setdefault("conns", {})
+        c = conns.get((scheme, netloc))
+        if c is not None and c.sock is not None and select.select([c.sock], [], [], 0)[0]:
+            c.close()       # readable while idle: the server closed it (or sent junk)
+        if c is None:
+            cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+            c = conns[(scheme, netloc)] = cls(netloc, timeout=self.timeout)
+            with self._lock:
+                self._all.append(c)
+        return c
 
     def request(self, method, url, json=None, params=None, headers=None):
         if params:
@@ -178,6 +207,26 @@ class _UrllibSession:
         if json is not None:
             data = _json_dumps(json).encode()
             hdrs["Content-Type"] = "application/json"
+        u = urllib.parse.urlsplit(url)
+        if u.scheme in urllib.request.getproxies() and not urllib.request.proxy_bypass(u.hostname or ""):
+            return self._urlopen(method, url, data, hdrs)
+        target = urllib.parse.urlunsplit(("", "", u.path or "/", u.query, ""))
+        for attempt in (0, 1):
+            c = self._conn(u.scheme, u.netloc)
+            reused = c.sock is not None
+            try:
+                c.request(method, target, body=data, headers=hdrs)
+                r = c.getresponse()
+                return _Response(r.status, r.read(), r.headers)
+            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+                c.close()
+                if not (reused and attempt == 0 and method.upper() in self._IDEMPOTENT):
+                    raise
+            except BaseException:
+                c.close()   # half-used: the next call starts a fresh connection
+                raise
+
+    def _urlopen(self, method, url, data, hdrs):
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
@@ -186,7 +235,10 @@ class _UrllibSession:
             return _Response(e.code, e.read(), e.headers)
 
     def close(self):
-        pass
+        with self._lock:
+            for c in self._all:
+                c.close()
+            self._all.clear()
 
 
 def _json_dumps(obj) -> str:
@@ -281,7 +333,8 @@ class RemoteDB:
         self.base = base_url.rstrip("/")
         self.namespace = namespace
         self._headers = {"X-API-Key": api_key} if api_key else {}
-        self._session = session if session is not None else _UrllibSession(timeout)
+        self._own_session = session is None      # a caller's session is theirs to close
+        self._session = session if session is not None else _StdlibSession(timeout)
         self._closed = False
 
     # ── plumbing ──────────────────────────────────────────────────────
@@ -309,6 +362,8 @@ class RemoteDB:
         if not self._closed and save:
             self.save()
         self._closed = True
+        if self._own_session:
+            self._session.close()
 
     @property
     def closed(self) -> bool:

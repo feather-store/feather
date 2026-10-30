@@ -297,8 +297,10 @@ and an image is only ever written by a full rewrite (new inode via rename).
 Measured, 100k×384, 10 concurrent readers (`benchmarks/readers_memory.py`):
 vectors-only DB 2,268 MB → 891 MB (737 private + 154 shared); with ~300-char
 agent text 3,547 MB → 2,283 MB. The rest is heap built at open — metadata,
-BM25 postings (rebuilt from content, now with a per-open stem cache: open
-2.1 s → 0.72 s), secondary indexes — which mapping does not reach.
+BM25 postings (rebuilt from content on the first keyword/hybrid search, not
+at open — `ensure_bm25()`; 8 bytes a posting), secondary indexes — which
+mapping does not reach. A new BM25 query entry point calls `ensure_bm25()`
+before taking `mutex_`; until the build, index updates are skipped.
 
 **Backward compatibility**: v3–v9 files load transparently (`read_base_file`
 falls through to the old reader); the first `save()` rewrites them as v10.

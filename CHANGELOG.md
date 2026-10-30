@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### RemoteDB keeps its connection open
+
+- **The default transport reuses one connection per thread.** It used
+  `urlopen`, which opens a new connection per request: a TCP handshake, plus
+  a TLS one over https, on every call. Now standard-library `http.client`
+  with keep-alive, still no dependency. Measured on localhost 0.26 → 0.14 ms
+  a call; over a network each call saves the handshake round trips. An idle
+  connection the server closed is detected before reuse and replaced; if it
+  closes between that check and the send, an idempotent request (GET, PUT,
+  DELETE) is sent once more on a fresh connection and a POST raises, since
+  it may have been applied. A proxy from the
+  environment still goes through `urlopen`. `RemoteDB.close()` now closes
+  the connections it opened. `tests/test_remote_keepalive.py`.
+
+### Performance gate
+
+- **`benchmarks/perf_gate.py`** turns the measurements behind this release's
+  speedups into checks, in ~5 s: a repeated embed never reaches the provider,
+  an open with text costs < 2.5× one without (12× before lazy BM25),
+  `RemoteDB` makes one connection for many calls, and search / keyword
+  search / a cold `Pocket.hot()` stay inside loose budgets. Every check is a
+  count or a same-run ratio, so runner speed cancels out. Runs as section 10
+  of `scripts/verify.sh` and in CI (ubuntu, 3.12); `--json` writes results.
+
+### Faster opens: BM25 built on first use
+
+- **The keyword index is built by the first keyword or hybrid search, not
+  by open.** Building it was ~0.8 s of a ~0.9 s open at 100k records with
+  text, paid by every reader process and every Cloud namespace reopen, while
+  `Pocket` and `FeatherStore` with an embedder only run vector search and
+  never query it. Measured at 100k × 384 with ~50-word records: open
+  920 → 130 ms; the first keyword search then takes the ~0.8 s once, later
+  ones 2.5 ms. A handle that never runs a keyword query never holds the
+  index in memory either. `tests/test_bm25_lazy.py`.
+
 ### Smaller BM25 index
 
 - **BM25 postings are 8 bytes, down from 16.** A posting names its document
@@ -28,6 +63,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entries, default 2048, `0` disables — the same knob and default the Cloud
   API's `EmbeddingProvider` already had. Failures are not cached; hits return
   a copy; `embed.stats` counts calls and hits. `tests/test_embedder_cache.py`.
+- **`local` embed provider.** `FEATHER_EMBED_PROVIDER=local` (or
+  `--embed-provider local`) embeds on the CPU with a small ONNX model via
+  `fastembed` (`pip install feather-db[local]`; default
+  `BAAI/bge-small-en-v1.5`, 384-d): 4–10 ms a text measured, against
+  100–300 ms for an API call, with no key and no network after the first
+  model download. Opt-in; vectors from different models are not comparable,
+  so choose one per database.
 
 ### Valid time (bitemporal records)
 
