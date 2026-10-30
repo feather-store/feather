@@ -63,10 +63,18 @@ def cmd_run(args):
             print(f"longmemeval_phase9 needs --dataset one of {sorted(LME_VARIANTS)}",
                   file=sys.stderr)
             return 2
-        questions = load_longmemeval(
-            variant=args.dataset,
-            limit=(args.limit if args.limit > 0 else None),
-        )
+        if args.split != "all" and (args.dataset != "s"
+                                    or args.limit is not None):
+            print("--split needs --dataset s and no --limit", file=sys.stderr)
+            return 2
+        questions = load_longmemeval(variant=args.dataset, limit=args.limit)
+        if args.split != "all":
+            from .datasets.lme_split import select
+            questions = select(questions, args.split)
+        count_tokens = None
+        if args.context_tokens:
+            from .tokens import gemini_counter
+            count_tokens = gemini_counter(args.tokenizer_model)
         # Embedder
         if args.embedder == "openai":
             from .embedders_openai import OpenAIEmbedder
@@ -111,10 +119,7 @@ def cmd_run(args):
             print(f"longmemeval needs --dataset one of {sorted(LME_VARIANTS)}",
                   file=sys.stderr)
             return 2
-        questions = load_longmemeval(
-            variant=args.dataset,
-            limit=(args.limit if args.limit > 0 else None),
-        )
+        questions = load_longmemeval(variant=args.dataset, limit=args.limit)
 
         # Build embedder
         if args.embedder == "openai":
@@ -200,8 +205,10 @@ def main(argv=None):
                        help="Subset queries. Use 0 for all.")
 
     # LongMemEval-specific knobs
-    p_run.add_argument("--limit", type=int, default=5,
-                       help="LongMemEval: max # questions to evaluate (0 = all).")
+    p_run.add_argument("--limit", type=lambda s: int(s) or None, default=None,
+                       help="LongMemEval: only the first N questions, for a "
+                            "smoke run (default: all; 0 also means all). A "
+                            "limited run is marked not reportable.")
     p_run.add_argument("--embedder", default="deterministic",
                        choices=["deterministic", "openai"],
                        help="LongMemEval embedder. Phase 1 = deterministic.")
@@ -221,6 +228,8 @@ def main(argv=None):
                        help="Provider for the answer-generation step. "
                             "Defaults to same as --judge-provider.")
     p_run.add_argument("--answerer-model", default=None,
+            verdict=lambda metrics, dirty: lme_reportability(
+                args, metrics, dirty),
                        help="Override answerer model.")
     p_run.add_argument("--decay-half-life", type=float, default=None,
                        help="Engage adaptive decay: half-life in days.")
@@ -245,7 +254,47 @@ def main(argv=None):
     p_rep.set_defaults(func=cmd_report)
 
     args = parser.parse_args(argv)
+    if "reportable" in result.metrics:
+        why = result.metrics["not_reportable_because"]
+        print("\n" + ("REPORTABLE: the full benchmark, official judge, "
+                      "committed code, no errors" if not why else
+                      "NOT REPORTABLE:\n" + "\n".join(f"  - {w}" for w in why)))
     return args.func(args)
+
+
+def lme_reportability(args, metrics: dict, dirty: bool) -> list[str]:
+    """Why a LongMemEval result is not a number to put next to another
+    system's: anything that changes WHAT was measured, or measured it
+    with something other than the official judge. Each of these once
+    produced a confident score that meant something else (`--limit`
+    defaulted to 5 and a "final" run scored 5 questions)."""
+    from .lme_eval import OFFICIAL_JUDGE_MODEL
+    why = []
+    if args.limit is not None:
+        why.append(f"--limit {args.limit}: the first {args.limit} questions")
+    if args.split != "all":
+        why.append(f"--split {args.split}: not all 500 questions")
+    if args.dataset == "oracle":
+        why.append("--dataset oracle: the evidence sessions are given")
+    if args.judge != "llm":
+        why.append(f"--judge {args.judge}: no LLM reader or judge")
+    if args.embedder == "deterministic":
+        why.append("--embedder deterministic: hash vectors, no semantics")
+    if not metrics.get("official_judge"):
+        why.append("no official judge: the score is the lenient one")
+    elif OFFICIAL_JUDGE_MODEL not in str(metrics["official_judge"]):
+        why.append(f"official judge is {metrics['official_judge']}, "
+                   f"not {OFFICIAL_JUDGE_MODEL}")
+    n_q, n_s = metrics.get("n_questions"), metrics.get("n_scored")
+    if n_q is not None and n_s != n_q:
+        why.append(f"{n_s} of {n_q} questions scored")
+    for key, what in (("run_errors", "failed to run (counted wrong)"),
+                      ("judge_errors", "were not judged (counted wrong)")):
+        if metrics.get(key):
+            why.append(f"{metrics[key]} questions {what}: rerun them")
+    if dirty:
+        why.append("uncommitted changes: no commit reproduces this run")
+    return why
 
 
 if __name__ == "__main__":

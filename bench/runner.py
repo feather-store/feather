@@ -54,6 +54,20 @@ def _rss_mb() -> float:
     r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # macOS reports bytes, Linux reports kilobytes.
     if sys.platform == "darwin":
+def _git_dirty() -> bool:
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL,
+            cwd=BENCH_DIR.parent).decode()
+    except Exception:
+        return False
+    # Untracked code counts (a new module is code no commit has); the
+    # bench's own output does not.
+    return any(not line[3:].startswith(("bench/results/", "bench/reports/"))
+               for line in out.splitlines() if line.strip())
+
+
         return r / (1024 * 1024)
     return r / 1024
 
@@ -69,8 +83,12 @@ class BenchRunner:
         RESULTS_DIR.mkdir(exist_ok=True)
         REPORTS_DIR.mkdir(exist_ok=True)
 
-    def run(self, fn, *, n: int, dim: int, **params) -> BenchResult:
-        """Call `fn(runner)` which populates runner.metrics and returns a dict."""
+    def run(self, fn, *, n: int, dim: int, verdict=None, **params) -> BenchResult:
+        """Call `fn(runner)` which populates runner.metrics and returns a dict.
+
+        verdict(metrics, dirty) -> reasons the result must not be reported
+        (empty: reportable). Stored in the result as `reportable` and
+        `not_reportable_because`, so a smoke run cannot pass for a score."""
         self.params.update(params)
         started = time.time()
         metrics = fn(self)
@@ -80,6 +98,11 @@ class BenchRunner:
         result = BenchResult(
             scenario=self.scenario,
             dataset=self.dataset,
+        dirty = _git_dirty()
+        if verdict is not None:
+            reasons = list(verdict(metrics, dirty))
+            metrics["reportable"] = not reasons
+            metrics["not_reportable_because"] = reasons
             n=n,
             dim=dim,
             feather_version=getattr(feather_db, "__version__", "unknown"),
@@ -95,6 +118,9 @@ class BenchRunner:
         self._persist(result)
         return result
 
+            command=" ".join([os.path.basename(sys.executable), "-m", "bench",
+                              *sys.argv[1:]]),
+            dirty=dirty,
     def _persist(self, result: BenchResult) -> None:
         stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(result.started_at))
         name = f"{result.scenario}__{result.dataset}__{stamp}.json"

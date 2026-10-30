@@ -10,14 +10,18 @@ Claude / OpenAI / Gemini / Ollama just by swapping the provider object.
 from __future__ import annotations
 import os
 import re
+import random
 import time
 from typing import Optional, Callable
 
 from .judges import Judge, JudgeResult
 
 
-def _retry(fn: Callable, *, attempts: int = 3, base_delay: float = 1.5,
-           label: str = "llm"):
+def _retry(fn: Callable, *, attempts: int = 6, base_delay: float = 2.0,
+           max_delay: float = 60.0, label: str = "llm"):
+    """Exponential backoff with jitter, ~2 minutes in all. Three tries over
+    ~4 s did not outlast a rate-limit window at 8 workers, and every call
+    that gave up became a question scored wrong."""
     last = None
     for i in range(attempts):
         try:
@@ -25,7 +29,8 @@ def _retry(fn: Callable, *, attempts: int = 3, base_delay: float = 1.5,
         except Exception as e:
             last = e
             if i + 1 < attempts:
-                time.sleep(base_delay ** (i + 1))
+                delay = min(max_delay, base_delay ** (i + 1))
+                time.sleep(delay * random.uniform(0.75, 1.25))
     raise RuntimeError(f"{label} failed after {attempts} attempts: {last}")
 
 
