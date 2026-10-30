@@ -122,9 +122,19 @@ class _Kind:
 
 
 class _Preferences(_Kind):
-    """Revised in place. The current answer is the only answer."""
+    """Revised in place. The current answer is the only answer.
 
-    def set(self, key: str, text: str, *, confidence: float = 1.0, **extra) -> str:
+    `at` is when the preference was stated, if not now. A statement older
+    than the one held is not newer information and is dropped, so
+    ingesting sessions out of order cannot roll a preference back."""
+
+    def set(self, key: str, text: str, *, confidence: float = 1.0,
+            at: Optional[float] = None, **extra) -> str:
+        if at is not None:
+            held = (self.get(key) or {}).get("since")
+            if held is not None and at < held:
+                return key
+            extra["since"] = extra["valid_at"] = at
         return self._write(key, {"text": text, "confidence": confidence, **extra})
 
 
@@ -145,7 +155,8 @@ class _Episodes(_Kind):
                 n += 1
                 key = f"{base}#{n}"
             return self._write(key, {"text": what, "outcome": outcome,
-                                     "happened_at": at, **extra}, ttl=ttl)
+                                     "happened_at": at, "valid_at": at,
+                                     **extra}, ttl=ttl)
 
     def all(self, limit: int = 100) -> list[dict]:
         """Episodes order by event time, not by write time — same as recent().
@@ -155,19 +166,23 @@ class _Episodes(_Kind):
         arbitrary order: asking for 3 returned events 298, 297, 296 rather than
         299, 298, 297.
         """
-        return [i.value for i in
-                self._mem.store.newest(self.namespace, limit, key=_event_time)]
+        return self.recent(limit)
 
     def recent(self, limit: int = 10) -> list[dict]:
         """The `limit` most recent episodes, by when they HAPPENED.
 
-        Sorted on the event time encoded in the key rather than on the value's
-        `happened_at`, so no JSON is parsed for the records that lose. An
-        episode may be backdated with `at=`, so the engine's own timestamp (when
-        it was written) is the wrong field here.
+        An episode may be backdated with `at=`, so the engine's own timestamp
+        (when it was written) is the wrong field. Each episode carries its
+        event time as the engine's valid time, so this is an index walk.
+        Episodes written before valid time existed have none; while any
+        remain, this falls back to the event time in their keys, which reads
+        and sorts the namespace.
         """
-        return [i.value for i in
-                self._mem.store.newest(self.namespace, limit, key=_event_time)]
+        store = self._mem.store
+        hits = store.newest(self.namespace, limit, by_valid=True)
+        if any("valid_at" not in h.value for h in hits):
+            hits = store.newest(self.namespace, limit, key=_event_time)
+        return [h.value for h in hits]
 
 
 class _Facts(_Kind):
@@ -175,14 +190,32 @@ class _Facts(_Kind):
     so an agent can answer 'since when' and spot a fact that keeps flipping."""
 
     def state(self, key: str, text: str, *, source: Optional[str] = None,
-              **extra) -> str:
+              at: Optional[float] = None, **extra) -> str:
+        """`at`: when the fact became true (valid time), if not now. The
+        superseded value's `until` is then that time, not the time of the
+        write, and a fact older than the current one goes into the history
+        in date order instead of replacing what is current."""
         previous = self.get(key)
         history = (previous or {}).get("supersedes", [])
+        since = at if at is not None else time.time()
+        held = (previous or {}).get("since")
+        if previous and held is not None and since < held:
+            if previous.get("text") == text or any(
+                    h.get("text") == text and h.get("since") == since
+                    for h in history):
+                return key
+            history = sorted([*history, {"text": text, "since": since,
+                                         "until": None, "source": source}],
+                             key=lambda h: h.get("since") or 0)
+            for h, nxt in zip(history, [*history[1:], {"since": held}]):
+                h["until"] = nxt.get("since")
+            return self._write(key, {**previous, "supersedes": history[-10:]})
         if previous and previous.get("text") != text:
             history = [*history, {"text": previous["text"],
-                                  "until": time.time(),
+                                  "since": held, "until": since,
                                   "source": previous.get("source")}][-10:]
         return self._write(key, {"text": text, "source": source,
+                                 "since": since, "valid_at": since,
                                  "supersedes": history, **extra})
 
     def history(self, key: str) -> list[dict]:
@@ -295,6 +328,52 @@ class AgentMemory:
             hits += self.store.search(ns, query=query, limit=limit)
         hits.sort(key=lambda h: -(h.score if h.score is not None else 0.0))
         return [h.value for h in hits[:limit]]
+
+    def ingest_facts(self, facts: Iterable[Any], *,
+                     source: Optional[str] = None) -> dict[str, int]:
+        """Route extracted facts (feather_db.extractors.Fact, e.g. from
+        SessionFactExtractor) to the kind whose lifetime fits each:
+
+            event       -> episodes, at the date it happened; the same
+                           event (entity + day) told twice is one episode
+            preference  -> preferences, keyed by subject/attribute
+            state/other -> facts, keyed by subject/attribute; a later
+                           value supersedes with its valid-from date
+
+        Every write carries the fact's valid time (`valid_at`), not the
+        time of ingest, so sessions can be ingested in any order.
+        Returns how many facts went to each kind (and how many were
+        repeats of an episode already held).
+        """
+        from feather_db.extractors import fact_key   # no import cycle at load
+        counts = {"episodes": 0, "preferences": 0, "facts": 0, "repeats": 0}
+        for f in facts:
+            m = f.metadata or {}
+            at = float(f.valid_at) if f.valid_at is not None else None
+            text = m.get("statement") or f"{f.subject} {f.predicate}: {f.object}"
+            kind = m.get("kind", "other")
+            src = source or m.get("session_id")
+            if kind == "event":
+                day = int(at if at is not None else time.time())
+                key = f"{day}_{_slug(m.get('entity') or text)}"
+                if self.store.get(self.episodes.namespace, key) is not None:
+                    counts["repeats"] += 1
+                    continue
+                self.episodes._write(key, {
+                    "text": text, "outcome": None, "happened_at": day,
+                    "valid_at": day,
+                    "entity": m.get("entity", ""), "amount": m.get("amount", ""),
+                    "own": m.get("own", True), "source": src})
+                counts["episodes"] += 1
+            elif kind == "preference":
+                self.preferences.set(_slug(fact_key(f), 80), text, at=at,
+                                     value=f.object, source=src)
+                counts["preferences"] += 1
+            else:
+                self.facts.state(_slug(fact_key(f), 80), text, at=at,
+                                 source=src, value=f.object)
+                counts["facts"] += 1
+        return counts
 
     def summary(self) -> dict[str, int]:
         """How much of each kind is held — cheap enough to log every turn."""
