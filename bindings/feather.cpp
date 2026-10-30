@@ -65,6 +65,7 @@ static py::dict metadata_to_dict(const feather::Metadata& m) {
     d["confidence"]       = m.confidence;
     d["key"]              = m.key;
     d["version"]          = m.version;
+    d["valid_at"]         = m.valid_at;
     return d;
 }
 
@@ -326,6 +327,13 @@ PYBIND11_MODULE(core, m) {
              "never reused. Pass it to DB.put_if() or a WriteBatch op's expected_version. "
              "Set by the DB: a value assigned here is ignored when the record is written.")
         .def_readwrite("timestamp",       &feather::Metadata::timestamp)
+        .def_readwrite("valid_at",        &feather::Metadata::valid_at,
+             "Valid time (unix seconds): when what this record says happened or became "
+             "true, where that differs from `timestamp` (when it was recorded). 0 = not "
+             "given. Filter with valid_after / valid_before; order with "
+             "DB.newest(by_valid=True).")
+        .def_property_readonly("valid_time", &feather::Metadata::valid_time,
+             "valid_at, or the timestamp when valid_at is 0.")
         .def_readwrite("importance",      &feather::Metadata::importance)
         .def_readwrite("type",            &feather::Metadata::type)
         .def_readwrite("source",          &feather::Metadata::source)
@@ -390,6 +398,8 @@ PYBIND11_MODULE(core, m) {
         .def_readwrite("source_prefix",    &feather::SearchFilter::source_prefix)
         .def_readwrite("timestamp_after",  &feather::SearchFilter::timestamp_after)
         .def_readwrite("timestamp_before", &feather::SearchFilter::timestamp_before)
+        .def_readwrite("valid_after",      &feather::SearchFilter::valid_after)
+        .def_readwrite("valid_before",     &feather::SearchFilter::valid_before)
         .def_readwrite("importance_gte",   &feather::SearchFilter::importance_gte)
         .def_readwrite("confidence_gte",   &feather::SearchFilter::confidence_gte)
         .def_readwrite("tags_contains",    &feather::SearchFilter::tags_contains)
@@ -590,7 +600,7 @@ PYBIND11_MODULE(core, m) {
              "record. With vec as add(); without, the metadata replaces the record's, "
              "keeping its edges when meta has none. Returns (id, version).")
         .def("newest", [](const feather::DB& db, const std::string& ns, size_t limit, bool prefix,
-                          py::object before) {
+                          py::object before, bool by_valid) {
                  std::optional<std::pair<int64_t, uint64_t>> cursor;
                  if (py::isinstance<py::tuple>(before)) {
                      auto t = before.cast<py::tuple>();
@@ -599,12 +609,14 @@ PYBIND11_MODULE(core, m) {
                      cursor = std::make_pair(before.cast<int64_t>(), uint64_t{0});   // older than ts
                  }
                  py::gil_scoped_release rel;
-                 return db.newest(ns, limit, prefix, cursor);
+                 return db.newest(ns, limit, prefix, cursor, by_valid);
              }, py::arg("namespace") = "", py::arg("limit") = 10, py::arg("prefix") = false,
-             py::arg("before") = py::none(),
+             py::arg("before") = py::none(), py::arg("by_valid") = false,
              "Ids of the `limit` newest live records in `namespace` (prefix=True: and every "
              "namespace below it), newest first by (timestamp, id). `before` pages: a "
              "timestamp, or the (timestamp, id) of the last record of the previous page. "
+             "by_valid=True orders by (valid_time, id) instead — when it happened, not "
+             "when it was written — and `before` is then a valid time. "
              "An ordered index walk, not a scan and sort.")
         .def("namespace_ann_info", [](const feather::DB& db) {
                  feather::DB::NsAnnInfo i;
