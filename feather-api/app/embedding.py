@@ -319,6 +319,12 @@ class EmbeddingProvider:
                 self._api_key = ""
         return self.snapshot()
 
+    def key_for(self, provider: str) -> str:
+        """The configured API key if `provider` is the configured provider,
+        else "". Lets the describe service reuse a Gemini key set here."""
+        with self._lock:
+            return self._api_key if self.provider == provider else ""
+
     def _cfg(self) -> _Cfg:
         with self._lock:
             cfg = _Cfg(provider=self.provider, model=self.model, base_url=self.base_url,
