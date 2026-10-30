@@ -11,7 +11,7 @@ Schema per question (from the official repo):
     question_id          : str
     question_type        : str  e.g. "single-session-user", "multi-session",
                                 "temporal-reasoning", "knowledge-update",
-                                "_abs" suffix on abstention questions
+                                (abstention is "_abs" in question_id)
     question             : str
     answer               : str   gold reference answer
     question_date        : str   ISO timestamp the question was posed
@@ -131,7 +131,7 @@ def iter_history_turns(question: dict) -> Iterator[tuple[str, str, str, str, str
             )
 
 
-def question_type_axis(qtype: str) -> str:
+def question_type_axis(qtype: str, question_id: str = "") -> str:
     """Map question_type to one of the LongMemEval ability axes.
 
     The cleaned dataset ships these question types:
@@ -139,9 +139,12 @@ def question_type_axis(qtype: str) -> str:
         multi-session                                   -> multi-session-reasoning
         temporal-reasoning                              -> temporal-reasoning
         knowledge-update                                -> knowledge-updates
-        *_abs (if present)                              -> abstention
+        "_abs" in question_id                           -> abstention
+
+    Abstention is marked only in the question_id (30 of 500, typed as
+    their underlying category), as in the official evaluate_qa.py.
     """
-    if qtype.endswith("_abs"):
+    if "_abs" in (question_id or "") or qtype.endswith("_abs"):
         return "abstention"
     base = qtype
     if base in ("single-session-user",
