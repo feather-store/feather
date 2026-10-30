@@ -13,8 +13,7 @@
 [![HuggingFace Space](https://img.shields.io/badge/demo-HuggingFace-yellow)](https://huggingface.co/spaces/Hawky-ai/feather-db)
 [![Benchmark Results](https://img.shields.io/badge/dataset-benchmarks-orange)](https://huggingface.co/datasets/Hawky-ai/feather-db-benchmarks)
 
-[![LongMemEval_S](https://img.shields.io/badge/LongMemEval__S-0.693%20%7C%20gpt--4o-success)](docs/benchmarks/longmemeval.md)
-[![LongMemEval_S Cheap](https://img.shields.io/badge/LongMemEval__S-0.657%20%7C%20gemini--flash-success)](docs/benchmarks/longmemeval.md)
+[![LongMemEval_S](https://img.shields.io/badge/LongMemEval__S-0.912%20%7C%20gemini--2.5--flash-success)](#memory-benchmark--longmemeval-xu-et-al-2024)
 [![ANN p50](https://img.shields.io/badge/SIFT1M%20p50-0.19ms-blue)](docs/benchmarks/longmemeval.md)
 [![ANN Recall](https://img.shields.io/badge/recall%4010-0.972-blue)](docs/benchmarks/longmemeval.md)
 
@@ -59,6 +58,34 @@ in-process.
 Integrations that already exist: an **MCP server** for Claude Desktop and Claude
 Code, and a **LangGraph `BaseStore`** — cross-thread agent memory in one line,
 `builder.compile(store=FeatherStore(...))`.
+
+---
+
+## What's New in v0.22 — Valid Time & Structured Agent Memory
+
+| Capability | Notes |
+|---|---|
+| **Valid time** | `Metadata.valid_at` records *when something happened*, beside `timestamp` (when it was recorded). Indexed per namespace (`db.newest(ns, n, by_valid=True)`), filterable (`FilterBuilder().valid_between(after, before)`), and exposed over the Cloud API and `RemoteDB`. Stored as a reserved attribute, so **no file-format or WAL change**. |
+| **Fact routing into `AgentMemory`** | `mem.ingest_facts(facts)` sends each extracted fact to the kind whose lifetime fits: events → episodes (deduplicated), preferences → preferences, the rest → facts with supersession. Every write carries the fact's valid time, so sessions can be ingested in any order. |
+| **Dated writes** | `mem.facts.state(..., at=ts)` and `mem.preferences.set(..., at=ts)`; an older `at` never overwrites a newer value. `episodes.recent()` / `all()` walk the valid-time index instead of sorting the namespace. |
+| **`SessionFactExtractor`** | Dated facts from a whole session, each with `kind`, canonical `entity`, `amount` and own-vs-mentioned; `ledger()` and `profile()` render them for a prompt. |
+| **File ingest (Cloud API)** | `POST /v1/{ns}/ingest_file` stores an image, video, audio, PDF or text file by what a multimodal model sees in it; there is an upload modal in the admin SPA. Hybrid search embeds the query server-side when no vector is given. |
+| **LongMemEval_S: 0.912** | All 500 questions, official GPT-4o judge. See [Benchmarks](#memory-benchmark--longmemeval-xu-et-al-2024). |
+
+```python
+from feather_db.integrations import AgentMemory
+from feather_db.extractors import SessionFactExtractor
+
+facts = SessionFactExtractor(provider).extract_session(turns, session_date)
+mem.ingest_facts(facts)            # {'episodes': 3, 'preferences': 1, 'facts': 4, 'repeats': 0}
+
+db.newest("user_842", 10, by_valid=True)                     # by when it happened
+f = FilterBuilder().namespace("user_842").valid_between(after=t0).build()
+```
+
+Nothing was removed or renamed. On `PUT`, an omitted `valid_at` keeps the stored
+value, so clients that predate the field can't erase it. Builds older than 0.22
+see it as an extra attribute named `"\0valid_at"` and write it back intact.
 
 ---
 
@@ -175,7 +202,9 @@ See [docs/quickstart.md](docs/quickstart.md) for a self-hosted setup walkthrough
 | **MCP Server** | `feather-serve` — connects Feather to Claude Desktop, Cursor, and any MCP client |
 | **LangChain / LlamaIndex** | Drop-in `FeatherVectorStore`, `FeatherMemory`, `FeatherRetriever` adapters |
 | **Self-Aligned Context Engine** | LLM-powered ingestion: auto-classifies, scores, links, and namespaces every record |
-| **Single-file persistence** | `.feather` binary format (v9, persisted HNSW graph for fast cold load + optional int8 compression on-disk and in-RAM); v3–v8 files load transparently |
+| **Valid time** | `valid_at` per record — indexed, filterable, ordered by when it happened rather than when it was written |
+| **Agent memory** | `Pocket` working sets, `AgentMemory`'s five kinds with enforced lifetimes, `ingest_facts()` routing |
+| **Single-file persistence** | `.feather` binary format **v10**: append-only commits behind two checksummed headers, so a save writes only what changed; persisted HNSW graph, optional int8 on-disk and in-RAM; v3–v9 files load transparently |
 
 ---
 
@@ -598,7 +627,7 @@ feather save   --db my.feather
 | Recall@10 (500K × 128-dim, ef=50, real SIFT) | **0.972** |
 | Max vectors per modality | unbounded — capacity grows adaptively (starts 4096) |
 | HNSW params | M=16, ef_construction=200, ef=50 (default in v0.8.0) |
-| File format | Binary `.feather` v9 (persisted HNSW graph: 5–25× faster cold load; optional int8: ~3× smaller on disk, ~1.7× less RAM) |
+| File format | Binary `.feather` v10 (append-only commits: 0.42 MB written per save instead of 176 MB at 100k×384; persisted HNSW graph; optional int8) |
 
 SIMD (AVX2/AVX512) optimizations are available in `space_l2.h`. Enable with `-DUSE_AVX -march=native` in `setup.py`.
 
@@ -612,30 +641,32 @@ Reproducible benchmark harness lives in [`bench/`](./bench/). Run any benchmark 
 
 500-question end-to-end memory QA benchmark, the standard for long-term memory in chat assistants. Full report: [`docs/benchmarks/longmemeval.md`](./docs/benchmarks/longmemeval.md).
 
-| Run | Variant | Answerer | Overall | Notes |
-|---|---|---|---|---|
-| Feather DB v0.8.0 + decay | **S** | gpt-4o | **0.693** | best run; same model as Supermemory |
-| Feather DB v0.8.0 + decay | **S** | gemini-2.5-flash | **0.657** | cheap-tier; ~$2.40 per full run |
-| Feather DB v0.8.0 + decay | oracle | gemini-2.5-flash | 0.670 | retrieval-easy ceiling |
+**0.912 on LongMemEval_S**: all 500 questions, scored by the paper's official judge (`gpt-4o-2024-08-06`), with gemini-2.5-flash as the reader. Retrieval used Gemini embeddings and the top 20 sessions, packed up to 160k characters. 0 failed questions; the evidence was fully in context for 99.4% of them.
+
+| Feather configuration (S, all 500, official judge) | Overall | |
+|---|---|---|
+| **Single reader + evidence packing** (v0.22 default) | **0.912** | +0.8 vs baseline: 23 fixed, 19 broken (McNemar p = 0.64, within noise) |
+| Single reader, baseline | 0.904 | |
+| Routed reader + count map-reduce | 0.794 | a regression: **not shipped**, kept only to reproduce it |
+
+By question type (0.912 run): task-averaged 0.910, abstention 0.900.
 
 | System | Variant | Answerer | Overall |
 |---|---|---|---|
-| **Feather DB v0.8.0 + decay** | **S** | **gemini-2.5-flash** | **0.657** |
-| Zep (graphiti) | S | gpt-4o-mini | 0.638 |
-| Full-context GPT-4o (paper "ceiling") | S | gpt-4o + CoN | 0.640 |
-| Full-context GPT-4o-mini | S | gpt-4o-mini | 0.554 |
-| Mem0 (prior algo) | S | gpt-4o-mini | 0.678 |
+| **Feather DB v0.22** | **S** | **gemini-2.5-flash** | **0.912** |
 | Supermemory | S | gpt-4o | 0.816 |
+| Mem0 (prior algo) | S | gpt-4o-mini | 0.678 |
+| Full-context GPT-4o (paper "ceiling") | S | gpt-4o + CoN | 0.640 |
+| Zep (graphiti) | S | gpt-4o-mini | 0.638 |
+| Full-context GPT-4o-mini | S | gpt-4o-mini | 0.554 |
+| Feather DB v0.8.0 + decay (earlier) | S | gemini-2.5-flash | 0.657 |
 
-Cost for the full Feather S run: **~$2.40** (Azure embeddings + Gemini answer + judge). Wall time 4.5 hours. 5 failures / 500 questions.
+Other systems' numbers are as they report them. The 0.912 run was made on a tree that was not yet committed, so the harness marks it *not reportable*. `scripts/lme_final.sh` reruns it on a committed tree, refuses to report a short or partly failed run, and compares the result with the 0.904 baseline on all 500 and on the held-out 400. Per-question records are in [`bench/results/`](./bench/results/) (`longmemeval__s__20261030_152859__questions.jsonl`).
 
-Reproduce:
+Reproduce (needs `OPENROUTER_API_KEY` for the official judge and `GOOGLE_API_KEY` or `GEMINI_API_KEY`):
 ```bash
-python -m bench run longmemeval --dataset s --limit 0 \
-  --embedder openai --judge llm \
-  --judge-provider gemini --judge-model gemini-2.0-flash \
-  --answerer-provider gemini --answerer-model gemini-2.5-flash \
-  --decay-half-life 14 --decay-time-weight 0.4 --k 10
+scripts/lme_final.sh               # all 500, official judge, checked for completeness
+scripts/lme_dev.sh                 # the 100-question dev split, for trying a change first
 ```
 
 ### ANN benchmark — SIFT1M
@@ -749,33 +780,25 @@ feather-db-cli (FFI via extern "C" from src/feather_core.cpp)
 
 ## File Format
 
+`.feather` **v10** is append-only. Two checksummed 64-byte headers sit at the
+front, and each commit appends typed, length-prefixed sections, then switches
+to the other header. A save writes only what changed: dirty graph slots,
+metadata records and salience updates. A crash mid-commit falls back to the
+previous header, and the WAL redoes the commit.
+
 ```
-[magic: 4B = "FEAT"] [version: 4B = 8]
---- Metadata Section ---
-[meta_count: 4B]
-  for each record:
-    [id: 8B] [serialized Metadata including namespace/entity/attributes/edges]
---- Modality Indices Section ---
-[modal_count: 4B]
-  for each modality:
-    [name_len: 2B] [name: N bytes]
-    [dim: 4B] [quantized: 1B]            # on-disk int8 flag (v7+)
-    [int8_ram: 1B] [scale: 4B if int8_ram]   # in-RAM int8 flag + global scale (v8+)
-    [persist_graph: 1B]                  # v9: 1 → prebuilt HNSW graph blob follows
-    if persist_graph:                    # fast cold load — no rebuild
-      [HNSW graph: header + base layer (vectors) + per-element link lists]
-    else:
-      [element_count: 4B]
-      for each element:
-        [id: 8B] then, per `quantized`:
-          0 → [float32 vector: dim * 4 bytes]
-          1 → [scale: 4B float] [int8 vector: dim bytes]
+[0,    4096)  header slot 0      magic "FEAT" | version 10 | generation | committed end | xxh64
+[4096, 8192)  header slot 1
+[8192, end)   sections: [type u32][flags u32][payload_len u64][payload][xxh64]
+              MODALITY · GRAPH · META · SALIENCE · VECTORS · VERSIONS · IDEMPOTENCY · FULLVEC
 ```
 
-v3–v8 files load transparently (the `quantized` flag is read for v7+, the
-`int8_ram` flag for v8+, the `persist_graph` flag for v9+); missing fields
-default to empty. The graph is persisted only for a clean, non-on-disk-quantized
-modality; otherwise load rebuilds it (parallel).
+Superseded bytes stay until a vacuum: `db.vacuum()`, or automatically once the
+file passes `FEATHER_VACUUM_RATIO` × the live size. Read-only handles map the
+vector image, so many reader processes share one copy through the page cache.
+v3–v9 files load transparently, and the first `save()` rewrites them as v10.
+`FEATHER_FORMAT=9` keeps writing v9. The full layout is in
+[`include/format_v10.h`](./include/format_v10.h).
 
 ---
 
@@ -783,7 +806,7 @@ modality; otherwise load rebuilds it (parallel).
 
 | Issue | Detail |
 |-------|--------|
-| No concurrent writes | HNSW is not thread-safe for simultaneous adds |
+| One writer per file | Writes are serialised within a process; a second writer *process* is refused (readers are unlimited) |
 | Soft deletes reclaimed on compaction | `forget()`/`purge()` mark vectors deleted; space is reclaimed by `compact()` or `set_auto_compact(ratio)` |
 | int8 quantization (two kinds) | `set_quantized()` = smaller files; `set_int8_ram()` = ~1.7× less RAM (opt-in, lossy) |
 | Index capacity | Adaptive (v0.15.3): starts at 4096, grows via `resizeIndex` on demand — no hard cap, RAM tracks the working set |
