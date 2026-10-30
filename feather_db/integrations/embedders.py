@@ -9,7 +9,11 @@ the Cloud API's plain vector endpoints) and handy for the local backend too.
     embed = make_embedder("gemini", api_key=KEY, dim=768)
     vec = embed("some text")          # -> list[float], length == dim
 
-Providers: gemini, openai, voyage, cohere, ollama, hash (deterministic, no key).
+Providers: gemini, openai, voyage, cohere, ollama, local, hash (deterministic,
+no key). `local` runs a small ONNX model on the CPU (`pip install fastembed`;
+bge-small, 384-d, ~4-10 ms a text against 100-300 ms for an API call, no key,
+works offline). Vectors from different models are not comparable: pick one
+per database.
 Provider embedders keep an LRU of recent texts (`FEATHER_EMBED_CACHE` entries,
 default 2048, 0 disables), as the Cloud API does: an agent re-embeds the same
 query and the same memory text turn after turn, and each miss is a 100-300 ms
@@ -36,6 +40,7 @@ _DEFAULT_MODELS = {
     "voyage":  "voyage-3-lite",
     "cohere":  "embed-english-v3.0",
     "ollama":  "nomic-embed-text",
+    "local":   "BAAI/bge-small-en-v1.5",
 }
 
 
@@ -122,6 +127,18 @@ def _hash_embedder(dim: int) -> Callable[[str], List[float]]:
     return embed
 
 
+def _local_embedder(model: str, dim: int) -> Callable[[str], List[float]]:
+    try:
+        from fastembed import TextEmbedding
+    except ImportError:
+        raise RuntimeError("local embedder needs fastembed: pip install fastembed")
+    m = TextEmbedding(model)            # loads now, so a bad name fails at startup
+
+    def embed(text: str) -> List[float]:
+        return _fit(next(iter(m.embed([text]))).tolist(), dim)
+    return embed
+
+
 def default_embedder(dim: int = 768, *, provider: Optional[str] = None,
                      model: Optional[str] = None):
     """Build an embedder from the environment, or return None if none is set.
@@ -151,9 +168,12 @@ def make_embedder(provider: str, model: Optional[str] = None,
     provider = (provider or "hash").lower()
     if provider in ("hash", "none", ""):
         return _hash_embedder(dim)
+    if provider == "local":
+        return _cached(_local_embedder(model or _DEFAULT_MODELS["local"], dim),
+                       int(os.getenv("FEATHER_EMBED_CACHE", "2048")))
     if provider not in _DRIVERS:
         raise ValueError(f"unknown embed provider: {provider} "
-                         f"(choose from {', '.join(_DRIVERS)} or hash)")
+                         f"(choose from {', '.join(_DRIVERS)}, local or hash)")
     model = model or _DEFAULT_MODELS[provider]
     key = (api_key or os.getenv("FEATHER_EMBED_API_KEY") or {
         "openai": os.getenv("OPENAI_API_KEY"),
