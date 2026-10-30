@@ -98,6 +98,19 @@ struct Metadata {
         return k;
     }
 
+    // Valid time: when what the record says happened or became true, as
+    // opposed to `timestamp`, when it was recorded (transaction time). A
+    // session on 2023/05/14 saying "last Saturday I went to a wedding" is
+    // recorded 05/14 and valid 05/06. 0 = not given: valid_time() is then
+    // the timestamp. Serialized as the reserved attribute VALID_ATTR
+    // (decimal), for the reasons `key` is.
+    int64_t valid_at = 0;
+    static const std::string& valid_attr() {
+        static const std::string k("\0valid_at", 9);
+        return k;
+    }
+    int64_t valid_time() const { return valid_at ? valid_at : timestamp; }
+
     Metadata() : timestamp(0), importance(1.0f), type(ContextType::FACT),
                  recall_count(0), last_recalled_at(0),
                  ttl(0), confidence(1.0f) {}
@@ -126,6 +139,7 @@ private:
         namespace_id = o.namespace_id; entity_id = o.entity_id;
         attributes = o.attributes; edges = o.edges;
         ttl = o.ttl; confidence = o.confidence; version = o.version; key = o.key;
+        valid_at = o.valid_at;
         recall_count.store(o.recalls(), std::memory_order_relaxed);
         last_recalled_at.store(o.recalled_at(), std::memory_order_relaxed);
     }
@@ -136,6 +150,7 @@ private:
         namespace_id = std::move(o.namespace_id); entity_id = std::move(o.entity_id);
         attributes = std::move(o.attributes); edges = std::move(o.edges);
         ttl = o.ttl; confidence = o.confidence; version = o.version; key = std::move(o.key);
+        valid_at = o.valid_at;
         recall_count.store(o.recalls(), std::memory_order_relaxed);
         last_recalled_at.store(o.recalled_at(), std::memory_order_relaxed);
     }
