@@ -109,6 +109,12 @@ class MetadataIn(BaseModel):
     # short-lived agent run scope needs.
     confidence: float = Field(1.0, ge=0.0, le=1.0)
     ttl: int = Field(0, ge=0, description="Seconds from timestamp; 0 = never expires")
+    valid_at: Optional[int] = Field(
+        None, description="Valid time (unix seconds): when what the record says happened or "
+                          "became true, where that differs from timestamp (when it was "
+                          "recorded). 0 = none (the timestamp stands in). On PUT, omitted "
+                          "keeps the record's, like key: a client that predates the field "
+                          "must not erase it.")
 
 
 class MetadataOut(MetadataIn):
@@ -119,6 +125,7 @@ class MetadataOut(MetadataIn):
     edges: List[EdgeIn] = Field(default_factory=list)
     key: str = Field("", description="Native key (unique within namespace_id), if the "
                      "record was written under one. Kept by PUT, like the edges.")
+    valid_at: int = 0
     version: int = Field(0, description="Compare-and-set version: changes on every write "
                          "to the record, never reused. Send it back as If-Match, or as a "
                          "batch op's expected_version.")
@@ -169,6 +176,8 @@ class SearchRequest(VectorInput):
     tags_contains: Optional[List[str]] = None
     timestamp_after: Optional[int] = None
     timestamp_before: Optional[int] = None
+    valid_after: Optional[int] = None    # valid time: when it happened
+    valid_before: Optional[int] = None
     # Scoring
     scoring_half_life: Optional[float] = None    # days
     scoring_weight: Optional[float] = None       # 0.0–1.0
@@ -212,9 +221,14 @@ class KeywordSearchRequest(BaseModel):
     tags_contains: Optional[List[str]] = None
     timestamp_after: Optional[int] = None
     timestamp_before: Optional[int] = None
+    valid_after: Optional[int] = None    # valid time: when it happened
+    valid_before: Optional[int] = None
 
 
 class HybridSearchRequest(VectorInput):
+    """BM25 over content fused with vector search. Omit `vector` and the server
+    embeds `query` with the configured embedding provider."""
+    VECTOR_REQUIRED: ClassVar[bool] = False
     query: str
     k: int = Field(
         10, ge=1, le=1000,
@@ -226,9 +240,6 @@ class HybridSearchRequest(VectorInput):
     modality: str = "text"
     include_metadata: bool = True
     # Filters
-    """BM25 over content fused with vector search. Omit `vector` and the server
-    embeds `query` with the configured embedding provider."""
-    VECTOR_REQUIRED: ClassVar[bool] = False
     namespace_id: Optional[str] = None
     types: Optional[List[int]] = Field(None, description="ContextType values to keep (0 fact, 1 preference, 2 event, 3 conversation).")
     namespace_prefix: Optional[str] = Field(None, description="This namespace and every one below it ('.' separates levels: 'acme.u1' matches 'acme.u1.prefs', not 'acme.u10'). Ranked inside them, not filtered from a global top-k.")
@@ -241,6 +252,8 @@ class HybridSearchRequest(VectorInput):
     tags_contains: Optional[List[str]] = None
     timestamp_after: Optional[int] = None
     timestamp_before: Optional[int] = None
+    valid_after: Optional[int] = None    # valid time: when it happened
+    valid_before: Optional[int] = None
     # Scoring
     scoring_half_life: Optional[float] = None
     scoring_weight: Optional[float] = None

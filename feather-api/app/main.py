@@ -504,7 +504,7 @@ def verify_api_key(x_api_key: str = Header(default="")):
 # silently discarded — see the import path and MetadataIn.model_config.
 _METADATA_KEYS = {
     "timestamp", "importance", "type", "source", "content", "tags_json",
-    "namespace_id", "entity_id", "attributes", "confidence", "ttl",
+    "namespace_id", "entity_id", "attributes", "confidence", "ttl", "valid_at",
     # accepted on input and ignored (server-owned), but not an error to send back
     "recall_count", "last_recalled_at", "links",
 }
@@ -526,6 +526,7 @@ def _meta_from_model(m_in, default_ns: str = "") -> Metadata:
     meta.entity_id       = m_in.entity_id
     meta.confidence      = m_in.confidence
     meta.ttl             = m_in.ttl
+    meta.valid_at        = getattr(m_in, "valid_at", None) or 0
     if getattr(m_in, "key", None):
         meta.key = m_in.key
     if getattr(m_in, "recall_count", None) is not None:
@@ -549,6 +550,8 @@ def _keep_identity(meta: Metadata, m_in, old) -> None:
         meta.edges = list(old.edges)
     if m_in is None or m_in.key is None:
         meta.key = getattr(old, "key", "")
+    if m_in is None or getattr(m_in, "valid_at", None) is None:
+        meta.valid_at = getattr(old, "valid_at", 0)
 
 
 def _with_version(response: Response, body: dict, result) -> dict:
@@ -573,6 +576,7 @@ def _meta_to_model(meta: Metadata) -> MetadataOut:
         attributes      = dict(meta.attributes),
         confidence      = meta.confidence,
         ttl             = meta.ttl,
+        valid_at        = meta.valid_at,
         recall_count    = meta.recall_count,
         last_recalled_at= meta.last_recalled_at,
         links           = list(meta.links),
@@ -589,6 +593,8 @@ def _build_filter(req: SearchRequest) -> Optional[SearchFilter]:
         req.entity_id, req.attributes_match,
         req.source, req.source_prefix, req.importance_gte,
         req.tags_contains, req.timestamp_after, req.timestamp_before,
+        getattr(req, "valid_after", None) is not None,
+        getattr(req, "valid_before", None) is not None,
         getattr(req, "confidence_gte", None) is not None,
     ])
     if not has_filter:
@@ -610,6 +616,10 @@ def _build_filter(req: SearchRequest) -> Optional[SearchFilter]:
     if req.tags_contains:     f.tags_contains   = req.tags_contains
     if req.timestamp_after:   f.timestamp_after = req.timestamp_after
     if req.timestamp_before:  f.timestamp_before = req.timestamp_before
+    if getattr(req, "valid_after", None) is not None:
+        f.valid_after = req.valid_after
+    if getattr(req, "valid_before", None) is not None:
+        f.valid_before = req.valid_before
     return f
 
 
@@ -1499,12 +1509,15 @@ def get_by_key(namespace: str, key: str, key_namespace: str = ""):
 
 @app.get("/v1/{namespace}/newest", tags=["records"], dependencies=[Depends(verify_api_key)])
 def newest(namespace: str, metadata_namespace: str = "", limit: int = 10, prefix: bool = False,
-           before_ts: Optional[int] = None, before_id: Optional[int] = None):
-    """Ids of the `limit` newest live records, newest first by (timestamp, id).
-    `before_ts` (+ `before_id`) pages from the last record of a previous page."""
+           before_ts: Optional[int] = None, before_id: Optional[int] = None,
+           by_valid: bool = False):
+    """Ids of the `limit` newest live records, newest first by (timestamp, id),
+    or with `by_valid` by (valid time, id). `before_ts` (+ `before_id`) pages
+    from the last record of a previous page."""
     db = _db_or_404(namespace)
     before = None if before_ts is None else ((before_ts, before_id) if before_id is not None else before_ts)
-    return {"ids": db.newest(metadata_namespace, max(0, min(limit, 10_000)), prefix=prefix, before=before)}
+    return {"ids": db.newest(metadata_namespace, max(0, min(limit, 10_000)), prefix=prefix,
+                             before=before, by_valid=by_valid)}
 
 
 @app.get("/v1/{namespace}/ids", tags=["records"], dependencies=[Depends(verify_api_key)])
@@ -1793,6 +1806,9 @@ def _keyword_search_impl(namespace: str, req):
 @app.post("/v1/{namespace}/hybrid_search", response_model=SearchResponse, tags=["search"],
           dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(HybridSearchRequest))
 async def hybrid_search(namespace: str, request: Request):
+    """With no `vector`, the server embeds `query` with the configured
+    provider: the same model that embedded /ingest_text and /ingest_file
+    records, so a client needs no embedding model of its own to search them."""
     req = await parse_body(request, HybridBody)
     q = None
     if not req.has_vector():
@@ -1806,9 +1822,6 @@ def _hybrid_search_impl(namespace: str, req, q=None):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
-    """With no `vector`, the server embeds `query` with the configured
-    provider: the same model that embedded /ingest_text and /ingest_file
-    records, so a client needs no embedding model of its own to search them."""
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
     sf = _build_filter(req)
@@ -2158,6 +2171,12 @@ async def ingest_text(namespace: str, req: IngestTextRequest, response: Response
     The embedding call is awaited (no thread is held while the provider
     responds) and coalesced with concurrent ingests into one provider request
     by the micro-batcher; only the engine write runs on the write pool."""
+    vec = await _embed_or_raise(req.text)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_WRITE_POOL, _store_ingested, namespace, req, vec, idem, response)
+
+
+async def _embed_or_raise(text: str):
     try:
         return await EMBED_BATCHER.embed(text)
     except UpstreamError as e:
@@ -2171,12 +2190,6 @@ def _upstream_error(e: UpstreamError) -> HTTPException:
     # a retry (503); refused (bad key or model) is our misconfiguration
     # (502), and retrying it only adds load.
     if e.transient:
-    vec = await _embed_or_raise(req.text)
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_WRITE_POOL, _store_ingested, namespace, req, vec, idem, response)
-
-
-async def _embed_or_raise(text: str):
         return errors.APIError(503, str(e), "upstream_unavailable", headers={"Retry-After": "1"})
     return errors.APIError(502, str(e), "upstream_error")
 
@@ -2411,19 +2424,6 @@ def _store_file(namespace: str, meta, vec, modality: str, idem: Idem,
     return out
 
 
-def _bulk_import_impl(namespace: str, req):
-    """Bulk insert N records. Each item has an id and EITHER a precomputed
-    `vector` (must match the namespace dim) OR `metadata.content`, which is
-    embedded server-side via the configured provider. Without this, records
-    pasted as plain text (no vector) were silently skipped and the namespace
-    stayed empty."""
-    db = manager.get(namespace)
-    # No padding: an established dim is authoritative; otherwise the first
-    # supplied (or embedded) vector defines it — any dimension is allowed.
-    locked_dim = _established_dim(db, req.modality)
-    skipped = 0
-    embedded = 0
-    errors: List[str] = []
 @app.post("/v1/{namespace}/import", response_model=ImportResponse, tags=["records"],
           dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(ImportRequest))
 async def bulk_import(namespace: str, request: Request):
@@ -2437,6 +2437,19 @@ async def bulk_import(namespace: str, request: Request):
     return await _in_write_pool(_bulk_import_impl, namespace, req)
 
 
+def _bulk_import_impl(namespace: str, req):
+    """Bulk insert N records. Each item has an id and EITHER a precomputed
+    `vector` (must match the namespace dim) OR `metadata.content`, which is
+    embedded server-side via the configured provider. Without this, records
+    pasted as plain text (no vector) were silently skipped and the namespace
+    stayed empty."""
+    db = manager.get(namespace)
+    # No padding: an established dim is authoritative; otherwise the first
+    # supplied (or embedded) vector defines it — any dimension is allowed.
+    locked_dim = _established_dim(db, req.modality)
+    skipped = 0
+    embedded = 0
+    errors: List[str] = []
 
     def _err(i, msg):
         nonlocal skipped
@@ -2530,6 +2543,7 @@ async def bulk_import(namespace: str, request: Request):
         meta.entity_id    = str(md.get("entity_id", ""))
         meta.confidence   = float(md.get("confidence", 1.0))
         meta.ttl          = int(md.get("ttl", 0))
+        meta.valid_at     = int(md.get("valid_at", 0) or 0)
         if md.get("key"):
             meta.key = str(md["key"])
         for k, v in (md.get("attributes") or {}).items():
