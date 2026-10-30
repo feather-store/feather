@@ -10,6 +10,10 @@ the Cloud API's plain vector endpoints) and handy for the local backend too.
     vec = embed("some text")          # -> list[float], length == dim
 
 Providers: gemini, openai, voyage, cohere, ollama, hash (deterministic, no key).
+Provider embedders keep an LRU of recent texts (`FEATHER_EMBED_CACHE` entries,
+default 2048, 0 disables), as the Cloud API does: an agent re-embeds the same
+query and the same memory text turn after turn, and each miss is a 100-300 ms
+round trip — more than the search it feeds, by two orders of magnitude.
 The returned vector is padded/truncated to `dim` so it always matches the
 namespace dimension. For an exact native match use Gemini `text-embedding-004`
 (768) or OpenAI `text-embedding-3-small` with `dim=768` (it supports a
@@ -22,6 +26,8 @@ import json
 import hashlib
 import urllib.request
 import urllib.error
+from collections import OrderedDict
+from threading import Lock
 from typing import Callable, List, Optional
 
 _DEFAULT_MODELS = {
@@ -163,4 +169,38 @@ def make_embedder(provider: str, model: Optional[str] = None,
 
     def embed(text: str) -> List[float]:
         return _fit(driver(text, model, key, dim, base_url), dim)
-    return embed
+    return _cached(embed, int(os.getenv("FEATHER_EMBED_CACHE", "2048")))
+
+
+def _cached(embed: Callable[[str], List[float]], cap: int) -> Callable[[str], List[float]]:
+    """Wrap `embed` in a thread-safe LRU keyed by the text's SHA-256.
+
+    One wrapper serves one (provider, model, dim, base_url), so the text is the
+    whole key. Failures are not cached. Each hit returns a copy, so a caller
+    that edits its vector in place cannot change what the next caller gets.
+    `embed.stats` counts calls and hits."""
+    if cap <= 0:
+        return embed
+    cache: "OrderedDict[bytes, List[float]]" = OrderedDict()
+    lock = Lock()
+    stats = {"calls": 0, "cache_hits": 0}
+
+    def cached(text: str) -> List[float]:
+        k = hashlib.sha256((text or "").encode("utf-8")).digest()
+        with lock:
+            stats["calls"] += 1
+            v = cache.get(k)
+            if v is not None:
+                cache.move_to_end(k)
+                stats["cache_hits"] += 1
+                return list(v)
+        v = embed(text)                       # outside the lock: never serialise I/O
+        with lock:
+            cache[k] = v
+            cache.move_to_end(k)
+            while len(cache) > cap:
+                cache.popitem(last=False)
+        return list(v)
+
+    cached.stats = stats
+    return cached
