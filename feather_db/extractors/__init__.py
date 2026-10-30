@@ -23,6 +23,8 @@ from .base import (
 )
 from .temporal import TemporalParser
 from .facts import FactExtractor
+from .session_facts import (SessionFactExtractor, link_validity, fact_key,
+                            timeline, ledger, profile)
 from .entities import EntityResolver
 from .ontology import OntologyLinker
 from .contradictions import ContradictionResolver
@@ -33,6 +35,8 @@ __all__ = [
     "ContradictionFinding",
     "TemporalParser",
     "FactExtractor",
+    "SessionFactExtractor", "link_validity", "fact_key", "timeline",
+    "ledger", "profile",
     "EntityResolver",
     "OntologyLinker",
     "ContradictionResolver",
