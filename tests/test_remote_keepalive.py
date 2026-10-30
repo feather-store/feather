@@ -5,6 +5,7 @@ every call. These run a real HTTP/1.1 server and count accepted connections.
 """
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -15,6 +16,12 @@ from feather_db.remote import RemoteDB
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"          # keep-alive
     close_next = False
+    close_all = False
+    closed = threading.Event()
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.do_GET()
 
     def do_GET(self):
         body = json.dumps({"size": 7}).encode()
@@ -23,9 +30,14 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        if type(self).close_next:          # an idle timeout, as a proxy would
+        if type(self).close_next or type(self).close_all:   # closes, unannounced
             type(self).close_next = False
             self.close_connection = True
+
+    def finish(self):
+        super().finish()
+        if self.close_connection:
+            type(self).closed.set()
 
     def log_message(self, *a):
         pass
@@ -66,11 +78,39 @@ def test_one_connection_for_many_calls(server):
 def test_server_closed_idle_connection_is_replaced(server):
     url, accepted = server
     db = RemoteDB(url, "ns")
+    _Handler.closed.clear()
     _Handler.close_next = True
     assert _call(db) == 7                 # the server closes after answering
+    assert _Handler.closed.wait(5)        # ...and the close lands while idle
+    time.sleep(0.05)
     assert _call(db) == 7                 # no error: a fresh connection is used
     assert _call(db) == 7
     assert len(accepted) == 2
+
+
+def test_close_racing_the_send(server, monkeypatch):
+    """The server closes between the liveness check and the send."""
+    url, accepted = server
+
+    def landed():                         # the close has reached the socket
+        assert _Handler.closed.wait(5)
+        _Handler.closed.clear()
+        time.sleep(0.05)
+
+    _Handler.close_all = True             # every connection dies after one answer
+    try:
+        _Handler.closed.clear()
+        db = RemoteDB(url, "ns")
+        assert _call(db) == 7
+        landed()
+        monkeypatch.setattr("feather_db.remote.select.select", lambda *a: ([], [], []))
+        assert db._call("GET", "/stats")["size"] == 7     # idempotent: sent again
+        landed()
+        with pytest.raises((ConnectionError, OSError)):   # may have been applied
+            db._call("POST", "/stats", body={})
+        assert len(accepted) == 2
+    finally:
+        _Handler.close_all = False
 
 
 def test_close_releases_connection(server):

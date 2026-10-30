@@ -174,9 +174,12 @@ class _StdlibSession:
     per request (what urlopen does) pays a TCP handshake, and a TLS one over
     https, on every call: several round trips for a search that takes 0.1 ms.
     An idle connection the server has closed is noticed before reuse and
-    replaced, so no request goes out on a dead socket and nothing is ever
-    resent. Behind a proxy from the environment it falls back to urlopen,
-    which honours it."""
+    replaced. The server can still close it between that check and the send;
+    then an idempotent request is sent once more on a fresh connection, as
+    urllib3 does, and a POST raises, since it may have been applied. Behind a
+    proxy from the environment it falls back to urlopen, which honours it."""
+
+    _IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
 
     def __init__(self, timeout: float):
         self.timeout = timeout
@@ -207,15 +210,21 @@ class _StdlibSession:
         u = urllib.parse.urlsplit(url)
         if u.scheme in urllib.request.getproxies() and not urllib.request.proxy_bypass(u.hostname or ""):
             return self._urlopen(method, url, data, hdrs)
-        c = self._conn(u.scheme, u.netloc)
-        try:
-            c.request(method, urllib.parse.urlunsplit(("", "", u.path or "/", u.query, "")),
-                      body=data, headers=hdrs)
-            r = c.getresponse()
-            return _Response(r.status, r.read(), r.headers)
-        except BaseException:
-            c.close()       # half-used: the next call starts a fresh connection
-            raise
+        target = urllib.parse.urlunsplit(("", "", u.path or "/", u.query, ""))
+        for attempt in (0, 1):
+            c = self._conn(u.scheme, u.netloc)
+            reused = c.sock is not None
+            try:
+                c.request(method, target, body=data, headers=hdrs)
+                r = c.getresponse()
+                return _Response(r.status, r.read(), r.headers)
+            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+                c.close()
+                if not (reused and attempt == 0 and method.upper() in self._IDEMPOTENT):
+                    raise
+            except BaseException:
+                c.close()   # half-used: the next call starts a fresh connection
+                raise
 
     def _urlopen(self, method, url, data, hdrs):
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)

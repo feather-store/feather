@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a TLS one over https, on every call. Now standard-library `http.client`
   with keep-alive, still no dependency. Measured on localhost 0.26 → 0.14 ms
   a call; over a network each call saves the handshake round trips. An idle
-  connection the server closed is detected before reuse and replaced, so no
-  request is sent on a dead socket and none is resent. A proxy from the
+  connection the server closed is detected before reuse and replaced; if it
+  closes between that check and the send, an idempotent request (GET, PUT,
+  DELETE) is sent once more on a fresh connection and a POST raises, since
+  it may have been applied. A proxy from the
   environment still goes through `urlopen`. `RemoteDB.close()` now closes
   the connections it opened. `tests/test_remote_keepalive.py`.
 
