@@ -48,6 +48,13 @@ dev = [
 examples = [
     "sentence-transformers>=2.0",
 ]
+# bench/: --context-tokens counts with Gemini's local tokenizer
+# (google.genai.local_tokenizer; verified on google-genai 2.34).
+bench = [
+    "google-genai>=2.34",
+    "sentencepiece>=0.2",
+    "protobuf>=4.0",
+]
 langgraph = [
     "langgraph>=0.2.0",
 ]
