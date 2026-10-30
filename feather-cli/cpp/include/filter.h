@@ -14,6 +14,10 @@ struct SearchFilter {
     std::optional<std::string> source_prefix;
     std::optional<int64_t> timestamp_after;
     std::optional<int64_t> timestamp_before;
+    // Valid time (Metadata::valid_time()): when it happened, not when it
+    // was recorded. Inclusive, like the timestamp bounds.
+    std::optional<int64_t> valid_after;
+    std::optional<int64_t> valid_before;
     std::optional<float> importance_gte;
     // Metadata::confidence has been persisted since Phase 2 but was never
     // filterable, so a caller could store how certain a fact was and then had
@@ -51,6 +55,8 @@ struct SearchFilter {
         if (source_prefix && meta.source.find(*source_prefix) != 0) return false;
         if (timestamp_after && meta.timestamp < *timestamp_after) return false;
         if (timestamp_before && meta.timestamp > *timestamp_before) return false;
+        if (valid_after && meta.valid_time() < *valid_after) return false;
+        if (valid_before && meta.valid_time() > *valid_before) return false;
         if (importance_gte && meta.importance < *importance_gte) return false;
         if (confidence_gte && meta.confidence < *confidence_gte) return false;
 
