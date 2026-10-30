@@ -1,0 +1,120 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "s",
+  "n": 500,
+  "dim": 3072,
+  "feather_version": "0.21.0",
+  "python_version": "3.12.15",
+  "platform": "Darwin arm64",
+  "commit": "1ab37d8",
+  "started_at": 1793346367.061941,
+  "wall_seconds": 1261.5710091590881,
+  "metrics": {
+    "n_scored": 500,
+    "overall_official": 0.904,
+    "by_question_type_official": {
+      "knowledge-update": 0.9103,
+      "multi-session": 0.8271,
+      "single-session-assistant": 0.9821,
+      "single-session-preference": 0.9,
+      "single-session-user": 0.9714,
+      "temporal-reasoning": 0.9098
+    },
+    "task_averaged_official": 0.9168,
+    "abstention_official": 0.8333,
+    "overall_lenient": 0.876,
+    "by_question_type_lenient": {
+      "knowledge-update": 0.8846,
+      "multi-session": 0.8271,
+      "single-session-assistant": 0.9643,
+      "single-session-preference": 0.8667,
+      "single-session-user": 0.9429,
+      "temporal-reasoning": 0.8496
+    },
+    "task_averaged_lenient": 0.8892,
+    "abstention_lenient": 0.8333,
+    "judge_agreement": 0.968,
+    "official_only_correct": 15,
+    "lenient_only_correct": 1,
+    "evidence_fully_in_context": 0.9681,
+    "evidence_fully_retrieved": 0.9979,
+    "multi_round_questions": 243,
+    "multi_round_evidence_round1": 0.991,
+    "multi_round_evidence_final": 0.955,
+    "failure_buckets": {
+      "reader_wrong": 39,
+      "retrieval_miss": 8,
+      "judge_disagreement": 1
+    },
+    "failure_buckets_by_type": {
+      "knowledge-update": {
+        "reader_wrong": 7
+      },
+      "multi-session": {
+        "retrieval_miss": 4,
+        "reader_wrong": 18,
+        "judge_disagreement": 1
+      },
+      "single-session-assistant": {
+        "reader_wrong": 1
+      },
+      "single-session-preference": {
+        "reader_wrong": 3
+      },
+      "single-session-user": {
+        "reader_wrong": 2
+      },
+      "temporal-reasoning": {
+        "reader_wrong": 8,
+        "retrieval_miss": 4
+      }
+    },
+    "questions_file": "/Users/apple/OpenSource/memory/feather/bench/results/longmemeval__s__20261030_131554__questions.jsonl",
+    "overall": 0.904,
+    "headline_judge": "official",
+    "by_axis": {
+      "abstention": 0.8333,
+      "information-extraction": 0.96,
+      "knowledge-updates": 0.9167,
+      "multi-session-reasoning": 0.8347,
+      "temporal-reasoning": 0.9134
+    },
+    "per_q_seconds_p50": 19.078000000000003,
+    "per_q_seconds_mean": 19.914878,
+    "n_questions": 500,
+    "n_failures": 0,
+    "failures_sample": [],
+    "history_turns_total": 246738,
+    "embeddings_emitted": 247572,
+    "embedder": "gemini_gemini-embedding-001_d3072",
+    "judge": "llm_judge=gemini-text/gemini-2.5-flash_ans=gemini-text/gemini-2.5-flash",
+    "official_judge": "official=openrouter/openai/gpt-4o-2024-08-06",
+    "top_k": 20,
+    "unit": "session",
+    "context_chars": 160000,
+    "multi_round": "auto",
+    "workers": 8,
+    "facts": "off",
+    "decay_engaged": false,
+    "decay_half_life_days": null,
+    "decay_time_weight": null,
+    "peak_rss_mb": 2008.84375
+  },
+  "params": {
+    "k": 20,
+    "ef": null,
+    "embedder": "gemini_gemini-embedding-001_d3072",
+    "judge": "llm_judge=gemini-text/gemini-2.5-flash_ans=gemini-text/gemini-2.5-flash",
+    "variant": "s",
+    "unit": "session",
+    "multi_round": "auto",
+    "facts": "off",
+    "system_provider": null,
+    "system_model": null,
+    "official_judge": "official=openrouter/openai/gpt-4o-2024-08-06",
+    "context_chars": 160000,
+    "decay_half_life": null,
+    "decay_time_weight": null
+  },
+  "notes": ""
+}

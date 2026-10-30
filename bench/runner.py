@@ -32,6 +32,10 @@ class BenchResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     params: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
+    # The exact invocation, and whether `commit` alone reproduces it:
+    # a run on a dirty tree measured code that no commit contains.
+    command: str = ""
+    dirty: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -48,6 +52,20 @@ def _git_commit() -> str:
         return out
     except Exception:
         return "unknown"
+
+
+def _git_dirty() -> bool:
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL,
+            cwd=BENCH_DIR.parent).decode()
+    except Exception:
+        return False
+    # Untracked code counts (a new module is code no commit has); the
+    # bench's own output does not.
+    return any(not line[3:].startswith(("bench/results/", "bench/reports/"))
+               for line in out.splitlines() if line.strip())
 
 
 def _rss_mb() -> float:
@@ -69,13 +87,22 @@ class BenchRunner:
         RESULTS_DIR.mkdir(exist_ok=True)
         REPORTS_DIR.mkdir(exist_ok=True)
 
-    def run(self, fn, *, n: int, dim: int, **params) -> BenchResult:
-        """Call `fn(runner)` which populates runner.metrics and returns a dict."""
+    def run(self, fn, *, n: int, dim: int, verdict=None, **params) -> BenchResult:
+        """Call `fn(runner)` which populates runner.metrics and returns a dict.
+
+        verdict(metrics, dirty) -> reasons the result must not be reported
+        (empty: reportable). Stored in the result as `reportable` and
+        `not_reportable_because`, so a smoke run cannot pass for a score."""
         self.params.update(params)
         started = time.time()
         metrics = fn(self)
         elapsed = time.time() - started
         metrics.setdefault("peak_rss_mb", _rss_mb())
+        dirty = _git_dirty()
+        if verdict is not None:
+            reasons = list(verdict(metrics, dirty))
+            metrics["reportable"] = not reasons
+            metrics["not_reportable_because"] = reasons
 
         result = BenchResult(
             scenario=self.scenario,
@@ -91,6 +118,9 @@ class BenchRunner:
             metrics=metrics,
             params=self.params,
             notes=self.notes,
+            command=" ".join([os.path.basename(sys.executable), "-m", "bench",
+                              *sys.argv[1:]]),
+            dirty=dirty,
         )
         self._persist(result)
         return result

@@ -26,6 +26,16 @@ class FilterBuilder:
     def before(self, ts):
         self._filter.timestamp_before = int(ts)
         return self
+
+    def valid_between(self, after=None, before=None):
+        """By valid time — when it happened, not when it was recorded
+        (Metadata.valid_at, else the timestamp). Inclusive; either bound
+        may be omitted."""
+        if after is not None:
+            self._filter.valid_after = int(after)
+        if before is not None:
+            self._filter.valid_before = int(before)
+        return self
     
     def min_importance(self, v):
         self._filter.importance_gte = float(v)

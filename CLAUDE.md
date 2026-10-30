@@ -377,6 +377,18 @@ address keyed records through `db.upsert()` / `id_for()` / `WriteBatch` key
 refs, and from Python through `feather_db.keys`, which also finds and adopts
 records written at the old hashed ids.
 
+**Valid time** (`Metadata.valid_at`, 0.22): when what a record says
+happened or became true, where `timestamp` is when it was recorded. 0 = not
+given; `valid_time()` then falls back to the timestamp. Serialized as the
+reserved attribute `"\0valid_at"` (decimal) for the same reason as `key`, so
+no format, WAL or downgrade change. `valid_index_` orders each namespace by
+`(valid_time(), id)` beside `time_index_` (maintained in `index_meta` /
+`deindex_meta`); `newest(..., by_valid=True)` walks it, and `SearchFilter`
+has `valid_after` / `valid_before`. A new filter field must also go into
+`namespace_only()`, or a namespace graph walk skips it. `FeatherStore` maps a
+numeric `valid_at` in an item's value onto it; `AgentMemory` writes one for
+episodes (event time) and for dated facts and preferences.
+
 **CRITICAL GOTCHA**: `meta.attributes['k'] = v` silently does nothing in Python (pybind11 returns a copy of the map). Always use `meta.set_attribute(key, value)` and `meta.get_attribute(key)`.
 
 **Backward-compat**: Python `meta.links` property still works (returns list of target IDs from edges).
@@ -1109,7 +1121,7 @@ If the feature is agent-facing, it probably belongs in `feather_db/pocket.py`,
 | BM25 is Porter-stemmed, not semantic | plurals and verb forms now match (`creative`/`creatives`, `running`/`run`, `policy`/`policies`), but Porter does not unify every derivational pair — `allergy` still does not find `allergic` (it stems to `allergi` vs `allerg`). A paraphrase with no shared root still returns nothing, indistinguishable from "never stored" — set `FEATHER_EMBED_PROVIDER` for anything relying on paraphrase. `FEATHER_STEM=0` restores exact matching. Tokens over 64 chars are left unstemmed — a blob or id is not a word, and folding it kept a superlinear term on the ingest and load paths |
 | Namespace graphs are rebuilt after every open | not persisted: the first filtered search on a large namespace after a reopen queues a background build (~6 s at 50k × 384) and scans until it finishes |
 | ~~BM25 cannot match a record by its KEY~~ | **Fixed in 0.22**: native keys (`Metadata.key`) are BM25-indexed with the content (`bm25_text()`) |
-| `newest(key=...)` still scans | the `(timestamp, id)` index serves the engine timestamp only; a custom key (episodes' event time) reads and sorts the namespace |
+| `newest(key=...)` still scans | a custom key reads and sorts the namespace. Episodes no longer need one: they order by valid time (`by_valid=True`), except that a namespace holding episodes written before 0.22 (no `valid_at`) falls back to the key scan |
 | `all()` ties within one second | the engine timestamp is whole seconds, so items written in the same second order arbitrarily. `_Episodes` overrides this using the event time in the key; sub-second ordering needs format v10's second timestamp |
 
 ---
@@ -1160,4 +1172,4 @@ cd p-test && ./run_tests.sh   # Rust CLI tests
 | Phase 7 | Done | Secondary metadata indexes, pre-filtered ANN, auto-compaction (v0.11.0), on-disk int8 quantization / format v7 (v0.12.0) |
 | Phase 8 | Done | Parallel load + `add_batch`, SIMD-on-x86 (v0.13.0), in-RAM int8 / format v8 (v0.15.0), Claude MCP connector + real embedders (v0.14–v0.15), adaptive index capacity (v0.15.3), persisted HNSW graph / format v9 (v0.16.0) |
 | Phase 9 | Done | Agent memory: `Pocket` hot/warm/cache tiering, `FeatherStore` (LangGraph `BaseStore`), `AgentMemory`'s five kinds, `feather-agent` MCP server for SDK 2.0 tested over the real protocol, inter-process file locking (v0.19–v0.20) |
-| Phase 10 | In progress | Format v10 **done**: append-only commits, two checksummed headers, typed length-prefixed sections, incremental saves, vacuum. Still planned on top of it (new section types): metric tag, typed attributes, bitemporal — which also turns three `FeatherStore` Python workarounds into engine features: namespace-prefix indexing, typed attributes for real comparisons, a second timestamp. Plus multi-tenant auth, in-RAM int8 SIMD distance |
+| Phase 10 | In progress | Format v10 **done**: append-only commits, two checksummed headers, typed length-prefixed sections, incremental saves, vacuum. Valid time **done** (0.22, `Metadata.valid_at`, indexed + filterable; a reserved attribute, no format change). Still planned: metric tag, typed attributes for real comparisons, sub-second timestamps. Plus multi-tenant auth, in-RAM int8 SIMD distance |

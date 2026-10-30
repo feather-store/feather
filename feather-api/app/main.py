@@ -30,6 +30,7 @@ import os
 import time
 import asyncio
 import functools
+import hashlib
 import logging
 import pathlib
 import tempfile
@@ -59,6 +60,7 @@ from .metrics import METRICS, classify, namespace_from_path
 from . import writes
 from .writes import Idem, Op
 from .embedding import EMBEDDING, EMBED_BATCHER, SUPPORTED_MODELS, UpstreamError
+from . import describe
 from .fastparse import (parse_body, SearchBody, HybridBody, KeywordBody,
                         ContextChainBody, AddVectorBody, ImportBody)
 
@@ -502,7 +504,7 @@ def verify_api_key(x_api_key: str = Header(default="")):
 # silently discarded — see the import path and MetadataIn.model_config.
 _METADATA_KEYS = {
     "timestamp", "importance", "type", "source", "content", "tags_json",
-    "namespace_id", "entity_id", "attributes", "confidence", "ttl",
+    "namespace_id", "entity_id", "attributes", "confidence", "ttl", "valid_at",
     # accepted on input and ignored (server-owned), but not an error to send back
     "recall_count", "last_recalled_at", "links",
 }
@@ -524,6 +526,7 @@ def _meta_from_model(m_in, default_ns: str = "") -> Metadata:
     meta.entity_id       = m_in.entity_id
     meta.confidence      = m_in.confidence
     meta.ttl             = m_in.ttl
+    meta.valid_at        = getattr(m_in, "valid_at", None) or 0
     if getattr(m_in, "key", None):
         meta.key = m_in.key
     if getattr(m_in, "recall_count", None) is not None:
@@ -547,6 +550,8 @@ def _keep_identity(meta: Metadata, m_in, old) -> None:
         meta.edges = list(old.edges)
     if m_in is None or m_in.key is None:
         meta.key = getattr(old, "key", "")
+    if m_in is None or getattr(m_in, "valid_at", None) is None:
+        meta.valid_at = getattr(old, "valid_at", 0)
 
 
 def _with_version(response: Response, body: dict, result) -> dict:
@@ -571,6 +576,7 @@ def _meta_to_model(meta: Metadata) -> MetadataOut:
         attributes      = dict(meta.attributes),
         confidence      = meta.confidence,
         ttl             = meta.ttl,
+        valid_at        = meta.valid_at,
         recall_count    = meta.recall_count,
         last_recalled_at= meta.last_recalled_at,
         links           = list(meta.links),
@@ -587,6 +593,8 @@ def _build_filter(req: SearchRequest) -> Optional[SearchFilter]:
         req.entity_id, req.attributes_match,
         req.source, req.source_prefix, req.importance_gte,
         req.tags_contains, req.timestamp_after, req.timestamp_before,
+        getattr(req, "valid_after", None) is not None,
+        getattr(req, "valid_before", None) is not None,
         getattr(req, "confidence_gte", None) is not None,
     ])
     if not has_filter:
@@ -608,6 +616,10 @@ def _build_filter(req: SearchRequest) -> Optional[SearchFilter]:
     if req.tags_contains:     f.tags_contains   = req.tags_contains
     if req.timestamp_after:   f.timestamp_after = req.timestamp_after
     if req.timestamp_before:  f.timestamp_before = req.timestamp_before
+    if getattr(req, "valid_after", None) is not None:
+        f.valid_after = req.valid_after
+    if getattr(req, "valid_before", None) is not None:
+        f.valid_before = req.valid_before
     return f
 
 
@@ -1497,12 +1509,15 @@ def get_by_key(namespace: str, key: str, key_namespace: str = ""):
 
 @app.get("/v1/{namespace}/newest", tags=["records"], dependencies=[Depends(verify_api_key)])
 def newest(namespace: str, metadata_namespace: str = "", limit: int = 10, prefix: bool = False,
-           before_ts: Optional[int] = None, before_id: Optional[int] = None):
-    """Ids of the `limit` newest live records, newest first by (timestamp, id).
-    `before_ts` (+ `before_id`) pages from the last record of a previous page."""
+           before_ts: Optional[int] = None, before_id: Optional[int] = None,
+           by_valid: bool = False):
+    """Ids of the `limit` newest live records, newest first by (timestamp, id),
+    or with `by_valid` by (valid time, id). `before_ts` (+ `before_id`) pages
+    from the last record of a previous page."""
     db = _db_or_404(namespace)
     before = None if before_ts is None else ((before_ts, before_id) if before_id is not None else before_ts)
-    return {"ids": db.newest(metadata_namespace, max(0, min(limit, 10_000)), prefix=prefix, before=before)}
+    return {"ids": db.newest(metadata_namespace, max(0, min(limit, 10_000)), prefix=prefix,
+                             before=before, by_valid=by_valid)}
 
 
 @app.get("/v1/{namespace}/ids", tags=["records"], dependencies=[Depends(verify_api_key)])
@@ -1791,11 +1806,19 @@ def _keyword_search_impl(namespace: str, req):
 @app.post("/v1/{namespace}/hybrid_search", response_model=SearchResponse, tags=["search"],
           dependencies=[Depends(verify_api_key)], openapi_extra=_body_doc(HybridSearchRequest))
 async def hybrid_search(namespace: str, request: Request):
+    """With no `vector`, the server embeds `query` with the configured
+    provider: the same model that embedded /ingest_text and /ingest_file
+    records, so a client needs no embedding model of its own to search them."""
     req = await parse_body(request, HybridBody)
-    return await run_in_threadpool(_retry_closed, _hybrid_search_impl, namespace, req)
+    q = None
+    if not req.has_vector():
+        if not req.query.strip():
+            raise HTTPException(422, "give `vector`, or a non-empty `query` to embed")
+        q = await _embed_or_raise(req.query)
+    return await run_in_threadpool(_retry_closed, _hybrid_search_impl, namespace, req, q)
 
 
-def _hybrid_search_impl(namespace: str, req):
+def _hybrid_search_impl(namespace: str, req, q=None):
     try:
         db = manager.get(namespace, create=False)
     except KeyError:
@@ -1803,7 +1826,7 @@ def _hybrid_search_impl(namespace: str, req):
 
     sf = _build_filter(req)
     sc = _build_scoring(req)
-    q = req.vector_array()
+    q = req.vector_array() if q is None else np.asarray(q, dtype=np.float32)
     _check_query_dim(db, q, req.modality)
     raw = db.hybrid_search(q, req.query, k=req.k,
                             rrf_k=req.rrf_k, filter=sf, scoring=sc,
@@ -2148,19 +2171,27 @@ async def ingest_text(namespace: str, req: IngestTextRequest, response: Response
     The embedding call is awaited (no thread is held while the provider
     responds) and coalesced with concurrent ingests into one provider request
     by the micro-batcher; only the engine write runs on the write pool."""
-    try:
-        vec = await EMBED_BATCHER.embed(req.text)
-    except UpstreamError as e:
-        # The provider failed, not the request. Rate-limited or down is worth
-        # a retry (503); refused (bad key or model) is our misconfiguration
-        # (502), and retrying it only adds load.
-        if e.transient:
-            raise errors.APIError(503, str(e), "upstream_unavailable", headers={"Retry-After": "1"})
-        raise errors.APIError(502, str(e), "upstream_error")
-    except RuntimeError as e:
-        raise HTTPException(400, str(e))
+    vec = await _embed_or_raise(req.text)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_WRITE_POOL, _store_ingested, namespace, req, vec, idem, response)
+
+
+async def _embed_or_raise(text: str):
+    try:
+        return await EMBED_BATCHER.embed(text)
+    except UpstreamError as e:
+        raise _upstream_error(e)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+
+
+def _upstream_error(e: UpstreamError) -> HTTPException:
+    # The provider failed, not the request. Rate-limited or down is worth
+    # a retry (503); refused (bad key or model) is our misconfiguration
+    # (502), and retrying it only adds load.
+    if e.transient:
+        return errors.APIError(503, str(e), "upstream_unavailable", headers={"Retry-After": "1"})
+    return errors.APIError(502, str(e), "upstream_error")
 
 
 def _store_ingested(namespace: str, req: IngestTextRequest, vec, idem: Idem = Idem(),
@@ -2194,6 +2225,203 @@ def _store_ingested(namespace: str, req: IngestTextRequest, vec, idem: Idem = Id
         r = writes.prior(db, idem) or writes.apply(
             db, [Op("put", rec_id, meta, np.asarray(vec, dtype=np.float32), req.modality)], idem, body)
     return _with_version(response, body, r)
+
+
+MAX_INGEST_FILE_BYTES = int(os.getenv("FEATHER_MAX_INGEST_FILE_MB", "512")) * 1024 * 1024
+# What a file's record keeps as content (BM25 reads all of it) and how much of
+# that is embedded (embedding models read ~2k tokens; the most descriptive
+# fields come first, see describe.compose).
+INGEST_MAX_CHARS = int(os.getenv("FEATHER_INGEST_MAX_CHARS", "40000"))
+INGEST_EMBED_CHARS = int(os.getenv("FEATHER_INGEST_EMBED_CHARS", "8000"))
+
+
+@app.post("/v1/{namespace}/ingest_file", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+async def ingest_file(
+    namespace: str,
+    request: Request,
+    response: Response,
+    file: UploadFile = File(..., description="Image, video, audio, PDF or text file."),
+    metadata: Optional[str] = Form(
+        None, description="JSON object, as `metadata` on /ingest_text. Its `content`, if any, "
+                          "is kept ahead of the description; its `tags_json` is merged."),
+    modality: str = Form("text"),
+    refresh: bool = Form(False, description="Describe the file again even if this record "
+                                            "already holds a description of the same bytes."),
+):
+    """Store a file by what is IN it, not by its name.
+
+    The file is read: text as is; images, video, audio and PDFs by a
+    multimodal model (describe.py), which writes down what it shows and says,
+    including every word of visible text and speech. That description is the
+    record's content (so /keyword_search finds exact words) and is embedded
+    (so /hybrid_search with just `query` finds it by meaning). The file name
+    is kept as the `file_name` attribute and is never searched.
+
+    The record is keyed `file:<sha256>` in its namespace unless `metadata.key`
+    says otherwise, so uploading the same file again updates it instead of
+    adding a duplicate, and reuses the stored description unless `refresh`.
+    The file itself is not stored: keep it in your object store and put its
+    URL in `metadata.attributes`."""
+    m_in = None
+    if metadata and metadata.strip():
+        try:
+            m_in = _metadata_in(json.loads(metadata))
+        except ValueError:
+            raise HTTPException(422, "metadata is not valid JSON")
+    filename = file.filename or ""
+    mime = describe.resolve_mime(file.content_type, filename)
+    kind = describe.kind_of(mime)
+    if kind is None:
+        raise errors.APIError(415, f"cannot read {mime} files: send an image, video, audio, "
+                                   f"PDF or text file", "unsupported_media_type")
+    sha, size = await run_in_threadpool(_hash_upload, file.file)
+    if size == 0:
+        raise HTTPException(400, "the file is empty")
+
+    fp = hashlib.sha256(
+        f"ingest_file {namespace}\n{sha}\n{modality}\n{refresh}\n{metadata or ''}".encode()).hexdigest()
+    idem = writes.idempotency_of(request, fp)
+    prep = await run_in_threadpool(_retry_closed, _prepare_file_record,
+                                   namespace, m_in, sha, idem, refresh, response)
+    if isinstance(prep, dict):                       # an Idempotency-Key replay
+        return prep
+    meta, prior_desc, caller_content = prep
+
+    described_by = ""
+    if prior_desc is not None:
+        desc_text = prior_desc
+    else:
+        desc_text, tags, colors, described_by = await _read_file(file.file, size, mime, kind, filename)
+        meta.set_attribute("described_by", described_by)
+        if colors:
+            meta.set_attribute("colors", ", ".join(colors))
+        meta.tags_json = _merge_tags(meta.tags_json, tags)
+    desc_text = desc_text[:INGEST_MAX_CHARS]
+    content = f"{caller_content}\n\n{desc_text}" if caller_content else desc_text
+    meta.content = content
+    meta.set_attribute("described_chars", str(len(desc_text)))
+    meta.set_attribute("file_name", filename)
+    meta.set_attribute("mime_type", mime)
+    meta.set_attribute("media_kind", kind)
+    meta.set_attribute("file_sha256", sha)
+    meta.set_attribute("file_bytes", str(size))
+
+    vec = await _embed_or_raise(content[:INGEST_EMBED_CHARS])
+    body = {"namespace": namespace, "key": meta.key, "file_name": filename, "mime_type": mime,
+            "kind": kind, "bytes": size, "described": prior_desc is None,
+            "described_by": described_by or meta.get_attribute("described_by", ""),
+            "content": content, "embedded": True, "dim": len(vec)}
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_WRITE_POOL, _store_file, namespace, meta, vec,
+                                      modality, idem, response, body)
+
+
+def _hash_upload(f) -> Tuple[str, int]:
+    """sha256 and size of the received upload, enforcing the size cap. Runs on
+    a worker thread (Starlette has already spooled a large upload to disk)."""
+    h, size = hashlib.sha256(), 0
+    f.seek(0)
+    while True:
+        chunk = f.read(1 << 20)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > MAX_INGEST_FILE_BYTES:
+            raise HTTPException(413, f"file exceeds {MAX_INGEST_FILE_BYTES // (1024*1024)} MB limit")
+        h.update(chunk)
+    f.seek(0)
+    return h.hexdigest(), size
+
+
+def _prepare_file_record(namespace: str, m_in, sha: str, idem: Idem, refresh: bool,
+                         response: Response):
+    """The record to write, the description to reuse (None: describe the
+    file), and the caller's own content. Or, for a replayed Idempotency-Key,
+    the first attempt's response."""
+    db = manager.get(namespace)
+    r = writes.prior(db, idem)
+    if r is not None:
+        return writes.respond(response, {}, r, lambda r: {"id": r.ids[-1], "version": r.versions[-1]})
+    meta = _meta_from_model(m_in, namespace) if m_in else Metadata()
+    if not m_in:
+        meta.namespace_id = namespace
+        meta.timestamp = int(time.time())
+    if not meta.key:
+        meta.key = f"file:{sha}"
+    if not meta.source:
+        meta.source = "ingest_file"
+    caller_content = (meta.content or "").strip()
+
+    prior_desc = None
+    old = db.get_by_key(meta.key, meta.namespace_id)
+    if old is not None and not refresh and old.get_attribute("file_sha256", "") == sha:
+        n = old.get_attribute("described_chars", "")
+        if n.isdigit() and 0 < int(n) <= len(old.content):
+            # Same bytes, already described: the description is the tail of
+            # its content. Carry what came with it, and the caller's tags.
+            prior_desc = old.content[len(old.content) - int(n):]
+            for k in ("described_by", "colors"):
+                if old.get_attribute(k, ""):
+                    meta.set_attribute(k, old.get_attribute(k, ""))
+            meta.tags_json = _merge_tags(meta.tags_json, _tags_of(old.tags_json))
+    return meta, prior_desc, caller_content
+
+
+async def _read_file(f, size: int, mime: str, kind: str, filename: str):
+    """(description, tags, colors, described_by) for an upload."""
+    if kind == "text":
+        text = await run_in_threadpool(describe.decode_text, f, INGEST_MAX_CHARS)
+        return text, [], [], "text"
+    layer = ""
+    if kind == "document":
+        layer = await run_in_threadpool(describe.pdf_text, f, INGEST_MAX_CHARS)
+        if layer and describe.DESCRIBER.provider == "none":
+            return layer, [], [], "pdf-text"
+    try:
+        d = await describe.DESCRIBER.describe(f, size, mime, filename)
+    except UpstreamError as e:
+        raise _upstream_error(e)
+    except RuntimeError as e:
+        raise errors.APIError(400, str(e), "describe_not_configured")
+    text = f"{d.text}\n\nDocument text:\n{layer}" if layer else d.text
+    return text, d.tags, d.colors, d.model
+
+
+def _tags_of(tags_json: str) -> List[str]:
+    try:
+        v = json.loads(tags_json) if tags_json else []
+    except ValueError:
+        return []
+    return [str(t) for t in v] if isinstance(v, list) else []
+
+
+def _merge_tags(tags_json: str, extra) -> str:
+    out, seen = [], set()
+    for t in _tags_of(tags_json) + [str(x).strip().lower() for x in extra]:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return json.dumps(out[:50], ensure_ascii=False) if out else tags_json
+
+
+def _store_file(namespace: str, meta, vec, modality: str, idem: Idem,
+                response: Response, body: dict):
+    db = manager.get(namespace)
+    ns_dim = _established_dim(db, modality)
+    if ns_dim and len(vec) != ns_dim:
+        raise HTTPException(
+            400,
+            f"embedding dim {len(vec)} != namespace dim {ns_dim} for modality "
+            f"'{modality}'; the configured model doesn't match this namespace",
+        )
+    with manager.lock(namespace):
+        r = writes.prior(db, idem) or writes.apply(
+            db, [Op("upsert", 0, meta, np.asarray(vec, dtype=np.float32), modality)], idem, body)
+    out = writes.respond(response, body, r, lambda r: {"id": r.ids[-1], "version": r.versions[-1]})
+    if r is not None:
+        response.headers["ETag"] = writes.etag(r.versions[-1])
+    return out
 
 
 @app.post("/v1/{namespace}/import", response_model=ImportResponse, tags=["records"],
@@ -2315,6 +2543,7 @@ def _bulk_import_impl(namespace: str, req):
         meta.entity_id    = str(md.get("entity_id", ""))
         meta.confidence   = float(md.get("confidence", 1.0))
         meta.ttl          = int(md.get("ttl", 0))
+        meta.valid_at     = int(md.get("valid_at", 0) or 0)
         if md.get("key"):
             meta.key = str(md["key"])
         for k, v in (md.get("attributes") or {}).items():

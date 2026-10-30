@@ -225,6 +225,13 @@ class FeatherStore(BaseStore):
         meta.content      = _indexed_text(dict(op.value), self._index_fields)
         meta.set_attribute(_VALUE_ATTR, json.dumps(dict(op.value)))
         meta.set_attribute(_CREATED_ATTR, created)
+        # A numeric `valid_at` in the value is when the item happened or
+        # became true (unix seconds), as opposed to when it was put: the
+        # engine indexes it, so newest(by_valid=True) and a valid-time
+        # filter use it without parsing JSON.
+        valid = dict(op.value).get("valid_at")
+        if isinstance(valid, (int, float)) and not isinstance(valid, bool):
+            meta.valid_at = int(valid)
         if op.ttl is not None:
             # LangGraph ttl is in MINUTES; Feather stores whole SECONDS, where 0
             # means "never expires". Truncating would turn any ttl under one
@@ -406,7 +413,7 @@ class FeatherStore(BaseStore):
         return len(self.scan(namespace, prefix=prefix))
 
     def newest(self, namespace: tuple[str, ...], limit: int = 10, *,
-               key=None, prefix: bool = False) -> list[Any]:
+               key=None, prefix: bool = False, by_valid: bool = False) -> list[Any]:
         """The `limit` most recent items, newest first.
 
         Exists because `search(limit=n)` cannot answer this. It has no ordering,
@@ -417,7 +424,9 @@ class FeatherStore(BaseStore):
         By the engine timestamp (updated_at), it walks the engine's
         (timestamp, id) index from the end: O(log n + limit), where it used to
         read and sort the whole namespace. Items that expired are skipped and
-        the walk pages on. A custom `key(meta)` cannot use that index, so it
+        the walk pages on. `by_valid` walks the (valid time, id) index
+        instead: newest by when it happened (the value's `valid_at`, else
+        updated_at). A custom `key(meta)` cannot use either index, so it
         still scans the namespace and sorts.
         """
         if key is not None:
@@ -428,13 +437,14 @@ class FeatherStore(BaseStore):
         now = time.time()
         while len(out) < limit:
             want = limit - len(out)
-            ids = self.db.newest(flat, want, prefix=prefix, before=before)
+            ids = self.db.newest(flat, want, prefix=prefix, before=before,
+                                 by_valid=by_valid)
             cursor = before
             for rid in ids:
                 meta = self.db.get_metadata(rid)
                 if meta is None:              # removed since: nothing to show
                     continue
-                cursor = (meta.timestamp, rid)
+                cursor = (meta.valid_time if by_valid else meta.timestamp, rid)
                 if not _is_dead(meta, now):
                     out.append(self._item_of(meta))
             # A short page is the end; a page the cursor cannot move past (all

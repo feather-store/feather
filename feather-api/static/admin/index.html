@@ -431,6 +431,12 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-3.5 h-3.5"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
                 Ingest text
               </button>
+              <button @click="fileModal.open=true; fileModal.result=null; fileModal.entity_id=''; fileModal.notes=''"
+                class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 transition flex items-center gap-1.5"
+                :class="{ 'opacity-50': embedding.provider === 'none' }">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-3.5 h-3.5"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                Upload creative
+              </button>
               <button @click="importModal.open=true; importModal.json_text=''"
                 class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 transition flex items-center gap-1.5">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-3.5 h-3.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
@@ -530,7 +536,10 @@
                   <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Query text</label>
                   <input x-model="search.query" type="text" placeholder="…" class="mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
                 </div>
-                <div x-show="search.mode!=='keyword'">
+                <div x-show="search.mode==='hybrid' && embedding.provider !== 'none'" class="text-[11px]" style="color:var(--ink-mid)">
+                  The query is embedded with <span class="mono" x-text="embedding.provider"></span>: it matches by meaning ("blue car", "woman in a saree") and by exact words.
+                </div>
+                <div x-show="search.mode==='vector' || (search.mode==='hybrid' && embedding.provider === 'none')">
                   <label class="text-[11px] uppercase tracking-wide text-slate-500 font-medium">Vector seed</label>
                   <div class="mt-1.5 flex gap-2">
                     <input x-model.number="search.seed" type="number" class="mono w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
@@ -1216,6 +1225,42 @@
     </div>
   </div>
 
+  <!-- ──────────────────────────  Upload creative modal ────────────────────────── -->
+  <div x-show="fileModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="fileModal.busy || (fileModal.open=false)">
+    <div class="bg-white rounded-lg w-[560px] max-w-[calc(100vw-32px)] max-h-[90vh] overflow-y-auto p-6 shadow-xl border border-slate-200">
+      <h3 class="text-lg font-semibold">Upload creative</h3>
+      <p class="text-[12px] mt-1" style="color:var(--ink-mid)">The file is read, not its name: what it shows, its colours, the people and what they wear, every word on screen and every word spoken. That description is stored and embedded, so search finds it by content.</p>
+      <div x-show="embedding.provider === 'none'" class="mt-3 text-[12px] px-3 py-2 rounded border border-amber-200 bg-amber-50" style="color:#a16207">
+        Embedding service not configured. Set one in <a href="#" @click.prevent="fileModal.open=false; navigate('settings')" class="underline">Settings</a> first.
+      </div>
+      <div class="space-y-3 mt-4">
+        <div>
+          <label class="caption">Files (image, video, audio, PDF, text)</label>
+          <input type="file" multiple x-ref="creativeFiles" accept="image/*,video/*,audio/*,application/pdf,text/*,.md,.csv,.json" class="mt-1.5 block w-full text-[12px]">
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="caption">entity_id (optional)</label>
+            <input x-model="fileModal.entity_id" placeholder="e.g. nike" class="mono mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+          </div>
+          <div>
+            <label class="caption">Notes (optional, searchable)</label>
+            <input x-model="fileModal.notes" placeholder="e.g. Diwali campaign" class="mt-1.5 w-full text-sm px-3 py-1.5 border border-slate-300 rounded-md focus-ring">
+          </div>
+        </div>
+        <div x-show="fileModal.progress" class="text-[12px] mono" style="color:var(--ink-mid)" x-text="fileModal.progress"></div>
+        <div x-show="fileModal.result" class="text-[12px] border border-slate-200 rounded-md bg-slate-50 p-3">
+          <div class="caption mb-1">What Feather understood — <span class="mono" x-text="fileModal.result?.file_name"></span></div>
+          <pre class="whitespace-pre-wrap text-[12px] max-h-64 overflow-y-auto" x-text="fileModal.result?.content"></pre>
+        </div>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button @click="fileModal.open=false" :disabled="fileModal.busy" class="text-sm px-3 py-1.5 border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-40">Close</button>
+        <button @click="submitCreativeFiles()" :disabled="fileModal.busy || embedding.provider==='none'" class="btn-primary disabled:opacity-40" x-text="fileModal.busy ? 'Reading…' : 'Read + embed'"></button>
+      </div>
+    </div>
+  </div>
+
   <!-- ──────────────────────────  Bulk import modal ────────────────────────── -->
   <div x-show="importModal.open" x-trap.noscroll="importModal.open" x-cloak class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50" @click.self="importModal.open=false">
     <div class="bg-white rounded-lg w-[640px] p-6 shadow-xl border border-slate-200">
@@ -1316,6 +1361,7 @@
         addRecModal: { open: false, ns_id: '', content: '', entity_id: '' },
         seedModal: { open: false, count: 100, ns_id: '', template: 'seed record {i}' },
         ingestModal: { open: false, text: '', ns_id: '', entity_id: '' },
+        fileModal: { open: false, busy: false, entity_id: '', notes: '', progress: '', result: null },
         importModal: { open: false, json_text: '' },
         embedding: { provider: 'none', model: '', base_url: '', api_key_set: false, api_key: '', dim: 768 },
         connectionInfo: { base_url: '', sample_curl: '', sample_python: '', sample_javascript: '', docs_url: '' },
@@ -1461,6 +1507,34 @@
             this.toast(`Ingested record ${d.id}.`);
             await this.loadRecords(true); await this.loadOverview();
           } catch (e) { this.toast(`Ingest failed: ${e.message}`, 'error'); }
+        },
+
+        // ── upload creatives: the server reads each file and embeds what is in it
+        async submitCreativeFiles() {
+          const files = Array.from(this.$refs.creativeFiles?.files || []);
+          if (!files.length) { this.toast('Pick a file first.', 'error'); return; }
+          this.fileModal.busy = true; this.fileModal.result = null;
+          let ok = 0;
+          try {
+            for (const [i, f] of files.entries()) {
+              this.fileModal.progress = `Reading ${i + 1}/${files.length}: ${f.name}`;
+              const fd = new FormData();
+              fd.append('file', f);
+              const meta = { namespace_id: this.ns.name, entity_id: this.fileModal.entity_id || '' };
+              if (this.fileModal.notes) meta.content = this.fileModal.notes;
+              fd.append('metadata', JSON.stringify(meta));
+              try {
+                const res = await fetch(`/v1/${encodeURIComponent(this.activeNs)}/ingest_file`, {
+                  method: 'POST', headers: { 'X-API-Key': this.apiKey }, body: fd,
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+                this.fileModal.result = data; ok++;
+              } catch (e) { this.toast(`${f.name}: ${e.message}`, 'error'); }
+            }
+            this.fileModal.progress = `${ok}/${files.length} stored.`;
+            if (ok) { this.toast(`Stored ${ok} file${ok > 1 ? 's' : ''}.`); await this.loadRecords(true); await this.loadOverview(); }
+          } finally { this.fileModal.busy = false; }
         },
 
         // ── bulk import
@@ -1966,7 +2040,11 @@
             body.query = this.search.query || '';
           } else {
             const dim = this.ns.dim || 768;
-            body.vector = this.deterministicVec(this.search.seed | 0, dim);
+            const embedQuery = this.search.mode === 'hybrid' && this.embedding.provider !== 'none'
+              && (this.search.query || '').trim();
+            // With an embedder configured the server embeds the query text,
+            // so hybrid search is by meaning; the seed vector is for demos.
+            if (!embedQuery) body.vector = this.deterministicVec(this.search.seed | 0, dim);
             if (this.search.mode === 'hybrid') {
               path = `/v1/${ns}/hybrid_search`;
               body.query = this.search.query || '';

@@ -79,12 +79,15 @@ class SearchBody(_VectorMixin, msgspec.Struct, kw_only=True):
     tags_contains: Optional[List[str]] = None
     timestamp_after: Optional[int] = None
     timestamp_before: Optional[int] = None
+    valid_after: Optional[int] = None    # valid time: when it happened
+    valid_before: Optional[int] = None
     scoring_half_life: Optional[float] = None
     scoring_weight: Optional[float] = None
     scoring_min: Optional[float] = None
 
 
 class HybridBody(_VectorMixin, msgspec.Struct, kw_only=True):
+    VECTOR_REQUIRED = False         # the route embeds `query` instead
     query: str
     vector: Optional[List[float]] = None
     vector_b64: Optional[str] = None
@@ -104,6 +107,8 @@ class HybridBody(_VectorMixin, msgspec.Struct, kw_only=True):
     tags_contains: Optional[List[str]] = None
     timestamp_after: Optional[int] = None
     timestamp_before: Optional[int] = None
+    valid_after: Optional[int] = None    # valid time: when it happened
+    valid_before: Optional[int] = None
     scoring_half_life: Optional[float] = None
     scoring_weight: Optional[float] = None
     scoring_min: Optional[float] = None
@@ -125,6 +130,8 @@ class KeywordBody(msgspec.Struct, kw_only=True):
     tags_contains: Optional[List[str]] = None
     timestamp_after: Optional[int] = None
     timestamp_before: Optional[int] = None
+    valid_after: Optional[int] = None    # valid time: when it happened
+    valid_before: Optional[int] = None
 
 
 class ContextChainBody(_VectorMixin, msgspec.Struct, kw_only=True):

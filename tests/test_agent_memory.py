@@ -333,3 +333,80 @@ def test_the_store_primitives_are_bounded(mem):
     # scan returns (id, metadata) and never touches the value JSON
     rid, meta = mem.store.scan(ns)[0]
     assert isinstance(rid, int) and meta.namespace_id == ".".join(ns)
+
+
+# ── valid time: what an extractor read, ingested in any order ─────────────
+
+def _fact(kind, date, subject, attribute, value, statement, entity="",
+          own=True, amount=""):
+    import datetime
+    from feather_db.extractors import Fact
+    at = int(datetime.datetime.strptime(date, "%Y/%m/%d").timestamp())
+    return Fact(subject=subject, predicate=attribute, object=value, valid_at=at,
+                metadata={"statement": statement, "date": date, "kind": kind,
+                          "entity": entity, "own": own, "amount": amount,
+                          "session_id": "s1"})
+
+
+def test_a_superseded_fact_ends_when_the_new_one_began_not_when_written(mem):
+    mem.facts.state("mortgage", "pre-approved for $350k", at=1_680_000_000)
+    mem.facts.state("mortgage", "pre-approved for $400k", at=1_683_000_000)
+    cur = mem.facts.get("mortgage")
+    assert cur["text"] == "pre-approved for $400k"
+    assert cur["since"] == 1_683_000_000
+    assert mem.facts.history("mortgage") == [{
+        "text": "pre-approved for $350k", "since": 1_680_000_000,
+        "until": 1_683_000_000, "source": None}]
+
+
+def test_an_older_fact_ingested_late_goes_into_history(mem):
+    mem.facts.state("mortgage", "pre-approved for $400k", at=1_683_000_000)
+    mem.facts.state("mortgage", "pre-approved for $350k", at=1_680_000_000)
+    assert mem.facts.get("mortgage")["text"] == "pre-approved for $400k"
+    h = mem.facts.history("mortgage")
+    assert [x["text"] for x in h] == ["pre-approved for $350k"]
+    assert h[0]["until"] == 1_683_000_000
+    mem.facts.state("mortgage", "pre-approved for $350k", at=1_680_000_000)
+    assert len(mem.facts.history("mortgage")) == 1          # idempotent
+
+
+def test_an_older_preference_does_not_roll_back_a_newer_one(mem):
+    mem.preferences.set("drink", "coffee", at=200)
+    mem.preferences.set("drink", "tea", at=100)
+    assert mem.preferences.get("drink")["text"] == "coffee"
+
+
+def test_ingest_facts_routes_each_kind_by_its_lifetime(mem):
+    facts = [
+        _fact("event", "2023/05/06", "user", "wedding", "rachel and mike",
+              "On 2023/05/06 the user attended the wedding of Rachel and Mike.",
+              entity="wedding of rachel and mike"),
+        # The same wedding retold in a later session: one episode.
+        _fact("event", "2023/05/06", "user", "wedding", "rachel and mike",
+              "The user went to Rachel and Mike's wedding.",
+              entity="wedding of rachel and mike"),
+        _fact("event", "2023/06/10", "user", "bike", "chain",
+              "On 2023/06/10 the user replaced the bike chain for $25.",
+              entity="bike chain replacement", amount="$25"),
+        _fact("preference", "2023/03/01", "user", "phone charging",
+              "power bank", "The user carries a portable power bank."),
+        _fact("state", "2023/05/14", "user", "mortgage pre-approval", "$400k",
+              "On 2023/05/14 the user was pre-approved for $400k."),
+        _fact("state", "2023/04/02", "user", "mortgage pre-approval", "$350k",
+              "On 2023/04/02 the user was pre-approved for $350k."),
+    ]
+    got = mem.ingest_facts(facts)
+    assert got == {"episodes": 2, "preferences": 1, "facts": 2, "repeats": 1}
+    eps = mem.episodes.recent(10)
+    assert [e["entity"] for e in eps] == ["bike chain replacement",
+                                          "wedding of rachel and mike"]
+    assert eps[0]["amount"] == "$25" and eps[0]["own"] is True
+    (pref,) = mem.preferences.all()
+    assert "power bank" in pref["text"] and pref["value"] == "power bank"
+    (fact,) = mem.facts.all()
+    assert fact["value"] == "$400k"
+    assert [h["text"] for h in fact["supersedes"]] == [
+        "On 2023/04/02 the user was pre-approved for $350k."]
+    mem.ingest_facts(facts)                       # re-ingest: nothing new
+    assert len(mem.episodes) == 2 and len(mem.facts.history(
+        "user_mortgage_pre_approval")) == 1

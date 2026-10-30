@@ -12,6 +12,7 @@ Requests are counted per class, because they wait on different resources:
     read    GETs and the read-only POSTs (search, ...)   FEATHER_MAX_INFLIGHT_READS   (256)
     write   every other POST / PUT / PATCH / DELETE        FEATHER_MAX_INFLIGHT_WRITES  (64)
     upload  POST /v1/admin/upload (a disk copy + a load)   FEATHER_MAX_INFLIGHT_UPLOADS (2)
+    file    POST /v1/{ns}/ingest_file (a model reads it)   FEATHER_MAX_INFLIGHT_FILES   (8)
 
 Health, the SPAs and the docs are never refused. A limit of 0 disables it.
 The count lives on the event loop (incremented and decremented there only),
@@ -36,9 +37,11 @@ LIMITS = {
     "read": _env_int("FEATHER_MAX_INFLIGHT_READS", 256),
     "write": _env_int("FEATHER_MAX_INFLIGHT_WRITES", 64),
     "upload": _env_int("FEATHER_MAX_INFLIGHT_UPLOADS", 2),
+    "file": _env_int("FEATHER_MAX_INFLIGHT_FILES", 8),
 }
 RETRY_AFTER_S = _env_int("FEATHER_RETRY_AFTER_S", 1) or 1
 
+_FILE_POST = re.compile(r"^/v1/[^/]+/ingest_file$")
 _READ_POSTS = re.compile(r"^/v1/[^/]+/(search|keyword_search|hybrid_search|context_chain)$")
 _EXEMPT = ("/health", "/admin", "/app", "/static", "/docs", "/redoc", "/openapi.json", "/dashboard")
 
@@ -48,6 +51,8 @@ def classify(method: str, path: str):
         return None
     if path == "/v1/admin/upload":
         return "upload"
+    if method == "POST" and _FILE_POST.match(path):
+        return "file"
     if method in ("GET", "HEAD", "OPTIONS") or (method == "POST" and _READ_POSTS.match(path)):
         return "read"
     return "write"

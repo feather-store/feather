@@ -203,6 +203,7 @@ def _meta_json(m) -> dict:
         "source": m.source, "content": m.content, "tags_json": m.tags_json,
         "namespace_id": m.namespace_id, "entity_id": m.entity_id, "key": m.key,
         "attributes": dict(m.attributes), "confidence": float(m.confidence), "ttl": int(m.ttl),
+        "valid_at": int(m.valid_at),
         "recall_count": int(m.recall_count), "last_recalled_at": int(m.last_recalled_at),
         "edges": [{"target_id": e.target_id, "rel_type": e.rel_type, "weight": float(e.weight)}
                   for e in m.edges],
@@ -224,6 +225,7 @@ def _meta_from(d: Optional[dict]):
     m.key = d.get("key") or ""
     m.confidence = float(d.get("confidence", 1.0))
     m.ttl = int(d.get("ttl", 0))
+    m.valid_at = int(d.get("valid_at", 0) or 0)
     m.version = int(d.get("version", 0))
     m.recall_count = int(d.get("recall_count", 0))
     m.last_recalled_at = int(d.get("last_recalled_at", 0))
@@ -239,7 +241,8 @@ def _filter_json(f) -> dict:
         return {}
     out = {}
     for name in ("namespace_id", "namespace_prefix", "entity_id", "source", "source_prefix",
-                 "importance_gte", "confidence_gte", "timestamp_after", "timestamp_before"):
+                 "importance_gte", "confidence_gte", "timestamp_after", "timestamp_before",
+                 "valid_after", "valid_before"):
         v = getattr(f, name, None)
         if v is not None:
             out[name] = v
@@ -472,9 +475,11 @@ class RemoteDB:
             [RemoteContextEdge(e["source_id"], e["target_id"], e["rel_type"], e["weight"])
              for e in r["edges"]])
 
-    def newest(self, namespace="", limit=10, prefix=False, before=None):
+    def newest(self, namespace="", limit=10, prefix=False, before=None, by_valid=False):
         params = {"metadata_namespace": namespace, "limit": int(limit),
                   "prefix": "true" if prefix else "false"}
+        if by_valid:
+            params["by_valid"] = "true"
         if isinstance(before, tuple):
             params["before_ts"], params["before_id"] = int(before[0]), int(before[1])
         elif before is not None:

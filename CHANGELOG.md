@@ -9,6 +9,199 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Smaller BM25 index
+
+- **BM25 postings are 8 bytes, down from 16.** A posting names its document
+  by a u32 doc number instead of the u64 id, and the document length is
+  stored once per doc instead of in every posting. Measured at 100k docs of
+  ~50 words (4.2M postings): a reader's heap after open 211 → 167 MB, query
+  latency unchanged. Every process that opens the file builds its own index,
+  so this is per reader. The index is never serialised: no format change.
+
+### Client-side embedding cache
+
+- **`make_embedder()` / `default_embedder()` cache provider calls.** An agent
+  re-embeds the same query and memory text turn after turn; each miss is a
+  100–300 ms provider round trip, against a sub-millisecond search. Provider
+  embedders (used by `feather-agent`, `FeatherStore`, `feather-serve`) now keep
+  a thread-safe LRU keyed by the text's SHA-256 — `FEATHER_EMBED_CACHE`
+  entries, default 2048, `0` disables — the same knob and default the Cloud
+  API's `EmbeddingProvider` already had. Failures are not cached; hits return
+  a copy; `embed.stats` counts calls and hits. `tests/test_embedder_cache.py`.
+
+### Valid time (bitemporal records)
+
+- **`Metadata.valid_at`: when it happened, beside when it was recorded.**
+  A session on 05/14 saying "last Saturday I went to a wedding" is
+  recorded 05/14 and valid 05/06; `timestamp` could only hold one of them.
+  0 means not given, and `valid_time` then falls back to the timestamp.
+  Stored as a reserved attribute, like the native key: no format change,
+  the WAL carries it, and a build without it writes it back intact.
+- **Indexed and filterable.** `DB.newest(..., by_valid=True)` walks a
+  `(valid time, id)` index (O(log n + limit)); `SearchFilter.valid_after` /
+  `valid_before` and `FilterBuilder.valid_between()` filter on it. Over
+  HTTP: `valid_at` on metadata, `valid_after`/`valid_before` on search,
+  hybrid and keyword, `by_valid` on `GET /newest`; `RemoteDB` matches.
+- **Episodes order by an index walk.** `FeatherStore` maps a numeric
+  `valid_at` in an item's value to the engine field, and `AgentMemory`
+  writes one per episode, so `episodes.recent()` / `all()` no longer read
+  and sort the namespace. A namespace with episodes from before 0.22
+  falls back to the old key scan.
+
+### AgentMemory
+
+- **`ingest_facts(facts)` routes extracted facts by lifetime:** events to
+  episodes (one per entity and day, so a retold event is not a second
+  one), preferences to `preferences`, everything else to `facts` with
+  supersession. Each write carries the fact's valid time, not the ingest
+  time.
+- **`facts.state(..., at=)` and `preferences.set(..., at=)` take a valid
+  time.** A superseded fact's `until` is when its successor became true,
+  not when the successor was written, and an older fact ingested late
+  goes into the history in date order instead of replacing the current
+  value. An older preference does not roll back a newer one.
+
+### Extractors
+
+- **`SessionFactExtractor`: dated facts from a whole session in one call.**
+  `FactExtractor` reads one text at a time and is never told when it was
+  said, so "last Tuesday" stayed relative. The new extractor reads a
+  session per call (cheaper than per turn, and each turn is read with the
+  rest), gets the session date, makes every date absolute, and keys each
+  fact by `(subject, attribute)` with the turn it came from.
+  `link_validity()` chains facts with the same key: each keeps its
+  valid-from date and gains a valid-until instead of being overwritten;
+  `timeline()` renders the values that changed. Exported from
+  `feather_db.extractors`.
+
+- **Session facts carry `kind`, `entity`, `amount`, `own` (extractor
+  0.2.0).** `kind` is event / state / preference / other; `entity` names
+  an event's specific instance the same way each time it comes up;
+  `own` separates what the user did from what they mentioned, asked about
+  or were told. `ledger(facts)` renders events one row per distinct
+  entity, every date it was mentioned on, others' marked NOT the user's
+  own; `profile(chains)` the latest value of each preference. The version
+  bump invalidates cached v0.1 extractions.
+
+### LongMemEval bench: the reader sees every retrieved session
+
+- **The context budget is filled breadth first.** All 500 contexts sat at
+  the 160k-char cap: sessions were admitted best-first at the fullest
+  rendering that fit, so ~14 of ~22 retrieved sessions reached the reader.
+  Now every session is admitted at its most compact rendering, then
+  upgraded in rank order while the budget allows (`lme_context.render`).
+- **Admission is bounded per session (`EVIDENCE` level).** Multi-round
+  retrieval merges ~100 hit turns per round, so a top session carried 10+
+  hits and cost ~25k chars even at its compact rendering: 160k admitted
+  12-15 of ~25 sessions and cut golds retrieved at ranks 10-24. Every
+  session is now admitted at its best hit ±2 turns (or HITS_ONLY, if
+  cheaper), ~3k chars at most, before any is expanded.
+- **`--facts session` adds an event ledger and a preference profile.**
+  Count questions get the ledger of the events most similar to the
+  question (`LEDGER_K` = 60, kind-filtered search) with every mention of
+  each; every question gets the user's preferences (`PROFILE_K` = 30).
+  Both sit above the sessions with their reading rules in their headers,
+  so `ANSWER_SYSTEM`, and every run without facts, is unchanged. Records
+  gain `ledger` and `profile`.
+- **A LongMemEval number can no longer mean something else.** `--limit`
+  defaulted to 5 and `--split all` did not override it, so
+  `lme_final.sh` scored 5 questions (a "final" 1.000) and `lme_dev.sh`
+  refused to start; `--limit` now defaults to every question. A question
+  that crashed was dropped from the denominator (an outage on hard
+  questions raised the score); it is now a record scored wrong, bucket
+  `run_error`, as is an answerer error. Every result carries
+  `reportable` / `not_reportable_because` (subset, split, oracle,
+  substring judge, hash embedder, missing or non-official judge,
+  errors, uncommitted code) and prints it. `python -m bench.lme_eval
+  --check RUN.jsonl N` fails a questions file that is short, duplicated,
+  errored or unjudged, and both scripts run it. LLM retries back off for
+  ~2 minutes (was ~4 s, short of a rate-limit window). In the routed
+  reader a failed check keeps the draft instead of failing the question.
+- **Measured: the routed reader is worse; `--reader verified` keeps
+  what survived.** All 500, official judge: routed + map-reduce 0.794 vs
+  0.904 (75 answers lost, 20 gained, McNemar p < 0.001). The separate
+  premise check flipped 81 answers to "not mentioned", 46 of them right
+  (it demands every premise from a user turn, so questions about what
+  the assistant said fail; unanswerable questions are built from
+  near-miss entities, so no word-overlap guard separates good flips from
+  bad: a guard that stops the 46 also stops 25 of 27 good ones).
+  Map-reduce lost 11 net on aggregations (98 -> 87 right); the sliced
+  per-route prompts lost on preferences. Abstention re-search + quoted
+  verify changed one answer, to a right one, and every quote was real.
+  `--reader verified` is the single prompt plus that verify step;
+  `routed` is kept only to reproduce the result.
+- **Routed reader (`--reader routed`, `bench/lme_reader.py`).** One
+  prompt with six procedures made the premise check and the abstention
+  rule pull against each other: the 0.904 run returned "not mentioned"
+  on 11 answerable questions (9 with all evidence in context) and
+  answered 5 unanswerable ones. Now one short classify call routes each
+  question to its procedure alone (sliced from `ANSWER_SYSTEM`, so the
+  text is the measured one). An abstention is searched again (paraphrased
+  queries + BM25 on the key nouns) and verified by a call that must quote
+  the answering turn; the answer stands only if the quote is found in what
+  it was shown. Every other factual answer, including a recovered one,
+  gets its premises checked by their own call (SUPPORTED with a quote, or
+  UNSUPPORTED). `--reader single` (the default) is unchanged. Records gain
+  `reader` (route, draft, research, verify, premises).
+- **Map-reduce covers every aggregation.** With `--count-map`, "most /
+  least / in what order" questions are mapped too and reduced by
+  `AGG_REDUCE_SYSTEM`; counts keep `REDUCE_SYSTEM`. With `--facts
+  session` the reduce also reads the event ledger rows.
+- **New failure bucket `packing_miss`:** every gold session was retrieved
+  but one was cut by the budget. `retrieval_miss` now means a gold was
+  never retrieved. `summarize()` recomputes buckets, so older JSONL is
+  relabelled: the 0.904 baseline's 8 retrieval misses are 7 packing, 1
+  retrieval.
+- **Shortening cuts assistant prose, not user turns.** User turns are 13%
+  of the text and 94% of the evidence; the compact renderings used to clip
+  them to 300 chars or drop them when they were not next to a hit. Each
+  record now has `evidence_levels`, and the summary `evidence_shortened`.
+- **Answer prompt:** counting writes an IN/OUT ledger (time window, the
+  user's own, duplicates, latest running total); "unknown" requires a
+  second search under other words; the two weeks before the current date
+  are listed with weekdays. A date-difference answer given without
+  `DAYS_BETWEEN` is sent back once, and the tool also reports rounded
+  months and years.
+- **`--count-map retrieved|haystack`: counts by map-reduce.** Each session
+  is read whole by its own short call that lists every candidate instance
+  with an absolute date and a status (did / plans / asked / assistant said
+  / running total) and decides nothing; one reduce call reads only those
+  lists and applies the window, ownership, duplicate and running-total
+  rules, with `DAYS_BETWEEN`. Each read is ~10k chars instead of one 160k
+  read of a shortened context. `haystack` maps every session (an upper
+  bound with no retrieval). Off by default; per-record `count_map` stats,
+  and a failed map step falls back to the single read.
+- **Premise check in the answer prompt.** A factual answer first lists
+  what the question presupposes and finds where the user says each; a
+  premise found only in an assistant reply, or replaced by something else,
+  or a missing operand, makes the answer "not mentioned". Every example in
+  the prompts is invented: the earlier ones were lifted from failing test
+  questions, which tunes on test (a test now fails on any of them).
+- **`--map-provider` / `--map-model`**: the count map calls on a cheap
+  model under a strong answerer.
+- **Gemini 2.5 Pro as answerer no longer disables multi-round retrieval.**
+  Calls of ≤512 tokens asked for `thinking_budget=0`, which Pro rejects;
+  the planner's failure was swallowed as "no follow-ups". Pro now gets
+  its minimum budget (128).
+- **`scripts/lme_dev.sh`** runs one-change ablations on the dev split
+  (current, countmap, strong, facts, votes, tokens), each compared with
+  the baseline; **`scripts/lme_final.sh`** refuses a dirty tree, runs all
+  500 once and prints the headline and the held-out 400. `pip install
+  feather-db[bench]` adds the tokenizer dependencies.
+- **A frozen dev/test split** (`bench/datasets/longmemeval_s_dev.json`, 100
+  of 500, stratified by type × abstention, picked by sha1 of the id).
+  `--split dev|test|all`. Tune on dev; the headline stays all 500.
+- **`--context-tokens N`** budgets the context in the answer model's
+  tokens (Gemini's local tokenizer, `bench/tokens.py`; needs
+  `sentencepiece` + `protobuf`). A 160k-char context was 34–40k tokens.
+- **Results record the exact command and whether the tree was dirty**
+  (untracked code counts): `commit` alone did not reproduce a run made
+  on uncommitted changes.
+- **`python -m bench.lme_eval A.jsonl B.jsonl` compares two runs** question
+  by question: exact McNemar p and the paired SE, overall and per type,
+  and the ids each run fixed or broke. One run's score has a ±1.3-point
+  standard error at n=500; a headline difference is not evidence.
+
 ### Deleted HNSW slots are no longer reused
 
 - **`add()` after `forget()` could make other records unfindable.** Reusing
@@ -23,6 +216,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Cloud API
 
+- **`POST /v1/{ns}/ingest_file` stores a file by what is in it, not its
+  name.** Text is read as is; images, video, audio and PDFs are described by
+  a multimodal model (`app/describe.py`, Gemini: objects and colours, people
+  and their clothing, the setting, every word of visible text, every spoken
+  word). The description is the record's content (BM25) and is embedded with
+  the configured provider. The file name is kept as the `file_name`
+  attribute and never searched. Records are keyed `file:<sha256>`, so the
+  same file uploaded again updates one record and reuses its description
+  (`refresh=true` re-reads it). Files over `FEATHER_DESCRIBE_INLINE_MB` (14)
+  go through Gemini's File API and are deleted from it afterwards. Config:
+  `FEATHER_DESCRIBE_API_KEY` (or `GEMINI_API_KEY` / `GOOGLE_API_KEY`, or a
+  Gemini embedding key), `FEATHER_DESCRIBE_MODEL` (default
+  `gemini-2.5-flash`), `FEATHER_MAX_INGEST_FILE_MB` (512). Its own admission
+  class, `FEATHER_MAX_INFLIGHT_FILES` (8). `pypdf`, when installed, adds a
+  PDF's full text layer.
+- **`hybrid_search` without a `vector` embeds `query` on the server**, with
+  the same model that embedded the records, so `{"query": "blue car"}` is a
+  complete content search. The admin UI's hybrid search now does this when
+  an embedder is configured (it used to send a seeded random vector), and has
+  an "Upload creative" button that shows what was understood.
 - **A namespace move no longer answers 500 mid-handover.** A request that
   reached the target shard while the source still held the file's write
   lock got a 500 (a 502 through the gateway). It is now a retryable 503
