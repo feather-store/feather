@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "../include/metadata.h"
 #include <algorithm>
 #include <iostream>
@@ -53,9 +54,11 @@ void Metadata::serialize(std::ostream& os) const {
         os.write(reinterpret_cast<const char*>(&val_len), 4);
         os.write(v.data(), val_len);
     };
-    uint16_t attr_count = static_cast<uint16_t>(attributes.size() + (key.empty() ? 0 : 1));
+    uint16_t attr_count = static_cast<uint16_t>(attributes.size() + (key.empty() ? 0 : 1)
+                                                + (valid_at ? 1 : 0));
     os.write(reinterpret_cast<const char*>(&attr_count), 2);
     if (!key.empty()) put_attr(key_attr(), key);
+    if (valid_at) put_attr(valid_attr(), std::to_string(valid_at));
     for (const auto& [k, val] : attributes) put_attr(k, val);
 
     // Phase 5: typed, weighted edges
@@ -158,6 +161,15 @@ Metadata Metadata::deserialize(std::istream& is) {
     for (uint16_t i = 0; i < attr_count; ++i) {
         std::string key = get_str<uint16_t>(is);
         if (key == Metadata::key_attr()) m.key = get_str<uint32_t>(is);
+        else if (key == Metadata::valid_attr()) {
+            // Not a number: keep it as the attribute it was, rather than
+            // lose it or throw on a file an older build wrote back.
+            std::string v = get_str<uint32_t>(is);
+            char* end = nullptr;
+            long long t = std::strtoll(v.c_str(), &end, 10);
+            if (!v.empty() && end && *end == '\0') m.valid_at = t;
+            else m.attributes[std::move(key)] = std::move(v);
+        }
         else                             m.attributes[std::move(key)] = get_str<uint32_t>(is);
     }
 
