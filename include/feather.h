@@ -790,6 +790,13 @@ private:
     std::unordered_map<uint64_t, uint32_t> doc_lengths_;   // id -> doc number
     std::vector<uint64_t> bm25_doc_id_;                    // doc number -> id
     std::vector<uint32_t> bm25_doc_len_;                   // doc number -> tokens
+    // Built on the first keyword/hybrid search, not at open (ensure_bm25):
+    // the build was ~0.8 s of a 0.9 s open at 100k records, paid by every
+    // reader and every reopen, and vector-only callers (Pocket and
+    // FeatherStore with an embedder) never query it. Until then index
+    // updates are skipped; the build reads metadata_store_ as it is then.
+    // Set under the exclusive lock; read without it only as a fast path.
+    std::atomic<bool> bm25_ready_{false};
     // Running sum of doc_lengths_ so avg_dl_ is an O(1) update per document.
     // Re-summing the whole map on every insert made indexing O(n^2): a cold
     // load of a text-bearing DB rebuilds the index document by document, so
@@ -1852,8 +1859,8 @@ private:
     /// non-alphanumerics, so a single long run of y's — a base64 blob or an id
     /// run will do, it need not be adversarial — is ONE token. Measured before
     /// this fix: 20k chars 0.84 s, 50k chars 3.27 s, and because
-    /// rebuild_bm25_index() runs on every load(), a single 30 KB record cost
-    /// 0.58 s on EVERY open of that file, permanently.
+    /// rebuild_bm25_index() then ran on every load(), a single 30 KB record
+    /// cost 0.58 s on EVERY open of that file, permanently.
     static bool stem_is_consonant(const std::string& w, size_t i) {
         char c = w[i];
         if (stem_vowel(c)) return false;
@@ -2055,6 +2062,7 @@ private:
     // content genuinely isn't known — that falls back to a scan of the entire
     // vocabulary, which is O(corpus) and should stay off any hot path.
     void remove_from_bm25_index(uint64_t id, const std::string* old_content) {
+        if (!bm25_ready_.load(std::memory_order_relaxed)) return;   // built later
         auto len_it = doc_lengths_.find(id);
         if (len_it == doc_lengths_.end()) return;     // not indexed
         const uint32_t doc = len_it->second;
@@ -2093,6 +2101,7 @@ private:
     void add_to_bm25_index(uint64_t id, const std::string& content,
                            const std::string* old_content = nullptr,
                            StemCache* cache = nullptr) {
+        if (!bm25_ready_.load(std::memory_order_relaxed)) return;   // built later
         // Re-indexing an existing doc: retire its old postings first. Blanked
         // content (forget()) therefore also removes the doc, as it should.
         if (doc_lengths_.count(id)) remove_from_bm25_index(id, old_content);
@@ -2104,12 +2113,14 @@ private:
         std::unordered_map<std::string, uint32_t> tf;
         for (const auto& t : tokens) tf[t]++;
 
-        // Every re-index takes a fresh number; a writer that has used them
-        // all (4G re-indexes since the last rebuild) renumbers from scratch.
-        if (bm25_doc_id_.size() >= std::numeric_limits<uint32_t>::max()) {
-            rebuild_bm25_index();
-            if (doc_lengths_.count(id)) return;        // the rebuild indexed it
-        }
+        // Every re-index takes a fresh number, so a long-lived writer's
+        // numbering fills with retired ones: compact it once they outnumber
+        // the live (amortised O(1) postings per re-index).
+        if (bm25_doc_id_.size() >= std::numeric_limits<uint32_t>::max() ||
+            (bm25_doc_id_.size() >= 65536 && bm25_doc_id_.size() >= 2 * doc_lengths_.size()))
+            renumber_bm25_docs();
+        if (bm25_doc_id_.size() >= std::numeric_limits<uint32_t>::max())
+            throw std::length_error("BM25 index: more than 2^32 documents");
         const uint32_t doc = static_cast<uint32_t>(bm25_doc_id_.size());
         bm25_doc_id_.push_back(id);
         bm25_doc_len_.push_back(static_cast<uint32_t>(tokens.size()));
@@ -2121,7 +2132,38 @@ private:
         recompute_avg_dl();   // O(1) — running total, not a scan
     }
 
+    // Renumber the live documents 0..n-1 in their current order, so every
+    // posting list stays sorted, and drop postings of retired numbers.
+    void renumber_bm25_docs() {
+        constexpr uint32_t gone = std::numeric_limits<uint32_t>::max();
+        std::vector<uint32_t> remap(bm25_doc_id_.size(), gone);
+        std::vector<uint64_t> ids;
+        std::vector<uint32_t> lens;
+        ids.reserve(doc_lengths_.size());
+        lens.reserve(doc_lengths_.size());
+        for (size_t old = 0; old < bm25_doc_id_.size(); ++old) {
+            auto it = doc_lengths_.find(bm25_doc_id_[old]);
+            if (it == doc_lengths_.end() || it->second != old) continue;   // retired
+            remap[old] = it->second = static_cast<uint32_t>(ids.size());
+            ids.push_back(bm25_doc_id_[old]);
+            lens.push_back(bm25_doc_len_[old]);
+        }
+        for (auto pit = bm25_index_.begin(); pit != bm25_index_.end(); ) {
+            auto& postings = pit->second;
+            size_t w = 0;
+            for (const auto& p : postings)
+                if (remap[p.doc] != gone) postings[w++] = {remap[p.doc], p.term_freq};
+            postings.resize(w);
+            if (postings.empty()) { pit = bm25_index_.erase(pit); continue; }
+            postings.shrink_to_fit();
+            ++pit;
+        }
+        bm25_doc_id_.swap(ids);
+        bm25_doc_len_.swap(lens);
+    }
+
     void rebuild_bm25_index() {
+        bm25_ready_.store(true, std::memory_order_release);   // caller holds mutex_ exclusively
         bm25_index_.clear();
         doc_lengths_.clear();
         bm25_doc_id_.clear();
@@ -4560,7 +4602,6 @@ private:
         retire_orphan_nodes();
         build_reverse_index();
         build_secondary_indexes();
-        rebuild_bm25_index();
         load_complete_ = true; // last statement: a throw anywhere above leaves
                                // this false and the destructor won't checkpoint
     }
@@ -6484,9 +6525,18 @@ private:
         return results;
     }
 
+    // Takes mutex_ itself: call before taking it shared, never while holding it.
+    void ensure_bm25() {
+        if (bm25_ready_.load(std::memory_order_acquire)) return;
+        std::unique_lock<RWMutex> lock(mutex_);
+        ensure_open();
+        if (!bm25_ready_.load(std::memory_order_relaxed)) rebuild_bm25_index();
+    }
+
 public:
     std::vector<SearchResult> keyword_search(const std::string& query, size_t k = 10,
                                              const SearchFilter* filter = nullptr) {
+        ensure_bm25();
         std::shared_lock<RWMutex> lock(mutex_);
 
         ensure_open();
@@ -6506,6 +6556,7 @@ public:
         // Read-only end to end (RRF fusion never touches salience), so this
         // runs fully concurrently with other queries. Both rankings and the
         // fusion work on (score, id); metadata is copied for the final k only.
+        ensure_bm25();
         std::shared_lock<RWMutex> lock(mutex_);
         ensure_open();
         const size_t candidates = k * 3;
