@@ -747,6 +747,9 @@ private:
     // "the newest n" is a walk from the end, not a scan and a sort.
     using TimeKey = std::pair<int64_t, uint64_t>;
     std::unordered_map<std::string, std::set<TimeKey>> time_index_;
+    // The same, ordered by (valid_time(), id): "what happened most recently"
+    // where a record's event time differs from when it was written.
+    std::unordered_map<std::string, std::set<TimeKey>> valid_index_;
 
     // ── Auto-compaction ──────────────────────────────────────────────
     // When a modality index's deleted/total ratio crosses this threshold after
@@ -776,12 +779,17 @@ private:
     uint64_t fv_seq_ = 0;          // PendingFull::seq source; under mutex_ (exclusive)
 
     // ── BM25 Inverted Index ──────────────────────────────────────────
-    // doc_len rides in the padding after term_freq (still 16 bytes). A doc's
-    // postings are always written and retired together with its length, so
-    // the copy never goes stale, and scoring needs no doc_lengths_ lookup.
-    struct PostingEntry { uint64_t doc_id; uint32_t term_freq; uint32_t doc_len; };
+    // A posting names its document by a u32 doc number, not the u64 id, and
+    // the length lives once per doc in bm25_doc_len_: 8 bytes a posting
+    // instead of 16, at ~50 postings a document. Numbers are handed out in
+    // increasing order and never reused until the next rebuild, so a stale
+    // posting can only point at the doc that wrote it (same as when it held
+    // the id), and a list stays in number order for sequential lookups.
+    struct PostingEntry { uint32_t doc; uint32_t term_freq; };
     std::unordered_map<std::string, std::vector<PostingEntry>> bm25_index_;
-    std::unordered_map<uint64_t, uint32_t> doc_lengths_;
+    std::unordered_map<uint64_t, uint32_t> doc_lengths_;   // id -> doc number
+    std::vector<uint64_t> bm25_doc_id_;                    // doc number -> id
+    std::vector<uint32_t> bm25_doc_len_;                   // doc number -> tokens
     // Running sum of doc_lengths_ so avg_dl_ is an O(1) update per document.
     // Re-summing the whole map on every insert made indexing O(n^2): a cold
     // load of a text-bearing DB rebuilds the index document by document, so
@@ -1394,6 +1402,7 @@ private:
 
     void index_meta(uint64_t id, const Metadata& m) {
         time_index_[m.namespace_id].insert({m.timestamp, id});
+        valid_index_[m.namespace_id].insert({m.valid_time(), id});
         if (!m.key.empty()) key_index_[key_ref(m.namespace_id, m.key)] = id;
         if (!m.namespace_id.empty()) {
             auto& set = ns_index_[m.namespace_id];
@@ -1416,6 +1425,10 @@ private:
             t->second.erase({m.timestamp, id});
             if (t->second.empty()) time_index_.erase(t);
         }
+        if (auto t = valid_index_.find(m.namespace_id); t != valid_index_.end()) {
+            t->second.erase({m.valid_time(), id});
+            if (t->second.empty()) valid_index_.erase(t);
+        }
         if (!m.key.empty()) {
             auto k = key_index_.find(key_ref(m.namespace_id, m.key));
             if (k != key_index_.end() && k->second == id) key_index_.erase(k);
@@ -1436,6 +1449,7 @@ private:
         key_index_.clear();
         ns_names_.clear();
         time_index_.clear();
+        valid_index_.clear();
         for (const auto& [id, meta] : metadata_store_) {
             if (is_dead_meta(meta)) continue;   // candidate sets are live-only
             index_meta(id, meta);
@@ -2043,13 +2057,14 @@ private:
     void remove_from_bm25_index(uint64_t id, const std::string* old_content) {
         auto len_it = doc_lengths_.find(id);
         if (len_it == doc_lengths_.end()) return;     // not indexed
-        total_dl_ -= static_cast<double>(len_it->second);
+        const uint32_t doc = len_it->second;
+        total_dl_ -= static_cast<double>(bm25_doc_len_[doc]);
         doc_lengths_.erase(len_it);
 
-        auto drop_from = [id](std::vector<PostingEntry>& postings) {
+        auto drop_from = [doc](std::vector<PostingEntry>& postings) {
             postings.erase(
                 std::remove_if(postings.begin(), postings.end(),
-                    [id](const PostingEntry& p) { return p.doc_id == id; }),
+                    [doc](const PostingEntry& p) { return p.doc == doc; }),
                 postings.end());
         };
 
@@ -2089,11 +2104,19 @@ private:
         std::unordered_map<std::string, uint32_t> tf;
         for (const auto& t : tokens) tf[t]++;
 
-        // Update doc length and posting lists
-        doc_lengths_[id] = static_cast<uint32_t>(tokens.size());
+        // Every re-index takes a fresh number; a writer that has used them
+        // all (4G re-indexes since the last rebuild) renumbers from scratch.
+        if (bm25_doc_id_.size() >= std::numeric_limits<uint32_t>::max()) {
+            rebuild_bm25_index();
+            if (doc_lengths_.count(id)) return;        // the rebuild indexed it
+        }
+        const uint32_t doc = static_cast<uint32_t>(bm25_doc_id_.size());
+        bm25_doc_id_.push_back(id);
+        bm25_doc_len_.push_back(static_cast<uint32_t>(tokens.size()));
+        doc_lengths_[id] = doc;
         total_dl_ += static_cast<double>(tokens.size());
         for (const auto& [term, freq] : tf)
-            bm25_index_[term].push_back({id, freq, static_cast<uint32_t>(tokens.size())});
+            bm25_index_[term].push_back({doc, freq});
 
         recompute_avg_dl();   // O(1) — running total, not a scan
     }
@@ -2101,6 +2124,8 @@ private:
     void rebuild_bm25_index() {
         bm25_index_.clear();
         doc_lengths_.clear();
+        bm25_doc_id_.clear();
+        bm25_doc_len_.clear();
         total_dl_ = 0.0;
         avg_dl_   = 0.0;
         StemCache cache;
@@ -5748,18 +5773,21 @@ public:
     // (timestamp, id). `before` pages: only records strictly older than that
     // (timestamp, id). A walk from the end of an ordered index — O(log n +
     // limit), a k-way merge for a prefix — where a caller used to read the
-    // whole namespace and sort it.
+    // whole namespace and sort it. `by_valid`: by (valid_time(), id) instead,
+    // newest event first, and `before` is then a valid-time cursor.
     std::vector<uint64_t> newest(const std::string& ns, size_t limit, bool prefix = false,
-                                 std::optional<std::pair<int64_t, uint64_t>> before = std::nullopt) const {
+                                 std::optional<std::pair<int64_t, uint64_t>> before = std::nullopt,
+                                 bool by_valid = false) const {
         std::shared_lock<RWMutex> lock(mutex_);
         ensure_open();
+        const auto& index = by_valid ? valid_index_ : time_index_;
         std::vector<const std::set<TimeKey>*> sets;
         auto add = [&](const std::string& name) {
-            auto it = time_index_.find(name);
-            if (it != time_index_.end()) sets.push_back(&it->second);
+            auto it = index.find(name);
+            if (it != index.end()) sets.push_back(&it->second);
         };
         if (prefix && !ns.empty()) for_each_ns_under(ns, add);
-        else if (prefix) for (const auto& [name, set] : time_index_) sets.push_back(&set);
+        else if (prefix) for (const auto& [name, set] : index) sets.push_back(&set);
         else add(ns);
         using RIt = std::set<TimeKey>::const_reverse_iterator;
         struct Head { RIt it, end; };
@@ -6074,7 +6102,8 @@ private:
     // Whether a filter constrains nothing but namespaces.
     static bool namespace_only(const SearchFilter& f) {
         return !f.types && !f.source && !f.source_prefix && !f.timestamp_after &&
-               !f.timestamp_before && !f.importance_gte && !f.confidence_gte &&
+               !f.timestamp_before && !f.valid_after && !f.valid_before &&
+               !f.importance_gte && !f.confidence_gte &&
                !f.tags_contains && !f.entity_id && !f.attributes_match;
     }
 
@@ -6401,30 +6430,31 @@ private:
                    (!filter || filter->matches(mit->second));
         };
 
-        // Each posting carries its document's length, so scoring needs no
-        // doc_lengths_ lookup. A filter is applied per posting: it usually
+        // Scores accumulate by doc number and become ids only for the ranking:
+        // a list is in number order, so its length and id lookups are
+        // sequential reads. A filter is applied per posting: it usually
         // rejects most documents, and keeping them out of `scores` is cheaper
         // than scoring them. Without one, forget()/purge() already drop
         // postings, so eligibility is only checked on the winners below.
         const double N = static_cast<double>(doc_lengths_.size());
         const double avdl = avg_dl_ > 0.0 ? avg_dl_ : 1.0;
-        std::unordered_map<uint64_t, float> scores;
+        std::unordered_map<uint32_t, float> scores;
         if (!filter) scores.reserve(total_postings);
         for (const auto* postings : lists) {
             const double n_t = static_cast<double>(postings->size());
             // IDF (BM25+): log((N - n_t + 0.5) / (n_t + 0.5) + 1)
             const double idf = std::log((N - n_t + 0.5) / (n_t + 0.5) + 1.0);
             for (const auto& p : *postings) {
-                if (filter && !eligible(p.doc_id)) continue;
+                if (filter && !eligible(bm25_doc_id_[p.doc])) continue;
                 const double tf = static_cast<double>(p.term_freq);
                 const double tf_norm = (tf * (BM25_K1 + 1.0)) /
-                    (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * static_cast<double>(p.doc_len) / avdl));
-                scores[p.doc_id] += static_cast<float>(idf * tf_norm);
+                    (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * static_cast<double>(bm25_doc_len_[p.doc]) / avdl));
+                scores[p.doc] += static_cast<float>(idf * tf_norm);
             }
         }
 
         ranked.reserve(scores.size());
-        for (const auto& [id, sc] : scores) ranked.emplace_back(sc, id);
+        for (const auto& [doc, sc] : scores) ranked.emplace_back(sc, bm25_doc_id_[doc]);
         // A stale posting that reaches the top is dropped and the next best
         // takes its place. With a filter every entry is already eligible, so
         // this loop runs once.
@@ -7214,9 +7244,12 @@ private:
         decltype(key_index_)().swap(key_index_);
         decltype(ns_names_)().swap(ns_names_);
         decltype(time_index_)().swap(time_index_);
+        decltype(valid_index_)().swap(valid_index_);
         decltype(ns_graphs_)().swap(ns_graphs_);
         decltype(bm25_index_)().swap(bm25_index_);
         decltype(doc_lengths_)().swap(doc_lengths_);
+        decltype(bm25_doc_id_)().swap(bm25_doc_id_);
+        decltype(bm25_doc_len_)().swap(bm25_doc_len_);
         decltype(dirty_meta_)().swap(dirty_meta_);
         decltype(idem_)().swap(idem_);
         decltype(idem_order_)().swap(idem_order_);
