@@ -63,13 +63,9 @@ async def idempotency(request: Request) -> Idem:
     """FastAPI dependency: the request's key, and a fingerprint of everything
     the request says (method, path, query, body). The fingerprint is what
     tells a retry apart from a different request reusing the key."""
-    key = request.headers.get(IDEMPOTENCY_HEADER, "")
+    key = _checked_key(request)
     if not key:
         return Idem()
-    if len(key) > MAX_KEY_LEN:
-        raise HTTPException(400, f"{IDEMPOTENCY_HEADER} is longer than {MAX_KEY_LEN} characters")
-    if not HAS_BATCH:
-        raise HTTPException(501, f"{IDEMPOTENCY_HEADER} needs feather-db >= 0.22 on the server")
     h = hashlib.sha256()
     h.update(f"{request.method} {request.url.path}?{request.url.query}\n".encode())
     body = await request.body()
@@ -81,6 +77,23 @@ async def idempotency(request: Request) -> Idem:
 
 
 _HASH_INLINE_MAX = 1 << 20
+
+
+def idempotency_of(request: Request, fingerprint: str) -> Idem:
+    """As `idempotency`, for a route that fingerprints its own request: a
+    multipart upload, whose body the form parser has already consumed and
+    which is too large to hash a second time."""
+    key = _checked_key(request)
+    return Idem(key, fingerprint) if key else Idem()
+
+
+def _checked_key(request: Request) -> str:
+    key = request.headers.get(IDEMPOTENCY_HEADER, "")
+    if key and len(key) > MAX_KEY_LEN:
+        raise HTTPException(400, f"{IDEMPOTENCY_HEADER} is longer than {MAX_KEY_LEN} characters")
+    if key and not HAS_BATCH:
+        raise HTTPException(501, f"{IDEMPOTENCY_HEADER} needs feather-db >= 0.22 on the server")
+    return key
 
 
 def if_match_version(value: Optional[str]) -> Optional[int]:
