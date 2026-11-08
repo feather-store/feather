@@ -13,6 +13,9 @@ from .triggers import WatchManager, ContradictionDetector
 from .episodes import EpisodeManager
 from .merge    import merge
 
+# Time travel: DB.open(path, as_of=...) and the diff of two states
+from .history  import diff, MemoryDiff
+
 # LLM agent connectors (lazy-import safe — heavy deps are optional)
 from .integrations import (
     ClaudeConnector,
@@ -32,7 +35,7 @@ from .providers import (
 from .engine import ContextEngine
 
 __all__ = [
-    "Pocket", "PocketItem", "pocket", "scoped_id",
+    "Pocket", "PocketItem", "IndexEntry", "pocket", "scoped_id",
     "PacketBuilder", "ContextPacket", "Ref", "Omission",
     "RequiredRule", "RequiredContextUnavailable",
     "DB", "ContextType", "Metadata", "ScoringConfig",
@@ -46,6 +49,7 @@ __all__ = [
     # v0.6.0 memory layer
     "MemoryManager", "WatchManager", "ContradictionDetector",
     "EpisodeManager", "merge",
+    "diff", "MemoryDiff",
     # Integrations
     "ClaudeConnector", "OpenAIConnector",
     "GeminiConnector", "GeminiEmbedder",
@@ -54,7 +58,7 @@ __all__ = [
     "OllamaProvider", "GeminiProvider",
     "ContextEngine",
 ]
-from .pocket import Pocket, PocketItem, pocket  # noqa: E402
+from .pocket import IndexEntry, Pocket, PocketItem, pocket  # noqa: E402
 
 __version__ = "0.21.0"
 

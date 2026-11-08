@@ -1,0 +1,183 @@
+{
+  "scenario": "locomo",
+  "dataset": "locomo10",
+  "n": 1540,
+  "dim": 3072,
+  "feather_version": "0.21.0",
+  "python_version": "3.12.15",
+  "platform": "Darwin arm64",
+  "commit": "031055e",
+  "dirty": true,
+  "argv": [
+    "/Users/apple/OpenSource/memory/feather/bench/locomo.py",
+    "run",
+    "--memory",
+    "facts",
+    "--k",
+    "75"
+  ],
+  "started_at": 1794115828.496264,
+  "wall_seconds": 254.1,
+  "params": {
+    "conversations": [
+      "conv-26",
+      "conv-30",
+      "conv-41",
+      "conv-42",
+      "conv-43",
+      "conv-44",
+      "conv-47",
+      "conv-48",
+      "conv-49",
+      "conv-50"
+    ],
+    "k": 75,
+    "memory": "facts",
+    "categories": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "retrieval": "hybrid_search (BM25 + dense, RRF), no scoring",
+    "extractor": "openrouter:openai/gpt-4o-mini",
+    "extracted": {
+      "extracted": 2109,
+      "episodes": 641,
+      "preferences": 257,
+      "facts": 1190,
+      "repeats": 21,
+      "records": 1859
+    },
+    "facts_system": "You answer questions about a long conversation between {a} and {b}, from memories extracted from it.\n\nEach memory is one statement that starts with the date it refers to; they are listed oldest first.\n\n- Answer with the absolute date, month or year when asked when.\n- Give the answer only: a short phrase, no explanation. For a list, give every item the memories support.\n- If the memories do not state the answer outright, give the most likely answer they support.",
+    "embedder": "gemini-embedding-001",
+    "reader": "openrouter:openai/gpt-4o-mini",
+    "judge": "openrouter:openai/gpt-4o-mini",
+    "judge_source": "https://github.com/mem0ai/mem0/blob/393a4fd5a6cfeb754857a2229726f567a9fadf36/evaluation/metrics/llm_judge.py",
+    "data_url": "https://raw.githubusercontent.com/snap-research/locomo/3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376/data/locomo10.json",
+    "data_sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+    "answer_system": "You answer questions about a long conversation between {a} and {b}, from excerpts of it retrieved from memory.\n\nThe excerpts are grouped by session, oldest first; each session is headed by the date it took place.\n\n- Resolve every relative date against the date of the session it was said in: \"yesterday\" in a session of Monday 8 May 2023 is 7 May 2023, \"last year\" is 2022, \"last Saturday\" is 6 May 2023. Answer with the absolute date, month or year.\n- Give the answer only: a short phrase, no explanation. For a list, give every item the excerpts support.\n- If the excerpts do not state the answer outright, give the most likely answer they support.",
+    "answer_user": "Excerpts:\n\n{context}\n\nQuestion: {question}\nAnswer:",
+    "bleu1_impl": "approximate (nltk missing: regex tokenizer, same BLEU-1 formula)",
+    "category_mapping": {
+      "1": {
+        "name": "multi-hop",
+        "mem0_paper_column": "Single Hop"
+      },
+      "2": {
+        "name": "temporal",
+        "mem0_paper_column": "Temporal"
+      },
+      "3": {
+        "name": "open-domain",
+        "mem0_paper_column": "Multi-Hop"
+      },
+      "4": {
+        "name": "single-hop",
+        "mem0_paper_column": "Open Domain"
+      }
+    }
+  },
+  "metrics": {
+    "overall": {
+      "n": 1540,
+      "J": 64.48,
+      "F1": 34.08,
+      "BLEU1": 30.95,
+      "evidence_recall": 0.7123,
+      "all_evidence_retrieved": 0.6354
+    },
+    "by_category": {
+      "1": {
+        "name": "multi-hop",
+        "mem0_paper_column": "Single Hop",
+        "n": 282,
+        "J": 68.79,
+        "F1": 36.62,
+        "BLEU1": 28.17,
+        "evidence_recall": 0.6674,
+        "all_evidence_retrieved": 0.3901
+      },
+      "2": {
+        "name": "temporal",
+        "mem0_paper_column": "Temporal",
+        "n": 321,
+        "J": 67.6,
+        "F1": 15.75,
+        "BLEU1": 27.03,
+        "evidence_recall": 0.8333,
+        "all_evidence_retrieved": 0.8006
+      },
+      "3": {
+        "name": "open-domain",
+        "mem0_paper_column": "Multi-Hop",
+        "n": 96,
+        "J": 55.21,
+        "F1": 23.71,
+        "BLEU1": 18.58,
+        "evidence_recall": 0.6419,
+        "all_evidence_retrieved": 0.4565
+      },
+      "4": {
+        "name": "single-hop",
+        "mem0_paper_column": "Open Domain",
+        "n": 841,
+        "J": 62.9,
+        "F1": 41.41,
+        "BLEU1": 34.78,
+        "evidence_recall": 0.6889,
+        "all_evidence_retrieved": 0.6742
+      }
+    },
+    "judge_unparsed": 0,
+    "reader_errors": 0,
+    "context_tokens_est_mean": 1258
+  },
+  "cost": {
+    "reader_tokens": {
+      "in": 2389702,
+      "out": 15441
+    },
+    "judge_tokens": {
+      "in": 628994,
+      "out": 9241
+    },
+    "embed_tokens_new": 0,
+    "reader_usd": 0.36671190000000015,
+    "judge_usd": 0.09989370000000004,
+    "embed_usd": 0.0,
+    "prices_per_1m": {
+      "gpt-4o-mini": [
+        0.15,
+        0.6
+      ],
+      "gpt-4o": [
+        2.5,
+        10.0
+      ],
+      "gemini-embedding-001": [
+        0.15,
+        0.0
+      ]
+    },
+    "cost_source": {
+      "reader": "openrouter usage.cost",
+      "judge": "openrouter usage.cost",
+      "embed": "list price x chars/4"
+    },
+    "served_by": {
+      "reader": {
+        "OpenAI": 1540
+      },
+      "judge": {
+        "OpenAI": 1540
+      }
+    },
+    "extractor_tokens": {},
+    "extractor_usd": 0.0,
+    "extractor_note": "0 when every extraction came from the cache",
+    "usd": 0.4666,
+    "projected_all_10_llm_usd": 0.467
+  },
+  "questions_file": "/Users/apple/OpenSource/memory/feather/bench/results/locomo__locomo10_facts__20261108_110031__questions.jsonl"
+}

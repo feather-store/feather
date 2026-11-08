@@ -1,0 +1,102 @@
+{
+  "params": {
+    "trials": 20,
+    "benign": 120,
+    "poison": 16,
+    "queries": 40,
+    "budget": 1500,
+    "k": 10,
+    "seed": 0
+  },
+  "results": {
+    "undefended": {
+      "packet(query)": {
+        "n": 800,
+        "reached": 800,
+        "poison": 5237,
+        "instr": 800,
+        "binding": 800,
+        "displaced": 0,
+        "pinned_in": 0,
+        "pinned_planted": 0,
+        "forged": 32,
+        "blocked": 0,
+        "benign": 7135,
+        "benign_planted": 0
+      },
+      "packet(hot)": {
+        "n": 20,
+        "reached": 20,
+        "poison": 179,
+        "instr": 20,
+        "binding": 20,
+        "displaced": 20,
+        "pinned_in": 80,
+        "pinned_planted": 80,
+        "forged": 6,
+        "blocked": 0,
+        "benign": 1012,
+        "benign_planted": 2400
+      },
+      "hot_text": {
+        "n": 20,
+        "reached": 20,
+        "poison": 167,
+        "instr": 20,
+        "binding": 0,
+        "displaced": 20,
+        "pinned_in": 80,
+        "pinned_planted": 80,
+        "forged": 10,
+        "blocked": 0,
+        "benign": 1326,
+        "benign_planted": 2400
+      }
+    },
+    "defended": {
+      "packet(query)": {
+        "n": 800,
+        "reached": 465,
+        "poison": 844,
+        "instr": 0,
+        "binding": 0,
+        "displaced": 0,
+        "pinned_in": 0,
+        "pinned_planted": 0,
+        "forged": 0,
+        "blocked": 0,
+        "benign": 7155,
+        "benign_planted": 0
+      },
+      "packet(hot)": {
+        "n": 20,
+        "reached": 20,
+        "poison": 77,
+        "instr": 0,
+        "binding": 0,
+        "displaced": 0,
+        "pinned_in": 32,
+        "pinned_planted": 80,
+        "forged": 0,
+        "blocked": 0,
+        "benign": 1245,
+        "benign_planted": 2400
+      },
+      "hot_text": {
+        "n": 20,
+        "reached": 20,
+        "poison": 110,
+        "instr": 0,
+        "binding": 0,
+        "displaced": 0,
+        "pinned_in": 45,
+        "pinned_planted": 80,
+        "forged": 0,
+        "blocked": 0,
+        "benign": 1498,
+        "benign_planted": 2400
+      }
+    }
+  },
+  "wall_seconds": 1.07
+}

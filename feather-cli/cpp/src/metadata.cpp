@@ -30,8 +30,7 @@ void Metadata::serialize(std::ostream& os) const {
     os.write(reinterpret_cast<const char*>(&links_count), 2);
     // Salience counters are atomic — snapshot them into plain values so the
     // on-disk layout is byte-identical to previous versions.
-    uint32_t rc = recalls();
-    uint64_t lr = recalled_at();
+    const auto [rc, lr] = recall_state();
     os.write(reinterpret_cast<const char*>(&rc), 4);
     os.write(reinterpret_cast<const char*>(&lr), 8);
 

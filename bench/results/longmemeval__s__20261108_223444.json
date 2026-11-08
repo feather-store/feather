@@ -1,0 +1,130 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "s",
+  "n": 100,
+  "dim": 3072,
+  "feather_version": "0.21.0",
+  "python_version": "3.12.15",
+  "platform": "Darwin arm64",
+  "commit": "031055e",
+  "started_at": 1794157484.39772,
+  "wall_seconds": 308.21889090538025,
+  "metrics": {
+    "n_scored": 100,
+    "run_errors": 0,
+    "judge_errors": 0,
+    "overall_official": 0.93,
+    "by_question_type_official": {
+      "knowledge-update": 0.9375,
+      "multi-session": 0.8889,
+      "single-session-assistant": 1.0,
+      "single-session-preference": 0.6667,
+      "single-session-user": 1.0,
+      "temporal-reasoning": 0.9615
+    },
+    "task_averaged_official": 0.9091,
+    "abstention_official": 0.8333,
+    "overall_lenient": 0.89,
+    "by_question_type_lenient": {
+      "knowledge-update": 0.875,
+      "multi-session": 0.8519,
+      "single-session-assistant": 1.0,
+      "single-session-preference": 1.0,
+      "single-session-user": 0.9286,
+      "temporal-reasoning": 0.8462
+    },
+    "task_averaged_lenient": 0.9169,
+    "abstention_lenient": 0.6667,
+    "judge_agreement": 0.92,
+    "official_only_correct": 6,
+    "lenient_only_correct": 2,
+    "evidence_fully_in_context": 1.0,
+    "evidence_shortened": 0.2872,
+    "evidence_fully_retrieved": 1.0,
+    "multi_round_questions": 41,
+    "multi_round_evidence_round1": 1.0,
+    "multi_round_evidence_final": 1.0,
+    "failure_buckets": {
+      "reader_wrong": 5,
+      "judge_disagreement": 2
+    },
+    "failure_buckets_by_type": {
+      "knowledge-update": {
+        "reader_wrong": 1
+      },
+      "multi-session": {
+        "reader_wrong": 3
+      },
+      "single-session-preference": {
+        "judge_disagreement": 2
+      },
+      "temporal-reasoning": {
+        "reader_wrong": 1
+      }
+    },
+    "questions_file": "/Users/apple/OpenSource/memory/feather/bench/results/longmemeval__s__20261108_223440__questions.jsonl",
+    "overall": 0.93,
+    "headline_judge": "official",
+    "by_axis": {
+      "abstention": 0.8333,
+      "information-extraction": 0.9333,
+      "knowledge-updates": 0.9333,
+      "multi-session-reasoning": 0.9167,
+      "temporal-reasoning": 0.96
+    },
+    "per_q_seconds_p50": 20.7145,
+    "per_q_seconds_mean": 23.886999999999997,
+    "n_questions": 100,
+    "n_failures": 0,
+    "failures_sample": [],
+    "history_turns_total": 49525,
+    "embeddings_emitted": 49683,
+    "embedder": "gemini_gemini-embedding-001_d3072",
+    "judge": "llm_judge=gemini-text/gemini-2.5-flash_ans=gemini-text/gemini-2.5-flash",
+    "official_judge": "official=openrouter/openai/gpt-4o-2024-08-06",
+    "top_k": 20,
+    "unit": "session",
+    "context_chars": 160000,
+    "context_tokens": null,
+    "multi_round": "auto",
+    "count_map": "off",
+    "reader": "single",
+    "workers": 8,
+    "facts": "off",
+    "decay_engaged": false,
+    "decay_half_life_days": null,
+    "decay_time_weight": null,
+    "peak_rss_mb": 1657.453125,
+    "reportable": false,
+    "not_reportable_because": [
+      "--split dev: not all 500 questions",
+      "uncommitted changes: no commit reproduces this run"
+    ]
+  },
+  "params": {
+    "k": 20,
+    "ef": null,
+    "embedder": "gemini_gemini-embedding-001_d3072",
+    "judge": "llm_judge=gemini-text/gemini-2.5-flash_ans=gemini-text/gemini-2.5-flash",
+    "variant": "s",
+    "unit": "session",
+    "multi_round": "auto",
+    "facts": "off",
+    "count_map": "off",
+    "split": "dev",
+    "reader": "single",
+    "context_tokens": null,
+    "tokenizer_model": null,
+    "count_votes": 1,
+    "context_chars_budget": 160000,
+    "system_provider": null,
+    "system_model": null,
+    "official_judge": "official=openrouter/openai/gpt-4o-2024-08-06",
+    "context_chars": 160000,
+    "decay_half_life": null,
+    "decay_time_weight": null
+  },
+  "notes": "",
+  "command": "python -m bench run longmemeval --dataset s --k 20 --embedder gemini --judge llm --judge-provider gemini-text --judge-model gemini-2.5-flash --official-judge-provider openrouter --official-judge-model openai/gpt-4o-2024-08-06 --workers 8 --limit 0 --split dev",
+  "dirty": true
+}

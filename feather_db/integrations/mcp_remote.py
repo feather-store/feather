@@ -296,9 +296,12 @@ class RemoteFeatherTools:
         text = a["text"]
         rid = _gen_id(text)
         vec = self._embed(text)
+        # The model wrote it, so it is `agent` at most (feather_db.origin):
+        # it cannot vouch that the user said it rather than a page it read.
         meta = {"content": text, "namespace_id": ns,
                 "source": a.get("source", "claude"),
-                "importance": float(a.get("importance", 1.0))}
+                "importance": float(a.get("importance", 1.0)),
+                "attributes": {"_origin": "agent"}}
         if a.get("entity_id"):
             meta["entity_id"] = a["entity_id"]
         self._req("POST", f"/v1/{ns}/vectors", {"id": rid, "vector": vec, "metadata": meta},

@@ -1,0 +1,134 @@
+{
+ "pocket_remember": {
+  "n": 8000,
+  "p50_ms": 0.997,
+  "p95_ms": 1.808,
+  "p99_ms": 2.348,
+  "mean_ms": 0.984,
+  "max_ms": 23.936
+ },
+ "pocket_hot_cold": {
+  "n": 20,
+  "p50_ms": 1.248,
+  "p95_ms": 1.318,
+  "p99_ms": 1.424,
+  "mean_ms": 1.261,
+  "max_ms": 1.45
+ },
+ "pocket_hot_warm": {
+  "n": 200,
+  "p50_ms": 0.0,
+  "p95_ms": 0.001,
+  "p99_ms": 0.001,
+  "mean_ms": 0.0,
+  "max_ms": 0.003
+ },
+ "pocket_hot_text_warm": {
+  "n": 100,
+  "p50_ms": 0.022,
+  "p95_ms": 0.024,
+  "p99_ms": 0.028,
+  "mean_ms": 0.023,
+  "max_ms": 0.113
+ },
+ "pocket_recall": {
+  "n": 200,
+  "p50_ms": 1.986,
+  "p95_ms": 2.373,
+  "p99_ms": 2.509,
+  "mean_ms": 2.038,
+  "max_ms": 2.652
+ },
+ "packet_build_query": {
+  "n": 200,
+  "p50_ms": 2.901,
+  "p95_ms": 3.561,
+  "p99_ms": 8.337,
+  "mean_ms": 3.21,
+  "max_ms": 24.478
+ },
+ "packet_build_hot": {
+  "n": 50,
+  "p50_ms": 0.556,
+  "p95_ms": 0.63,
+  "p99_ms": 1.405,
+  "mean_ms": 0.593,
+  "max_ms": 2.129
+ },
+ "agent_records": 8021,
+ "store_put_autosave": {
+  "n": 2000,
+  "p50_ms": 0.702,
+  "p95_ms": 1.407,
+  "p99_ms": 3.107,
+  "mean_ms": 0.831,
+  "max_ms": 12.282
+ },
+ "store_get": {
+  "n": 500,
+  "p50_ms": 0.008,
+  "p95_ms": 0.013,
+  "p99_ms": 0.015,
+  "mean_ms": 0.01,
+  "max_ms": 0.097
+ },
+ "store_search_query": {
+  "n": 200,
+  "p50_ms": 0.631,
+  "p95_ms": 0.829,
+  "p99_ms": 0.982,
+  "mean_ms": 0.656,
+  "max_ms": 1.174
+ },
+ "memory_preferences_set": {
+  "n": 200,
+  "p50_ms": 3.828,
+  "p95_ms": 6.994,
+  "p99_ms": 7.567,
+  "mean_ms": 3.746,
+  "max_ms": 8.593
+ },
+ "memory_episodes_record": {
+  "n": 200,
+  "p50_ms": 1.38,
+  "p95_ms": 2.007,
+  "p99_ms": 2.114,
+  "mean_ms": 1.443,
+  "max_ms": 2.655
+ },
+ "memory_facts_state": {
+  "n": 200,
+  "p50_ms": 3.795,
+  "p95_ms": 7.151,
+  "p99_ms": 7.657,
+  "mean_ms": 3.865,
+  "max_ms": 12.068
+ },
+ "memory_about": {
+  "n": 50,
+  "p50_ms": 1.98,
+  "p95_ms": 2.147,
+  "p99_ms": 2.297,
+  "mean_ms": 2.007,
+  "max_ms": 2.32
+ },
+ "memory_recall": {
+  "n": 200,
+  "p50_ms": 0.355,
+  "p95_ms": 0.384,
+  "p99_ms": 0.445,
+  "mean_ms": 0.359,
+  "max_ms": 0.497
+ },
+ "_env": {
+  "python": "3.12.15",
+  "feather": "0.21.0",
+  "cpus": 8,
+  "simd": {
+   "active": "neon",
+   "detected": "neon"
+  },
+  "when": "2026-11-08 22:25:31"
+ },
+ "_section_s": 17.2
+}

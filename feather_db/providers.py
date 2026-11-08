@@ -304,3 +304,18 @@ class GeminiProvider(LLMProvider):
 
     def name(self) -> str:
         return f"GeminiProvider({self._model})"
+
+
+PROVIDERS = ("claude", "openai", "gemini", "ollama")
+
+
+def make_provider(name: str, model: Optional[str] = None) -> LLMProvider:
+    """The provider called `name` (one of PROVIDERS; "anthropic" is
+    "claude"), with `model` or its default. Keys come from each provider's
+    usual environment variable."""
+    cls = {"claude": ClaudeProvider, "anthropic": ClaudeProvider,
+           "openai": OpenAIProvider, "gemini": GeminiProvider,
+           "ollama": OllamaProvider}.get((name or "").lower())
+    if cls is None:
+        raise ValueError(f"unknown provider {name!r}: one of {', '.join(PROVIDERS)}")
+    return cls(model=model) if model else cls()

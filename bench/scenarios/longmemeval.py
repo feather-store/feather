@@ -47,7 +47,7 @@ from typing import Optional
 import feather_db
 
 from feather_db.extractors import (fact_key, ledger, link_validity, profile,
-                                   timeline)
+                                   replaces, timeline)
 from feather_db.filter import FilterBuilder
 
 from .. import lme_answer, lme_eval, lme_reader, lme_retrieve
@@ -60,8 +60,6 @@ from .lme_context import Turn, parse_lme_date, render, session_text
 # ranked by its best turn, so the pool must be wide enough to reach every
 # session a multi-session count needs.
 SESSION_POOL_FACTOR = 5
-# Concurrent fact extractions per question (x --workers questions).
-FACT_WORKERS = 8
 # Facts searched for the event ledger (count questions) and the preference
 # profile (every question), by similarity to the question, kind-filtered.
 LEDGER_K = 60
@@ -301,16 +299,26 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
                 for t in turns:
                     by_session.setdefault(t.session_id, []).append(t)
                 facts = []
-                # One extraction call per session, FACT_WORKERS at a time:
-                # a question has ~50 sessions and each call waits on an LLM.
-                with ThreadPoolExecutor(max_workers=FACT_WORKERS) as fpool:
-                    extracted = list(fpool.map(
-                        lambda item: fact_cache.facts(
-                            item[0], item[1][0].session_date,
-                            [{"role": t.role, "content": t.content}
-                             for t in item[1]]),
-                        by_session.items()))
-                for (sid, sturns), got in zip(by_session.items(), extracted):
+                # One extraction call per session, in date order, each told
+                # the one-value keys the earlier sessions produced, so an
+                # attribute keeps one name across the haystack (extractor
+                # 0.3: separate calls named one thing "address", "home
+                # city", "location"). Sequential within a question;
+                # questions run in parallel (--workers).
+                def _when(item):
+                    d = parse_lme_date(item[1][0].session_date)
+                    return d.timestamp() if d else 0.0
+                ordered = sorted(by_session.items(), key=_when)
+                known: set = set()
+                extracted = []
+                for sid, sturns in ordered:
+                    got = fact_cache.facts(
+                        sid, sturns[0].session_date,
+                        [{"role": t.role, "content": t.content} for t in sturns],
+                        known_keys=sorted(known))
+                    known |= {fact_key(f) for f in got if replaces(f)}
+                    extracted.append(got)
+                for (sid, sturns), got in zip(ordered, extracted):
                     for f in got:
                         i = f.metadata.get("turn")
                         anchor = (sturns[i] if isinstance(i, int)

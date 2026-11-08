@@ -17,6 +17,18 @@ Requests are counted per class, because they wait on different resources:
 Health, the SPAs and the docs are never refused. A limit of 0 disables it.
 The count lives on the event loop (incremented and decremented there only),
 so it needs no lock.
+
+Fair between tenants. A class's slots are shared by the namespaces using
+them (the namespace in the path; /v1/admin/* is one tenant): with n holding
+slots, a tenant may hold at most limit / n, and a tenant alone at most
+limit minus a reserve (FEATHER_ADMISSION_RESERVE, 1/8 of the limit, for
+limits of 4 or more). So one tenant's bulk import cannot take every write
+slot: another tenant's request finds the reserve free and is admitted at
+once, and from then on the two share. Nothing is preempted; a tenant over
+its share is refused (429, `fair_share`) until its own requests finish.
+O(1) per request. There is no queue to schedule (a request is admitted or
+refused at once, see above), so this is deficit round robin's fairness
+without its queue. FEATHER_FAIR_ADMISSION=0 turns it off.
 """
 import os
 import re
@@ -40,9 +52,31 @@ LIMITS = {
     "file": _env_int("FEATHER_MAX_INFLIGHT_FILES", 8),
 }
 RETRY_AFTER_S = _env_int("FEATHER_RETRY_AFTER_S", 1) or 1
+FAIR = os.getenv("FEATHER_FAIR_ADMISSION", "1") != "0"
+try:
+    RESERVE = min(0.5, max(0.0, float(os.getenv("FEATHER_ADMISSION_RESERVE", "0.125"))))
+except ValueError:
+    RESERVE = 0.125
+
+_TENANT = re.compile(r"^/v1/([^/]+)")
+
+
+def tenant_of(path: str) -> str:
+    m = _TENANT.match(path)
+    return m.group(1) if m else ""
+
+
+def fair_cap(limit: int, others: int) -> int:
+    """The most slots of `limit` one tenant may hold while `others` other
+    tenants hold some."""
+    if others == 0:
+        reserve = max(1, int(limit * RESERVE)) if limit >= 4 and RESERVE > 0 else 0
+        return max(1, limit - reserve)
+    return max(1, limit // (others + 1))
 
 _FILE_POST = re.compile(r"^/v1/[^/]+/ingest_file$")
-_READ_POSTS = re.compile(r"^/v1/[^/]+/(search|keyword_search|hybrid_search|context_chain)$")
+_READ_POSTS = re.compile(
+    r"^/v1/[^/]+/(search|keyword_search|hybrid_search|context_chain|records/get_many|by_keys|heat_select)$")
 _EXEMPT = ("/health", "/admin", "/app", "/static", "/docs", "/redoc", "/openapi.json", "/dashboard")
 
 
@@ -63,6 +97,8 @@ class Admission:
 
     inflight = {k: 0 for k in LIMITS}
     rejected = {k: 0 for k in LIMITS}
+    rejected_fair = {k: 0 for k in LIMITS}
+    held = {k: {} for k in LIMITS}          # class -> tenant -> requests in flight
 
     def __init__(self, app):
         self.app = app
@@ -70,25 +106,50 @@ class Admission:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        cls = classify(scope.get("method", "GET"), scope.get("path", ""))
+        path = scope.get("path", "")
+        cls = classify(scope.get("method", "GET"), path)
         limit = LIMITS.get(cls, 0) if cls else 0
         if not limit:
             return await self.app(scope, receive, send)
+        tenant = tenant_of(path)
+        held = Admission.held[cls]
+        mine = held.get(tenant, 0)
         if Admission.inflight[cls] >= limit:
             Admission.rejected[cls] += 1
-            resp = JSONResponse(
-                status_code=429, headers={"Retry-After": str(RETRY_AFTER_S)},
-                content=errors.body(429, f"server busy: {limit} {cls} requests already in "
-                                         f"flight; retry after {RETRY_AFTER_S}s",
-                                    limit=limit, kind=cls))
-            return await resp(scope, receive, send)
+            return await self._refuse(scope, receive, send,
+                                      f"server busy: {limit} {cls} requests already in flight",
+                                      limit=limit, kind=cls)
+        if FAIR:
+            cap = fair_cap(limit, len(held) - (1 if mine else 0))
+            if mine >= cap:
+                Admission.rejected[cls] += 1
+                Admission.rejected_fair[cls] += 1
+                return await self._refuse(
+                    scope, receive, send,
+                    f"fair share: namespace {tenant!r} already has {mine} of {limit} {cls} "
+                    f"requests in flight", limit=limit, kind=cls, share=cap,
+                    error="fair_share")
         Admission.inflight[cls] += 1
+        held[tenant] = mine + 1
         try:
             await self.app(scope, receive, send)
         finally:
             Admission.inflight[cls] -= 1
+            n = held[tenant] - 1
+            if n:
+                held[tenant] = n
+            else:
+                del held[tenant]
+
+    @staticmethod
+    async def _refuse(scope, receive, send, why: str, error: str = None, **extra):
+        body = errors.body(429, f"{why}; retry after {RETRY_AFTER_S}s", error, **extra)
+        resp = JSONResponse(status_code=429, headers={"Retry-After": str(RETRY_AFTER_S)},
+                            content=body)
+        return await resp(scope, receive, send)
 
     @classmethod
     def stats(cls) -> dict:
-        return {k: {"inflight": cls.inflight[k], "limit": LIMITS[k], "rejected": cls.rejected[k]}
+        return {k: {"inflight": cls.inflight[k], "limit": LIMITS[k], "rejected": cls.rejected[k],
+                    "rejected_fair": cls.rejected_fair[k], "tenants": len(cls.held[k])}
                 for k in LIMITS}

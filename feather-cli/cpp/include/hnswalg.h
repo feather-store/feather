@@ -327,6 +327,103 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
     }
 
+    // Feather: the label a scrubbed slot carries (see scrubDeleted).
+    static constexpr labeltype kScrubbedLabel = std::numeric_limits<labeltype>::max();
+
+    // Feather: take deleted nodes out of the graph for good, without a
+    // rebuild (erase(): a compaction rebuild cost 14.5 s at 50k x 384 to
+    // remove 50 nodes). Every remaining node that links to one gets its list
+    // re-chosen, by the construction heuristic, from its remaining neighbours
+    // and the removed nodes' neighbours; then each removed node's links,
+    // vector and upper levels are cleared and its label set to
+    // kScrubbedLabel. It stays a slot (deleted, unreachable, all zero) until
+    // a compaction renumbers. Caller holds the index exclusively. Returns the
+    // number of nodes scrubbed.
+    size_t scrubDeleted(const std::vector<tableint>& ids) {
+        const size_t n = cur_element_count;
+        std::vector<char> gone(n, 0);
+        size_t count = 0;
+        for (tableint id : ids)
+            if (id < n && isMarkedDeleted(id) && !gone[id]) { gone[id] = 1; ++count; }
+        if (!count) return 0;
+
+        std::vector<tableint> stack;
+        std::unordered_set<tableint> seen, cand;
+        for (size_t xi = 0; xi < n; ++xi) {
+            const tableint x = static_cast<tableint>(xi);
+            if (gone[x]) continue;
+            for (int l = 0; l <= element_levels_[x]; ++l) {
+                linklistsizeint *ll = get_linklist_at_level(x, l);
+                const size_t cnt = getListCount(ll);
+                tableint *nb = (tableint *) (ll + 1);
+                bool touched = false;
+                for (size_t j = 0; j < cnt && !touched; ++j) touched = gone[nb[j]];
+                if (!touched) continue;
+                // Candidates: the surviving neighbours, and through each
+                // removed one (and any removed chain behind it) its neighbours.
+                cand.clear(); seen.clear(); stack.clear();
+                for (size_t j = 0; j < cnt; ++j) {
+                    if (!gone[nb[j]]) cand.insert(nb[j]);
+                    else if (seen.insert(nb[j]).second) stack.push_back(nb[j]);
+                }
+                while (!stack.empty()) {
+                    const tableint g = stack.back(); stack.pop_back();
+                    if (element_levels_[g] < l) continue;
+                    linklistsizeint *gl = get_linklist_at_level(g, l);
+                    tableint *gnb = (tableint *) (gl + 1);
+                    for (size_t k = 0, gc = getListCount(gl); k < gc; ++k) {
+                        const tableint z = gnb[k];
+                        if (z == x || element_levels_[z] < l) continue;
+                        if (!gone[z]) cand.insert(z);
+                        else if (seen.insert(z).second) stack.push_back(z);
+                    }
+                }
+                std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>,
+                                    CompareByFirst> top;
+                for (tableint c : cand)
+                    top.emplace(fstdistfunc_(getDataByInternalId(x), getDataByInternalId(c),
+                                             dist_func_param_), c);
+                const size_t mmax = l ? maxM_ : maxM0_;
+                if (top.size() > mmax) getNeighborsByHeuristic2(top, mmax);
+                size_t k = 0;
+                while (!top.empty()) { nb[k++] = top.top().second; top.pop(); }
+                setListCount(ll, static_cast<unsigned short>(k));   // keeps the delete mark
+                markDirty(x, DIRTY_LINKS);
+            }
+        }
+
+        for (size_t i = 0; i < n; ++i) {
+            if (!gone[i]) continue;
+            const tableint id = static_cast<tableint>(i);
+            setListCount(get_linklist0(id), 0);
+            if (element_levels_[id] > 0) {
+                free(linkLists_[id]);
+                linkLists_[id] = nullptr;
+                element_levels_[id] = 0;
+            }
+            std::memset(getDataByInternalId(id), 0, data_size_);
+            auto it = label_lookup_.find(getExternalLabel(id));
+            if (it != label_lookup_.end() && it->second == id) label_lookup_.erase(it);
+            setExternalLabel(id, kScrubbedLabel);
+            markDirty(id, DIRTY_LINKS | DIRTY_DATA);
+        }
+
+        // A removed entry point: the highest remaining node takes over.
+        if (gone[enterpoint_node_]) {
+            tableint best = enterpoint_node_;
+            int best_level = -1;
+            for (size_t i = 0; i < n; ++i)
+                if (!gone[i] && element_levels_[i] > best_level) {
+                    best = static_cast<tableint>(i);
+                    best_level = element_levels_[i];
+                }
+            if (best_level < 0) { best = 0; best_level = 0; }   // every node removed
+            enterpoint_node_ = best;
+            maxlevel_ = best_level;
+        }
+        return count;
+    }
+
     void restoreFinish(tableint enterpoint, int maxlevel) {
         checkGraph(enterpoint, maxlevel);
         const size_t n = cur_element_count;

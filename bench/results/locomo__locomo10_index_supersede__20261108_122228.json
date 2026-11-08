@@ -1,0 +1,187 @@
+{
+  "scenario": "locomo",
+  "dataset": "locomo10",
+  "n": 1540,
+  "dim": 3072,
+  "feather_version": "0.21.0",
+  "python_version": "3.12.15",
+  "platform": "Darwin arm64",
+  "commit": "031055e",
+  "dirty": true,
+  "argv": [
+    "/Users/apple/OpenSource/memory/feather/bench/locomo.py",
+    "run",
+    "--memory",
+    "index",
+    "--supersede",
+    "--reuse",
+    "bench/results/locomo__locomo10_index__20261108_121646__questions.jsonl"
+  ],
+  "started_at": 1794120742.219647,
+  "wall_seconds": 79.0,
+  "params": {
+    "conversations": [
+      "conv-26",
+      "conv-30",
+      "conv-41",
+      "conv-42",
+      "conv-43",
+      "conv-44",
+      "conv-47",
+      "conv-48",
+      "conv-49",
+      "conv-50"
+    ],
+    "k": 30,
+    "memory": "index",
+    "categories": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "retrieval": "hybrid_search (BM25 + dense, RRF), no scoring over turns + extracted facts; a fact hit counts for the turn it cites; k distinct turns",
+    "extractor": "openrouter:openai/gpt-4o-mini",
+    "index": {
+      "index_entries": 2109,
+      "keys": 1211,
+      "superseded_pairs": 55,
+      "superseded_keys": 117,
+      "turns_with_notes": 51
+    },
+    "supersede": true,
+    "supersede_gate": "ContradictionResolver: definite + supersedes",
+    "note_format": "  \u21b3 later, session N: <newest statement of the key>",
+    "reused_from": "bench/results/locomo__locomo10_index__20261108_121646__questions.jsonl",
+    "reused": 1187,
+    "embedder": "gemini-embedding-001",
+    "reader": "openrouter:openai/gpt-4o-mini",
+    "judge": "openrouter:openai/gpt-4o-mini",
+    "judge_source": "https://github.com/mem0ai/mem0/blob/393a4fd5a6cfeb754857a2229726f567a9fadf36/evaluation/metrics/llm_judge.py",
+    "data_url": "https://raw.githubusercontent.com/snap-research/locomo/3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376/data/locomo10.json",
+    "data_sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+    "answer_system": "You answer questions about a long conversation between {a} and {b}, from excerpts of it retrieved from memory.\n\nThe excerpts are grouped by session, oldest first; each session is headed by the date it took place.\n\n- Resolve every relative date against the date of the session it was said in: \"yesterday\" in a session of Monday 8 May 2023 is 7 May 2023, \"last year\" is 2022, \"last Saturday\" is 6 May 2023. Answer with the absolute date, month or year.\n- Give the answer only: a short phrase, no explanation. For a list, give every item the excerpts support.\n- If the excerpts do not state the answer outright, give the most likely answer they support.",
+    "answer_user": "Excerpts:\n\n{context}\n\nQuestion: {question}\nAnswer:",
+    "bleu1_impl": "approximate (nltk missing: regex tokenizer, same BLEU-1 formula)",
+    "category_mapping": {
+      "1": {
+        "name": "multi-hop",
+        "mem0_paper_column": "Single Hop"
+      },
+      "2": {
+        "name": "temporal",
+        "mem0_paper_column": "Temporal"
+      },
+      "3": {
+        "name": "open-domain",
+        "mem0_paper_column": "Multi-Hop"
+      },
+      "4": {
+        "name": "single-hop",
+        "mem0_paper_column": "Open Domain"
+      }
+    }
+  },
+  "metrics": {
+    "overall": {
+      "n": 1540,
+      "J": 82.66,
+      "F1": 59.04,
+      "BLEU1": 47.34,
+      "evidence_recall": 0.8591,
+      "all_evidence_retrieved": 0.7962
+    },
+    "by_category": {
+      "1": {
+        "name": "multi-hop",
+        "mem0_paper_column": "Single Hop",
+        "n": 282,
+        "J": 74.82,
+        "F1": 43.72,
+        "BLEU1": 33.9,
+        "evidence_recall": 0.6707,
+        "all_evidence_retrieved": 0.422
+      },
+      "2": {
+        "name": "temporal",
+        "mem0_paper_column": "Temporal",
+        "n": 321,
+        "J": 81.0,
+        "F1": 62.63,
+        "BLEU1": 46.48,
+        "evidence_recall": 0.9361,
+        "all_evidence_retrieved": 0.9097
+      },
+      "3": {
+        "name": "open-domain",
+        "mem0_paper_column": "Multi-Hop",
+        "n": 96,
+        "J": 53.12,
+        "F1": 27.04,
+        "BLEU1": 21.73,
+        "evidence_recall": 0.5811,
+        "all_evidence_retrieved": 0.4674
+      },
+      "4": {
+        "name": "single-hop",
+        "mem0_paper_column": "Open Domain",
+        "n": 841,
+        "J": 89.3,
+        "F1": 66.46,
+        "BLEU1": 55.1,
+        "evidence_recall": 0.9233,
+        "all_evidence_retrieved": 0.9144
+      }
+    },
+    "judge_unparsed": 0,
+    "reader_errors": 0,
+    "context_tokens_est_mean": 1413
+  },
+  "cost": {
+    "reader_tokens": {
+      "in": 591690,
+      "out": 2799
+    },
+    "judge_tokens": {
+      "in": 143694,
+      "out": 2119
+    },
+    "embed_tokens_new": 0,
+    "reader_usd": 0.0858825,
+    "judge_usd": 0.02282550000000002,
+    "embed_usd": 0.0,
+    "prices_per_1m": {
+      "gpt-4o-mini": [
+        0.15,
+        0.6
+      ],
+      "gpt-4o": [
+        2.5,
+        10.0
+      ],
+      "gemini-embedding-001": [
+        0.15,
+        0.0
+      ]
+    },
+    "cost_source": {
+      "reader": "openrouter usage.cost",
+      "judge": "openrouter usage.cost",
+      "embed": "list price x chars/4"
+    },
+    "served_by": {
+      "reader": {
+        "OpenAI": 353
+      },
+      "judge": {
+        "OpenAI": 353
+      }
+    },
+    "extractor_tokens": {},
+    "extractor_usd": 0.0,
+    "extractor_note": "0 when every extraction came from the cache",
+    "usd": 0.1087,
+    "projected_all_10_llm_usd": 0.109
+  },
+  "questions_file": "/Users/apple/OpenSource/memory/feather/bench/results/locomo__locomo10_index_supersede__20261108_122228__questions.jsonl"
+}

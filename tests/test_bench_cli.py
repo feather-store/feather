@@ -20,7 +20,9 @@ GOOD = {"official_judge": "official=openrouter/openai/gpt-4o-2024-08-06",
         "judge_errors": 0}
 
 
-def test_limit_defaults_to_every_question(monkeypatch):
+def test_limit_defaults_to_every_question(monkeypatch, tmp_path):
+    import bench.runner
+    monkeypatch.setattr(bench.runner, "RESULTS_DIR", tmp_path)   # not the real results
     seen = {}
     def load(variant, limit):
         seen["limit"] = limit
@@ -35,6 +37,8 @@ def test_limit_defaults_to_every_question(monkeypatch):
         with pytest.raises(SystemExit):
             cli.main(argv)
         assert seen["limit"] == want, argv
+    # A run that wrote nothing leaves no empty questions file behind.
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_split_and_limit_together_are_refused(capsys):

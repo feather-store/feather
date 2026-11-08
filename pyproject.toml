@@ -85,7 +85,7 @@ all = [
 ]
 
 [project.scripts]
-feather-serve = "feather_db.integrations.mcp_server:main"
+feather-serve = "feather_db.integrations.mcp_agent:main"
 feather-agent = "feather_db.integrations.mcp_agent:main"
 
 [project.urls]

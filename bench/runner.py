@@ -127,11 +127,48 @@ class BenchRunner:
 
     def _persist(self, result: BenchResult) -> None:
         stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(result.started_at))
-        name = f"{result.scenario}__{result.dataset}__{stamp}.json"
-        path = RESULTS_DIR / name
+        path = reserve(f"{result.scenario}__{result.dataset}__{stamp}", ".json")
         with open(path, "w") as f:
             json.dump(result.to_dict(), f, indent=2, default=str)
         print(f"[bench] wrote {path}")
+
+
+_CLAIMS: set = set()
+
+
+def reserve(stem: str, suffix: str, directory=None) -> Path:
+    """RESULTS_DIR/<stem><suffix>, created empty so no other run can take it:
+    <stem>_2<suffix>, _3, ... when it exists. Names are stamped to the
+    second, and two runs started together wrote one file, the second
+    overwriting the first's answers. A claim nothing was written to is
+    removed by release_unused_claims() when the run ends."""
+    d = Path(directory or RESULTS_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        path = d / f"{stem}{'' if n == 1 else f'_{n}'}{suffix}"
+        try:
+            open(path, "x").close()
+            _CLAIMS.add(path)
+            return path
+        except FileExistsError:
+            n += 1
+
+
+def release_unused_claims() -> int:
+    """Delete this process's claims that are still empty: a run that failed
+    or returned before its first record left them, and an empty results file
+    reads as a run that scored nothing. Returns how many."""
+    n = 0
+    for path in list(_CLAIMS):
+        _CLAIMS.discard(path)
+        try:
+            if path.stat().st_size == 0:
+                path.unlink()
+                n += 1
+        except FileNotFoundError:
+            pass
+    return n
 
 
 def load_results() -> list[dict]:

@@ -1,0 +1,25 @@
+{
+ "dataset": "locomo10",
+ "unit": "conversation",
+ "rule": "the 3 sample_ids with the smallest sha1(sample_id)",
+ "frozen": "2026-11-08",
+ "dev": [
+  "conv-43",
+  "conv-44",
+  "conv-50"
+ ],
+ "test": [
+  "conv-26",
+  "conv-30",
+  "conv-41",
+  "conv-42",
+  "conv-47",
+  "conv-48",
+  "conv-49"
+ ],
+ "questions_cat1_4": {
+  "dev": 459,
+  "test": 1081
+ },
+ "not_held_out": "the 0.2.0-0.3.1 extractor prompts were tuned with all 10 conversations in view"
+}

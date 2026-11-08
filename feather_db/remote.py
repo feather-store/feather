@@ -51,15 +51,19 @@ PARITY = {
     "forget":            "DELETE /records/{record_id}",
     "forget_expired":    "POST /forget_expired",
     "purge":             "POST /purge",
+    "erase":             "POST /erase",
     "link":              "POST /records/{record_id}/link",
     "auto_link":         "POST /auto_link",
     "touch":             "POST /records/{record_id}/touch",
     # reads
     "get_metadata":      "GET /records/{record_id}",
+    "get_metadata_many": "POST /records/get_many",
     "get_vector":        "GET /records/{record_id}",
     "version":           "GET /records/{record_id}",
     "get_by_key":        "GET /by_key",
     "id_for":            "GET /by_key",
+    "ids_for_many":      "POST /by_keys",
+    "heat_select":       "POST /heat_select",
     "get_edges":         "GET /records/{record_id}/edges",
     "get_incoming":      "GET /records/{record_id}/edges",
     "search":            "POST /search",
@@ -95,19 +99,44 @@ PARITY = {
     "set_quantized":     "PUT /admin/settings",
     "is_int8_ram":       "GET /admin/engine",
     "int8_info":         "GET /admin/engine",
+    "background_cosine": "GET /admin/engine",
     "set_int8_ram":      "PUT /admin/settings",
     "namespace_ann_info": "GET /admin/engine",
     "set_namespace_ann_min": "PUT /admin/settings",
     "wait_for_namespace_graphs": "GET /admin/engine",
+    # history (time travel): RemoteDB(url, ns, as_of=...) sends X-Feather-As-Of
+    "history":           "GET /history",
+    "tags":              "GET /history",
+    "history_retention": "GET /history",
+    "tag":               "POST /tags",
+    "untag":             "DELETE /tags/{name}",
+    "set_history_retention": "PUT /admin/settings",
+    "as_of":             "GET /as_of",
+    "now":               "GET /as_of",
+    "record_versions":   "GET /record_versions",
     # the handle itself, not a feature of the data
-    "open":              "-: a server opens its files; RemoteDB(url, namespace) is the open",
+    "open":              "-: a server opens its files; RemoteDB(url, namespace) is the open, "
+                         "and RemoteDB(..., as_of=, generation=) the X-Feather-As-Of header",
     "close":             "-: RemoteDB.close() ends the client session; the server keeps the file",
     "closed":            "-: client-side (RemoteDB.closed)",
     "is_closed":         "-: client-side (RemoteDB.is_closed)",
-    "is_read_only":      "-: client-side (RemoteDB.is_read_only is False)",
+    "is_read_only":      "-: client-side (True only for RemoteDB(..., as_of=))",
     "write_error":       "-: the server recovers a failed handle itself (503 write_failed)",
     "idempotent_result": "-: over HTTP, the Idempotency-Key header",
 }
+
+
+def _as_of_header(as_of, generation):
+    """DB.open's as_of= / generation= as the X-Feather-As-Of header value."""
+    if generation is not None:
+        return f"generation:{int(generation)}"
+    if as_of is None:
+        return None
+    if isinstance(as_of, str):
+        return "tag:" + urllib.parse.quote(as_of, safe="")
+    if hasattr(as_of, "timestamp"):
+        as_of = as_of.timestamp()
+    return f"time:{float(as_of)!r}"
 
 
 @dataclass
@@ -311,7 +340,7 @@ def _scoring_json(s) -> dict:
     if s is None:
         return {}
     return {"scoring_half_life": s.decay_half_life_days, "scoring_weight": s.time_weight,
-            "scoring_min": s.min_weight}
+            "scoring_min": s.min_weight, "scoring_relevance_floor": s.relevance_floor}
 
 
 def _vec(v) -> str:
@@ -329,10 +358,19 @@ class RemoteDB:
     BATCH_MAX = 10_000          # ops per POST /batch
 
     def __init__(self, base_url: str, namespace: str, api_key: str = "",
-                 session=None, timeout: float = 30.0):
+                 session=None, timeout: float = 30.0, as_of=None, generation=None):
         self.base = base_url.rstrip("/")
         self.namespace = namespace
         self._headers = {"X-API-Key": api_key} if api_key else {}
+        # As DB.open(..., as_of=, generation=): every request reads that commit.
+        if as_of is not None and generation is not None:
+            raise ValueError("RemoteDB: pass as_of or generation, not both")
+        if isinstance(as_of, bool):
+            raise ValueError("as_of is a time (unix seconds or datetime) or a tag name")
+        self._as_of_header = _as_of_header(as_of, generation)
+        if self._as_of_header:
+            self._headers["X-Feather-As-Of"] = self._as_of_header
+        self._as_of_info = None
         self._own_session = session is None      # a caller's session is theirs to close
         self._session = session if session is not None else _StdlibSession(timeout)
         self._closed = False
@@ -358,8 +396,23 @@ class RemoteDB:
         return self._call("PUT", "/admin/settings", body=kw)
 
     # ── handle ────────────────────────────────────────────────────────
+    def ensure_namespace(self, dim=None):
+        """Create this namespace if it does not exist; a no-op if it does.
+
+        `DB.open` creates a missing file. The server creates a namespace on its
+        first write but answers a READ of a missing one with 404, so a client
+        whose first call is a read (an agent loading its memory) must call this
+        first. `dim` only applies when the namespace is created."""
+        if self._closed:
+            raise RuntimeError("RemoteDB is closed")
+        body = {"name": self.namespace, **({"dim": int(dim)} if dim else {})}
+        r = self._session.request("POST", f"{self.base}/v1/namespaces", json=body,
+                                  params=None, headers=self._headers)
+        if r.status_code >= 400:
+            _raise(r)
+
     def close(self, save: bool = True):
-        if not self._closed and save:
+        if not self._closed and save and not self._as_of_header:
             self.save()
         self._closed = True
         if self._own_session:
@@ -373,7 +426,7 @@ class RemoteDB:
         return self._closed
 
     def is_read_only(self) -> bool:
-        return False
+        return self._as_of_header is not None
 
     def __enter__(self):
         return self
@@ -383,13 +436,17 @@ class RemoteDB:
 
     # ── writes ────────────────────────────────────────────────────────
     def add(self, id, vec, meta=None, modality="text"):
-        self._call("POST", "/vectors", body={"id": int(id), "vector_b64": _vec(vec),
-                                             "metadata": _meta_json(meta), "modality": modality})
+        # No meta: the vector only, and a live record keeps its metadata.
+        body = {"id": int(id), "vector_b64": _vec(vec), "modality": modality}
+        if meta is not None:
+            body["metadata"] = _meta_json(meta)
+        self._call("POST", "/vectors", body=body)
 
     def add_batch(self, ids, vecs, metas=None, modality="text"):
         vecs = np.asarray(vecs, dtype=np.float32)
         ops = [{"op": "put", "id": int(i), "vector": vecs[n].tolist(), "modality": modality,
-                "metadata": _meta_json(metas[n] if metas else None)} for n, i in enumerate(ids)]
+                **({"metadata": _meta_json(metas[n])} if metas else {})}
+               for n, i in enumerate(ids)]
         for s in range(0, len(ops), self.BATCH_MAX):
             self._call("POST", "/batch", body={"ops": ops[s:s + self.BATCH_MAX]})
 
@@ -455,6 +512,21 @@ class RemoteDB:
     def purge(self, namespace_id):
         return self._call("POST", "/purge", body={"namespace_id": namespace_id})["removed"]
 
+    def erase(self, ids=None, namespace="", entity="", prefix=False, cites=None,
+              feeds=None, dry_run=False):
+        body = {"ids": [int(i) for i in (ids or [])], "namespace_id": namespace,
+                "prefix": bool(prefix), "entity_id": entity, "dry_run": bool(dry_run)}
+        if cites is not None:
+            body["cites"] = list(cites)
+        if feeds is not None:
+            body["feeds"] = list(feeds)
+        try:
+            return self._call("POST", "/erase", body=body)
+        finally:                  # as DB.erase: pockets and embedding caches
+            if not dry_run:
+                from feather_db.pocket import _after_erase
+                _after_erase(self)
+
     def link(self, from_id, to_id, rel_type="related_to", weight=1.0):
         r = self._call("POST", f"/records/{int(from_id)}/link",
                        body={"to_id": int(to_id), "rel_type": rel_type, "weight": float(weight)},
@@ -475,6 +547,16 @@ class RemoteDB:
                        params={"include_deleted": "true" if include_dead else "false"}, ok_404=True)
         return _meta_from(r["metadata"]) if r else None
 
+    def get_metadata_many(self, ids, include_dead=False):
+        ids = [int(i) for i in ids]
+        out = []
+        for i in range(0, len(ids), self.BATCH_MAX):
+            r = self._call("POST", "/records/get_many",
+                           body={"ids": ids[i:i + self.BATCH_MAX],
+                                 "include_deleted": bool(include_dead)})
+            out += [_meta_from(x["metadata"]) if x else None for x in r["records"]]
+        return out
+
     def get_vector(self, id, modality="text"):
         r = self._call("GET", f"/records/{int(id)}", params={"include_vector": "true",
                                                               "modality": modality}, ok_404=True)
@@ -492,6 +574,33 @@ class RemoteDB:
     def id_for(self, key, namespace=""):
         r = self._call("GET", "/by_key", params={"key": key, "key_namespace": namespace}, ok_404=True)
         return int(r["id"]) if r else None
+
+    def heat_select(self, namespaces, now, budget, half_life_days, min_heat, trusted,
+                    exclude_sources, usage_half_life=3.0, unused_floor=0.4, inherit_decay=0.7,
+                    chars_per_token=4, pinned_attr="_pocket_pinned", due_attr="_pocket_due_at",
+                    origin_attr="_origin", text_attr="_lg_value",
+                    origins=("user", "agent", "tool", "external"), default_origin="user",
+                    unknown_origin="external"):
+        """DB.heat_select: an agent's working set in one request (Pocket.hot()
+        otherwise reads every record in scope over the wire)."""
+        body = dict(namespaces=list(namespaces), now=float(now), budget=float(budget),
+                    half_life_days=float(half_life_days), min_heat=float(min_heat),
+                    trusted=list(trusted), exclude_sources=list(exclude_sources),
+                    usage_half_life=usage_half_life, unused_floor=unused_floor,
+                    inherit_decay=inherit_decay, chars_per_token=chars_per_token,
+                    pinned_attr=pinned_attr, due_attr=due_attr, origin_attr=origin_attr,
+                    text_attr=text_attr, origins=list(origins), default_origin=default_origin,
+                    unknown_origin=unknown_origin)
+        r = self._call("POST", "/heat_select", body=body)
+        return [(int(i), int(d), float(h), int(t)) for i, d, h, t in r["picks"]]
+
+    def ids_for_many(self, refs):
+        refs = [[str(ns), str(k)] for ns, k in refs]
+        out = []
+        for s in range(0, len(refs), 10_000):
+            r = self._call("POST", "/by_keys", body={"refs": refs[s:s + 10_000]})
+            out += [int(x) if x is not None else None for x in r["ids"]]
+        return out
 
     def get_edges(self, id):
         r = self._call("GET", f"/records/{int(id)}/edges")
@@ -512,9 +621,11 @@ class RemoteDB:
                 **_filter_json(filter), **_scoring_json(scoring)}
         return self._hits(self._call("POST", "/search", body=body))
 
-    def keyword_search(self, query, k=10, filter=None):
+    def keyword_search(self, query, k=10, filter=None, record_salience=True):
         return self._hits(self._call("POST", "/keyword_search",
-                                     body={"query": query, "k": int(k), **_filter_json(filter)}))
+                                     body={"query": query, "k": int(k),
+                                           "track": bool(record_salience),
+                                           **_filter_json(filter)}))
 
     def hybrid_search(self, vec, query, k=10, rrf_k=60, filter=None, scoring=None, modality="text"):
         body = {"vector_b64": _vec(vec), "query": query, "k": int(k), "rrf_k": int(rrf_k),
@@ -583,14 +694,53 @@ class RemoteDB:
         return self._engine()["size"]
 
     def dim(self, modality="text"):
-        m = self._engine()["modalities"].get(modality)
-        return m["dim"] if m else self._engine()["dim"]
+        e = self._engine()                 # one request, not two
+        m = e["modalities"].get(modality)
+        return m["dim"] if m else e["dim"]
 
     def modality_names(self):
         return list(self._engine()["modalities"])
 
     def storage_stats(self):
         return self._engine()["storage"]
+
+    # ── history (time travel) ─────────────────────────────────────────
+    def history(self):
+        return self._call("GET", "/history")["commits"]
+
+    def tags(self):
+        return {k: int(v) for k, v in self._call("GET", "/history")["tags"].items()}
+
+    def history_retention(self):
+        r = self._call("GET", "/history")["retention_s"]
+        return float("inf") if r is None else float(r)
+
+    def tag(self, name):
+        self._call("POST", "/tags", body={"name": name})
+
+    def untag(self, name):
+        self._call("DELETE", f"/tags/{urllib.parse.quote(name, safe='')}")
+
+    def set_history_retention(self, seconds):
+        seconds = float(seconds)
+        if seconds != seconds or seconds < 0:
+            raise ValueError("history retention is seconds >= 0 (infinity: keep everything)")
+        self._settings(history_retention_s="inf" if seconds == float("inf") else seconds)
+
+    def as_of(self):
+        if self._as_of_header is None:
+            return None
+        if self._as_of_info is None:                 # one commit for the handle's life
+            self._as_of_info = self._call("GET", "/as_of")["as_of"]
+        return self._as_of_info
+
+    def now(self):
+        a = self.as_of()
+        return a["clock"] if a else time.time()
+
+    def record_versions(self, namespace=""):
+        rows = self._call("GET", "/record_versions", params={"namespace_prefix": namespace})["versions"]
+        return {int(i): int(v) for i, v in rows}
 
     def wal_size(self):
         return self._engine()["wal_size"]
@@ -629,6 +779,10 @@ class RemoteDB:
 
     def int8_info(self, modality):
         return self._engine()["modalities"][modality]["int8"]
+
+    def background_cosine(self, modality="text"):
+        m = self._engine()["modalities"].get(modality)
+        return float(m["background_cosine"]) if m else 0.0
 
     def set_int8_ram(self, modality, max_abs=None, refine=2):
         self._settings(int8_ram={modality: {"max_abs": max_abs, "refine": refine}})

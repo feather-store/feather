@@ -58,18 +58,22 @@ class SessionFactCache:
         # first time it is seen, and the second write is harmless.
         self._lock = threading.Lock()
 
-    def _key(self, session_date: str, turns: list[dict]) -> str:
+    def _key(self, session_date: str, turns: list[dict], known_keys=()) -> str:
         h = hashlib.sha1()
         h.update(f"{SessionFactExtractor.version}\0{self._model}\0"
                  f"{session_date}\0".encode())
+        if known_keys:       # what the extractor was told: part of the answer
+            h.update(("\0".join(sorted(known_keys)) + "\0\0").encode())
         h.update(json.dumps([[t.get("role"), t.get("content")] for t in turns],
                             ensure_ascii=False).encode())
         return h.hexdigest()
 
     def facts(self, session_id: str, session_date: str,
-              turns: list[dict]) -> list[Fact]:
-        """Fresh Fact objects (callers mutate metadata via link_validity)."""
-        key = self._key(session_date, turns)
+              turns: list[dict], known_keys=()) -> list[Fact]:
+        """Fresh Fact objects (callers mutate metadata via link_validity).
+        `known_keys`: the one-value keys extracted from this haystack's
+        earlier sessions, which the extractor reuses (extractor 0.3.0)."""
+        key = self._key(session_date, turns, known_keys)
         with self._lock:
             cached = self._mem.get(key)
             if cached is not None:
@@ -79,7 +83,8 @@ class SessionFactCache:
         if cached is None:
             errors = []
             got = self._extractor.extract_session(
-                turns, session_date, context={"on_error": errors.append})
+                turns, session_date, context={"on_error": errors.append,
+                                              "known_keys": sorted(known_keys)})
             if errors:
                 with self._lock:
                     self.failures += 1

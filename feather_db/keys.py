@@ -48,6 +48,28 @@ def resolve(db, namespace: str, key: str) -> Optional[int]:
     return rid if rid is not None else _legacy(db, namespace, key)
 
 
+def resolve_many(db, refs) -> list:
+    """resolve() for many (namespace, key) pairs: ids (None where there is no
+    live record), in order. One key lookup for all of them, and one metadata
+    read for the misses' legacy ids, instead of a round trip per key."""
+    refs = list(refs)
+    if not refs:
+        return []
+    if hasattr(db, "ids_for_many"):
+        ids = list(db.ids_for_many(refs))
+    else:                                        # a DB built before ids_for_many
+        ids = [db.id_for(k, ns) for ns, k in refs]
+    miss = [i for i, x in enumerate(ids) if x is None]
+    if miss:
+        lids = [legacy_id(*refs[i]) for i in miss]
+        for i, lid, m in zip(miss, lids, db.get_metadata_many(lids)):
+            ns, k = refs[i]
+            if (m is not None and not m.key and m.source != "_forgotten"
+                    and m.namespace_id == ns and m.entity_id == k):
+                ids[i] = lid
+    return ids
+
+
 def get(db, namespace: str, key: str):
     """(id, metadata) of the record keyed (namespace, key), or (None, None)."""
     rid = resolve(db, namespace, key)
@@ -71,15 +93,23 @@ def write(db, namespace: str, key: str, meta, vec=None, modality: str = "text") 
     return db.upsert(meta, vec, modality=modality)[0]
 
 
-def migrate(db, namespaces: Optional[Iterable[str]] = None, batch: int = 512) -> int:
+def migrate(db, namespaces: Optional[Iterable[str]] = None, batch: int = 512,
+            visit=None) -> int:
     """Give every legacy record in `namespaces` (default: all) its native key.
     Idempotent, and cheap once done: a record that already has a key is
-    skipped. Returns how many records were adopted."""
+    skipped. Returns how many records were adopted. `visit(namespace, ids,
+    metas)`, if given, sees each namespace's records as read: other one-off
+    upkeep shares this read instead of making its own."""
     names = list(namespaces) if namespaces is not None else db.list_namespaces()
     adopted, pending = 0, []
     for ns in names:
-        for rid in db.ids_in_namespace(ns):
-            m = db.get_metadata(rid)
+        ids = list(db.ids_in_namespace(ns))
+        # One read per namespace, not per record: an agent runs this on every
+        # start, and over the Cloud API each record was a round trip.
+        metas = db.get_metadata_many(ids) if ids else []
+        if visit is not None:
+            visit(ns, ids, metas)
+        for rid, m in zip(ids, metas):
             if (m is None or m.key or not m.entity_id or m.source not in LEGACY_SOURCES
                     or rid != legacy_id(ns, m.entity_id)):
                 continue

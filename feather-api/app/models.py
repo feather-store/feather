@@ -6,8 +6,8 @@ import base64
 import binascii
 
 import numpy as np
-from pydantic import BaseModel, Field, ConfigDict, model_validator
-from typing import Any, ClassVar, Dict, List, Literal, Optional
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 from enum import IntEnum
 
 
@@ -156,9 +156,9 @@ class SearchRequest(VectorInput):
         False,
         description="Also return `cosine`: the true cosine similarity between the "
                     "query and each stored vector, computed exactly. The default "
-                    "`score` is 1/(1+L2_squared), optionally blended with time "
-                    "decay — useful for ranking, but NOT a similarity, and it "
-                    "must not be thresholded.",
+                    "`score` is 1/(1+L2_squared), or with scoring_weight set "
+                    "cosine x freshness x importance — useful for ranking, but "
+                    "not a similarity, and it must not be thresholded.",
     )
     include_metadata: bool = Field(
         True, description="Set false to return only id/score(/cosine): skips copying "
@@ -182,12 +182,13 @@ class SearchRequest(VectorInput):
     scoring_half_life: Optional[float] = None    # days
     scoring_weight: Optional[float] = None       # 0.0–1.0
     scoring_min: Optional[float] = None
+    scoring_relevance_floor: Optional[float] = None   # < 0 / unset: the background cosine
 
 
 class SearchResultItem(BaseModel):
     id: int
-    # Ranking score: 1/(1+L2_squared), optionally blended with time decay.
-    # Correct for ordering, NOT a similarity — do not threshold it.
+    # Ranking score: 1/(1+L2_squared), or with scoring cosine x freshness x
+    # importance. Correct for ordering, NOT a similarity — do not threshold it.
     score: float
     # True cosine similarity, present only when raw_score=true was requested.
     cosine: Optional[float] = None
@@ -206,6 +207,12 @@ class KeywordSearchRequest(BaseModel):
         description="How many results. Capped at 1000; /search has no paging, so "
                     "to score a whole namespace larger than that, filter it down "
                     "first or list records and re-rank client-side.",
+    )
+    track: bool = Field(
+        True,
+        description="Whether this query counts as a recall for the records it "
+                    "returns, as for /search. False for evaluation, monitoring, "
+                    "or a client that fetches more than it will use.",
     )
     include_metadata: bool = True
     # Filters (same as SearchRequest)
@@ -258,6 +265,7 @@ class HybridSearchRequest(VectorInput):
     scoring_half_life: Optional[float] = None
     scoring_weight: Optional[float] = None
     scoring_min: Optional[float] = None
+    scoring_relevance_floor: Optional[float] = None   # < 0 / unset: the background cosine
 
 
 class LinkRequest(BaseModel):
@@ -278,6 +286,55 @@ class UpdateMetadataRequest(BaseModel):
 
 class PurgeRequest(BaseModel):
     namespace_id: str = Field(..., description="metadata.namespace_id to hard-delete (e.g. brand_id)")
+
+
+class HeatSelectRequest(BaseModel):
+    """DB.heat_select (Pocket.hot() in the engine)."""
+    model_config = ConfigDict(extra="forbid")
+    namespaces: List[str] = Field(..., max_length=64, description="scopes, deepest first")
+    now: float
+    budget: float = Field(..., ge=0)
+    half_life_days: float = Field(..., gt=0)
+    min_heat: float
+    trusted: List[str]
+    exclude_sources: List[str]
+    usage_half_life: float = 3.0
+    unused_floor: float = 0.4
+    inherit_decay: float = 0.7
+    chars_per_token: int = Field(4, ge=1)
+    pinned_attr: str = "_pocket_pinned"
+    due_attr: str = "_pocket_due_at"
+    origin_attr: str = "_origin"
+    text_attr: str = "_lg_value"
+    origins: List[str] = ["user", "agent", "tool", "external"]
+    default_origin: str = "user"
+    unknown_origin: str = "external"
+
+
+class ByKeysRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    refs: List[List[str]] = Field(..., description="[[key_namespace, key], ...]")
+
+    @model_validator(mode="after")
+    def _pairs(self):
+        if any(len(r) != 2 for r in self.refs):
+            raise ValueError("each ref is [key_namespace, key]")
+        return self
+
+
+class EraseRequest(BaseModel):
+    """What DB.erase() takes. Selects `ids`, plus every record whose
+    namespace_id AND entity_id match those given (at least one selector)."""
+    model_config = ConfigDict(extra="forbid")
+    ids: List[int] = Field(default_factory=list, description="Record ids to erase.")
+    namespace_id: str = Field("", description="metadata.namespace_id to erase.")
+    prefix: bool = Field(False, description="With namespace_id: its dotted children too.")
+    entity_id: str = Field("", description="metadata.entity_id to erase (within namespace_id if given).")
+    cites: Optional[List[str]] = Field(None, description="Edge kinds INTO an erased record that "
+                                       "make the source derived from it (default: the engine's).")
+    feeds: Optional[List[str]] = Field(None, description="Edge kinds OUT of an erased record that "
+                                       "point at a record made from it (default: the engine's).")
+    dry_run: bool = Field(False, description="Plan only: report, change nothing.")
 
 
 class BatchOpIn(BaseModel):
@@ -326,10 +383,32 @@ class EngineSettings(BaseModel):
     namespace_ann_min: Optional[int] = Field(None, ge=0)
     quantized: Optional[Dict[str, bool]] = None              # modality -> on
     int8_ram: Optional[Dict[str, Dict[str, Optional[float]]]] = None  # modality -> {max_abs, refine}
+    # DB.set_history_retention: seconds >= 0, or "inf" to keep every rewritten-away file.
+    history_retention_s: Optional[Union[float, Literal["inf"]]] = None
+
+    @field_validator("history_retention_s")
+    @classmethod
+    def _retention_non_negative(cls, v):
+        if v is not None and v != "inf" and not (v >= 0):
+            raise ValueError("history_retention_s is seconds >= 0, or \"inf\"")
+        return v
+
+
+class TagRequest(BaseModel):
+    """POST /tags: commit now and name the commit (DB.tag)."""
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(..., min_length=1, max_length=255)
 
 
 class BatchWriteRequest(BaseModel):
     ops: List[BatchOpIn] = Field(..., min_length=1, max_length=10_000)
+
+
+class GetManyRequest(BaseModel):
+    ids: List[int] = Field(..., max_length=10_000,
+                           description="Record ids to read, up to 10k per call.")
+    include_deleted: bool = Field(
+        False, description="Return tombstones too, as get_metadata(include_dead=True).")
 
 
 class BatchDeleteRequest(BaseModel):

@@ -1,0 +1,196 @@
+{
+  "params": {
+    "trials": 20,
+    "subjects": 8,
+    "distractors": 12,
+    "k": 10,
+    "budget": 1500,
+    "seed": 0,
+    "search": "dense (gemini)"
+  },
+  "results": {
+    "notes": {
+      "in order": {
+        "n": 400,
+        "current_in": 390,
+        "current_first": 166,
+        "stale": 798,
+        "stale_records": 798,
+        "stale_only": 10,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43372
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 395,
+        "current_first": 163,
+        "stale": 786,
+        "stale_records": 786,
+        "stale_only": 5,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43267
+      }
+    },
+    "notes, no valid time": {
+      "in order": {
+        "n": 400,
+        "current_in": 390,
+        "current_first": 166,
+        "stale": 798,
+        "stale_records": 798,
+        "stale_only": 10,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43372
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 395,
+        "current_first": 148,
+        "stale": 786,
+        "stale_records": 786,
+        "stale_only": 5,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43267
+      }
+    },
+    "keyed facts": {
+      "in order": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 44833
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 44713
+      }
+    },
+    "items + valid_at": {
+      "in order": {
+        "n": 400,
+        "current_in": 390,
+        "current_first": 166,
+        "stale": 798,
+        "stale_records": 798,
+        "stale_only": 10,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43372
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 395,
+        "current_first": 163,
+        "stale": 786,
+        "stale_records": 786,
+        "stale_only": 5,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43267
+      }
+    }
+  },
+  "reader": {
+    "model": "openrouter:openai/gpt-4o-mini",
+    "per": 40,
+    "results": {
+      "notes": {
+        "in order": {
+          "sent": 40,
+          "correct": 34,
+          "stale": 6
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 34,
+          "stale": 5
+        }
+      },
+      "notes, no valid time": {
+        "in order": {
+          "sent": 40,
+          "correct": 34,
+          "stale": 6
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 10,
+          "stale": 29
+        }
+      },
+      "keyed facts": {
+        "in order": {
+          "sent": 40,
+          "correct": 39,
+          "stale": 0
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 39,
+          "stale": 0
+        }
+      },
+      "items + valid_at": {
+        "in order": {
+          "sent": 40,
+          "correct": 35,
+          "stale": 5
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 34,
+          "stale": 5
+        }
+      }
+    },
+    "stale_examples": {
+      "notes/in order": {
+        "ask": "Which phone plan is Hana on now?",
+        "reply": "Mint 15GB",
+        "packet": "CONTEXT\n- [2025-09-29] Hana switched to Mint 15GB\n- [2026-09-22] Hana relocated to Toronto and lives there now\n- [2026-10-02] Hana's birthday is in March\n- [2026-09-11] Hana's manager is Ines Moreau\n- [2026-06-05] Hana moved to Osaka\n- [2026-09-05] Hana signed up for Cricket Core\n- [2026-07-15] Hana reports to Dev Malhotra\n- [2025-08-16] Hana's manager is Maya Cohen\n- [2026-09-20] Hana adopted a cat named Miso\n- [2026-10-05] Hana follows a vegetarian diet"
+      },
+      "notes, no valid time/in order": {
+        "ask": "Which phone plan is Hana on now?",
+        "reply": "Mint 15GB",
+        "packet": "CONTEXT\n- [2025-09-29] Hana switched to Mint 15GB\n- [2026-09-22] Hana relocated to Toronto and lives there now\n- [2026-10-02] Hana's birthday is in March\n- [2026-09-11] Hana's manager is Ines Moreau\n- [2026-06-05] Hana moved to Osaka\n- [2026-09-05] Hana signed up for Cricket Core\n- [2026-07-15] Hana reports to Dev Malhotra\n- [2025-08-16] Hana's manager is Maya Cohen\n- [2026-09-20] Hana adopted a cat named Miso\n- [2026-10-05] Hana follows a vegetarian diet"
+      },
+      "items + valid_at/in order": {
+        "ask": "Which phone plan is Hana on now?",
+        "reply": "Mint 15GB",
+        "packet": "CONTEXT\n- [2025-09-29] Hana switched to Mint 15GB\n- [2026-09-22] Hana relocated to Toronto and lives there now\n- [2026-10-02] Hana's birthday is in March\n- [2026-09-11] Hana's manager is Ines Moreau\n- [2026-06-05] Hana moved to Osaka\n- [2026-09-05] Hana signed up for Cricket Core\n- [2026-07-15] Hana reports to Dev Malhotra\n- [2025-08-16] Hana's manager is Maya Cohen\n- [2026-09-20] Hana adopted a cat named Miso\n- [2026-10-05] Hana follows a vegetarian diet"
+      },
+      "notes/shuffled": {
+        "ask": "Who is Mateo's manager now?",
+        "reply": "Omar Haddad",
+        "packet": "CONTEXT\n- [2025-07-01] Rui Costa became Mateo's manager\n- [2026-06-25] Omar Haddad became Mateo's manager\n- [2026-09-10] Mateo reports to Dev Malhotra\n- [2026-07-28] Mateo reports to Tom Okafor\n- [2026-07-24] Mateo moved to Osaka\n- [2025-08-28] Mateo follows a vegan diet\n- [2026-08-30] Mateo adopted a cat named Miso\n- [2026-08-17] Mateo went paleo\n- [2026-09-30] Mateo moved to Hobart\n- [2025-12-14] Mateo met Lucia Ferraro at a workshop"
+      },
+      "notes, no valid time/shuffled": {
+        "ask": "Which city does Priya live in now?",
+        "reply": "Porto",
+        "packet": "CONTEXT\n- [2026-11-08] Priya relocated to Toronto and lives there now\n- [2026-11-08] Priya relocated to Tbilisi and lives there now\n- [2026-11-08] Priya lives in Porto\n- [2026-11-08] Priya lives in Bergen\n- [2026-11-08] Priya's sister lives in Leeds\n- [2026-11-08] Priya's manager is Lucia Ferraro\n- [2026-11-08] Priya started a new job at Juniper Legal\n- [2026-11-08] Priya's birthday is in March\n- [2026-11-08] Priya eats halal\n- [2026-11-08] Rui Costa became Priya's manager"
+      },
+      "items + valid_at/shuffled": {
+        "ask": "Who is Mateo's manager now?",
+        "reply": "Omar Haddad",
+        "packet": "CONTEXT\n- [2025-07-01] Rui Costa became Mateo's manager\n- [2026-06-25] Omar Haddad became Mateo's manager\n- [2026-09-10] Mateo reports to Dev Malhotra\n- [2026-07-28] Mateo reports to Tom Okafor\n- [2026-07-24] Mateo moved to Osaka\n- [2025-08-28] Mateo follows a vegan diet\n- [2026-08-30] Mateo adopted a cat named Miso\n- [2026-08-17] Mateo went paleo\n- [2026-09-30] Mateo moved to Hobart\n- [2025-12-14] Mateo met Lucia Ferraro at a workshop"
+      }
+    }
+  },
+  "wall_seconds": 39.28
+}

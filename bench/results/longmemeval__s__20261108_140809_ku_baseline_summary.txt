@@ -1,0 +1,32 @@
+    knowledge-updates : 0.9583
+     per_q_seconds_p50 : 19.325
+    per_q_seconds_mean : 21.248
+           n_questions : 78
+            n_failures : 0
+       failures_sample : []
+   history_turns_total : 38086
+    embeddings_emitted : 38229
+              embedder : gemini_gemini-embedding-001_d3072
+                 judge : llm_judge=gemini-text/gemini-2.5-flash_ans=gemini-text/gemini-2.5-flash
+        official_judge : official=openrouter/openai/gpt-4o-2024-08-06
+                 top_k : 20
+                  unit : session
+         context_chars : 160000
+        context_tokens : None
+           multi_round : auto
+             count_map : off
+                reader : single
+               workers : 6
+                 facts : off
+         decay_engaged : False
+  decay_half_life_days : None
+     decay_time_weight : None
+           peak_rss_mb : 1375.375
+            reportable : False
+  not_reportable_because : ['--question-types knowledge-update: not all 500 questions', 'uncommitted changes: no commit reproduces this run']
+
+NOT REPORTABLE:
+  - --question-types knowledge-update: not all 500 questions
+  - uncommitted changes: no commit reproduces this run
+
+[exited with code 0]

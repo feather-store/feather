@@ -29,6 +29,22 @@ enum Commands {
         from: u64,
         to: u64,
     },
+    /// Erase records so nothing of them remains: the file is rewritten, the
+    /// WAL rotated away, and records derived from or citing them go too.
+    /// Prints the receipt (JSON); exits non-zero if it is not verified.
+    Erase {
+        db: PathBuf,
+        /// namespace_id to erase
+        #[arg(long)] namespace: Option<String>,
+        /// with --namespace: its dotted children too (a.b -> a.b.c)
+        #[arg(long)] prefix: bool,
+        /// entity_id to erase (with --namespace: only within it)
+        #[arg(long)] entity: Option<String>,
+        /// a record id to erase (repeatable)
+        #[arg(long = "id")] ids: Vec<u64>,
+        /// plan only: print what would be erased, change nothing
+        #[arg(long)] dry_run: bool,
+    },
     Search { 
         db: PathBuf, 
         #[arg(short)] npy: PathBuf, 
@@ -71,6 +87,15 @@ fn main() -> anyhow::Result<()> {
             db.try_link(from, to).map_err(|e| anyhow::anyhow!("Link failed: {e}"))?;
             db.try_save().map_err(|e| anyhow::anyhow!("Save failed: {e}"))?;
             println!("Linked {} -> {}", from, to);
+        }
+        Commands::Erase { db, namespace, prefix, entity, ids, dry_run } => {
+            let db = DB::try_open(&db, 0).map_err(|e| anyhow::anyhow!("Open failed: {e}"))?;
+            let receipt = db.try_erase(namespace.as_deref(), prefix, entity.as_deref(), &ids, dry_run)
+                .map_err(|e| anyhow::anyhow!("Erase failed: {e}"))?;
+            println!("{receipt}");
+            if !dry_run && !receipt.contains("\"verified\":true") {
+                anyhow::bail!("the erasure is not verified; see \"problems\" in the receipt");
+            }
         }
         Commands::Search { db, npy, k, type_filter, source_filter, modality } => {
             let arr: Array1<f32> = ndarray_npy::read_npy(&npy)?;

@@ -1,0 +1,211 @@
+{
+  "params": {
+    "trials": 20,
+    "subjects": 8,
+    "distractors": 12,
+    "k": 10,
+    "budget": 1500,
+    "seed": 0,
+    "search": "dense (gemini)",
+    "variants": [
+      "notes",
+      "keyed facts",
+      "notes + keys",
+      "notes + extracted keys"
+    ]
+  },
+  "results": {
+    "notes": {
+      "in order": {
+        "n": 400,
+        "current_in": 388,
+        "current_first": 165,
+        "stale": 796,
+        "stale_records": 796,
+        "stale_only": 11,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43376
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 396,
+        "current_first": 164,
+        "stale": 782,
+        "stale_records": 782,
+        "stale_only": 4,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43266
+      }
+    },
+    "keyed facts": {
+      "in order": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 44828
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 44638
+      }
+    },
+    "notes + keys": {
+      "in order": {
+        "n": 400,
+        "current_in": 399,
+        "current_first": 399,
+        "stale": 817,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 68819
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 809,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 67844
+      }
+    },
+    "notes + extracted keys": {
+      "in order": {
+        "n": 400,
+        "current_in": 399,
+        "current_first": 350,
+        "stale": 813,
+        "stale_records": 155,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 63267
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 340,
+        "stale": 806,
+        "stale_records": 146,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 63749
+      }
+    }
+  },
+  "extraction": {
+    "model": "openai/gpt-4o-mini",
+    "extractor": "session_fact_extractor 0.3.1",
+    "calls_tokens": {
+      "in": 3988421,
+      "out": 312578
+    },
+    "usd": 0.7858099500000015
+  },
+  "reader": {
+    "model": "openrouter:openai/gpt-4o-mini",
+    "per": 400,
+    "results": {
+      "notes": {
+        "in order": {
+          "sent": 400,
+          "correct": 333,
+          "stale": 64
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 344,
+          "stale": 53
+        }
+      },
+      "keyed facts": {
+        "in order": {
+          "sent": 400,
+          "correct": 397,
+          "stale": 0
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 398,
+          "stale": 0
+        }
+      },
+      "notes + keys": {
+        "in order": {
+          "sent": 400,
+          "correct": 387,
+          "stale": 12
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 388,
+          "stale": 12
+        }
+      },
+      "notes + extracted keys": {
+        "in order": {
+          "sent": 400,
+          "correct": 380,
+          "stale": 18
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 375,
+          "stale": 24
+        }
+      }
+    },
+    "stale_examples": {
+      "notes/in order": {
+        "ask": "Which phone plan is Hana on now?",
+        "reply": "Mint 15GB",
+        "packet": "CONTEXT\n- [2025-09-29] Hana switched to Mint 15GB\n- [2026-09-23] Hana relocated to Toronto and lives there now\n- [2026-10-02] Hana's birthday is in March\n- [2026-09-11] Hana's manager is Ines Moreau\n- [2026-06-05] Hana moved to Osaka\n- [2026-09-05] Hana signed up for Cricket Core\n- [2026-07-15] Hana reports to Dev Malhotra\n- [2025-08-16] Hana's manager is Maya Cohen\n- [2026-09-21] Hana adopted a cat named Miso\n- [2026-10-05] Hana follows a vegetarian diet"
+      },
+      "notes/shuffled": {
+        "ask": "Who is Mateo's manager now?",
+        "reply": "Omar Haddad",
+        "packet": "CONTEXT\n- [2025-07-01] Rui Costa became Mateo's manager\n- [2026-06-25] Omar Haddad became Mateo's manager\n- [2026-09-10] Mateo reports to Dev Malhotra\n- [2026-07-29] Mateo reports to Tom Okafor\n- [2026-07-24] Mateo moved to Osaka\n- [2025-08-28] Mateo follows a vegan diet\n- [2026-08-31] Mateo adopted a cat named Miso\n- [2026-08-18] Mateo went paleo\n- [2026-09-30] Mateo moved to Hobart\n- [2025-12-14] Mateo met Lucia Ferraro at a workshop"
+      },
+      "notes + extracted keys/shuffled": {
+        "ask": "What diet does Priya follow now?",
+        "reply": "low-FODMAP",
+        "packet": "CONTEXT\n- [2025-10-02] Priya is low-FODMAP now\n- [2026-09-18] Priya eats halal\n- [2026-08-24] Priya relocated to Tbilisi and lives there now\n    earlier: [2025-01-25] Priya relocated to Toronto and lives there now\n    earlier: [2024-07-04] Priya lives in Porto\n- [2026-06-25] Priya cooked a keto dinner for guests\n- [2026-10-15] Priya switched to Cricket Core\n    earlier: [2026-07-19] Priya switched to Visible Plus\n- [2026-11-03] Priya's birthday is in March\n- [2026-08-23] Priya joined Dunmore Bank\n    earlier: [2026-05-04] Priya started a new job at Juniper Legal\n    earlier: [2025-06-23] Priya's employer is Corvid Health\n    earlier: [2024-07-13] Priya's employer is Bluefin Labs\n- [2026-09-22] Priya is training for a half marathon"
+      },
+      "notes + keys/in order": {
+        "ask": "Which city does Emeka live in now?",
+        "reply": "Bergen",
+        "packet": "CONTEXT\n- [2026-09-21] Emeka's home city is Leeds\n    earlier: [2026-08-07] Emeka lives in Bergen\n- [2026-05-20] Emeka's sister lives in Toronto\n- [2026-10-08] Emeka's manager is Tom Okafor\n    earlier: [2025-12-07] Emeka reports to Maya Cohen\n- [2026-10-03] Emeka works at Acme Robotics\n    earlier: [2026-04-03] Emeka started a new job at Juniper Legal\n    earlier: [2025-07-10] Emeka started a new job at Bluefin Labs\n    earlier: [2025-03-17] Emeka joined Corvid Health\n- [2026-10-25] Emeka went paleo\n    earlier: [2026-09-15] Emeka eats vegan\n    earlier: [2025-12-26] Emeka eats keto\n- [2025-12-24] Emeka's birthday is in March"
+      },
+      "notes + extracted keys/in order": {
+        "ask": "Which city does Emeka live in now?",
+        "reply": "Bergen",
+        "packet": "CONTEXT\n- [2026-09-21] Emeka's home city is Leeds\n    earlier: [2026-08-07] Emeka lives in Bergen\n- [2026-05-20] Emeka's sister lives in Toronto\n- [2026-10-08] Emeka's manager is Tom Okafor\n- [2026-10-03] Emeka works at Acme Robotics\n    earlier: [2026-04-03] Emeka started a new job at Juniper Legal\n    earlier: [2025-07-10] Emeka started a new job at Bluefin Labs\n    earlier: [2025-03-17] Emeka joined Corvid Health\n- [2026-10-25] Emeka went paleo\n- [2025-12-24] Emeka's birthday is in March\n- [2026-09-15] Emeka eats vegan"
+      },
+      "notes + keys/shuffled": {
+        "ask": "Which city does Oskar live in now?",
+        "reply": "Nairobi",
+        "packet": "CONTEXT\n- [2026-09-06] Oskar's home city is Denver\n    earlier: [2026-03-15] Oskar relocated to Nairobi and lives there now\n- [2026-05-19] Oskar's sister lives in Austin\n- [2026-05-11] Oskar's birthday is in March\n- [2026-02-07] Oskar adopted a cat named Miso\n- [2026-11-03] Oskar is halal now\n    earlier: [2025-12-25] Oskar follows a keto diet\n    earlier: [2025-09-13] Oskar went vegan\n    earlier: [2025-01-10] Oskar eats low-FODMAP\n- [2026-09-06] Oskar works at Halcyon Games\n    earlier: [2025-10-13] Oskar's employer is Juniper Legal\n    earlier: [2024-10-22] Oskar started a new job at Corvid Health\n- [2026-04-02] Oskar prefers email to phone calls"
+      }
+    }
+  },
+  "wall_seconds": 1142.63
+}

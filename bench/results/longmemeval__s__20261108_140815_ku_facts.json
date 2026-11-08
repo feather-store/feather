@@ -1,0 +1,111 @@
+{
+  "scenario": "longmemeval",
+  "dataset": "s",
+  "n": 78,
+  "dim": 3072,
+  "feather_version": "0.21.0",
+  "python_version": "3.12.15",
+  "platform": "Darwin arm64",
+  "commit": "031055e",
+  "started_at": 1794127095.159549,
+  "wall_seconds": 3979.5172278881073,
+  "metrics": {
+    "n_scored": 78,
+    "run_errors": 0,
+    "judge_errors": 0,
+    "overall_official": 0.9615,
+    "by_question_type_official": {
+      "knowledge-update": 0.9615
+    },
+    "task_averaged_official": 0.9615,
+    "abstention_official": 1.0,
+    "overall_lenient": 0.9231,
+    "by_question_type_lenient": {
+      "knowledge-update": 0.9231
+    },
+    "task_averaged_lenient": 0.9231,
+    "abstention_lenient": 1.0,
+    "judge_agreement": 0.9615,
+    "official_only_correct": 3,
+    "lenient_only_correct": 0,
+    "evidence_fully_in_context": 1.0,
+    "evidence_shortened": 0.2639,
+    "evidence_fully_retrieved": 1.0,
+    "multi_round_questions": 48,
+    "multi_round_evidence_round1": 1.0,
+    "multi_round_evidence_final": 1.0,
+    "failure_buckets": {
+      "reader_wrong": 3
+    },
+    "failure_buckets_by_type": {
+      "knowledge-update": {
+        "reader_wrong": 3
+      }
+    },
+    "questions_file": "/Users/apple/OpenSource/memory/feather/bench/results/longmemeval__s__20261108_140809_ku_facts__questions.jsonl",
+    "overall": 0.9615,
+    "headline_judge": "official",
+    "by_axis": {
+      "abstention": 1.0,
+      "knowledge-updates": 0.9583
+    },
+    "per_q_seconds_p50": 290.832,
+    "per_q_seconds_mean": 307.15341025641027,
+    "n_questions": 78,
+    "n_failures": 0,
+    "failures_sample": [],
+    "history_turns_total": 38086,
+    "embeddings_emitted": 49316,
+    "embedder": "gemini_gemini-embedding-001_d3072",
+    "judge": "llm_judge=gemini-text/gemini-2.5-flash_ans=gemini-text/gemini-2.5-flash",
+    "official_judge": "official=openrouter/openai/gpt-4o-2024-08-06",
+    "top_k": 20,
+    "unit": "session",
+    "context_chars": 160000,
+    "context_tokens": null,
+    "multi_round": "auto",
+    "count_map": "off",
+    "reader": "single",
+    "workers": 10,
+    "facts": "session",
+    "fact_extraction_calls": 3704,
+    "fact_cache_hits": 0,
+    "fact_extraction_failures": 0,
+    "fact_cache_file": "/Users/apple/.cache/feather/longmemeval/facts/openrouter-openai_gpt-4o-mini.jsonl",
+    "decay_engaged": false,
+    "decay_half_life_days": null,
+    "decay_time_weight": null,
+    "peak_rss_mb": 1759.203125,
+    "reportable": false,
+    "not_reportable_because": [
+      "--question-types knowledge-update: not all 500 questions",
+      "uncommitted changes: no commit reproduces this run"
+    ]
+  },
+  "params": {
+    "k": 20,
+    "ef": null,
+    "embedder": "gemini_gemini-embedding-001_d3072",
+    "judge": "llm_judge=gemini-text/gemini-2.5-flash_ans=gemini-text/gemini-2.5-flash",
+    "variant": "s",
+    "unit": "session",
+    "multi_round": "auto",
+    "facts": "session",
+    "count_map": "off",
+    "split": "all",
+    "reader": "single",
+    "context_tokens": null,
+    "tokenizer_model": null,
+    "count_votes": 1,
+    "context_chars_budget": 160000,
+    "system_provider": "openrouter",
+    "system_model": "openai/gpt-4o-mini",
+    "official_judge": "official=openrouter/openai/gpt-4o-2024-08-06",
+    "context_chars": 160000,
+    "decay_half_life": null,
+    "decay_time_weight": null
+  },
+  "notes": "",
+  "command": "python -m bench run longmemeval --dataset s --k 20 --embedder gemini --judge llm --judge-provider gemini-text --judge-model gemini-2.5-flash --official-judge-provider openrouter --official-judge-model openai/gpt-4o-2024-08-06 --workers 10 --limit 0 --question-types knowledge-update --facts session --system-provider openrouter --system-model openai/gpt-4o-mini",
+  "dirty": true
+}
