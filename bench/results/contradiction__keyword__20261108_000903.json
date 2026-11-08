@@ -1,0 +1,196 @@
+{
+  "params": {
+    "trials": 20,
+    "subjects": 8,
+    "distractors": 12,
+    "k": 10,
+    "budget": 1500,
+    "seed": 0,
+    "search": "keyword (BM25)"
+  },
+  "results": {
+    "notes": {
+      "in order": {
+        "n": 400,
+        "current_in": 321,
+        "current_first": 193,
+        "stale": 545,
+        "stale_records": 545,
+        "stale_only": 49,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 29115
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 333,
+        "current_first": 190,
+        "stale": 554,
+        "stale_records": 554,
+        "stale_only": 43,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 28950
+      }
+    },
+    "notes, no valid time": {
+      "in order": {
+        "n": 400,
+        "current_in": 321,
+        "current_first": 193,
+        "stale": 545,
+        "stale_records": 545,
+        "stale_only": 49,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 29115
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 293,
+        "current_first": 140,
+        "stale": 579,
+        "stale_records": 579,
+        "stale_only": 76,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 28997
+      }
+    },
+    "keyed facts": {
+      "in order": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 818,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 295663
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 809,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 294117
+      }
+    },
+    "items + valid_at": {
+      "in order": {
+        "n": 400,
+        "current_in": 321,
+        "current_first": 192,
+        "stale": 541,
+        "stale_records": 541,
+        "stale_only": 48,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 56404
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 334,
+        "current_first": 191,
+        "stale": 552,
+        "stale_records": 552,
+        "stale_only": 42,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 56348
+      }
+    }
+  },
+  "reader": {
+    "model": "openrouter:openai/gpt-4o-mini",
+    "per": 40,
+    "results": {
+      "notes": {
+        "in order": {
+          "sent": 40,
+          "correct": 14,
+          "stale": 21
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 13,
+          "stale": 25
+        }
+      },
+      "notes, no valid time": {
+        "in order": {
+          "sent": 40,
+          "correct": 15,
+          "stale": 20
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 11,
+          "stale": 25
+        }
+      },
+      "keyed facts": {
+        "in order": {
+          "sent": 40,
+          "correct": 40,
+          "stale": 0
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 40,
+          "stale": 0
+        }
+      },
+      "items + valid_at": {
+        "in order": {
+          "sent": 40,
+          "correct": 26,
+          "stale": 10
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 27,
+          "stale": 11
+        }
+      }
+    },
+    "stale_examples": {
+      "notes/in order": {
+        "ask": "Which phone plan is Emeka on now?",
+        "reply": "Emeka is on the Cricket Core phone plan.",
+        "packet": "CONTEXT\n- Emeka's phone plan is AT&T Value\n- Emeka's phone plan is Visible Plus\n- Emeka is on the Cricket Core phone plan\n- Emeka is pescatarian now\n- Emeka asked about the Google Fi Flexible phone plan for a parent\n- Emeka now reports to Priya Natarajan\n- Emeka now reports to Sara Lindqvist\n- Emeka relocated to Leeds and lives there now\n- Emeka's birthday is in March\n- Emeka moved to Toronto"
+      },
+      "notes, no valid time/in order": {
+        "ask": "Which phone plan is Emeka on now?",
+        "reply": "Emeka is on the Cricket Core phone plan.",
+        "packet": "CONTEXT\n- Emeka's phone plan is AT&T Value\n- Emeka's phone plan is Visible Plus\n- Emeka is on the Cricket Core phone plan\n- Emeka is pescatarian now\n- Emeka asked about the Google Fi Flexible phone plan for a parent\n- Emeka now reports to Priya Natarajan\n- Emeka now reports to Sara Lindqvist\n- Emeka relocated to Leeds and lives there now\n- Emeka's birthday is in March\n- Emeka moved to Toronto"
+      },
+      "items + valid_at/in order": {
+        "ask": "Where does Mateo work now?",
+        "reply": "Juniper Legal",
+        "packet": "CONTEXT\n- text: Mateo is vegetarian now\nvalid_at: 1788374793\n- text: Mateo works at Juniper Legal\nvalid_at: 1721123324\n- text: Mateo relocated to Hobart and lives there now\nvalid_at: 1787133830\n- text: Mateo lives in Toronto\nvalid_at: 1778219224\n- text: Mateo moved to Cusco\nvalid_at: 1771596085\n- text: Mateo's birthday is in March\nvalid_at: 1770620044\n- text: Mateo is learning Portuguese\nvalid_at: 1770455039\n- text: Mateo went pescatarian\nvalid_at: 1765416564\n- text: Mateo went paleo\nvalid_at: 1731867350\n- text: Mateo joined Acme Robotics\nvalid_at: 1788378229"
+      },
+      "notes/shuffled": {
+        "ask": "Which city does Priya live in now?",
+        "reply": "Bergen",
+        "packet": "CONTEXT\n- Priya relocated to Tbilisi and lives there now\n- Priya relocated to Toronto and lives there now\n- Priya lives in Bergen\n- Priya lives in Porto\n- Priya is low-FODMAP now\n- Priya's sister lives in Leeds\n- Priya's birthday is in March\n- Priya eats halal\n- Priya is learning Portuguese\n- Priya switched to Cricket Core"
+      },
+      "notes, no valid time/shuffled": {
+        "ask": "Which city does Priya live in now?",
+        "reply": "Porto",
+        "packet": "CONTEXT\n- Priya relocated to Tbilisi and lives there now\n- Priya relocated to Toronto and lives there now\n- Priya lives in Porto\n- Priya lives in Bergen\n- Priya is low-FODMAP now\n- Priya's sister lives in Leeds\n- Priya eats halal\n- Priya is learning Portuguese\n- Priya's birthday is in March\n- Priya's employer is Corvid Health"
+      },
+      "items + valid_at/shuffled": {
+        "ask": "What diet does Jun follow now?",
+        "reply": "Jun is paleo now.",
+        "packet": "CONTEXT\n- text: Jun follows a vegetarian diet\nvalid_at: 1740284106\n- text: Jun follows a low-FODMAP diet\nvalid_at: 1792027834\n- text: Jun is paleo now\nvalid_at: 1761882371\n- text: Jun now reports to Tom Okafor\nvalid_at: 1771611573\n- text: Jun relocated to Osaka and lives there now\nvalid_at: 1790713877\n- text: Jun is learning Portuguese\nvalid_at: 1783488022\n- text: Jun's birthday is in March\nvalid_at: 1769725573\n- text: Jun moved to Lisbon\nvalid_at: 1739633809\n- text: Jun had coffee with a recruiter from Corvid Health\nvalid_at: 1793783666\n- text: Jun works at Juniper Legal\nvalid_at: 1790467378"
+      }
+    }
+  },
+  "wall_seconds": 35.99
+}

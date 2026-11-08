@@ -1,0 +1,214 @@
+{
+  "params": {
+    "trials": 20,
+    "subjects": 8,
+    "distractors": 12,
+    "k": 10,
+    "budget": 1500,
+    "seed": 0,
+    "search": "dense (gemini)",
+    "variants": [
+      "notes",
+      "keyed facts",
+      "notes + keys",
+      "notes + extracted keys"
+    ],
+    "question": "now",
+    "history": "section",
+    "now": 1794126998.0
+  },
+  "results": {
+    "notes": {
+      "in order": {
+        "n": 400,
+        "current_in": 388,
+        "current_first": 165,
+        "stale": 796,
+        "stale_records": 796,
+        "stale_only": 11,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43369
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 396,
+        "current_first": 163,
+        "stale": 782,
+        "stale_records": 782,
+        "stale_only": 4,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43266
+      }
+    },
+    "keyed facts": {
+      "in order": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 44831
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 44638
+      }
+    },
+    "notes + keys": {
+      "in order": {
+        "n": 400,
+        "current_in": 399,
+        "current_first": 399,
+        "stale": 817,
+        "stale_records": 817,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 61590
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 809,
+        "stale_records": 809,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 60803
+      }
+    },
+    "notes + extracted keys": {
+      "in order": {
+        "n": 400,
+        "current_in": 399,
+        "current_first": 351,
+        "stale": 813,
+        "stale_records": 813,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 58036
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 343,
+        "stale": 807,
+        "stale_records": 807,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 58403
+      }
+    }
+  },
+  "extraction": {
+    "model": "openai/gpt-4o-mini",
+    "extractor": "session_fact_extractor 0.3.1",
+    "calls_tokens": {
+      "in": 322029,
+      "out": 25358
+    },
+    "usd": 0.06351915000000002
+  },
+  "reader": {
+    "model": "openrouter:openai/gpt-4o-mini",
+    "per": 400,
+    "results": {
+      "notes": {
+        "in order": {
+          "sent": 400,
+          "correct": 331,
+          "stale": 66
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 345,
+          "stale": 52
+        }
+      },
+      "keyed facts": {
+        "in order": {
+          "sent": 400,
+          "correct": 397,
+          "stale": 0
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 398,
+          "stale": 0
+        }
+      },
+      "notes + keys": {
+        "in order": {
+          "sent": 400,
+          "correct": 398,
+          "stale": 1
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 399,
+          "stale": 1
+        }
+      },
+      "notes + extracted keys": {
+        "in order": {
+          "sent": 400,
+          "correct": 389,
+          "stale": 9
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 379,
+          "stale": 21
+        }
+      }
+    },
+    "stale_examples": {
+      "notes/in order": {
+        "ask": "Which phone plan is Hana on now?",
+        "reply": "Mint 15GB",
+        "packet": "CONTEXT\n- [2025-09-29] Hana switched to Mint 15GB\n- [2026-09-23] Hana relocated to Toronto and lives there now\n- [2026-10-02] Hana's birthday is in March\n- [2026-09-11] Hana's manager is Ines Moreau\n- [2026-06-05] Hana moved to Osaka\n- [2026-09-05] Hana signed up for Cricket Core\n- [2026-07-15] Hana reports to Dev Malhotra\n- [2025-08-16] Hana's manager is Maya Cohen\n- [2026-09-21] Hana adopted a cat named Miso\n- [2026-10-05] Hana follows a vegetarian diet"
+      },
+      "notes/shuffled": {
+        "ask": "Who is Mateo's manager now?",
+        "reply": "Omar Haddad",
+        "packet": "CONTEXT\n- [2025-07-01] Rui Costa became Mateo's manager\n- [2026-06-25] Omar Haddad became Mateo's manager\n- [2026-09-10] Mateo reports to Dev Malhotra\n- [2026-07-29] Mateo reports to Tom Okafor\n- [2026-07-24] Mateo moved to Osaka\n- [2025-08-28] Mateo follows a vegan diet\n- [2026-08-31] Mateo adopted a cat named Miso\n- [2026-08-18] Mateo went paleo\n- [2026-09-30] Mateo moved to Hobart\n- [2025-12-14] Mateo met Lucia Ferraro at a workshop"
+      },
+      "notes + extracted keys/shuffled": {
+        "ask": "What diet does Priya follow now?",
+        "reply": "low-FODMAP",
+        "packet": "CONTEXT\n- [2025-10-02] Priya is low-FODMAP now\n- [2026-09-18] Priya eats halal\n- [2026-08-24] Priya relocated to Tbilisi and lives there now\n- [2026-06-25] Priya cooked a keto dinner for guests\n- [2026-10-15] Priya switched to Cricket Core\n- [2026-11-03] Priya's birthday is in March\n- [2026-08-23] Priya joined Dunmore Bank\n- [2026-09-22] Priya is training for a half marathon\n\nEARLIER VALUES (superseded)\n- [2025-01-25] Priya relocated to Toronto and lives there now\n- [2024-07-04] Priya lives in Porto\n- [2026-07-19] Priya switched to Visible Plus\n- [2026-05-04] Priya started a new job at Juniper Legal\n- [2025-06-23] Priya's employer is Corvid Health\n- [2024-07-13] Priya's employer is Bluefin Labs"
+      },
+      "notes + keys/in order": {
+        "ask": "Which phone plan is Farah on now?",
+        "reply": "Farah switched to US Mobile Starter.",
+        "packet": "CONTEXT\n- [2026-08-18] Farah signed up for Cricket Core\n- [2025-11-19] Farah prefers email to phone calls\n- [2026-08-20] Farah is keto now\n- [2026-08-18] Farah relocated to Hobart and lives there now\n- [2026-10-28] Farah joined Elmstead Foods\n\nEARLIER VALUES (superseded)\n- [2026-06-21] Farah switched to US Mobile Starter\n- [2025-08-21] Farah switched to AT&T Value\n- [2026-05-22] Farah is gluten-free now\n- [2025-11-02] Farah follows a low-FODMAP diet\n- [2025-04-24] Farah is vegan now\n- [2025-12-02] Farah moved to Austin\n- [2025-02-04] Farah's home city is Bergen\n- [2024-12-24] Farah relocated to Lisbon and lives there now\n- [2026-03-31] Farah works at Ironleaf Energy\n- [2025-04-16] Farah's employer is Corvid Health"
+      },
+      "notes + extracted keys/in order": {
+        "ask": "Which phone plan is Farah on now?",
+        "reply": "Farah switched to US Mobile Starter.",
+        "packet": "CONTEXT\n- [2026-08-18] Farah signed up for Cricket Core\n- [2025-11-19] Farah prefers email to phone calls\n- [2026-08-20] Farah is keto now\n- [2026-08-18] Farah relocated to Hobart and lives there now\n- [2026-10-28] Farah joined Elmstead Foods\n\nEARLIER VALUES (superseded)\n- [2026-06-21] Farah switched to US Mobile Starter\n- [2025-08-21] Farah switched to AT&T Value\n- [2026-05-22] Farah is gluten-free now\n- [2025-11-02] Farah follows a low-FODMAP diet\n- [2025-04-24] Farah is vegan now\n- [2025-12-02] Farah moved to Austin\n- [2025-02-04] Farah's home city is Bergen\n- [2024-12-24] Farah relocated to Lisbon and lives there now\n- [2026-03-31] Farah works at Ironleaf Energy\n- [2025-04-16] Farah's employer is Corvid Health"
+      },
+      "notes + keys/shuffled": {
+        "ask": "Which phone plan is Bruno on now?",
+        "reply": "Google Fi Flexible phone plan",
+        "packet": "CONTEXT\n- [2026-10-30] Bruno signed up for Cricket Core\n- [2026-11-07] Bruno eats vegetarian\n- [2025-11-16] Bruno's birthday is in March\n- [2026-06-17] Bruno adopted a cat named Miso\n- [2026-09-28] Bruno's manager is Sara Lindqvist\n- [2026-10-30] Bruno works at Acme Robotics\n\nEARLIER VALUES (superseded)\n- [2026-05-19] Bruno is on the Google Fi Flexible phone plan\n- [2026-06-02] Bruno went pescatarian\n- [2025-11-25] Bruno went keto\n- [2026-06-02] Bruno now reports to Dev Malhotra\n- [2025-06-15] Lucia Ferraro became Bruno's manager\n- [2025-12-23] Bruno joined Corvid Health\n- [2025-02-04] Bruno started a new job at Granite Freight\n- [2024-05-25] Bruno joined Elmstead Foods"
+      }
+    }
+  },
+  "wall_seconds": 418.04
+}

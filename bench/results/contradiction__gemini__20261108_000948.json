@@ -1,0 +1,196 @@
+{
+  "params": {
+    "trials": 20,
+    "subjects": 8,
+    "distractors": 12,
+    "k": 10,
+    "budget": 1500,
+    "seed": 0,
+    "search": "dense (gemini)"
+  },
+  "results": {
+    "notes": {
+      "in order": {
+        "n": 400,
+        "current_in": 390,
+        "current_first": 166,
+        "stale": 798,
+        "stale_records": 798,
+        "stale_only": 10,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 30323
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 395,
+        "current_first": 163,
+        "stale": 786,
+        "stale_records": 786,
+        "stale_only": 5,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 30218
+      }
+    },
+    "notes, no valid time": {
+      "in order": {
+        "n": 400,
+        "current_in": 390,
+        "current_first": 166,
+        "stale": 798,
+        "stale_records": 798,
+        "stale_only": 10,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 30323
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 395,
+        "current_first": 148,
+        "stale": 786,
+        "stale_records": 786,
+        "stale_only": 5,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 30218
+      }
+    },
+    "keyed facts": {
+      "in order": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 31791
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 31653
+      }
+    },
+    "items + valid_at": {
+      "in order": {
+        "n": 400,
+        "current_in": 390,
+        "current_first": 166,
+        "stale": 798,
+        "stale_records": 798,
+        "stale_only": 10,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 30323
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 395,
+        "current_first": 163,
+        "stale": 786,
+        "stale_records": 786,
+        "stale_only": 5,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 30218
+      }
+    }
+  },
+  "reader": {
+    "model": "openrouter:openai/gpt-4o-mini",
+    "per": 40,
+    "results": {
+      "notes": {
+        "in order": {
+          "sent": 40,
+          "correct": 14,
+          "stale": 25
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 16,
+          "stale": 22
+        }
+      },
+      "notes, no valid time": {
+        "in order": {
+          "sent": 40,
+          "correct": 14,
+          "stale": 25
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 14,
+          "stale": 25
+        }
+      },
+      "keyed facts": {
+        "in order": {
+          "sent": 40,
+          "correct": 39,
+          "stale": 0
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 38,
+          "stale": 0
+        }
+      },
+      "items + valid_at": {
+        "in order": {
+          "sent": 40,
+          "correct": 14,
+          "stale": 25
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 18,
+          "stale": 21
+        }
+      }
+    },
+    "stale_examples": {
+      "notes/in order": {
+        "ask": "Which phone plan is Emeka on now?",
+        "reply": "Emeka is on the Cricket Core phone plan.",
+        "packet": "CONTEXT\n- Emeka's phone plan is Visible Plus\n- Emeka's phone plan is AT&T Value\n- Emeka switched to US Mobile Starter\n- Emeka is on the Cricket Core phone plan\n- Emeka relocated to Leeds and lives there now\n- Emeka is pescatarian now\n- Emeka moved to Toronto\n- Emeka eats paleo\n- Emeka now reports to Priya Natarajan\n- Emeka started a new job at Fathom Analytics"
+      },
+      "notes, no valid time/in order": {
+        "ask": "Which phone plan is Emeka on now?",
+        "reply": "Emeka is on the Cricket Core phone plan.",
+        "packet": "CONTEXT\n- Emeka's phone plan is Visible Plus\n- Emeka's phone plan is AT&T Value\n- Emeka switched to US Mobile Starter\n- Emeka is on the Cricket Core phone plan\n- Emeka relocated to Leeds and lives there now\n- Emeka is pescatarian now\n- Emeka moved to Toronto\n- Emeka eats paleo\n- Emeka now reports to Priya Natarajan\n- Emeka started a new job at Fathom Analytics"
+      },
+      "items + valid_at/in order": {
+        "ask": "Which phone plan is Emeka on now?",
+        "reply": "Emeka is on the Cricket Core phone plan.",
+        "packet": "CONTEXT\n- Emeka's phone plan is Visible Plus\n- Emeka's phone plan is AT&T Value\n- Emeka switched to US Mobile Starter\n- Emeka is on the Cricket Core phone plan\n- Emeka relocated to Leeds and lives there now\n- Emeka is pescatarian now\n- Emeka moved to Toronto\n- Emeka eats paleo\n- Emeka now reports to Priya Natarajan\n- Emeka started a new job at Fathom Analytics"
+      },
+      "notes/shuffled": {
+        "ask": "Which city does Priya live in now?",
+        "reply": "Porto",
+        "packet": "CONTEXT\n- Priya relocated to Toronto and lives there now\n- Priya relocated to Tbilisi and lives there now\n- Priya lives in Porto\n- Priya lives in Bergen\n- Priya's sister lives in Leeds\n- Priya's birthday is in March\n- Priya's manager is Lucia Ferraro\n- Priya started a new job at Juniper Legal\n- Priya eats halal\n- Rui Costa became Priya's manager"
+      },
+      "notes, no valid time/shuffled": {
+        "ask": "Which city does Priya live in now?",
+        "reply": "Porto",
+        "packet": "CONTEXT\n- Priya relocated to Toronto and lives there now\n- Priya relocated to Tbilisi and lives there now\n- Priya lives in Porto\n- Priya lives in Bergen\n- Priya's sister lives in Leeds\n- Priya's manager is Lucia Ferraro\n- Priya started a new job at Juniper Legal\n- Priya's birthday is in March\n- Priya eats halal\n- Rui Costa became Priya's manager"
+      },
+      "items + valid_at/shuffled": {
+        "ask": "Which city does Priya live in now?",
+        "reply": "Porto",
+        "packet": "CONTEXT\n- Priya relocated to Toronto and lives there now\n- Priya relocated to Tbilisi and lives there now\n- Priya lives in Porto\n- Priya lives in Bergen\n- Priya's sister lives in Leeds\n- Priya's birthday is in March\n- Priya's manager is Lucia Ferraro\n- Priya started a new job at Juniper Legal\n- Priya eats halal\n- Rui Costa became Priya's manager"
+      }
+    }
+  },
+  "wall_seconds": 84.33
+}

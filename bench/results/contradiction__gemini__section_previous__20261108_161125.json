@@ -1,0 +1,211 @@
+{
+  "params": {
+    "trials": 20,
+    "subjects": 8,
+    "distractors": 12,
+    "k": 10,
+    "budget": 1500,
+    "seed": 0,
+    "search": "dense (gemini)",
+    "variants": [
+      "notes",
+      "keyed facts",
+      "notes + keys",
+      "notes + extracted keys"
+    ],
+    "question": "previous",
+    "history": "section",
+    "now": 1794126998.0
+  },
+  "results": {
+    "notes": {
+      "in order": {
+        "n": 400,
+        "current_in": 398,
+        "current_first": 241,
+        "stale": 415,
+        "stale_records": 415,
+        "stale_only": 2,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43912
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 394,
+        "current_first": 250,
+        "stale": 408,
+        "stale_records": 408,
+        "stale_only": 6,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 43710
+      }
+    },
+    "keyed facts": {
+      "in order": {
+        "n": 400,
+        "current_in": 0,
+        "current_first": 0,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 400,
+        "tokens": 45259
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 0,
+        "current_first": 0,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 400,
+        "tokens": 44927
+      }
+    },
+    "notes + keys": {
+      "in order": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 418,
+        "stale_records": 418,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 61823
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 409,
+        "stale_records": 409,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 61274
+      }
+    },
+    "notes + extracted keys": {
+      "in order": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 356,
+        "stale": 416,
+        "stale_records": 416,
+        "stale_only": 0,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 58298
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 399,
+        "current_first": 360,
+        "stale": 409,
+        "stale_records": 409,
+        "stale_only": 1,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 58607
+      }
+    }
+  },
+  "extraction": {
+    "model": "openai/gpt-4o-mini",
+    "extractor": "session_fact_extractor 0.3.1",
+    "calls_tokens": {},
+    "usd": 0.0
+  },
+  "reader": {
+    "model": "openrouter:openai/gpt-4o-mini",
+    "per": 400,
+    "results": {
+      "notes": {
+        "in order": {
+          "sent": 400,
+          "correct": 277,
+          "stale": 119
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 291,
+          "stale": 106
+        }
+      },
+      "keyed facts": {
+        "in order": {
+          "sent": 400,
+          "correct": 0,
+          "stale": 0
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 0,
+          "stale": 0
+        }
+      },
+      "notes + keys": {
+        "in order": {
+          "sent": 400,
+          "correct": 361,
+          "stale": 30
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 348,
+          "stale": 37
+        }
+      },
+      "notes + extracted keys": {
+        "in order": {
+          "sent": 400,
+          "correct": 327,
+          "stale": 65
+        },
+        "shuffled": {
+          "sent": 400,
+          "correct": 332,
+          "stale": 61
+        }
+      }
+    },
+    "stale_examples": {
+      "notes/in order": {
+        "ask": "Which phone plan was Emeka on before AT&T Value?",
+        "reply": "US Mobile Starter",
+        "packet": "CONTEXT\n- [2026-09-14] Emeka's phone plan is AT&T Value\n- [2025-07-13] Emeka switched to US Mobile Starter\n- [2026-05-29] Emeka's phone plan is Visible Plus\n- [2025-06-06] Emeka is on the Cricket Core phone plan\n- [2026-07-15] Emeka moved to Toronto\n- [2026-02-01] Emeka went gluten-free\n- [2026-08-26] Emeka relocated to Leeds and lives there now\n- [2025-06-24] Emeka is pescatarian now\n- [2026-08-31] Emeka now reports to Priya Natarajan\n- [2026-10-25] Emeka asked about the Google Fi Flexible phone plan for a parent"
+      },
+      "notes + keys/in order": {
+        "ask": "Who was Alice's manager before Tom Okafor?",
+        "reply": "Ken Watanabe",
+        "packet": "CONTEXT\n- [2026-08-23] Alice's manager is Tom Okafor\n- [2026-10-27] Alice is halal now\n- [2026-10-25] Alice's employer is Bluefin Labs\n- [2026-10-08] Alice relocated to Toronto and lives there now\n\nEARLIER VALUES (superseded)\n- [2025-11-21] Alice's manager is Sara Lindqvist\n- [2025-07-13] Alice reports to Priya Natarajan\n- [2024-09-06] Ken Watanabe became Alice's manager\n- [2026-08-19] Alice went pescatarian\n- [2026-02-03] Alice went keto\n- [2025-12-23] Alice follows a paleo diet\n- [2026-03-13] Alice works at Elmstead Foods\n- [2025-10-13] Alice joined Juniper Legal\n- [2024-10-17] Alice started a new job at Acme Robotics\n- [2026-05-08] Alice lives in Nairobi"
+      },
+      "notes + extracted keys/in order": {
+        "ask": "What diet did Emeka follow before keto?",
+        "reply": "Paleo",
+        "packet": "CONTEXT\n- [2026-08-19] Emeka follows a keto diet\n- [2024-10-10] Emeka eats paleo\n- [2026-08-26] Emeka relocated to Leeds and lives there now\n- [2026-01-20] Emeka cooked a halal dinner for guests\n- [2026-09-14] Emeka's phone plan is AT&T Value\n- [2026-09-05] Emeka started a new job at Fathom Analytics\n- [2025-12-19] Emeka is training for a half marathon\n\nEARLIER VALUES (superseded)\n- [2026-02-01] Emeka went gluten-free\n- [2025-06-24] Emeka is pescatarian now\n- [2026-07-15] Emeka moved to Toronto\n- [2026-05-29] Emeka's phone plan is Visible Plus\n- [2025-07-13] Emeka switched to US Mobile Starter\n- [2025-06-06] Emeka is on the Cricket Core phone plan\n- [2026-03-01] Emeka started a new job at Elmstead Foods\n- [2024-10-16] Emeka works at Corvid Health"
+      },
+      "notes/shuffled": {
+        "ask": "Which city did Lena live in before Bergen?",
+        "reply": "Hobart",
+        "packet": "CONTEXT\n- [2026-10-04] Lena relocated to Bergen and lives there now\n- [2024-07-03] Lena moved to Hobart\n- [2026-03-01] Lena's home city is Austin\n- [2025-03-03] Lena's home city is Cusco\n- [2026-07-04] Lena's sister lives in Porto\n- [2026-07-23] Lena's birthday is in March\n- [2026-06-30] Lena went paleo\n- [2026-09-21] Lena started a new job at Juniper Legal\n- [2026-01-13] Lena's manager is Maya Cohen\n- [2026-01-17] Lena is learning Portuguese"
+      },
+      "notes + keys/shuffled": {
+        "ask": "Who was Mateo's manager before Dev Malhotra?",
+        "reply": "Omar Haddad",
+        "packet": "CONTEXT\n- [2026-09-10] Mateo reports to Dev Malhotra\n- [2026-09-30] Mateo moved to Hobart\n- [2026-08-18] Mateo went paleo\n- [2025-12-14] Mateo met Lucia Ferraro at a workshop\n- [2026-08-31] Mateo adopted a cat named Miso\n\nEARLIER VALUES (superseded)\n- [2026-07-29] Mateo reports to Tom Okafor\n- [2026-06-25] Omar Haddad became Mateo's manager\n- [2025-07-01] Rui Costa became Mateo's manager\n- [2026-07-24] Mateo moved to Osaka\n- [2025-08-28] Mateo follows a vegan diet\n- [2024-09-07] Mateo eats low-FODMAP"
+      },
+      "notes + extracted keys/shuffled": {
+        "ask": "Who was Mateo's manager before Dev Malhotra?",
+        "reply": "Omar Haddad",
+        "packet": "CONTEXT\n- [2026-09-10] Mateo reports to Dev Malhotra\n- [2026-09-30] Mateo moved to Hobart\n- [2026-08-18] Mateo went paleo\n- [2025-12-14] Mateo met Lucia Ferraro at a workshop\n- [2025-08-28] Mateo follows a vegan diet\n- [2026-08-31] Mateo adopted a cat named Miso\n\nEARLIER VALUES (superseded)\n- [2026-07-29] Mateo reports to Tom Okafor\n- [2026-06-25] Omar Haddad became Mateo's manager\n- [2025-07-01] Rui Costa became Mateo's manager\n- [2026-07-24] Mateo moved to Osaka"
+      }
+    }
+  },
+  "wall_seconds": 325.97
+}

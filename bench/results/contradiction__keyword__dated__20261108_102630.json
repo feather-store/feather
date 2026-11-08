@@ -1,0 +1,196 @@
+{
+  "params": {
+    "trials": 20,
+    "subjects": 8,
+    "distractors": 12,
+    "k": 10,
+    "budget": 1500,
+    "seed": 0,
+    "search": "keyword (BM25)"
+  },
+  "results": {
+    "notes": {
+      "in order": {
+        "n": 400,
+        "current_in": 321,
+        "current_first": 193,
+        "stale": 545,
+        "stale_records": 545,
+        "stale_only": 49,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 41994
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 333,
+        "current_first": 190,
+        "stale": 554,
+        "stale_records": 554,
+        "stale_only": 43,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 41805
+      }
+    },
+    "notes, no valid time": {
+      "in order": {
+        "n": 400,
+        "current_in": 321,
+        "current_first": 193,
+        "stale": 545,
+        "stale_records": 545,
+        "stale_only": 49,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 41994
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 293,
+        "current_first": 140,
+        "stale": 579,
+        "stale_records": 579,
+        "stale_only": 76,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 41836
+      }
+    },
+    "keyed facts": {
+      "in order": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 45043
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 400,
+        "current_first": 400,
+        "stale": 0,
+        "stale_records": 0,
+        "stale_only": 0,
+        "held_current": 400,
+        "held_n": 400,
+        "tokens": 44792
+      }
+    },
+    "items + valid_at": {
+      "in order": {
+        "n": 400,
+        "current_in": 321,
+        "current_first": 192,
+        "stale": 541,
+        "stale_records": 541,
+        "stale_only": 48,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 42053
+      },
+      "shuffled": {
+        "n": 400,
+        "current_in": 334,
+        "current_first": 191,
+        "stale": 552,
+        "stale_records": 552,
+        "stale_only": 42,
+        "held_current": 0,
+        "held_n": 0,
+        "tokens": 41878
+      }
+    }
+  },
+  "reader": {
+    "model": "openrouter:openai/gpt-4o-mini",
+    "per": 40,
+    "results": {
+      "notes": {
+        "in order": {
+          "sent": 40,
+          "correct": 26,
+          "stale": 10
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 29,
+          "stale": 7
+        }
+      },
+      "notes, no valid time": {
+        "in order": {
+          "sent": 40,
+          "correct": 26,
+          "stale": 10
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 12,
+          "stale": 24
+        }
+      },
+      "keyed facts": {
+        "in order": {
+          "sent": 40,
+          "correct": 40,
+          "stale": 0
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 39,
+          "stale": 0
+        }
+      },
+      "items + valid_at": {
+        "in order": {
+          "sent": 40,
+          "correct": 26,
+          "stale": 10
+        },
+        "shuffled": {
+          "sent": 40,
+          "correct": 29,
+          "stale": 7
+        }
+      }
+    },
+    "stale_examples": {
+      "notes/in order": {
+        "ask": "Who is Noor's manager now?",
+        "reply": "Maya Cohen",
+        "packet": "CONTEXT\n- [2026-10-13] Noor's manager is Sara Lindqvist\n- [2026-07-30] Noor now reports to Maya Cohen\n- [2026-10-12] Noor eats pescatarian\n- [2026-10-06] Noor lives in Nairobi\n- [2026-05-10] Noor eats halal\n- [2026-01-25] Noor is learning Portuguese\n- [2025-11-18] Noor lives in Austin\n- [2025-11-03] Noor's birthday is in March\n- [2025-03-08] Noor moved to Cusco\n- [2026-10-25] Noor switched to Visible Plus"
+      },
+      "notes, no valid time/in order": {
+        "ask": "Who is Noor's manager now?",
+        "reply": "Maya Cohen",
+        "packet": "CONTEXT\n- [2026-10-13] Noor's manager is Sara Lindqvist\n- [2026-07-30] Noor now reports to Maya Cohen\n- [2026-10-12] Noor eats pescatarian\n- [2026-10-06] Noor lives in Nairobi\n- [2026-05-10] Noor eats halal\n- [2026-01-25] Noor is learning Portuguese\n- [2025-11-18] Noor lives in Austin\n- [2025-11-03] Noor's birthday is in March\n- [2025-03-08] Noor moved to Cusco\n- [2026-10-25] Noor switched to Visible Plus"
+      },
+      "items + valid_at/in order": {
+        "ask": "Who is Noor's manager now?",
+        "reply": "Maya Cohen",
+        "packet": "CONTEXT\n- [2026-10-13] Noor's manager is Sara Lindqvist\n- [2026-07-30] Noor now reports to Maya Cohen\n- [2026-10-12] Noor eats pescatarian\n- [2026-10-06] Noor lives in Nairobi\n- [2026-05-10] Noor eats halal\n- [2026-01-25] Noor is learning Portuguese\n- [2025-11-18] Noor lives in Austin\n- [2025-11-03] Noor's birthday is in March\n- [2025-03-08] Noor moved to Cusco\n- [2026-10-25] Noor switched to Visible Plus"
+      },
+      "notes/shuffled": {
+        "ask": "Who is Mateo's manager now?",
+        "reply": "Omar Haddad",
+        "packet": "CONTEXT\n- [2026-06-25] Omar Haddad became Mateo's manager\n- [2025-07-01] Rui Costa became Mateo's manager\n- [2026-09-30] Mateo moved to Hobart\n- [2026-08-17] Mateo went paleo\n- [2026-07-24] Mateo moved to Osaka\n- [2026-06-27] Mateo is learning Portuguese\n- [2026-09-10] Mateo reports to Dev Malhotra\n- [2026-08-18] Mateo joined Granite Freight\n- [2026-07-28] Mateo reports to Tom Okafor\n- [2026-05-04] Mateo's sister lives in Tbilisi"
+      },
+      "notes, no valid time/shuffled": {
+        "ask": "Which city does Priya live in now?",
+        "reply": "Porto",
+        "packet": "CONTEXT\n- [2026-11-08] Priya relocated to Tbilisi and lives there now\n- [2026-11-08] Priya relocated to Toronto and lives there now\n- [2026-11-08] Priya lives in Porto\n- [2026-11-08] Priya lives in Bergen\n- [2026-11-08] Priya is low-FODMAP now\n- [2026-11-08] Priya's sister lives in Leeds\n- [2026-11-08] Priya eats halal\n- [2026-11-08] Priya is learning Portuguese\n- [2026-11-08] Priya's birthday is in March\n- [2026-11-08] Priya's employer is Corvid Health"
+      },
+      "items + valid_at/shuffled": {
+        "ask": "Who is Mateo's manager now?",
+        "reply": "Omar Haddad",
+        "packet": "CONTEXT\n- [2026-06-25] Omar Haddad became Mateo's manager\n- [2025-07-01] Rui Costa became Mateo's manager\n- [2026-09-30] Mateo moved to Hobart\n- [2026-08-17] Mateo went paleo\n- [2026-07-24] Mateo moved to Osaka\n- [2026-06-27] Mateo is learning Portuguese\n- [2026-09-10] Mateo reports to Dev Malhotra\n- [2026-08-18] Mateo joined Granite Freight\n- [2026-07-28] Mateo reports to Tom Okafor\n- [2026-05-04] Mateo's sister lives in Tbilisi"
+      }
+    }
+  },
+  "wall_seconds": 35.69
+}

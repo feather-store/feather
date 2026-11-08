@@ -1,0 +1,88 @@
+{
+ "records": 100000,
+ "commits": 200,
+ "save": {
+  "n": 200,
+  "p50_ms": 0.524,
+  "p95_ms": 0.697,
+  "p99_ms": 1.227,
+  "mean_ms": 0.821,
+  "max_ms": 46.669
+ },
+ "commit_bytes_median": 45341,
+ "marker_bytes_per_commit": 51,
+ "vacuum_ms": 211.1,
+ "history_call": {
+  "n": 20,
+  "p50_ms": 2.085,
+  "p95_ms": 2.742,
+  "p99_ms": 11.756,
+  "mean_ms": 2.671,
+  "max_ms": 14.009
+ },
+ "history_commits": 207,
+ "open_read_only_plain": {
+  "n": 10,
+  "p50_ms": 213.787,
+  "p95_ms": 257.876,
+  "p99_ms": 273.079,
+  "mean_ms": 221.541,
+  "max_ms": 276.88
+ },
+ "open_as_of_time_live_file": {
+  "n": 15,
+  "p50_ms": 200.86,
+  "p95_ms": 219.52,
+  "p99_ms": 221.538,
+  "mean_ms": 202.551,
+  "max_ms": 222.042
+ },
+ "open_as_of_time_kept_file": {
+  "n": 15,
+  "p50_ms": 203.801,
+  "p95_ms": 426.452,
+  "p99_ms": 710.907,
+  "mean_ms": 248.751,
+  "max_ms": 782.021
+ },
+ "open_as_of_tag": {
+  "n": 10,
+  "p50_ms": 353.36,
+  "p95_ms": 417.739,
+  "p99_ms": 424.59,
+  "mean_ms": 334.469,
+  "max_ms": 426.302
+ },
+ "first_search_after_as_of_live": {
+  "n": 15,
+  "p50_ms": 0.704,
+  "p95_ms": 0.828,
+  "p99_ms": 0.835,
+  "mean_ms": 0.713,
+  "max_ms": 0.836
+ },
+ "first_search_after_as_of_kept": {
+  "n": 15,
+  "p50_ms": 0.704,
+  "p95_ms": 1.02,
+  "p99_ms": 1.184,
+  "mean_ms": 0.742,
+  "max_ms": 1.224
+ },
+ "diff_100k_ms": 45.0,
+ "diff_size": 2237,
+ "history_files": 1,
+ "history_mb": 415.7,
+ "live_file_mb": 417.8,
+ "_env": {
+  "python": "3.12.15",
+  "feather": "0.21.0",
+  "cpus": 8,
+  "simd": {
+   "active": "neon",
+   "detected": "neon"
+  },
+  "when": "2026-11-08 22:25:31"
+ },
+ "_section_s": 22.0
+}

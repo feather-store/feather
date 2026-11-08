@@ -1,0 +1,70 @@
+{
+ "embed_ms": {
+  "n": 120,
+  "p50_ms": 504.446,
+  "p95_ms": 663.11,
+  "p99_ms": 838.342,
+  "mean_ms": 574.747,
+  "max_ms": 7489.989
+ },
+ "retrieve_ms": {
+  "n": 120,
+  "p50_ms": 1.308,
+  "p95_ms": 5.454,
+  "p99_ms": 10.991,
+  "mean_ms": 1.961,
+  "max_ms": 13.004
+ },
+ "render_ms": {
+  "n": 120,
+  "p50_ms": 0.224,
+  "p95_ms": 0.426,
+  "p99_ms": 1.063,
+  "mean_ms": 0.258,
+  "max_ms": 2.226
+ },
+ "llm_ms": {
+  "n": 120,
+  "p50_ms": 845.688,
+  "p95_ms": 1221.424,
+  "p99_ms": 1673.539,
+  "mean_ms": 895.991,
+  "max_ms": 1863.042
+ },
+ "total_ms": {
+  "n": 120,
+  "p50_ms": 1351.702,
+  "p95_ms": 1852.539,
+  "p99_ms": 2349.702,
+  "mean_ms": 1472.958,
+  "max_ms": 9182.516
+ },
+ "retrieve_api_ms": {
+  "n": 120,
+  "p50_ms": 5.836,
+  "p95_ms": 9.399,
+  "p99_ms": 19.314,
+  "mean_ms": 6.365,
+  "max_ms": 29.97
+ },
+ "questions": 120,
+ "context_chars_median": 5302,
+ "feather_share_of_total_pct": 0.15,
+ "reader": "openrouter:openai/gpt-4o-mini",
+ "reader_usd": 0.028335150000000003,
+ "served_by": {
+  "OpenAI": 120
+ },
+ "embed_model": "gemini-embedding-001",
+ "_env": {
+  "python": "3.12.15",
+  "feather": "0.21.0",
+  "cpus": 8,
+  "simd": {
+   "active": "neon",
+   "detected": "neon"
+  },
+  "when": "2026-11-08 22:28:17"
+ },
+ "_section_s": 179.2
+}

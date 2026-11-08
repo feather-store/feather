@@ -1,0 +1,47 @@
+{
+ "open_ms": {
+  "n": 5,
+  "p50_ms": 201.858,
+  "p95_ms": 537.116,
+  "p99_ms": 603.704,
+  "mean_ms": 283.684,
+  "max_ms": 620.351
+ },
+ "first_keyword_ms": {
+  "n": 5,
+  "p50_ms": 1952.621,
+  "p95_ms": 2086.654,
+  "p99_ms": 2090.84,
+  "mean_ms": 1988.838,
+  "max_ms": 2091.887
+ },
+ "rss_open_mb": 495.9,
+ "rss_bm25_mb": 81.8,
+ "keyword_search": {
+  "n": 500,
+  "p50_ms": 1.852,
+  "p95_ms": 2.907,
+  "p99_ms": 3.613,
+  "mean_ms": 1.945,
+  "max_ms": 25.927
+ },
+ "hybrid_search": {
+  "n": 500,
+  "p50_ms": 2.331,
+  "p95_ms": 3.279,
+  "p99_ms": 3.818,
+  "mean_ms": 2.328,
+  "max_ms": 4.464
+ },
+ "_env": {
+  "python": "3.12.15",
+  "feather": "0.21.0",
+  "cpus": 8,
+  "simd": {
+   "active": "neon",
+   "detected": "neon"
+  },
+  "when": "2026-11-08 22:25:31"
+ },
+ "_section_s": 18.3
+}
