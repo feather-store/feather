@@ -13,7 +13,7 @@
 [![HuggingFace Space](https://img.shields.io/badge/demo-HuggingFace-yellow)](https://huggingface.co/spaces/Hawky-ai/feather-db)
 [![Benchmark Results](https://img.shields.io/badge/dataset-benchmarks-orange)](https://huggingface.co/datasets/Hawky-ai/feather-db-benchmarks)
 
-[![LongMemEval_S](https://img.shields.io/badge/LongMemEval__S-0.912%20%7C%20gemini--2.5--flash-success)](#memory-benchmark--longmemeval-xu-et-al-2024)
+[![LongMemEval_S](https://img.shields.io/badge/LongMemEval__S-0.911%20%7C%20gemini--2.5--flash-success)](#memory-benchmark--longmemeval-xu-et-al-2024)
 [![ANN p50](https://img.shields.io/badge/SIFT1M%20p50-0.19ms-blue)](docs/benchmarks/longmemeval.md)
 [![ANN Recall](https://img.shields.io/badge/recall%4010-0.972-blue)](docs/benchmarks/longmemeval.md)
 
@@ -72,7 +72,7 @@ Code, and a **LangGraph `BaseStore`** — cross-thread agent memory in one line,
 | **File ingest (Cloud API)** | `POST /v1/{ns}/ingest_file` stores an image, video, audio, PDF or text file by what a multimodal model sees in it; there is an upload modal in the admin SPA. Hybrid search embeds the query server-side when no vector is given. |
 | **Time travel** | `DB.open(path, as_of=t)` opens the memory as it was at a past moment: by time, by tag (`as_of="run-42"`) or by commit (`generation=n`). The handle is read-only and scores with its clock pinned to that moment, so a replay retrieves what the agent retrieved then. `db.history()`, `db.tag()`, `feather_db.diff(a, b)`. Costs 51 bytes a commit; opening the past costs what a read-only open costs. See [Time Travel](#time-travel). |
 | **History retention** | `db.set_history_retention(seconds)` keeps the file a rewrite (vacuum, compact, purge) replaces, so `as_of` reaches back that far. Off by default; tags keep their commit regardless. `erase()` deletes all history. |
-| **LongMemEval_S: 0.912** | All 500 questions, official GPT-4o judge. See [Benchmarks](#memory-benchmark--longmemeval-xu-et-al-2024). |
+| **LongMemEval_S: 0.911** | Mean of three reportable runs on all 500 questions, official GPT-4o judge (0.916, 0.904, 0.914). See [Benchmarks](#memory-benchmark--longmemeval-xu-et-al-2024). |
 | **Measured end to end** | Latency p50/p99 for every layer, from a live agent turn down to one search, plus LongMemEval, LoCoMo, contradiction and poisoning scores: [Performance](#performance) and [Benchmarks](#benchmarks). |
 
 ```python
@@ -763,19 +763,19 @@ Reproduce: `benchmarks/e2e_latency.py`, `benchmarks/full_suite.py`,
 
 500-question end-to-end memory QA benchmark, the standard for long-term memory in chat assistants. Full report: [`docs/benchmarks/longmemeval.md`](./docs/benchmarks/longmemeval.md).
 
-**0.912 on LongMemEval_S**: all 500 questions, scored by the paper's official judge (`gpt-4o-2024-08-06`), with gemini-2.5-flash as the reader. Retrieval used Gemini embeddings and the top 20 sessions, packed up to 160k characters. 0 failed questions; the evidence was fully in context for 99.4% of them. One run: its 95% interval on question sampling alone is 0.886-0.936, and rerun noise is not yet measured (`REPEATS=3 scripts/lme_final.sh`; bench/README.md, "Evaluation protocol").
+**0.911 on LongMemEval_S**: the mean of three runs on all 500 questions (0.916, 0.904, 0.914), scored by the paper's official judge (`gpt-4o-2024-08-06`), with gemini-2.5-flash as the reader. Retrieval used Gemini embeddings and the top 20 sessions, packed up to 160k characters. 0 failed questions; the evidence was fully in context for 99.4% of them. On the 400 held-out questions the mean is 0.908. Rerun noise, now measured: a standard deviation of 0.64 points between runs, and two runs disagree on 3.6% of questions; question sampling alone puts a 95% interval of about ±2.5 points on any one run. All three runs were made by `scripts/lme_final.sh` on committed code (`8160eca`), so the harness marks each one *reportable* (bench/README.md, "Evaluation protocol").
 
 | Feather configuration (S, all 500, official judge) | Overall | |
 |---|---|---|
-| **Single reader + evidence packing** (v0.22 default) | **0.912** | +0.8 vs baseline: 23 fixed, 19 broken (McNemar p = 0.64, within noise) |
+| **Single reader + evidence packing** (v0.22 default) | **0.911** | mean of 3 runs; +0.7 vs baseline [−1.7, +3.2], 25 fixed, 23 broken (McNemar p = 0.89, within noise) |
 | Single reader, baseline | 0.904 | |
 | Routed reader + count map-reduce | 0.794 | a regression: **not shipped**, kept only to reproduce it |
 
-By question type (0.912 run): task-averaged 0.910, abstention 0.900.
+By question type (mean of the three runs; baseline in brackets): knowledge-update 0.957 (0.910), temporal-reasoning 0.930 (0.910), single-session-user 0.976 (0.971), single-session-assistant 0.970 (0.982), multi-session 0.837 (0.827), single-session-preference 0.778 (0.900). Task-averaged 0.908, abstention 0.878. No per-type difference from the baseline is distinguishable from noise; preference (30 questions) moved most.
 
 | System | Variant | Answerer | Overall |
 |---|---|---|---|
-| **Feather DB v0.22** | **S** | **gemini-2.5-flash** | **0.912** |
+| **Feather DB v0.22** | **S** | **gemini-2.5-flash** | **0.911** (mean of 3) |
 | Supermemory | S | gpt-4o | 0.816 |
 | Mem0 (prior algo) | S | gpt-4o-mini | 0.678 |
 | Full-context GPT-4o (paper "ceiling") | S | gpt-4o + CoN | 0.640 |
@@ -783,7 +783,7 @@ By question type (0.912 run): task-averaged 0.910, abstention 0.900.
 | Full-context GPT-4o-mini | S | gpt-4o-mini | 0.554 |
 | Feather DB v0.8.0 + decay (earlier) | S | gemini-2.5-flash | 0.657 |
 
-Other systems' numbers are as they report them. The 0.912 run was made on a tree that was not yet committed, so the harness marks it *not reportable*. `scripts/lme_final.sh` reruns it on a committed tree, refuses to report a short or partly failed run, and compares the result with the 0.904 baseline on all 500 and on the held-out 400. Per-question records are in [`bench/results/`](./bench/results/) (`longmemeval__s__20261030_152859__questions.jsonl`).
+Other systems' numbers are as they report them, mostly from one run. An earlier single run of this configuration scored 0.912 on an uncommitted tree; the three reportable runs above replace it. `scripts/lme_final.sh` refuses an uncommitted tree or a short or partly failed run, and compares the result with the 0.904 baseline on all 500 and on the held-out 400. Per-question records are in [`bench/results/`](./bench/results/) (`longmemeval__s__20261108_230418__questions.jsonl`, `..._232726__...`, `..._235119__...`).
 
 Reproduce (needs `OPENROUTER_API_KEY` for the official judge and `GOOGLE_API_KEY` or `GEMINI_API_KEY`):
 ```bash
@@ -795,11 +795,11 @@ scripts/lme_dev.sh                 # the 100-question dev split, for trying a ch
 
 A check of the current code on the frozen dev splits, one run each. Under the
 harness's protocol these are not reportable headline numbers (dev split,
-uncommitted tree); the 0.912 above is.
+uncommitted tree); the 0.911 above is.
 
 | Benchmark | Configuration | n | Score |
 |---|---|---:|---:|
-| LongMemEval_S dev | as for the 0.912 run, official GPT-4o judge | 100 | **0.930** (the 0.904 baseline scored 0.920 on the same 100: within noise) |
+| LongMemEval_S dev | as for the headline runs, official GPT-4o judge | 100 | **0.930** (the earlier 0.912 run also scored 0.930 on these 100, the 0.904 baseline 0.920: the dev questions are easier than the full set) |
 | LoCoMo dev | turns + extracted facts, gpt-4o-mini reader, Mem0's judge | 459 | J **81.5** |
 | LoCoMo dev, sound key | the same, without the 99 known-wrong answers | 427 | J **83.8** |
 
