@@ -773,23 +773,78 @@ Reproduce: `benchmarks/e2e_latency.py`, `benchmarks/full_suite.py`,
 
 By question type (mean of the three runs; baseline in brackets): knowledge-update 0.957 (0.910), temporal-reasoning 0.930 (0.910), single-session-user 0.976 (0.971), single-session-assistant 0.970 (0.982), multi-session 0.837 (0.827), single-session-preference 0.778 (0.900). Task-averaged 0.908, abstention 0.878. No per-type difference from the baseline is distinguishable from noise; preference (30 questions) moved most.
 
-| System | Variant | Answerer | Overall |
-|---|---|---|---|
-| **Feather DB v0.22** | **S** | **gemini-2.5-flash** | **0.911** (mean of 3) |
-| Supermemory | S | gpt-4o | 0.816 |
-| Mem0 (prior algo) | S | gpt-4o-mini | 0.678 |
-| Full-context GPT-4o (paper "ceiling") | S | gpt-4o + CoN | 0.640 |
-| Zep (graphiti) | S | gpt-4o-mini | 0.638 |
-| Full-context GPT-4o-mini | S | gpt-4o-mini | 0.554 |
-| Feather DB v0.8.0 + decay (earlier) | S | gemini-2.5-flash | 0.657 |
+**Published LongMemEval_S results** (checked against each source, November 2026).
+Every number but Feather's is self-reported by its vendor, mostly from a
+single run, with different answer models and judges. The answer model moves
+a score more than most of the gaps between rows (Mastra: 0.842 with gpt-4o,
+0.949 with gpt-5-mini), so compare rows only where the answer model matches.
 
-Other systems' numbers are as they report them, mostly from one run. An earlier single run of this configuration scored 0.912 on an uncommitted tree; the three reportable runs above replace it. `scripts/lme_final.sh` refuses an uncommitted tree or a short or partly failed run, and compares the result with the 0.904 baseline on all 500 and on the held-out 400. Per-question records are in [`bench/results/`](./bench/results/) (`longmemeval__s__20261108_230418__questions.jsonl`, `..._232726__...`, `..._235119__...`).
+| System | Answer model | Overall | Source |
+|---|---|---:|---|
+| Supermemory (headline) | gpt-4o | 0.970 | [research page](https://supermemory.ai/research/longmembench) |
+| Mastra Observational Memory | gpt-5-mini | 0.949 | [research page](https://mastra.ai/research/observational-memory) |
+| Mem0 (April 2026 algorithm) | not stated | 0.944 | [blog](https://mem0.ai/blog/state-of-ai-agent-memory-2026) |
+| Mastra Observational Memory | gemini-3-pro-preview | 0.933 | [research page](https://mastra.ai/research/observational-memory) |
+| Hindsight (Vectorize) | gemini-3-pro-preview | 0.914 | [benchmarks repo](https://github.com/vectorize-io/hindsight-benchmarks) |
+| **Feather DB v0.22** | **gemini-2.5-flash** | **0.911** | mean of 3 reportable runs, this repo |
+| EmergenceMem Internal | not stated | 0.860 | [blog](https://www.emergence.ai/blog/sota-on-longmemeval-with-rag) |
+| Supermemory | gemini-3-pro | 0.852 | [research page](https://supermemory.ai/research/longmembench) |
+| Mastra Observational Memory | gpt-4o | 0.842 | [research page](https://mastra.ai/research/observational-memory) |
+| EmergenceMem Simple | gpt-4o | 0.824 | [blog](https://www.emergence.ai/blog/sota-on-longmemeval-with-rag) |
+| Zep | gpt-4o | 0.712 | [Supermemory's table](https://supermemory.ai/research/longmembench) (Zep's own figure) |
+| Full context, GPT-4o + chain-of-note | gpt-4o | 0.640 | LongMemEval paper |
+| Full context, GPT-4o-mini | gpt-4o-mini | 0.554 | LongMemEval paper |
+
+What this table does and does not show:
+
+- **Feather is in the leading group, not first.** Its 0.911 is with a cheaper
+  reader than the rows above it; Feather has not been run with gemini-3-pro or
+  gpt-5-mini, so the like-for-like comparison with Hindsight and Mastra is
+  still to be made.
+- **The score is mostly the reader's.** Feather retrieves the top 20 sessions
+  and packs up to 160k characters (~40k tokens) per question; the evidence is
+  in context 99.4% of the time, and most misses are reader errors. A
+  full-context run with the same reader (gemini-2.5-flash) has not been
+  measured yet, so this table does not yet show how much Feather's retrieval
+  adds over putting the whole history in the prompt. Mem0 reports ~6.8k tokens
+  per retrieval on this benchmark.
+- **Rerun noise is the size of many gaps here.** Feather's three runs span
+  0.904-0.916 (standard deviation 0.64 points; two runs disagree on 3.6% of
+  questions). A single run of any system carries the same noise.
+
+An earlier single run of Feather's configuration scored 0.912 on an
+uncommitted tree; the three reportable runs above replace it. `scripts/lme_final.sh` refuses an uncommitted tree or a short or partly failed run, and compares the result with the 0.904 baseline on all 500 and on the held-out 400. Per-question records are in [`bench/results/`](./bench/results/) (`longmemeval__s__20261108_230418__questions.jsonl`, `..._232726__...`, `..._235119__...`).
 
 Reproduce (needs `OPENROUTER_API_KEY` for the official judge and `GOOGLE_API_KEY` or `GEMINI_API_KEY`):
 ```bash
 scripts/lme_final.sh               # all 500, official judge, checked for completeness
 scripts/lme_dev.sh                 # the 100-question dev split, for trying a change first
 ```
+
+### Memory benchmark — LoCoMo (Maharana et al., 2024)
+
+Under Mem0's published protocol (gpt-4o-mini answers and judges with Mem0's
+judge prompt; categories 1-4, 1,540 questions), the protocol the 2025 papers
+used:
+
+| System | J | Source |
+|---|---:|---|
+| **Feather DB** (turns + extracted facts) | **82.4** | one run, all 10 conversations ([`bench/README.md`](./bench/README.md)) |
+| MemOS | 75.8 | [MemOS repo](https://github.com/MemTensor/MemOS/pull/428/files) |
+| Mem0g | 68.4 | Mem0 paper (arXiv:2504.19413), Table 2 |
+| Mem0 | 66.9 | Mem0 paper, Table 2 |
+| Zep | 66.0 | Mem0 paper, Table 2 (Zep reports ~75 under its own run) |
+| LangMem | 58.1 | Mem0 paper, Table 2 |
+| OpenAI memory | 52.9 | Mem0 paper, Table 2 |
+
+Feather's configuration was chosen with every conversation in view; on the 7
+conversations held out since, scored without the 99 known-wrong answers, it is
+84.9. Two cautions apply to every row: 6.4% of the published answers are
+wrong, and this judge accepts up to 63% of deliberately wrong answers
+([Penfield audit](https://penfieldlabs.substack.com/p/we-audited-locomo-64-of-the-answer)),
+so differences of a few points are not interpretable. The 2026 vendor claims
+(Mem0 92.5, Zep 94.7) use gpt-5-class models, or do not state theirs, and are
+not comparable with this table.
 
 ### End-to-end quality, this build (dev splits, 2026-11-08)
 
