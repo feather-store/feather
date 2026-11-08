@@ -7,7 +7,13 @@
 #   scripts/lme_dev.sh current countmap # chosen steps
 #
 # Steps add ONE change to the current code, so a gain can be attributed;
-# combine the winners, then freeze and run all 500 once (scripts/lme_final.sh).
+# combine the winners, then freeze and run all 500 (scripts/lme_final.sh).
+#
+# Every step runs REPEATS times (default 3): same-context reruns flip ~3% of
+# questions, more than most effects. BASELINE is a space-separated list of
+# runs of the baseline (`REPEATS=3 scripts/lme_dev.sh current` makes them);
+# each step is compared with it by bench.compare (bootstrap CI, McNemar,
+# rerun noise). A step is a gain only if bench.compare says "B better".
 # Each dev run is ~4 min at 8 workers. Needs GEMINI_API_KEY (or
 # GOOGLE_API_KEY) and OPENROUTER_API_KEY.
 set -euo pipefail
@@ -19,6 +25,7 @@ STRONG=${STRONG:-gemini-2.5-pro}       # the stronger reader to try
 CHEAP=${CHEAP:-gemini-2.5-flash}       # map calls and fact extraction
 TOKENS=${TOKENS:-80000}                # the larger budget to try
 LOG=bench/results/dev_runs.tsv
+REPEATS=${REPEATS:-3}
 
 : "${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY (official judge)}"
 [[ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ]] ||
@@ -51,18 +58,23 @@ steps=("$@")
 
 for step in "${steps[@]}"; do
   flags=$(step_flags "$step")
-  echo "==> dev: $step ${flags}"
-  marker=$(mktemp)
-  # shellcheck disable=SC2086  # flags are word lists by design
-  "$PY" -m bench run "${BASE[@]}" $flags
-  new=$(find bench/results -name '*__questions.jsonl' -newer "$marker" |
-        sort | tail -1)
-  rm -f "$marker"
-  [[ -n $new ]] || { echo "no questions file from step $step" >&2; exit 1; }
-  "$PY" -m bench.lme_eval --check "$new" 100 ||
-    { echo "step $step: $new is not a complete dev run" >&2; exit 1; }
-  printf "%s\t%s\t%s\n" "$step" "$new" "$flags" >> "$LOG"
-  "$PY" -m bench.lme_eval "$BASELINE" "$new" official dev |
+  runs=()
+  for rep in $(seq 1 "$REPEATS"); do
+    echo "==> dev: $step ${flags} (run $rep of $REPEATS)"
+    marker=$(mktemp)
+    # shellcheck disable=SC2086  # flags are word lists by design
+    "$PY" -m bench run "${BASE[@]}" $flags
+    new=$(find bench/results -name '*__questions.jsonl' -size +0 -newer "$marker" |
+          sort | tail -1)
+    rm -f "$marker"
+    [[ -n $new ]] || { echo "no questions file from step $step" >&2; exit 1; }
+    "$PY" -m bench.lme_eval --check "$new" 100 ||
+      { echo "step $step: $new is not a complete dev run" >&2; exit 1; }
+    printf "%s\t%s\t%s\n" "$step" "$new" "$flags" >> "$LOG"
+    runs+=("$new")
+  done
+  # shellcheck disable=SC2086  # BASELINE is a list of files
+  "$PY" -m bench.compare lme --a $BASELINE --b "${runs[@]}" --split dev |
     tee "bench/results/dev_${step}_vs_baseline.txt"
 done
 echo "runs logged in $LOG"

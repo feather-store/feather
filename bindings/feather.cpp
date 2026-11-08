@@ -71,6 +71,8 @@ static py::dict metadata_to_dict(const feather::Metadata& m) {
 
 PYBIND11_MODULE(core, m) {
     m.doc() = "Feather: Embedded Vector Database + Living Context Engine";
+    // The one half-life recall counts fade at (metadata.h); Pocket reads it.
+    m.attr("RECALL_HALF_LIFE_DAYS") = feather::RECALL_HALF_LIFE_DAYS;
 
     // ── SIMD introspection + kernel test hooks ──────────────────────────
     m.def("simd_info", []() {
@@ -238,6 +240,14 @@ PYBIND11_MODULE(core, m) {
               feather::fsio::sync_faults_after().store(n);
           }, py::arg("n"), py::arg("errno") = EIO);
 
+    // Crash injection for the erase tests: erase() stops after logging and
+    // applying, before its compaction and rewrite.
+    m.def("_halt_erase_after_log", [](bool on) {
+              feather::fsio::erase_halts_after_log().store(on);
+          }, py::arg("on"));
+    m.attr("ERASE_CITES") = py::cast(feather::DB::default_erase_cites());
+    m.attr("ERASE_FEEDS") = py::cast(feather::DB::default_erase_feeds());
+
     auto level_from = [](const std::string& name) -> int {
         const int det = feather_simd::detected_level();
         int l;
@@ -382,13 +392,18 @@ PYBIND11_MODULE(core, m) {
 
     // ── ScoringConfig ────────────────────────────────────────────────
     py::class_<feather::ScoringConfig>(m, "ScoringConfig")
-        .def(py::init<float, float, float>(),
+        .def(py::init<float, float, float, float>(),
              py::arg("half_life") = 30.0f,
              py::arg("weight")    = 0.3f,
-             py::arg("min")       = 0.0f)
+             py::arg("min")       = 0.0f,
+             py::arg("relevance_floor") = -1.0f,
+             "relevance_floor: the cosine at which a record counts as unrelated. "
+             "< 0 (default): the modality's background cosine, estimated from its "
+             "vectors (DB.background_cosine); 0: plain cosine.")
         .def_readwrite("decay_half_life_days", &feather::ScoringConfig::decay_half_life_days)
         .def_readwrite("time_weight",          &feather::ScoringConfig::time_weight)
-        .def_readwrite("min_weight",           &feather::ScoringConfig::min_weight);
+        .def_readwrite("min_weight",           &feather::ScoringConfig::min_weight)
+        .def_readwrite("relevance_floor",      &feather::ScoringConfig::relevance_floor);
 
     // ── SearchFilter ─────────────────────────────────────────────────
     py::class_<feather::SearchFilter>(m, "SearchFilter")
@@ -461,10 +476,48 @@ PYBIND11_MODULE(core, m) {
         , py::release_gil_before_calling_cpp_dtor()
 #endif
         )
-        .def_static("open", &feather::DB::open,
+        .def_static("open", [](const std::string& path, size_t dim, bool read_only,
+                               py::object as_of, std::optional<uint64_t> generation) {
+                        std::optional<feather::DB::AsOf> q;
+                        if (!as_of.is_none() && generation)
+                            throw std::invalid_argument("open(): pass as_of or generation, not both");
+                        if (generation) {
+                            q = feather::DB::AsOf{};
+                            q->kind = feather::DB::AsOf::GENERATION;
+                            q->gen  = *generation;
+                        } else if (py::isinstance<py::str>(as_of)) {
+                            q = feather::DB::AsOf{};
+                            q->kind = feather::DB::AsOf::TAG;
+                            q->tag  = as_of.cast<std::string>();
+                        } else if (!as_of.is_none()) {
+                            double t;
+                            if (py::hasattr(as_of, "timestamp")) {
+                                // A naive datetime is local time, as datetime.timestamp() says.
+                                t = as_of.attr("timestamp")().cast<double>();
+                            } else if (py::isinstance<py::bool_>(as_of)) {
+                                throw std::invalid_argument("as_of is a time (unix seconds or datetime) or a tag name");
+                            } else {
+                                t = as_of.cast<double>();
+                            }
+                            if (!std::isfinite(t)) throw std::invalid_argument("as_of must be a finite time");
+                            q = feather::DB::AsOf{};
+                            q->kind    = feather::DB::AsOf::TIME;
+                            q->time_us = static_cast<int64_t>(std::floor(t * 1e6));
+                        }
+                        py::gil_scoped_release rel;
+                        return feather::DB::open(path, dim, read_only, std::move(q));
+                    },
                     py::arg("path"), py::arg("dim") = 768,
-                    py::arg("read_only") = false, py::call_guard<py::gil_scoped_release>(),
+                    py::arg("read_only") = false, py::arg("as_of") = py::none(),
+                    py::arg("generation") = py::none(),
                     "Open a .feather file.\n\n"
+                    "as_of= opens the state the file had at a past moment instead: a time "
+                    "(unix seconds or a datetime) loads the newest commit made at or before it, "
+                    "a string loads the commit tagged with that name (tag()), and "
+                    "generation= loads one commit by number (history() lists them). Such a "
+                    "handle is read-only, ignores the WAL, records no salience, and scores "
+                    "with its clock pinned to that time (now()), so a search replays what "
+                    "an agent would have retrieved then.\n\n"
                     "Takes an exclusive inter-process write lock; a second "
                     "writer is refused with the holder's pid. read_only=True "
                     "takes a shared lock instead, so many readers may hold the "
@@ -484,7 +537,9 @@ PYBIND11_MODULE(core, m) {
             const float* ptr = static_cast<const float*>(buf.ptr);
             std::vector<float> v(ptr, ptr + buf.size);
             py::gil_scoped_release rel;   // C++ insert runs without the GIL
-            db.add(id, v, meta ? *meta : feather::Metadata(), modality);
+            // No meta: the vector only; a live record keeps its metadata.
+            if (meta) db.add(id, v, *meta, modality);
+            else      db.add_vector(id, v, modality);
         }, py::arg("id"), py::arg("vec"),
            py::arg("meta") = std::nullopt,
            py::arg("modality") = "text")
@@ -578,11 +633,65 @@ PYBIND11_MODULE(core, m) {
              py::call_guard<py::gil_scoped_release>(),
              "The record's metadata, or None if it does not exist or was forgotten "
              "(include_dead=True returns a forgotten record's tombstone until the next save).")
+        .def("background_cosine", &feather::DB::background_cosine, py::arg("modality") = "text",
+             py::call_guard<py::gil_scoped_release>(),
+             "The cosine two unrelated vectors of this modality typically have (median "
+             "over random pairs): the floor scored search measures relevance from.")
+        .def("get_metadata_many", &feather::DB::get_metadata_many, py::arg("ids"), py::arg("include_dead") = false,
+             py::call_guard<py::gil_scoped_release>(),
+             "get_metadata for each id, in order (None where get_metadata would "
+             "return None), under one lock; over the Cloud API, one request.")
         .def("update_metadata",   &feather::DB::update_metadata,   py::arg("id"), py::arg("meta"), py::call_guard<py::gil_scoped_release>())
         .def("update_importance", &feather::DB::update_importance, py::arg("id"), py::arg("importance"), py::call_guard<py::gil_scoped_release>())
         .def("id_for", &feather::DB::id_for, py::arg("key"), py::arg("namespace") = "",
              py::call_guard<py::gil_scoped_release>(),
              "The id of the live record holding `key` in `namespace`, or None.")
+        .def("ids_for_many", &feather::DB::ids_for_many, py::arg("refs"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Ids of the live records holding each (namespace, key) in `refs` (None "
+             "where there is none), in order, under one lock: one request remotely.")
+        .def("heat_select", [](const feather::DB& db, std::vector<std::string> namespaces,
+                               double now, double budget, double half_life_days, double min_heat,
+                               std::vector<std::string> trusted,
+                               std::vector<std::string> exclude_sources,
+                               double usage_half_life, double unused_floor, double inherit_decay,
+                               int64_t chars_per_token, std::string pinned_attr,
+                               std::string due_attr, std::string origin_attr,
+                               std::string text_attr, std::vector<std::string> origins,
+                               std::string default_origin, std::string unknown_origin) {
+                 feather::HeatQuery q;
+                 q.namespaces = std::move(namespaces);
+                 q.now = now; q.budget = budget; q.half_life_days = half_life_days;
+                 q.min_heat = min_heat;
+                 q.trusted.insert(trusted.begin(), trusted.end());
+                 q.exclude_sources.insert(exclude_sources.begin(), exclude_sources.end());
+                 q.usage_half_life = usage_half_life; q.unused_floor = unused_floor;
+                 q.inherit_decay = inherit_decay; q.chars_per_token = chars_per_token;
+                 q.pinned_attr = std::move(pinned_attr); q.due_attr = std::move(due_attr);
+                 q.origin_attr = std::move(origin_attr); q.text_attr = std::move(text_attr);
+                 q.origins = std::move(origins); q.default_origin = std::move(default_origin);
+                 q.unknown_origin = std::move(unknown_origin);
+                 std::vector<feather::HeatPick> picks;
+                 {
+                     py::gil_scoped_release nogil;
+                     picks = db.heat_select(q);
+                 }
+                 py::list out;
+                 for (const auto& p : picks)
+                     out.append(py::make_tuple(p.id, p.depth, p.heat, p.tokens));
+                 return out;
+             },
+             py::arg("namespaces"), py::arg("now"), py::arg("budget"), py::arg("half_life_days"),
+             py::arg("min_heat"), py::arg("trusted"), py::arg("exclude_sources"),
+             py::arg("usage_half_life") = 3.0, py::arg("unused_floor") = 0.4,
+             py::arg("inherit_decay") = 0.7, py::arg("chars_per_token") = 4,
+             py::arg("pinned_attr") = "_pocket_pinned", py::arg("due_attr") = "_pocket_due_at",
+             py::arg("origin_attr") = "_origin", py::arg("text_attr") = "_lg_value",
+             py::arg("origins") = std::vector<std::string>{"user", "agent", "tool", "external"},
+             py::arg("default_origin") = "user", py::arg("unknown_origin") = "external",
+             "Pocket.hot() in the engine (feather_db/pocket.py is the specification): "
+             "[(id, depth, heat, tokens)] of the records of `namespaces` (deepest first) "
+             "chosen by heat within `budget` tokens, in rank order.")
         .def("get_by_key", &feather::DB::get_by_key, py::arg("key"), py::arg("namespace") = "",
              py::call_guard<py::gil_scoped_release>(),
              "The metadata of the live record holding `key` in `namespace`, or None.")
@@ -702,11 +811,13 @@ PYBIND11_MODULE(core, m) {
 
         // -- BM25 keyword search --
         .def("keyword_search", [](feather::DB& db, const std::string& query, size_t k,
-                                   feather::SearchFilter* filter) {
+                                   feather::SearchFilter* filter, bool record_salience) {
             py::gil_scoped_release rel;
-            return db.keyword_search(query, k, filter);
+            return db.keyword_search(query, k, filter, record_salience);
         }, py::arg("query"), py::arg("k") = 10, py::arg("filter") = nullptr,
-           "BM25 keyword search over content field. Returns list of SearchResult.")
+           py::arg("record_salience") = true,
+           "BM25 keyword search over content field. Returns list of SearchResult. "
+           "record_salience=False: the hits are not counted as recalls.")
 
         // -- Hybrid search: BM25 + vector via RRF --
         .def("hybrid_search", [](feather::DB& db, py::array_t<float, py::array::c_style | py::array::forcecast> q,
@@ -800,6 +911,70 @@ PYBIND11_MODULE(core, m) {
         .def("forget_expired", &feather::DB::forget_expired,
              "Soft-delete all nodes where ttl>0 and now > timestamp+ttl. Returns count.",
              py::call_guard<py::gil_scoped_release>())
+        .def("erase", [](feather::DB& db, std::optional<std::vector<uint64_t>> ids,
+                         const std::string& ns, const std::string& entity, bool prefix,
+                         std::optional<std::vector<std::string>> cites,
+                         std::optional<std::vector<std::string>> feeds, bool dry_run) {
+            feather::DB::EraseRequest rq;
+            if (ids) rq.ids = *ids;
+            rq.namespace_id     = ns;
+            rq.namespace_prefix = prefix;
+            rq.entity_id        = entity;
+            if (cites) rq.cites = *cites;
+            if (feeds) rq.feeds = *feeds;
+            rq.dry_run = dry_run;
+            feather::DB::EraseReceipt r;
+            {
+                py::gil_scoped_release rel;
+                r = db.erase(rq);
+            }
+            py::dict req;
+            req["ids"] = r.request.ids;
+            req["namespace"] = r.request.namespace_id;
+            req["prefix"] = r.request.namespace_prefix;
+            req["entity"] = r.request.entity_id;
+            req["cites"] = r.request.cites;
+            req["feeds"] = r.request.feeds;
+            py::list derived, pruned;
+            for (const auto& d : r.derived) {
+                py::dict x; x["id"] = d.id; x["via"] = d.via; x["rel"] = d.rel;
+                derived.append(x);
+            }
+            for (const auto& e : r.pruned_edges) {
+                py::dict x; x["from"] = e.from; x["to"] = e.to; x["rel"] = e.rel;
+                pruned.append(x);
+            }
+            py::dict d;
+            d["receipt_id"]          = r.receipt_id;
+            d["completed_at"]        = r.completed_at;
+            d["dry_run"]             = r.dry_run;
+            d["request"]             = req;
+            d["matched"]             = r.matched;
+            d["not_found"]           = r.not_found;
+            d["derived"]             = derived;
+            d["pruned_edges"]        = pruned;
+            d["erased"]              = r.erased();
+            d["graph_nodes_removed"] = r.graph_nodes_removed;
+            d["generation"]          = r.generation;
+            d["full_rewrite"]        = r.full_rewrite;
+            d["history_files_removed"] = r.history_files_removed;
+            d["file_bytes_before"]   = r.file_bytes_before;
+            d["file_bytes_after"]    = r.file_bytes_after;
+            d["wal_bytes_after"]     = r.wal_bytes_after;
+            d["verified"]            = r.verified;
+            d["problems"]            = r.problems;
+            d["residuals"]           = feather::DB::erase_residuals();
+            return d;
+        }, py::arg("ids") = py::none(), py::arg("namespace") = "", py::arg("entity") = "",
+           py::arg("prefix") = false, py::arg("cites") = py::none(), py::arg("feeds") = py::none(),
+           py::arg("dry_run") = false,
+           "Erase records so nothing of them remains: the records `ids` names, those "
+           "in `namespace` (and its dotted children with prefix=True) and/or of "
+           "`entity`, plus every record derived from or citing them (edges of the "
+           "kinds in `cites` into an erased record; `feeds` out of one), transitively. "
+           "Hard-deletes, prunes survivors' edges into them, compacts (their vectors "
+           "go), rewrites the file and rotates the WAL away. Returns a receipt (a dict). "
+           "dry_run=True only plans. Unlike forget(), nothing is left for a vacuum.")
 
         // -- Persistence & info --
         .def("save", &feather::DB::save, py::call_guard<py::gil_scoped_release>(),
@@ -810,6 +985,65 @@ PYBIND11_MODULE(core, m) {
         .def("vacuum", &feather::DB::vacuum, py::call_guard<py::gil_scoped_release>(),
              "Rewrite the file now, dropping every superseded record (including "
              "earlier versions of updated and forgotten records).")
+        .def("history", [](const feather::DB& db) {
+            std::vector<feather::DB::CommitInfo> h;
+            {
+                py::gil_scoped_release rel;
+                h = db.history();
+            }
+            py::list out;
+            for (const auto& c : h) {
+                py::dict d;
+                d["generation"] = c.generation;
+                d["time"]       = c.time;
+                d["tags"]       = c.tags;
+                d["archived"]   = c.archived;
+                d["marked"]     = c.marked;
+                out.append(d);
+            }
+            return out;
+        }, "Every commit open(..., as_of=) can reach, oldest first: generation, time, "
+           "tags, archived (held by a kept file under <path>.history/), marked (False: "
+           "written by a build without history markers, known only from its header).")
+        .def("tag", &feather::DB::tag, py::arg("name"), py::call_guard<py::gil_scoped_release>(),
+             "Commit now and name the commit: open(path, as_of=name) loads it, and it "
+             "is kept past the retention window until untag(name).")
+        .def("untag", &feather::DB::untag, py::arg("name"), py::call_guard<py::gil_scoped_release>(),
+             "Drop a tag; its commit is then kept only while the retention window covers it.")
+        .def("tags", &feather::DB::tags, py::call_guard<py::gil_scoped_release>(),
+             "{tag: generation}.")
+        .def("set_history_retention", &feather::DB::set_history_retention, py::arg("seconds"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Keep every file a rewrite replaces for at least this long, so as_of can reach "
+             "back this far. 0 (the default) keeps none; float('inf') keeps all. Stored in "
+             "the file. Each kept file costs the size of the DB as it was.")
+        .def("history_retention", &feather::DB::history_retention,
+             py::call_guard<py::gil_scoped_release>(), "Seconds (inf: everything).")
+        .def("now", &feather::DB::now,
+             "The clock scoring uses: the as_of time on a past commit, else the current time.")
+        .def("as_of", [](const feather::DB& db) -> py::object {
+            auto a = db.as_of();
+            if (!a) return py::none();
+            py::dict d;
+            d["generation"]  = a->generation;
+            d["commit_time"] = a->commit_time;
+            d["clock"]       = a->clock;
+            d["file"]        = a->file;
+            return d;
+        }, "None, or the commit this handle was opened at: generation, commit_time, "
+           "clock (the time scoring runs at), file.")
+        .def("record_versions", [](const feather::DB& db, const std::string& ns) {
+            std::vector<std::pair<uint64_t, uint64_t>> v;
+            {
+                py::gil_scoped_release rel;
+                v = db.record_versions(ns);
+            }
+            py::dict d;
+            for (const auto& [id, ver] : v) d[py::int_(id)] = ver;
+            return d;
+        }, py::arg("namespace") = "",
+           "{id: version} of every live record under a namespace prefix (all when empty). "
+           "feather_db.diff() compares two of them.")
         .def("storage_stats", [](const feather::DB& db) {
             feather::DB::StorageStats s;
             {
@@ -826,6 +1060,8 @@ PYBIND11_MODULE(core, m) {
             d["commits"]             = s.commits;
             d["vacuums"]             = s.vacuums;
             d["mapped_bytes"]        = s.mapped_bytes;
+            d["history_files"]       = s.history_files;
+            d["history_bytes"]       = s.history_bytes;
             return d;
         }, "On-disk format, commit generation, committed bytes, and what the last save wrote.")
         .def("close", &feather::DB::close, py::arg("save") = true,

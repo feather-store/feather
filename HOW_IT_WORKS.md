@@ -286,7 +286,7 @@ The first step is to decide whether the filter touches an **indexed field**: `na
                  └──────────────┬───────────────┘
                                 ▼
             if record_salience: touch() each RETURNED hit
-            (recall_count++, last_recalled_at = now — atomic)
+            (recall_count faded by the gap, +1; last_recalled_at = now)
             if with_cosine: SearchResult.cosine = exact cosine(query, stored vector)
 ```
 
@@ -345,12 +345,27 @@ Note that the vector half of hybrid search always uses the HNSW-filtered path, n
 When a `ScoringConfig(half_life=30, weight=0.3, min=0)` is passed, each hit is scored as follows:
 
 ```
-similarity      = 1 / (1 + dist)
-stickiness      = 1 + ln(1 + recall_count)          # 0 recalls → 1.0, 10 → 3.4, 100 → 5.6
+cosine          = cos(query, stored vector)         # from the L2 distance and |x|
+relevance       = (cosine − floor) / (1 − floor)    # floor: background cosine of the modality
+recalls         = recall_count · 0.5 ^ (days since last recall / 30)
+stickiness      = 1 + ln(1 + recalls)               # 0 recalls → 1.0, 10 → 3.4, 100 → 5.6
 effective_age   = age_days / stickiness             # frequently-used memories age slower
 recency         = max(min, 0.5 ^ (effective_age / half_life))
-final           = ((1 − weight)·similarity + weight·recency) · importance
+freshness       = (1 − weight) + weight·recency
+final           = relevance · freshness · importance   # relevance ≤ 0 returned unchanged
 ```
+
+Before 0.22 this was `((1 − weight)·1/(1+dist) + weight·recency)·importance`.
+`1/(1+dist)` is `1/(3−2cos)` for unit vectors, so recency outweighed
+relevance (cos 0.5 today tied cos 0.8 a month old), and for vectors that are
+not unit length it was ~0 and recency ranked alone. And `recall_count` was
+read raw, so the loop below never unwound.
+
+`recall_count` is a moving count of recent recalls. Each recall first fades
+it by the gap since the previous one, at a fixed 30-day half-life, then adds
+one: `n ← round(n · 0.5^(gap/30d)) + 1`. The `recalls` line above then fades
+it the rest of the way to now. A record recalled 100 times a year ago and once
+yesterday counts 1. Counting all 101 and fading them from yesterday gave ~99.
 
 The loop that closes over this is:
 
@@ -360,7 +375,13 @@ The loop that closes over this is:
 4. It decays more slowly.
 5. It keeps ranking higher.
 
-`MemoryManager.why_retrieved()` re-implements this formula in Python so you can explain any single score (`memory.py:43-93`).
+Two things stop it running away. The count fades from the last recall, so
+once a record stops being used it stops being sticky. And the agent layer
+counts use, not return: `Pocket.recall()` counts only the k it hands back,
+and `PacketBuilder` only what it packs from a query, never what it fills in
+from `hot()`.
+
+`MemoryManager.why_retrieved()` re-implements this formula in Python so you can explain any single score (`memory.py`).
 
 > Recall counters are **not** WAL-logged. They reach disk only when `save()` runs. A crash loses salience updates made since the last save, but never records.
 
@@ -864,7 +885,7 @@ f = fdb.FilterBuilder().namespace("acme").build()
 hits = db.search(embed("theme settings"), k=5, filter=f,
                  scoring=fdb.ScoringConfig(half_life=30, weight=0.3))
 #   → namespace is indexed → exact scan over acme's ids → Scorer → top 5
-#   → each returned hit: recall_count += 1 (atomic)
+#   → each returned hit: recall_count faded by the gap, + 1
 
 # 💥 process killed here — no save()
 db = fdb.DB.open("ctx.feather", dim=768)

@@ -36,7 +36,7 @@ extern "C" {
     int feather_add(void* db_ptr, uint64_t id, const float* vec, size_t len) {
         if (!db_ptr) return -1;
         return guarded([&] {
-            db_of(db_ptr).add(id, std::vector<float>(vec, vec + len), feather::Metadata(), "text");
+            db_of(db_ptr).add_vector(id, std::vector<float>(vec, vec + len), "text");
         });
     }
 
@@ -124,6 +124,32 @@ extern "C" {
         size_t n = 0;
         return guarded([&] { n = db_of(db_ptr).purge(namespace_id); }) == 0 ? n : SIZE_MAX;
     }
+
+    // erase(): the receipt as a JSON string the caller frees with
+    // feather_free_string(), or nullptr (message in feather_last_error()).
+    // `ids` may be null when n_ids is 0; `namespace_id` and `entity_id` may be
+    // null or "" for "not given".
+    char* feather_erase(void* db_ptr, const char* namespace_id, int prefix,
+                        const char* entity_id, const uint64_t* ids, size_t n_ids,
+                        int dry_run) {
+        if (!db_ptr) return nullptr;
+        char* out = nullptr;
+        guarded([&] {
+            feather::DB::EraseRequest rq;
+            if (namespace_id) rq.namespace_id = namespace_id;
+            if (entity_id)    rq.entity_id    = entity_id;
+            rq.namespace_prefix = prefix != 0;
+            if (ids && n_ids) rq.ids.assign(ids, ids + n_ids);
+            rq.dry_run = dry_run != 0;
+            const std::string json = feather::DB::erase_receipt_json(db_of(db_ptr).erase(rq));
+            out = static_cast<char*>(std::malloc(json.size() + 1));
+            if (!out) throw std::bad_alloc();
+            std::memcpy(out, json.c_str(), json.size() + 1);
+        });
+        return out;
+    }
+
+    void feather_free_string(char* s) { std::free(s); }
 
     size_t feather_forget_expired(void* db_ptr) {
         if (!db_ptr) return 0;

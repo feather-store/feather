@@ -151,7 +151,12 @@ def _records(db, rng, ids, with_visual=True):
             m.key = f"key-{i}"            # the reserved "\0key" attribute
         db.add(i, rng.random(DIM, dtype=np.float32), m)
         if with_visual:
-            db.add(i, rng.random(4, dtype=np.float32), modality="visual")
+            # An explicit empty Metadata replaces the record's: the data this
+            # fuzz was tuned on, from when add() without metadata blanked a
+            # record. (Since 0.22 it keeps it; with that, more mutations land
+            # in text that decodes fine and the default seed fell under the
+            # floor below. Only the data differs, not what is checked.)
+            db.add(i, rng.random(4, dtype=np.float32), feather_db.Metadata(), modality="visual")
 
 
 def build(path, kind, monkeypatch):

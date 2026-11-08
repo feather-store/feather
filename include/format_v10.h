@@ -53,9 +53,20 @@
 // that carried an idempotency key, so a retry returns it instead of applying
 // the batch again. A full rewrite keeps only unexpired keys. SEC_OPTIONAL.
 //
+// COMMIT payload: [generation u64][time_us i64][keep_us i64][flags u8]
+// [n u16] n x ([op u8][generation u64][name str16]). The LAST section of every
+// commit, so the bytes from DATA_START to the end of a COMMIT section are
+// exactly the file as that commit left it: DB::open(..., as_of=) loads that
+// prefix. time_us never decreases within a file. keep_us is the history
+// retention in force (-1: never set). The ops change the tag map (TAG_SET
+// name -> generation, TAG_DEL name); with MARK_TAGS_FULL they ARE the map (a
+// full rewrite writes it, since the commits that set the tags are gone from
+// the new file). SEC_OPTIONAL: a build without it loads the file unchanged.
+//
 // MODALITY payloads may carry trailing fields, ignored by builds that predate
 // them: [refine u8][int8_train u8] (see DB::set_int8_ram).
 //   checksum = xxh64(payload, seed = xxh64(the 16 header bytes, 0))
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -64,6 +75,7 @@
 #include <stdexcept>
 #include <streambuf>
 #include <string>
+#include <vector>
 
 namespace feather {
 namespace v10 {
@@ -89,6 +101,7 @@ enum Section : uint32_t {
     SEC_FULLVEC  = 6,   // float32 originals of an in-RAM int8 modality (optional)
     SEC_VERSIONS = 7,   // compare-and-set versions + the version clock (optional)
     SEC_IDEMPOTENCY = 8,  // results of keyed write batches (optional)
+    SEC_COMMIT   = 9,   // end-of-commit marker: generation, time, tags (optional)
 };
 // A VECTORS section's vector bytes start at a multiple of this in the file,
 // so a reader can map them directly on 4K, 16K (Apple silicon) and 64K pages.
@@ -313,6 +326,148 @@ inline HeaderState decode_header(const char* b, size_t n, uint64_t file_size, He
     if (start != DATA_START || out.end < DATA_START || out.end > file_size)
         return HeaderState::INVALID;
     return HeaderState::VALID;
+}
+
+// ── Commit markers (SEC_COMMIT) ─────────────────────────────────────────
+constexpr uint8_t MARK_TAGS_FULL = 1;
+constexpr uint8_t TAG_SET = 1;
+constexpr uint8_t TAG_DEL = 2;
+constexpr size_t  MAX_TAG_LEN = 255;
+
+struct TagOp {
+    uint8_t     op  = TAG_SET;
+    uint64_t    gen = 0;
+    std::string name;
+};
+
+struct CommitMark {
+    uint64_t gen     = 0;
+    int64_t  time_us = 0;
+    int64_t  keep_us = -1;
+    uint8_t  flags   = 0;
+    std::vector<TagOp> tags;
+    uint64_t end     = 0;      // not stored: the file offset just past this section
+    bool     synthetic = false; // not stored: a commit with no marker, known from its header
+};
+
+inline std::string encode_mark(const CommitMark& m) {
+    std::string b;
+    put<uint64_t>(b, m.gen);
+    put<int64_t>(b, m.time_us);
+    put<int64_t>(b, m.keep_us);
+    put<uint8_t>(b, m.flags);
+    put<uint16_t>(b, static_cast<uint16_t>(m.tags.size()));
+    for (const auto& t : m.tags) {
+        put<uint8_t>(b, t.op);
+        put<uint64_t>(b, t.gen);
+        put_str16(b, t.name);
+    }
+    return b;
+}
+
+inline CommitMark decode_mark(Reader& r) {
+    CommitMark m;
+    m.gen     = r.get<uint64_t>();
+    m.time_us = r.get<int64_t>();
+    m.keep_us = r.get<int64_t>();
+    m.flags   = r.get<uint8_t>();
+    const uint16_t n = r.get<uint16_t>();
+    // Each op is at least 11 bytes: a count past what remains is corrupt.
+    if (static_cast<size_t>(n) * 11 > r.left())
+        throw std::runtime_error("corrupt .feather: COMMIT section claims more tags than it holds");
+    m.tags.reserve(n);
+    for (uint16_t i = 0; i < n; ++i) {
+        TagOp t;
+        t.op   = r.get<uint8_t>();
+        t.gen  = r.get<uint64_t>();
+        t.name = r.str16();
+        m.tags.push_back(std::move(t));
+    }
+    return m;
+}
+
+// Apply one marker's tag ops to a tag map.
+template <class Map> inline void apply_tags(Map& tags, const CommitMark& m) {
+    if (m.flags & MARK_TAGS_FULL) tags.clear();
+    for (const auto& t : m.tags) {
+        if (t.op == TAG_SET) tags[t.name] = t.gen;
+        else if (t.op == TAG_DEL) tags.erase(t.name);
+    }
+}
+
+// The commits of one file, read from its headers and COMMIT sections without
+// loading anything else (section payloads other than COMMIT are skipped by
+// seeking). `head` is the newest valid header. A commit without a marker (one
+// written by a build that predates them) is known only if it is the head; it
+// is then appended as `synthetic`. Scanning stops at the first section that
+// does not fit before the head's end or whose marker fails its checksum: the
+// commits before it are still whole.
+struct FileCommits {
+    Header head;
+    std::vector<CommitMark> marks;   // oldest first
+};
+
+inline bool read_file_commits(std::istream& f, uint64_t file_size, FileCommits& out) {
+    char s[2][HEADER_LEN] = {};
+    Header h[2];
+    HeaderState st[2] = {HeaderState::NOT_FEATHER, HeaderState::NOT_FEATHER};
+    for (int i = 0; i < 2; ++i) {
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(i * SLOT_SIZE));
+        f.read(s[i], HEADER_LEN);
+        const size_t n = static_cast<size_t>(f.gcount());
+        st[i] = decode_header(s[i], n, file_size, h[i]);
+    }
+    int best = -1;
+    for (int i = 0; i < 2; ++i)
+        if (st[i] == HeaderState::VALID && (best < 0 || h[i].generation > h[best].generation)) best = i;
+    if (best < 0) return false;
+    out.head = h[best];
+    out.marks.clear();
+    const uint64_t end = out.head.end;
+    uint64_t pos = DATA_START;
+    std::string payload;
+    while (pos < end) {
+        if (end - pos < SECTION_HDR + SECTION_TAIL) break;
+        char hdr[SECTION_HDR];
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(pos));
+        if (!f.read(hdr, sizeof(hdr))) break;
+        uint32_t type;
+        uint64_t len;
+        std::memcpy(&type, hdr, 4);
+        std::memcpy(&len, hdr + 8, 8);
+        if (len > end - pos - SECTION_HDR - SECTION_TAIL) break;
+        const uint64_t next = pos + SECTION_HDR + len + SECTION_TAIL;
+        if (type == SEC_COMMIT) {
+            if (len > (1u << 24)) break;             // markers are small; anything else is corrupt
+            payload.resize(static_cast<size_t>(len));
+            uint64_t sum = 0;
+            if ((len && !f.read(&payload[0], static_cast<std::streamsize>(len))) ||
+                !f.read(reinterpret_cast<char*>(&sum), 8))
+                break;
+            if (section_checksum(hdr, payload.data(), len) != sum) break;
+            try {
+                Reader r(payload.data(), payload.size());
+                CommitMark m = decode_mark(r);
+                m.end = next;
+                out.marks.push_back(std::move(m));
+            } catch (const std::exception&) {
+                break;
+            }
+        }
+        pos = next;
+    }
+    if (out.marks.empty() || out.marks.back().gen != out.head.generation) {
+        CommitMark m;
+        m.gen       = out.head.generation;
+        m.time_us   = static_cast<int64_t>(out.head.time) * 1000000;
+        if (!out.marks.empty()) m.time_us = std::max(m.time_us, out.marks.back().time_us);
+        m.end       = out.head.end;
+        m.synthetic = true;
+        out.marks.push_back(std::move(m));
+    }
+    return true;
 }
 
 // ── Stream adapters ─────────────────────────────────────────────────────

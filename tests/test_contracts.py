@@ -19,7 +19,7 @@ import pytest
 
 import feather_db
 from feather_db import (DB, Metadata, FilterBuilder, WriteBatch, ContextType,
-                        VersionConflictError, DuplicateKeyError)
+                        VersionConflictError, DuplicateKeyError, ScoringConfig)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 API_DIR = os.path.join(REPO, "feather-api")
@@ -155,6 +155,37 @@ def test_a_forgotten_record_is_gone(db):
     assert 1 not in ids(db.search(clustered(1)[0], k=5, record_salience=False))
 
 
+def test_an_add_without_metadata_keeps_the_records(db):
+    """A second modality's vector, added without metadata, used to replace
+    the record's metadata with an empty one."""
+    v = clustered(2, seed=4)
+    db.add(1, v[0], meta("n", key="k", content="kept words"))
+    db.add(1, v[1][:8], modality="visual")
+    db.add_batch([1], np.asarray([v[1]]))
+    m = db.get_metadata(1)
+    assert (m.content, m.key, m.namespace_id) == ("kept words", "k", "n")
+    db.add(2, v[1])                                  # a new id: empty metadata
+    assert db.get_metadata(2).content == ""
+
+
+def test_erase_takes_the_record_and_what_was_made_from_it(db):
+    v = clustered(3, seed=3)
+    db.add(1, v[0], meta("app.u1", content="erase these secret words"))
+    db.add(2, v[1], meta("summaries", content="a summary of secret words"))
+    db.add(3, v[2], meta("app.u2", content="kept"))
+    db.link(1, 2, "consolidated_into")
+    db.link(3, 1, "related_to")
+    plan = db.erase(namespace="app.u1", prefix=True, dry_run=True)
+    assert plan["matched"] == [1] and [d["id"] for d in plan["derived"]] == [2]
+    assert db.get_metadata(1) is not None
+    r = db.erase(namespace="app.u1", prefix=True)
+    assert r["verified"] and r["erased"] == 2 and r["full_rewrite"]
+    assert db.get_metadata(1) is None and db.get_metadata(2) is None
+    assert list(db.get_edges(3)) == []
+    assert db.keyword_search("secret", k=5) == []
+    assert ids(db.search(v[0], k=5, record_salience=False)) == [3]
+
+
 # ══ Keys, versions, batches ═══════════════════════════════════════════════
 
 def test_keys(db):
@@ -255,6 +286,12 @@ def test_salience(db):
     db.search(clustered(1)[0], k=1)                                   # record_salience default
     db.search(clustered(1)[0], k=1, record_salience=False)
     assert db.get_metadata(1).recall_count == 2
+    db.update_metadata(1, meta("n", content="salience word"))
+    before = db.get_metadata(1).recall_count
+    assert db.keyword_search("salience", k=1, record_salience=False)
+    assert db.get_metadata(1).recall_count == before
+    assert db.keyword_search("salience", k=1)
+    assert db.get_metadata(1).recall_count == before + 1
 
 
 # ══ Listings and namespaces ═══════════════════════════════════════════════
@@ -375,3 +412,43 @@ def test_a_read_only_open_is_a_consistent_snapshot(tmp_path):
     w.wait()
     assert opens > 50, f"only {opens} opens: the test measured nothing"
     assert torn == 0, f"{torn} of {opens} read-only opens saw a torn view"
+
+
+def test_get_metadata_many(db):
+    """One call, in order, None where get_metadata would return None."""
+    for i in range(3):
+        db.add(i, clustered(1, i)[0], meta("many", content=f"r{i}"))
+    db.forget(1)
+    got = db.get_metadata_many([2, 1, 99, 0])
+    assert [m.content if m else None for m in got] == ["r2", None, None, "r0"]
+    assert [m.content if m else None for m in db.get_metadata_many([1], include_dead=True)] \
+        in (["r1"], [""])                                   # a tombstone, until a save
+    assert db.get_metadata_many([]) == []
+
+
+def _background_case(db, dim):
+    """200 records at cosine ~0.5 to the query and to each other (the model's
+    background), an old relevant record at 0.75, a fresh unrelated one at 0.55."""
+    rng = np.random.default_rng(7)
+    e = np.eye(dim, dtype=np.float32)
+    q = (e[0] + e[1]) / np.sqrt(2)
+    old = int(time.time()) - 365 * 86400
+    for i in range(200):
+        noise = np.zeros(dim, dtype=np.float32)
+        noise[3:] = rng.standard_normal(dim - 3) / np.sqrt(dim - 3)
+        v = e[1] + noise
+        db.add(1000 + i, (v / np.linalg.norm(v)).astype(np.float32), meta("bg", ts=old))
+    db.add(1, (0.75 * q + np.sqrt(1 - 0.75 ** 2) * e[2]).astype(np.float32), meta("bg", ts=old))
+    db.add(2, (0.55 * q + np.sqrt(1 - 0.55 ** 2) * e[2]).astype(np.float32), meta("bg"))
+    return q
+
+
+def test_scoring_measures_relevance_from_the_background(db):
+    q = _background_case(db, DIM)
+    assert 0.4 < db.background_cosine() < 0.6
+    calibrated = db.search(q, k=1, scoring=ScoringConfig(30.0, 0.3, 0.0),
+                           record_salience=False)
+    plain = db.search(q, k=1, scoring=ScoringConfig(30.0, 0.3, 0.0, relevance_floor=0.0),
+                      record_salience=False)
+    assert calibrated[0].id == 1          # old but relevant
+    assert plain[0].id == 2               # raw cosine: fresh and unrelated wins

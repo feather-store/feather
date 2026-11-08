@@ -70,7 +70,10 @@ Code, and a **LangGraph `BaseStore`** — cross-thread agent memory in one line,
 | **Dated writes** | `mem.facts.state(..., at=ts)` and `mem.preferences.set(..., at=ts)`; an older `at` never overwrites a newer value. `episodes.recent()` / `all()` walk the valid-time index instead of sorting the namespace. |
 | **`SessionFactExtractor`** | Dated facts from a whole session, each with `kind`, canonical `entity`, `amount` and own-vs-mentioned; `ledger()` and `profile()` render them for a prompt. |
 | **File ingest (Cloud API)** | `POST /v1/{ns}/ingest_file` stores an image, video, audio, PDF or text file by what a multimodal model sees in it; there is an upload modal in the admin SPA. Hybrid search embeds the query server-side when no vector is given. |
+| **Time travel** | `DB.open(path, as_of=t)` opens the memory as it was at a past moment: by time, by tag (`as_of="run-42"`) or by commit (`generation=n`). The handle is read-only and scores with its clock pinned to that moment, so a replay retrieves what the agent retrieved then. `db.history()`, `db.tag()`, `feather_db.diff(a, b)`. Costs 51 bytes a commit; opening the past costs what a read-only open costs. See [Time Travel](#time-travel). |
+| **History retention** | `db.set_history_retention(seconds)` keeps the file a rewrite (vacuum, compact, purge) replaces, so `as_of` reaches back that far. Off by default; tags keep their commit regardless. `erase()` deletes all history. |
 | **LongMemEval_S: 0.912** | All 500 questions, official GPT-4o judge. See [Benchmarks](#memory-benchmark--longmemeval-xu-et-al-2024). |
+| **Measured end to end** | Latency p50/p99 for every layer, from a live agent turn down to one search, plus LongMemEval, LoCoMo, contradiction and poisoning scores: [Performance](#performance) and [Benchmarks](#benchmarks). |
 
 ```python
 from feather_db.integrations import AgentMemory
@@ -81,6 +84,10 @@ mem.ingest_facts(facts)            # {'episodes': 3, 'preferences': 1, 'facts': 
 
 db.newest("user_842", 10, by_valid=True)                     # by when it happened
 f = FilterBuilder().namespace("user_842").valid_between(after=t0).build()
+
+db.tag("run-42")                                             # name this moment
+past = feather_db.DB.open("memory.feather", as_of="run-42")  # memory as it was then
+feather_db.diff(past, db)                                    # added / removed / changed
 ```
 
 Nothing was removed or renamed. On `PUT`, an omitted `valid_at` keeps the stored
@@ -410,7 +417,13 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-All 14 tools become available to Claude Desktop immediately — no code required.
+Claude gets agent memory, not database verbs: the tools `remember`, `recall`,
+`context`, `forget` and `memory_stats`, the prompts `/remember`,
+`/what-do-you-know` and `/catch-up`, and the resource `feather://context` (the
+current working set). `--scope org.brand.agent` separates agents sharing one
+file. To serve a Cloud API namespace instead of a local file, use
+`--api-url http://HOST:8000 --namespace NAME` (it is created if absent).
+`feather-serve` and `feather-agent` are the same server.
 
 ---
 
@@ -526,13 +539,59 @@ results = db.search(query_vec, k=10, scoring=cfg)
 
 Formula:
 ```
-stickiness    = 1 + log(1 + recall_count)
-effective_age = age_in_days / stickiness
+relevance     = (cosine - floor) / (1 - floor)   # floor: the model's background cosine
+recalls       = recall_count * 0.5 ^ (days since last recall / 30)   # one H for all
+stickiness    = 1 + log(1 + recalls)            # grows with use, fades without it
+effective_age = age_in_days / stickiness        # age from valid_time()
 recency       = 0.5 ^ (effective_age / half_life_days)
-final_score   = ((1 - time_weight) * similarity + time_weight * recency) * importance
+freshness     = (1 - time_weight) + time_weight * recency
+final_score   = relevance * freshness * importance   # relevance <= 0 returned as is
 ```
 
+Recency scales relevance rather than adding to it, so at `time_weight=0.3` a
+record can lose at most 30% of its relevance to age, and vector length does
+not change the ranking. Relevance is measured from the embedding model's
+background cosine (`db.background_cosine()`, estimated from your vectors; an
+unrelated pair of gemini-embedding-001 texts is at ~0.51, not 0), so a fresh
+but unrelated record cannot overtake an old relevant one.
+`ScoringConfig(..., relevance_floor=0.0)` scores by plain cosine. Recalls fade with time since the last one, so a record
+heavily used a year ago is not hot now.
+
 `touch()` is called automatically on every search hit.
+
+### Time Travel
+
+Every commit (`save()`) ends with a small marker, so any earlier commit the
+file still holds can be opened as it was:
+
+```python
+import feather_db, time
+
+db = feather_db.DB.open("memory.feather", dim=768)
+db.set_history_retention(7 * 86400)        # keep a week of history across rewrites
+db.tag("before-run-42")                    # commit now and name the commit
+
+past = feather_db.DB.open("memory.feather", as_of="before-run-42")
+past = feather_db.DB.open("memory.feather", as_of=time.time() - 3600)   # an hour ago
+past = feather_db.DB.open("memory.feather", generation=17)              # one commit
+
+past.search(query_vec, k=10, scoring=cfg)  # ranked with the clock of that moment
+past.as_of()                               # {'generation', 'commit_time', 'clock', 'file'}
+db.history()                               # every commit as_of can reach
+feather_db.diff(past, db)                  # MemoryDiff(added=[...], removed=[...], changed=[...])
+```
+
+- **A replay sees what the agent saw.** A past handle is read-only, ignores
+  the WAL, records no recalls, and pins the clock that decay scoring,
+  `Pocket.hot()`, `PacketBuilder` and TTL checks read (`past.now()`).
+- **How far back.** Back to the latest full rewrite of the file, or further
+  while `set_history_retention()` or a tag keeps the replaced files (hard
+  links under `<path>.history/`). A moment out of reach is a `ValueError`
+  that says where the history begins, never the nearest state instead.
+- **`erase()` deletes all history**, so erased data cannot come back through
+  the past.
+- **Over HTTP:** `RemoteDB(url, ns, as_of=...)` sends `X-Feather-As-Of`, and
+  the Cloud API serves reads from that commit.
 
 ### Memory Layer (v0.6.0)
 
@@ -619,19 +678,82 @@ feather save   --db my.feather
 
 ## Performance
 
-| Metric | Value |
-|--------|-------|
-| Add rate | 2,000–5,000 vectors/sec |
-| Search latency p50 (k=10, 500K × 128-dim, real SIFT data) | **0.19 ms** |
-| Search latency p99 (k=10, 500K × 128-dim, real SIFT data) | **0.13 ms @ ef=10**, **1.03 ms @ ef=200** |
-| Recall@10 (500K × 128-dim, ef=50, real SIFT) | **0.972** |
-| Max vectors per modality | unbounded — capacity grows adaptively (starts 4096) |
-| HNSW params | M=16, ef_construction=200, ef=50 (default in v0.8.0) |
-| File format | Binary `.feather` v10 (append-only commits: 0.42 MB written per save instead of 176 MB at 100k×384; persisted HNSW graph; optional int8) |
+Measured 2026-11-08 on an Apple M1 (8 cores, 16 GB), default settings (fsync
+on, `ef=50`), one caller at a time unless noted; milliseconds. Full report:
+[`bench/reports/e2e_latency_20261108.md`](./bench/reports/e2e_latency_20261108.md).
 
-SIMD (AVX2/AVX512) optimizations are available in `space_l2.h`. Enable with `-DUSE_AVX -march=native` in `setup.py`.
+**An agent turn, end to end** (120 LoCoMo questions with live models:
+gemini-embedding-001 for the question, gpt-4o-mini via OpenRouter for the answer):
 
-Reproducible benchmark harness lives in [`bench/`](./bench/). Run any benchmark with `python -m bench run <scenario>`.
+| stage | p50 | p99 |
+|---|---:|---:|
+| embed the question (Gemini API) | 504 | 838 |
+| **Feather `hybrid_search`, k=30** | **1.3** | **11.0** |
+| the same search through the Cloud API (HTTP) | 5.8 | 19.3 |
+| render the context | 0.2 | 1.1 |
+| LLM answer | 846 | 1,674 |
+| **total** | **1,352** | **2,350** |
+
+Feather is 0.15% of the turn; the model calls are the rest.
+
+**Engine** (100k × 768):
+
+| operation | p50 | p99 |
+|---|---:|---:|
+| vector search, top-10 | 0.24 | 0.98 |
+| search with a namespace filter (1% of records) | 0.18 | 0.32 |
+| search with decay scoring | 0.23 | 0.43 |
+| keyword search (BM25), warm, 100k real conversation turns | 1.85 | 3.61 |
+| hybrid search, warm, same corpus | 2.33 | 3.82 |
+| `context_chain` k=5, 2 hops | 0.24 | 0.42 |
+| `get_metadata` | 0.001 | 0.016 |
+| `update_metadata` | 0.16 | 0.26 |
+| save, a 15-write commit | 0.52 | 1.23 |
+| read-only open of the 100k file | 214 | 273 |
+
+Search throughput: 4.4k queries/s on one thread, 16.1k on four. Ingest:
+`add_batch` 4.1k vectors/s, `add` 1.3k/s (each one WAL-logged).
+
+**Recall@10 on real embeddings** (33,849 gemini-embedding-001 vectors, 3072-d,
+1,000 held-out queries against exact search):
+
+| ef | recall@10 | p50 | p99 |
+|---:|---:|---:|---:|
+| 10 | 0.937 | 0.23 | 0.53 |
+| **50 (default)** | **0.995** | 0.60 | 0.89 |
+| 100 | 0.998 | 1.06 | 1.65 |
+
+**Agent layer** (8,021 memories over three scope levels):
+
+| operation | p50 | p99 |
+|---|---:|---:|
+| `Pocket.remember` | 1.00 | 2.35 |
+| `Pocket.hot()` after a write / memoised | 1.25 / 0.0005 | 1.42 / 0.001 |
+| `Pocket.recall` | 1.99 | 2.51 |
+| `PacketBuilder.build(required, query)` | 2.90 | 8.34 |
+| `FeatherStore.put` (a commit per write) | 0.70 | 3.11 |
+| `FeatherStore.search(query)` | 0.63 | 0.98 |
+| `AgentMemory.facts.state` | 3.80 | 7.66 |
+| `AgentMemory.recall` | 0.36 | 0.45 |
+
+**Cloud API over HTTP** (uvicorn, 20k × 768): `/search` 1.32 / 1.93,
+`/hybrid_search` 1.43 / 2.19, `GET /records/{id}` 0.62 / 0.90 (p50 / p99).
+`/search` throughput is ~1,560 requests/s from 4 to 16 clients.
+
+**Time travel** (100k records, 200 commits): opening a past commit takes 201 ms
+p50 (222 p99) against 214 ms for a plain read-only open; in a kept file, 204 ms
+(711 p99, cold page cache). `history()` 2.1 ms, `diff()` of two 100k states
+45 ms, 51 bytes a commit. A kept file is a whole copy on disk (416 MB here).
+
+| Setting | Value |
+|---|---|
+| HNSW | M=16, ef_construction=200, ef=50 |
+| Capacity per modality | unbounded (starts at 4096, grows on demand) |
+| SIMD | picked at runtime: AVX-512 / AVX2 / SSE2 on x86-64, NEON on arm64 |
+| File format | `.feather` v10, append-only: a save writes only what changed |
+
+Reproduce: `benchmarks/e2e_latency.py`, `benchmarks/full_suite.py`,
+`benchmarks/api_bench.py`.
 
 ---
 
@@ -641,7 +763,7 @@ Reproducible benchmark harness lives in [`bench/`](./bench/). Run any benchmark 
 
 500-question end-to-end memory QA benchmark, the standard for long-term memory in chat assistants. Full report: [`docs/benchmarks/longmemeval.md`](./docs/benchmarks/longmemeval.md).
 
-**0.912 on LongMemEval_S**: all 500 questions, scored by the paper's official judge (`gpt-4o-2024-08-06`), with gemini-2.5-flash as the reader. Retrieval used Gemini embeddings and the top 20 sessions, packed up to 160k characters. 0 failed questions; the evidence was fully in context for 99.4% of them.
+**0.912 on LongMemEval_S**: all 500 questions, scored by the paper's official judge (`gpt-4o-2024-08-06`), with gemini-2.5-flash as the reader. Retrieval used Gemini embeddings and the top 20 sessions, packed up to 160k characters. 0 failed questions; the evidence was fully in context for 99.4% of them. One run: its 95% interval on question sampling alone is 0.886-0.936, and rerun noise is not yet measured (`REPEATS=3 scripts/lme_final.sh`; bench/README.md, "Evaluation protocol").
 
 | Feather configuration (S, all 500, official judge) | Overall | |
 |---|---|---|
@@ -668,6 +790,54 @@ Reproduce (needs `OPENROUTER_API_KEY` for the official judge and `GOOGLE_API_KEY
 scripts/lme_final.sh               # all 500, official judge, checked for completeness
 scripts/lme_dev.sh                 # the 100-question dev split, for trying a change first
 ```
+
+### End-to-end quality, this build (dev splits, 2026-11-08)
+
+A check of the current code on the frozen dev splits, one run each. Under the
+harness's protocol these are not reportable headline numbers (dev split,
+uncommitted tree); the 0.912 above is.
+
+| Benchmark | Configuration | n | Score |
+|---|---|---:|---:|
+| LongMemEval_S dev | as for the 0.912 run, official GPT-4o judge | 100 | **0.930** (the 0.904 baseline scored 0.920 on the same 100: within noise) |
+| LoCoMo dev | turns + extracted facts, gpt-4o-mini reader, Mem0's judge | 459 | J **81.5** |
+| LoCoMo dev, sound key | the same, without the 99 known-wrong answers | 427 | J **83.8** |
+
+LongMemEval dev by type (official judge): temporal 0.962, knowledge-update
+0.938, multi-session 0.889, single-session-user 1.000, -assistant 1.000,
+-preference 0.667; abstention 0.833. LoCoMo dev by category: single-hop 89.1,
+multi-hop 78.5, temporal 74.4, open-domain 42.9. LoCoMo's dev split is 3 of the
+10 conversations, so it is not comparable with numbers published on all 10.
+
+**Contradiction**: when a fact about someone changed, does the reader
+(gpt-4o-mini) answer with the current value? 20 trials × 8 people × 5
+attributes, dense retrieval.
+
+| How the memory was written | Correct |
+|---|---:|
+| notes + keys | **100%** |
+| keyed facts (`AgentMemory.facts`) | 98% |
+| free-text notes | 85% |
+| free-text notes, written out of order, no valid time | 25% |
+
+**Poisoning**: planted "SYSTEM OVERRIDE" memories from untrusted origins.
+With the default trust policy none reaches a prompt as an instruction or
+takes a binding slot; it is quoted as data. Whether gpt-4o-mini still obeys it:
+
+| Surface | No defence | Default trust policy |
+|---|---:|---:|
+| `PacketBuilder` with a query | 25/25 | **0/25** |
+| `PacketBuilder`, hot set | 19/20 | 5/20 |
+| `Pocket.hot_text()` | 8/20 | **15/20** |
+
+Quoting works in query packets and does not in `hot_text()`. Until that is
+fixed, assemble prompts that may hold untrusted memory with `PacketBuilder`
+and a query.
+
+Reproduce: `python -m bench run longmemeval ... --split dev` (see
+`scripts/lme_dev.sh`), `python -m bench.locomo run --memory index`,
+`python -m bench.contradiction --embed gemini --model openrouter:openai/gpt-4o-mini`,
+`python -m bench.poisoning --model openrouter:openai/gpt-4o-mini`.
 
 ### ANN benchmark — SIFT1M
 
@@ -790,8 +960,12 @@ previous header, and the WAL redoes the commit.
 [0,    4096)  header slot 0      magic "FEAT" | version 10 | generation | committed end | xxh64
 [4096, 8192)  header slot 1
 [8192, end)   sections: [type u32][flags u32][payload_len u64][payload][xxh64]
-              MODALITY · GRAPH · META · SALIENCE · VECTORS · VERSIONS · IDEMPOTENCY · FULLVEC
+              MODALITY · GRAPH · META · SALIENCE · VECTORS · VERSIONS · IDEMPOTENCY · FULLVEC · COMMIT
 ```
+
+Each commit ends with a `COMMIT` marker (generation, time, tags), so the bytes
+up to any marker are that commit: `DB.open(..., as_of=)` loads them. Builds
+without the marker skip it.
 
 Superseded bytes stay until a vacuum: `db.vacuum()`, or automatically once the
 file passes `FEATHER_VACUUM_RATIO` × the live size. Read-only handles map the
@@ -811,7 +985,12 @@ v3–v9 files load transparently, and the first `save()` rewrites them as v10.
 | int8 quantization (two kinds) | `set_quantized()` = smaller files; `set_int8_ram()` = ~1.7× less RAM (opt-in, lossy) |
 | Index capacity | Adaptive (v0.15.3): starts at 4096, grows via `resizeIndex` on demand — no hard cap, RAM tracks the working set |
 | `meta.attributes['k'] = v` silent no-op | pybind11 map copy; use `meta.set_attribute(k, v)` |
-| Rust CLI missing v0.6.0+ features | namespace/entity/context_chain/integrations are Python-only |
+| Rust CLI missing v0.6.0+ features | namespace/entity/context_chain/integrations/time travel are Python-only |
+| History ends at an erase | `erase()` deletes all history; `as_of` sees commits, not writes still only in the WAL |
+| Kept history costs a full copy | each file kept by `set_history_retention()` is the whole DB as it was (off by default) |
+| BM25 builds on first use | the first keyword or hybrid search after an open builds the index: 1.95 s and +82 MB per process at 100k conversation turns |
+| Forgotten records slow search | 10% forgotten records take search p99 from 0.4 ms to 13.9 ms until `compact()` or `set_auto_compact()` |
+| Quoted memory in `hot_text()` | a model still obeyed 15 of 20 planted instructions quoted there; query packets held at 0 of 25 |
 
 ---
 

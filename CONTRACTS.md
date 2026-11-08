@@ -79,6 +79,20 @@ Test: `test_contracts.py::test_a_read_only_open_is_a_consistent_snapshot`. The
 writer commits and vacuums while readers open. A gap, a partial batch or a
 wrong record fails it.
 
+**Except after an erasure.** A snapshot that holds erased records is not
+served: once the writer's erasure is durable, a read-only handle opened
+before it raises `ClosedError` on every call (it checks at most every 50 ms),
+and must be reopened. `test_erase.py::test_a_reader_opened_before_an_erasure_refuses_after_it`.
+
+**A past commit, exactly.** `DB.open(path, as_of=t | "tag", generation=n)`
+loads one commit exactly as it was — no later write, no WAL — and scores
+with its clock pinned to that moment. A moment it cannot reach (before the
+history begins, an unknown tag, a gap left by commits written without
+markers) is a `ValueError` naming why, never the nearest state instead.
+History reaches back to the latest full rewrite, or further while
+`set_history_retention()` or a tag keeps the replaced files; never past an
+`erase()`. Test: `test_time_travel.py`, embedded and remote.
+
 ## 4. One feature set in every mode
 
 Embedded Feather (`feather_db.DB`) and the Cloud API (`feather_db.RemoteDB`, or
@@ -104,10 +118,17 @@ plain HTTP) offer the same operations with the same results:
   forward reference.
 - **A `WriteBatch` link** needs both ends live unless `require_target=False`.
 - **What a crash recovers** is what the process had, record versions included.
+- **A forgotten record is gone from reads, not from disk.** Its bytes stay until
+  a vacuum and its vector until a compaction. **An erased record is gone from
+  disk:** after `erase()` returns, no byte of it, nor of a record derived from
+  or citing it, is in the file, the WAL or a kept history file
+  (`test_erase.py` reads every file), and a crash part-way is finished by the
+  next open. A forgotten record stays readable through `as_of` while history
+  holds it; an erased one never is.
 
 **Not covered:**
 
-- The Rust CLI is a deliberately small subset (add, search, link, save).
+- The Rust CLI is a deliberately small subset (add, search, link, save, erase).
 - The MCP servers expose agent-shaped tools, not the `DB` API.
 
 Tests:

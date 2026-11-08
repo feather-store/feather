@@ -21,6 +21,10 @@ extern "C" {
                                    type_filter: u8, source_filter: *const c_char,
                                    out_ids: *mut u64, out_dists: *mut f32, modality: *const c_char) -> i32;
     fn feather_save(db: *mut c_void) -> i32;
+    fn feather_erase(db: *mut c_void, namespace_id: *const c_char, prefix: i32,
+                     entity_id: *const c_char, ids: *const u64, n_ids: usize,
+                     dry_run: i32) -> *mut c_char;
+    fn feather_free_string(s: *mut c_char);
     fn feather_close(db: *mut c_void);
 }
 
@@ -104,6 +108,24 @@ impl DB {
     }
 
     pub fn try_save(&self) -> Result<(), String> { check(unsafe { feather_save(self.0) }) }
+
+    /// Erase records so nothing of them remains (file, WAL, derived records);
+    /// returns the receipt as JSON. See `DB::erase` in include/feather.h.
+    pub fn try_erase(&self, namespace_id: Option<&str>, prefix: bool, entity_id: Option<&str>,
+                     ids: &[u64], dry_run: bool) -> Result<String, String> {
+        let ns = namespace_id.map(std::ffi::CString::new).transpose().map_err(|e| e.to_string())?;
+        let ent = entity_id.map(std::ffi::CString::new).transpose().map_err(|e| e.to_string())?;
+        let p = unsafe {
+            feather_erase(self.0,
+                          ns.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()), prefix as i32,
+                          ent.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                          ids.as_ptr(), ids.len(), dry_run as i32)
+        };
+        if p.is_null() { return Err(last_error()); }
+        let json = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+        unsafe { feather_free_string(p) };
+        Ok(json)
+    }
 
     // ── Pre-0.22 signatures, kept so downstream crates still compile ─────
     // These used to abort the whole process (an uncaught C++ exception) on

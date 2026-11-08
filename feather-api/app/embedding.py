@@ -337,6 +337,12 @@ class EmbeddingProvider:
         return cfg
 
     # ── cache ───────────────────────────────────────────────────
+    def clear_cache(self) -> None:
+        """Drop every cached vector: an erasure removes texts whose
+        embeddings the cache would otherwise keep."""
+        with self._cache_lock:
+            self._cache.clear()
+
     def _cache_get(self, key: tuple) -> Optional[List[float]]:
         if not self._cache_cap:
             return None

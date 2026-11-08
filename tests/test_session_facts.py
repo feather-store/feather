@@ -83,6 +83,50 @@ def test_link_validity_keeps_every_value_with_its_dates():
     assert fact_key(_f("x", "2023/01/01", "User's", "Job!")) == "user's|job"
 
 
+def test_only_facts_that_replace_are_superseded():
+    """A later value of a one-value key ends the earlier one; a later value of
+    a key whose values add up (likes, plans) does not, and the extractor's
+    `replaces` is read strictly: anything but true is false."""
+    from feather_db.extractors import replaces
+    reply = json.dumps([
+        {"statement": "On 2023/05/14 the user moved to Denver.", "date": "2023/05/14",
+         "subject": "user", "attribute": "home city", "value": "Denver",
+         "one_value": True, "turn": 0},
+        {"statement": "On 2023/05/14 the user likes hiking.", "date": "2023/05/14",
+         "subject": "user", "attribute": "hobby", "value": "hiking",
+         "one_value": "true", "turn": 0},
+        {"statement": "On 2023/05/14 the user plans to paint.", "date": "2023/05/14",
+         "subject": "user", "attribute": "plan", "value": "paint", "turn": 0}])
+    p = _Provider(reply)
+    facts = SessionFactExtractor(p).extract_session(
+        TURNS, "2023/05/14", context={"user_name": "Alice",
+                                      "known_keys": ["user|home city", ("user", "car")]})
+    user = p.messages[0][1]["content"]
+    assert "The user is Alice." in user
+    assert "- user | car\n- user | home city" in user
+    assert [f.metadata["replaces"] for f in facts] == [True, False, False]
+    assert [replaces(f) for f in facts] == [True, False, False]
+    assert replaces(_f("x", "2023/01/01"))           # no field: the old rule
+    cat = _f("birthday party", "2023/01/01", attr="Event")
+    cat.metadata["replaces"] = True
+    assert not replaces(cat)                         # a category is not a key
+
+    def fact(value, date, attr, rep):
+        f = _f(value, date, attr=attr)
+        f.metadata["replaces"] = rep
+        return f
+    old_city, new_city = fact("Austin", "2023/01/10", "home city", True), \
+        fact("Denver", "2023/05/14", "home city", True)
+    old_plan, new_plan = fact("paint", "2023/01/10", "plan", False), \
+        fact("adopt", "2023/05/14", "plan", False)
+    chains = link_validity([new_city, old_city, new_plan, old_plan])
+    assert old_city.metadata["superseded_by"] == new_city.metadata["statement"]
+    assert "superseded_by" not in old_plan.metadata
+    assert "valid_until" not in old_plan.metadata
+    t = timeline(chains, [fact_key(old_city), fact_key(old_plan)])
+    assert "austin" in t.lower() and "paint" not in t
+
+
 def test_cache_skips_repeat_sessions_and_never_caches_failures(tmp_path):
     from bench.lme_facts import SessionFactCache
     reply = json.dumps([{"statement": "On 2023/05/14 the user likes tea.",
@@ -139,7 +183,8 @@ def test_facts_find_the_session_and_the_reader_gets_it(tmp_path):
             return "[]"
         return json.dumps([{"statement": f"On {d} the user's exercise class "
                             f"is {v}.", "date": d, "subject": "user",
-                            "attribute": "exercise class", "value": v, "turn": 0}])
+                            "attribute": "exercise class", "value": v,
+                            "one_value": True, "turn": 0}])
 
     class Reader:
         name = "fake"

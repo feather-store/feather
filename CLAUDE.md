@@ -27,9 +27,11 @@
 >   `recall()` reaches warm storage the budget could not carry. Scopes are
 >   dotted and **inherit**: `org.brand.creative` reads its own scope and every
 >   ancestor, decayed by `INHERIT_DECAY` per hop. `hot()` is memoised on
->   `(budget, write-generation, second)` — it is O(namespace) cold (171 ms at
->   10k) and 0.001 ms warm. `recall()` **invalidates** it, because `search()`
->   increments `recall_count`: a read that is really a write.
+>   `(budget, write-generation, second)` — cold it is chosen in the engine
+>   (`DB.heat_select`, 1.7 ms at 10k, 17 ms at 100k; it was 43 ms at 10k in
+>   Python) and 0.001 ms warm. `recall()` **invalidates** it, because it
+>   promotes (touches) the k it returns: a read that is really a write. Its
+>   searches run with `record_salience=False`; see §4.4 for who counts what.
 > - **`integrations/langgraph_store.py`** — `FeatherStore`, a LangGraph
 >   `BaseStore` (long-term, cross-thread memory, *not* `BaseCheckpointSaver`).
 >   Implements the two abstract methods, `batch`/`abatch`. Beyond the interface
@@ -121,7 +123,7 @@ feather/
 │       ├── langgraph_store.py  # ← FeatherStore: LangGraph BaseStore
 │       ├── agent_memory.py     # ← AgentMemory: the five kinds (§5.5)
 │       ├── mcp_agent.py        # ← feather-agent: MCP server for SDK 2.0
-│       ├── mcp_server.py       #   BROKEN on SDK 2.0 — superseded, do not use
+│       ├── mcp_server.py       #   BROKEN on SDK 2.0 — superseded, no script runs it
 │       ├── mcp_remote.py       #   MCP against the Cloud API instead of a file
 │       └── embedders.py        #   make_embedder() + default_embedder() (env)
 ├── feather-cli/             # Rust CLI crate (feather-db-cli)
@@ -182,7 +184,7 @@ private:
 - **Multimodal via multiple HNSW indices**: each call to `add(id, vec, meta, modality)` routes to the correct named `ModalityIndex`. New modalities are created on-demand.
 - **Shared metadata by ID**: a single `Metadata` object tracks all cross-modal data (edges, recall_count, importance, timestamps) for a given entity ID.
 - **HNSW params**: `M=16`, `ef_construction=200`. `max_elements` is **adaptive** (v0.15.3): each modality index starts at `INITIAL_MAX_ELEMENTS = 4096` and doubles via `resizeIndex()` on demand (`reserve()` is called before every insert), so RAM tracks the working set instead of preallocating 1M elements per index.
-- **`ef` (search beam width)** defaults to `10`. Higher = more accurate but slower.
+- **`ef` (search beam width)** defaults to `50` (`DEFAULT_EF`): recall@10 0.995 on real gemini embeddings, 0.937 at ef=10 (bench/reports/e2e_latency_20261108.md). Higher = more accurate but slower.
 - **Reverse edge index**: rebuilt from `metadata_store_` edges on every `load()`. Not persisted separately.
 
 ### 3.2 File Format (`.feather` binary v10, append-only)
@@ -211,6 +213,7 @@ section: [type u32][flags u32][payload_len u64][payload][xxh64 u64]
 | `VECTORS` (5) | `[name][count u32][stride u32][pad u32][pad][count × stride]`: one modality's vectors in slot order, starting on a 64 KiB file boundary. Written by a full rewrite; that image's GRAPH records then use vec encoding 2 (`VEC_IMAGE`, no vector bytes). |
 | `VERSIONS` (7, optional) | `[clock u64]` + `[id u64][version u64]` for every live record this commit's META put. **Written after META**: a META put resets the version it is loaded into. |
 | `IDEMPOTENCY` (8, optional) | `[key str16][fingerprint str16][created i64][n u32][(id, version) × n][note str32]` per keyed write batch. A full rewrite keeps only unexpired keys. |
+| `COMMIT` (9, optional) | `[gen u64][time_us i64][keep_us i64][flags u8][n u16]` + n × `[op u8][gen u64][name str16]`. The LAST section of every commit: the file up to the end of a COMMIT section is that commit, which is what `as_of` loads. `time_us` never decreases; `keep_us` is the retention in force (-1 unset); ops set/delete tags, and with `MARK_TAGS_FULL` (a full rewrite) they ARE the tag map. |
 | `FULLVEC` (6, optional) | `[name][dim u32][count u32]` + `[slot u32][float32 × dim]`: the originals of an in-RAM int8 modality with `refine > 0`. Written after the same commit's GRAPH records; a GRAPH data record voids the slot's earlier FULLVEC. Only offsets are kept in RAM (`fv_off`). |
 
 **In-RAM int8 originals (refine).** Search on an int8 modality walks with
@@ -429,13 +432,68 @@ struct SearchFilter {
 The **Adaptive Decay** formula:
 
 ```
-stickiness      = 1 + log(1 + recall_count)    # grows with access frequency
-effective_age   = age_in_days / stickiness      # sticky items age slower
-recency         = 0.5 ^ (effective_age / half_life_days)
-final_score     = ((1 - time_weight) * similarity + time_weight * recency) * importance
+relevance     = (cosine - floor) / (1 - floor)   # floor: the model's background cosine
+recalls       = recall_count * 0.5 ^ (days since last recall / 30)   # one H for all
+stickiness    = 1 + log(1 + recalls)            # grows with use, fades without it
+effective_age = age_in_days / stickiness        # age from valid_time()
+recency       = 0.5 ^ (effective_age / half_life_days)
+freshness     = (1 - time_weight) + time_weight * recency
+final_score   = relevance * freshness * importance   # relevance <= 0 returned as is
 ```
 
 **Default config**: `half_life=30 days`, `time_weight=0.3`, `min_weight=0.0`
+
+**Relevance is measured from the background** (0.22): `floor` is
+`DB::background_cosine(modality)`, the median cosine of 1024 random pairs of
+the modality's live vectors (cached in `background_`, re-estimated when the
+live count doubles or halves; 0 under 64 vectors). Raw cosine is not on a
+scale freshness can multiply: unrelated gemini-embedding-001 texts sit at
+~0.51, so a fresh unrelated record overtook an old relevant one (vector-only
+knowledge-update: both evidence sessions left the top 5 in 17/62; 0/62 with
+the floor). `ScoringConfig.relevance_floor` < 0 = estimate (default), 0 =
+plain cosine. The pool bound uses relevance too.
+
+Recency **scales** relevance (0.22); it was added to `1/(1+L2²)`, which is
+`1/(3−2cos)` for unit vectors and ~0 for longer ones, so recency outranked
+relevance (cos 0.5 today tied cos 0.8 a month old). Now freshness costs at most
+`time_weight` of a record's cosine. The cosine is computed from the L2 distance
+and the stored vector's norm (`CosineOf`), so vector length does not matter.
+`recall_count` is a moving count of RECENT recalls, not a lifetime total:
+`Metadata::note_recall` fades it by the gap since the previous recall before
+adding one (`round(n · 0.5^(gap/30d)) + 1`, fixed `RECALL_HALF_LIFE_DAYS`,
+under a striped mutex because it runs under the shared lock). A new path that
+sets the count must go through `note_recall` or set `last_recalled_at` with it.
+Recalls fade from `last_recalled_at` (`Scorer::effective_recalls`, same rule
+in `Pocket.heat` and `why_retrieved`): no format change. Measured on
+LongMemEval knowledge-update (78 q, hybrid, w=0.3): newest gold session at
+rank 1 in 31 (off) / 49 (old formula) / 58 (new); both gold in the top 5:
+78 / 55 / 75.
+
+Rules if you touch scoring:
+- **Age is `valid_time()`**, not `timestamp` (when it happened, not when it
+  was written), in the scorer, `Pocket.heat` and `why_retrieved`.
+- **Anything that persists the counters reads `recall_state()`**, the pair
+  under the stripe; two plain loads can pair a count with the previous
+  recall's time.
+- **A scored graph walk goes through `scored_pool_nolock`**, which doubles
+  the pool until no record outside it can beat the k-th score (cosine
+  bounded by the farthest fetched distance, freshness ≤ 1, importance ≤
+  max(1, seen)). A fixed 3k pool held 0.92 of the exact scored top 10 on
+  LongMemEval, 0.40 at worst. Exact for unit-length vectors only; for others
+  the first pool is kept. A new graph path with scoring= must use it.
+- **Every ranking that reads `recall_count` fades it** (`effective_recalls`):
+  scorer, `context_chain`, `Pocket.heat`, `why_retrieved`.
+
+`get_metadata_many(ids)` reads many records under one lock (one request over
+the Cloud API). Agent code that walks a scope uses it — `Pocket` does, and
+`keys.migrate` on every start — never `get_metadata` per id: remotely that
+was one round trip per record.
+
+**Salience counts use, not return** (0.22): `Pocket.recall()` searches with
+`record_salience=False` and touches only the k it returns; `PacketBuilder`
+calls it with `promote=False` and touches what it packs from a query — never
+required refs or a packet filled from `hot()` (counting hot records makes
+them hotter).
 
 ---
 
@@ -534,8 +592,15 @@ b = feather_db.WriteBatch()
 b.put(8, vec2, entity_meta).put(7, vec, fact_meta, expected_version=0).link(7, 8, "about")
 r = db.write(b, idempotency_key="req-123", fingerprint=h)   # all or none; a retry -> r.replayed
 
+past = feather_db.DB.open(path, as_of=t)            # the commit at/before t; read-only
+past = feather_db.DB.open(path, as_of="run-42")     # a tagged commit; generation=n by number
+db.tag("run-42"); db.history(); db.set_history_retention(7 * 86400)
+feather_db.diff(before, after)                       # added / removed / changed ids
+
 db.save()                 # v10: appends only what changed since the last save
 db.vacuum()               # rewrite now, dropping superseded bytes
+r = db.erase(entity="user_842")   # GDPR: gone from file, WAL, graph and derived records
+r = db.erase(namespace="org.user_842", prefix=True, dry_run=True)   # plan first
 db.storage_stats()        # {'format', 'generation', 'file_bytes', 'last_commit_bytes', ...}
 ```
 
@@ -552,10 +617,15 @@ pkt.hot()            # what to carry now, ranked by heat, trimmed to budget
 pkt.hot_text()       # the same, as a prompt-ready string
 pkt.recall("tone")   # reaches WARM storage the budget could not carry
 pkt.stats()          # hot/warm/cache counts, token usage, inherited scopes
+pkt.remember("dentist", "call the dentist", due_at=friday)  # an intention
+pkt.remember("t7", turn_text, valid_at=t, index=facts)  # facts find it; turn is shown
+pkt.known_keys()     # one-value keys on file: pass to the extractor as known_keys
+pkt.standing()       # trusted pins + due intentions, key order (index, no scan)
 
 # ── FeatherStore: LangGraph long-term memory ─────────────────────────────
 from feather_db.integrations.langgraph_store import FeatherStore
 store = FeatherStore("agent.feather", dim=768)       # embed= defaults to env
+store = FeatherStore(db=RemoteDB(url, "ns"))          # Cloud API; a run of puts = 1 batch
 graph = builder.compile(store=store)                 # ← the whole integration
 
 # ── AgentMemory: the five kinds, lifetimes enforced ─────────────────────
@@ -567,8 +637,15 @@ mem.facts.state("positioning", "premium")               # corrected, keeps histo
 mem.procedures.define("weekly", ["pull", "send"])       # versioned as name@N
 mem.entities.enrich("nike", {"industry": "apparel"})    # merged, org-wide
 mem.observations.note("style", "decisive", evidence=["comms"])
+mem.intentions.add("q3", "send Dana the Q3 numbers", due_at=friday)
+mem.intentions.due()                                    # due now, oldest first
+mem.intentions.done("q3", outcome="sent")               # removed; an episode records it
+mem.notes.add("ugh, knee again", index=facts)          # kept as said, found by its facts
+mem.ingest_session(turns, "2023/05/14", extractor)     # turns as notes, facts as index
 mem.about()                                             # all kinds, one prefix read
 mem.recall("how to contact", kinds=["preferences"])
+mem.erase_subject()                      # everything about this user, really gone
+mem.erase("preferences", "comms")        # one item + observations citing it
 ```
 
 ```python
@@ -581,12 +658,183 @@ if not packet.may_mutate:
     raise PolicyBlocked(packet.why_blocked())     # fail closed
 prompt = packet.text
 packet.manifest()    # refs + versions + omissions, for replay
+system = INSTRUCTIONS + packet.stable_text            # same every turn: cacheable
+turn   = packet.volatile_text + "\n\n" + question    # this query's recall, newest turn only
 ```
+
+**Intentions (prospective memory, 0.22).** A record with a due time
+(`Pocket.remember(due_at=)`; FeatherStore maps a numeric `due_at` in a value)
+carries `_pocket_due_at` plus the marker `_pocket_intention="true"` (the
+attribute index is exact-value, so the marker is what finds them). `heat()`
+gives a trusted one 0 until due and 1.0 from then on — a pin set in advance —
+until it is rewritten without one or forgotten; an untrusted one ranks like
+any note. `AgentMemory.intentions.done()` deletes it and records an episode:
+kept, a done intention reads as one still to do.
+
+**Facts as index, raw memory as payload (0.22).** `Pocket.remember(key,
+content, valid_at=, index=[...])` stores the raw text as the memory and each
+index entry (`IndexEntry`, a string, or a SessionFactExtractor `Fact`) as a
+record of its own: source `_pocket_index`, `entity_id` = the memory's key (so
+`erase(key)` takes it), `_pocket_index_for` = that key, native key
+`<key>\x1fix<i>`. A search hit on one counts for its memory (`recall` fetches
+3k per scope for that); a reader never sees one, `hot()` never carries one.
+Extracted facts as the payload lost 14 points on LoCoMo (J 64 vs 78.8); as an
+index over raw turns they gained 3.6 (82.4, `bench.locomo --memory index`;
+one run, published key, all 10 conversations in view while tuning; 84.5 on
+the audit's sound key, the gain +3.3 [+1.6, +5.1]: bench/README.md
+"Evaluation protocol").
+Rules if you touch it:
+- **Every filter of what is memory uses `_NOT_MEMORY`** (forgotten, cache,
+  index, key registry, ingest job; `DERIVED_KINDS` in FeatherStore's
+  `_is_dead`). A new path that lists or resolves records in a scope and
+  checks only `_forgotten`/`_CACHE_KIND` will hand index records to a reader.
+  A new bookkeeping record kind goes into both.
+- A rewrite replaces the index (`INDEX_N` on the memory says how many
+  records to keep); `index` left out keeps it (all of `INDEX_ATTRS`);
+  `forget(key)` forgets them.
+- **Every index write goes through `pocket.apply_index`**: the memory's
+  attributes, every index record, each key's registry entry and its
+  `registered_in` link, and the forgetting of a shrunk index's tail, in ONE
+  `WriteBatch` (one round trip over the Cloud API; it was 2-3 per entry).
+  Never `keys.write` index records one by one. A batch refuses to forget a
+  key that is not there, so stale records are found first
+  (`_stale_index_ids`, only when the index shrinks).
+- **`known_keys()` reads the key registry** (`_pocket_keyreg` records,
+  `KEYREG_NS` attribute): O(keys), 2 requests remotely. An index written
+  before the registry is backfilled by the `keys.migrate` pass a Pocket or
+  FeatherStore already makes on open (`visit=backfill_registry`).
+- **Write now, index later: `feather_db.ingest.IngestQueue`.** Jobs are
+  `_pocket_job` records in the scope (durable; one per memory or session by
+  key, so resubmitting replaces), holding keys. A job's index
+  write is conditional on each memory's version (a memory rewritten during
+  extraction runs again); finishing forgets the job only at the version it
+  read. An extractor's `on_error` is a failure (retried with backoff, then
+  `failed` with its error), never "no facts".
+- **Every job change is compare-and-set on the job's version**: the claim
+  (`JOB_LEASE` + `JOB_OWNER` = `host:pid:uuid`), the checkpoint, release,
+  failure, finish. A submission (an upsert) clears the claim, so a job
+  resubmitted while it ran is run again, never forgotten under it. Never
+  resubmit a job that exists (`_unqueued`): it would reset a running job's
+  claim (run twice) or a failed one's attempts (retried forever).
+- **The checkpoint (`JOB_RESULT`) holds extracted text**, so it is written
+  with a `derived_from` link to each memory it read (erasure takes it), and
+  reused only when the extractor id and every memory's version match.
+- **Reads nudge, never write.** `pocket.note_stale(db, metas)` is called
+  with what `recall` / `hot` / FeatherStore `search` return; with no queue
+  registered (`register_indexer`) it returns at once. A new read path that
+  returns memories calls it too.
+- **The index is versioned derived data.** Queue-made indexes carry
+  `INDEX_V` (`name@version+fingerprint`; `SessionFactExtractor.fingerprint()`
+  covers prompt, limits and model), `INDEX_JOB` and `INDEX_JOB_ARGS` (the
+  job's payload, so a session re-runs as a session). Per scope, one
+  `IXVER` registry entry per extractor; an idle worker re-queues indexes of
+  any other extractor, `reindex_batch` at a time. A change to the prompt
+  changes the fingerprint: everything re-indexes, lazily.
+- Resolving many keys: `keys.resolve_many` / `DB.ids_for_many` (one request),
+  never `keys.resolve` in a loop.
+
+**Supersession on raw memory (0.22).** An index entry with a one-value `key`
+('subject|attribute') puts its memory in that key's chain: index records
+carry `_pocket_supkey` = `<namespace>|<key>` (exact attribute index, no scan)
+and `_pocket_supval`; the memory lists its keys in `_pocket_supkeys`.
+`pocket.group_records` (wrapped by `Pocket.group_superseded`, called by
+`recall`, `hot_text`, `PacketBuilder`'s hot path; and by FeatherStore's
+search) shows a chain once: the memory holding the newest value (index valid
+time, then the memory's), older values in `PocketItem.earlier` (a store
+item's `value["earlier"]`). An older memory that matched brings the newest
+in. Rendered by `origin.render` / `PacketBuilder` / MCP `recall` with
+`history=` (`origin.HISTORY_MODES`): **"section"** by default (an `EARLIER
+VALUES (superseded)` block after the context), "inline" (`    earlier: `
+under the item), "none". bench.contradiction, gpt-4o-mini, current value /
+previous value asked: section 99.5% / 87.6% (keys extracted per note:
+96.0% / 82.4%), inline 96.9% / 91.8%, none 99.2% / 0%, plain dated notes
+84.5% / 71%, keyed facts 99.4% / 0% (no history in its packets). Inline
+lost because history lines matching the question's wording drew the reader;
+more explicit inline markers did worse ("no longer current:" 95.8%,
+"replaced by the line above:" 91.0%). Rules:
+- **An untrusted memory never makes a trusted one history**: the current
+  value is the newest trusted one when the chain has any (as shadowing).
+- `group_superseded` returns copies: `hot()` memoises its items.
+- Keys come from `SessionFactExtractor` 0.3.1: `fact_key` of a fact that
+  `replaces()` (the model's `one_value`: a later value makes it false; an
+  attribute named `event` never does). Pass `user_name` and `known_keys`
+  (`Pocket.known_keys()`, `FeatherStore.known_keys(ns)`): told nothing,
+  separate calls named one city "address", "home city", "location" (~70%
+  on one key); told them, 146/160. LoCoMo disagreeing keys: 117 (0.2.0),
+  52 (0.3.1). Tried and rejected: telling the model on-file keys are
+  one-value (0.3.2: diet 22/32 -> 6/32, LoCoMo 52 -> 75 false chains) and
+  deciding one-value per key in code (any flag: LoCoMo 52 -> 103; majority:
+  -> 67, contradiction coverage +1.5 points). What stays split is mostly
+  "diet", which the model reads as additive (one can be vegan and
+  gluten-free); a caller that knows better should declare the key.
+- A `Fact` without `replaces` keeps the old rule (supersedes).
+
+**Store and AgentMemory (0.22).** `FeatherStore.index(ns, key, entries)`
+indexes an item the same way (`pocket.write_index`): `search` resolves index
+hits to their items, `_is_dead` hides index records from every listing
+(`count`, `newest`, `scan`, filter search), `delete` takes them, a rewrite
+keeps them. `AgentMemory.notes` is the raw kind (`add(text, index=)`), and
+`AgentMemory.ingest_session(turns, date, extractor)` stores each turn as a
+note (`<session>#<turn>`, idempotent; user turns origin `user`, others
+`agent`) indexed by the facts citing it, the extractor told the notes' known
+keys: the measured counterpart of `ingest_facts`, which stores facts as the
+memory (LoCoMo 82.4 vs 64).
+
+**Every memory line is dated** (`pocket.date_tag`: `[YYYY-MM-DD] ` from
+`valid_time()`, UTC; `[due …] ` for an intention) in packets, `hot_text()`,
+session `context()` and MCP `recall`; required rules are not. Without dates a
+reader cannot order two statements of one fact (bench.contradiction: correct
+35% → 65–85%). A FeatherStore item renders as its value's `text`
+(`pocket.display_text`), never its indexed content (every field, history
+included: 739 → 113 tokens a keyed-fact packet). A new renderer uses both;
+on a quoted item the date goes before the quotes, never inside.
+
+**`hot()` is chosen in the engine** (`DB.heat_select`, `include/heat.h`):
+heat, shadowing, the display-text length (a FeatherStore value's `text`,
+read by a JSON scanner that accepts what `json.loads` accepts) and the greedy
+budget fill, mirrored from `Pocket._hot_scan`, which stays the specification
+and the fallback (a DB without it). Rules if you touch either:
+- **They agree to the bit**: same double operations in the same order, no
+  FMA (`FEATHER_NO_FMA` + `#pragma clang fp contract(off)`), the same
+  min/max forms as Python's. A change to `Pocket.heat`, `display_text`,
+  `estimate_tokens`, `_overrides` or the budget loop is a change to
+  `heat.h`/`heat_select` too; `tests/test_hot_select.py` compares them on
+  random scopes and fails on one ulp.
+- Only the picks leave the engine (`get_metadata_many` of ~k ids): over the
+  Cloud API `hot()` is 2 requests (`POST /heat_select`), whatever the scope.
+- Forward decay (an index sorted by `valid_time + H·log2(importance)`) was
+  considered and not built: the greedy "skip, don't stop" rule means the
+  walk cannot stop before `min_heat` anyway, and 100k is 17 ms.
+
+**Packets put the stable part first** (prompt caches reuse a prefix up to the
+first changed byte): required rules, then standing context (`Pocket.standing()`:
+trusted pins and due intentions), each in key order, as `stable_text`; this
+query's recall and the quoted section after, as `volatile_text`. Every packet
+carries the standing context, query or not. `standing()` goes through
+`ids_with_attribute`, never `hot()`: a packet's promotion invalidates hot()'s
+memo, so each packet would pay the cold O(namespace) read. Send
+`volatile_text` with the newest turn only — kept in the history it costs more
+than it caches (`python -m bench.packet_cache`: billed input vs the whole
+packet in the system prompt, 12 turns: split 0.71–0.81 on Gemini's implicit
+cache, 0.60 offline bound; kept in history 0.97–1.07).
 
 **Packet refs are versioned by `Metadata.version`**, never `recall_count`
 (every read moves that, and an edit does not). `PacketBuilder.revalidate()`
 replays a stored manifest against current versions; a required ref that is
 missing or changed blocks the mutation.
+
+**Every record has an origin** (`feather_db.origin`, attribute `_origin`):
+`user` | `agent` | `tool` | `external`; unlabelled reads as `user`. Only
+`user` is trusted by default (`Pocket(trusted_origins=)`, inherited by
+`PacketBuilder`). An untrusted record is rendered as a JSON string under
+`QUOTED MEMORY`, grouped by origin (`PacketBuilder`, `hot_text()`, MCP
+`context`/`recall`); it can never satisfy or shadow a required key, hide a
+trusted record of the same key, be lifted by a pin, or gain heat from use.
+Rules if you touch it: a new path that renders memory into a prompt goes
+through `origin.render` / `origin.quote`; a new writer records an origin; the
+MCP server never writes `user` except for a pin or a reminder (`due_at`) the
+user confirmed through elicitation (the model cannot vouch for anything). Measured by
+`python -m bench.poisoning`; `tests/test_origin.py` gates it.
 
 **`hot()` is not a policy path.** It fits a budget by heat, so a binding rule
 can be crowded out by ordinary notes — silently. Anything that gates a mutation
@@ -609,6 +857,8 @@ rule be enforced as binding. A key the resolver does not return is missing.
 | `procedures` | new version each write, `name@N` retained | a regression cannot be diffed against what worked |
 | `entities` | merge into existing attributes | additions overwrite instead of accumulating |
 | `observations` | cites `evidence` keys | a drawn conclusion cannot be traced or retracted |
+| `intentions` | held until `due_at`, carried until done; done = delete + episode | a reminder decays like a note and is forgotten when it is due |
+| `notes` | kept as said; found through the facts extracted from it | the facts become the memory and the detail a question asks about is gone |
 
 **Namespace ordering is load-bearing.** Search takes a *prefix*, so
 `(org, subject, kind)` makes "everything about this user" a prefix read while
@@ -891,8 +1141,9 @@ one, and a count bound instead of a time bound let 16 queued `add()`s shut
 readers out (9.8k → 0.7k reads/s). Benchmark a change to either with
 alternating runs; single runs on a laptop swing ±2×. It is
 **not recursive**: never take it shared while already holding it shared (a
-waiting writer would deadlock you). Lock order is `save_mutex_` → `mutex_` →
-`wal_mutex_`; never join the compactor thread while holding `mutex_`.
+waiting writer would deadlock you). Lock order is `erase_mutex_` →
+`compact_run_mx_` → `save_mutex_` → `mutex_` → `wal_mutex_`; never join the
+compactor thread while holding `mutex_`.
 Take `std::shared_lock<RWMutex>` if the method only
 reads (all const accessors, `search`, `keyword_search`, `hybrid_search`,
 `context_chain`, `save`'s snapshot); take `std::unique_lock<RWMutex>` if it mutates
@@ -934,9 +1185,102 @@ modality's index, not vectors. Rules if you touch them:
   freeing (never join it while holding `mutex_`).
 `tests/test_namespace_search.py` fails on any of these.
 
+A **time window** (`valid_after/before`, `timestamp_after/before`) is a
+range of `valid_index_` / `time_index_` (`window_ids`), used as the
+candidate set when it is under a quarter of every set it would be
+intersected with (a size guessed from each namespace's time span first, so
+a wide window costs nothing to refuse); across all namespaces only while the
+cost model would scan it. In id order, not time order: time order is random
+in memory and made a 50% window 3x slower. 100k x 128-d: a 1% window 4.9 ->
+0.13 ms; 50% unchanged. `tests/test_time_window_search.py` checks the
+exact top-k at every width.
+
 `FEATHER_PREFILTER_MODE=auto` separately enables the cost model that walks
 the GLOBAL graph for large unselective non-namespace sets (recall@10 ≈ 0.86 on
 a 50% filter). Don't make `auto` the default; it silently changes results.
+
+### Time travel: `DB.open(path, as_of=...)`
+Every commit ends with a `COMMIT` marker (§3.2), so `parse_v10(f, end)` with
+an earlier marker's end loads that commit. `read_timeline()` lists the
+commits of the kept files (`<path>.history/g<first>-<last>-t<us>.feather`,
+hard links made by `keep_history_file()` just before a full rewrite's
+rename) and the live file; `resolve_as_of()` picks one or throws
+`invalid_argument` saying why. An as_of handle is read-only, skips the WAL,
+never touches salience (`touch_nolock` returns), and pins `clock_now()` —
+the scorer's `now` — to the requested time. Rules if you touch it:
+- **A new section type goes BEFORE the COMMIT marker** of its commit, and
+  `append_delta`/`write_full_v10` keep the marker last. A section after it
+  belongs to no commit an as_of open can load.
+- **Anything that ranks, decays or expires memory reads the handle's clock**:
+  `clock_now()` in C++, `feather_db.clock.now(db)` in Python. A new
+  `std::time(nullptr)` / `time.time()` on a read path makes replays rank by
+  today's recency.
+- **Every full rewrite goes through `commit_finish`**, which keeps the old
+  file (retention or a tag) or, after `erase()`, deletes every kept file
+  BEFORE publishing. A new rewrite path that renames over `path_` itself
+  silently drops history — or, worse, keeps erased data.
+- **`erase()` always cuts history**, logged even when nothing matched
+  (`history_cut_`, set by replay of `WalOp::ERASE` too): erased data may
+  exist only in a kept file. Never narrow this to "if something matched".
+- Tags live in the markers, and a full rewrite writes the whole map: the
+  live file alone says what the tags are. `prune_history()` keeps a kept
+  file while a tag points into it or the window reaches it.
+- `history_files()` drops a kept file whose generations a newer file also
+  holds (a crash between the link and the rename leaves the live inode
+  under a second name; `prune_history()` deletes it on the next writer open).
+`tests/test_time_travel.py`.
+
+### Erasure: `erase()`, not `forget()`, for personal data
+`forget()` clears content but leaves the bytes in the file until a vacuum,
+the vector in the graph as a deleted node (a vacuum writes those too; only
+`compact()` drops them), the WAL's copy until the next save, and every record
+derived from it. `erase(ids=, namespace=, prefix=, entity=)` hard-deletes the
+selection plus everything that cites or was made from it (edge kinds in
+`DB::default_erase_cites()` into it, `default_erase_feeds()` out of it,
+transitively), prunes survivors' edges into it, cuts every deleted node out of
+the graph with its vector (`scrubDeleted`), rewrites the file and rotates the
+WAL away, and returns a receipt. Matching scans every record, forgotten shells
+included. `dry_run=True` plans. Rules if you touch it:
+- **Scrub, not compact.** `HierarchicalNSW::scrubDeleted` re-chooses, by the
+  construction heuristic, the links of every node that pointed at a removed
+  one (from its own and the removed node's neighbours), then zeroes the
+  removed slot's links, vector and level and gives it `kScrubbedLabel`. The
+  slot stays until a compaction renumbers. 50k x 384, one subject (500
+  records): 0.46 s vs 6.15 s for forget + compaction, recall@10 0.989 vs
+  0.992 (0.990 before). It runs under `compact_run_mx_`: a compaction built
+  from a snapshot taken before the erasure would swap the vectors back in.
+  It scrubs every deleted node, so earlier forgets' vectors go too; an int8
+  slot's float original (`fv_off` / `fv_pending`) and the modality's namespace
+  graphs are dropped with it.
+- **Read-only handles refuse after an erasure.** A commit that cuts history
+  (`c.cut`, i.e. an erasure's rewrite) bumps the count in `<path>.erasures`;
+  a read-only handle (`as_of` included) reads it before loading and
+  `ensure_open()` throws `SnapshotErased` (a `HandleClosed`, Python
+  `ClosedError`) once it moved, checked at most every 50 ms.
+- **Every checkpoint path takes `erase_mutex_` and finishes a pending
+  erasure first** (`checkpoint()`, `close()`, `~DB`; `open()` finishes one
+  replayed from the WAL). A checkpoint that rotated the WAL while erased
+  vectors were still graph nodes would discard the only record that the
+  erasure is unfinished. If it cannot finish, the checkpoint is refused
+  (`save`) or skipped (`close`, `~DB`): the WAL stays and the next open redoes
+  it. A new checkpoint entry point does the same.
+- `WalOp::ERASE` follows a FORGET per id in one write, as PURGE does, so a
+  build without it keeps the records deleted. Replay hard-deletes and leaves
+  the ids in `erase_pending_`.
+- A new edge kind that means "derived from" or "cites" goes into
+  `default_erase_cites()` / `default_erase_feeds()`, or erasing a source
+  leaves its derivatives behind. `AgentMemory` observations link `cites` to
+  their evidence for this reason.
+- Pocket memoises `hot()`: `DB.erase` is wrapped in `pocket.py` (and
+  `RemoteDB.erase` does the same) so a memoised view never serves erased
+  text, and every embedding cache in the process is emptied
+  (`embedders.clear_caches()`; the Cloud API empties its own).
+- The MCP `forget` tool erases (`Pocket.erase`); `forget_everything` erases
+  the agent's own scope (`Pocket.erase_all`) only after the user confirms by
+  elicitation. Inherited scopes are never erased from an agent.
+- It deletes every kept history file and the tags (see Time travel), and
+  the Cloud API closes the namespace's as_of handles after it.
+`tests/test_erase.py` reads every file on disk for the erased bytes.
 
 ### Auto-compaction is asynchronous
 `set_auto_compact()` compacts on a background thread. `size()` counts
@@ -1022,7 +1366,12 @@ must not invite one. Upstream (embedding provider) failures are
 `UpstreamError`: transient → 503, refused → 502, never the client's 4xx.
 
 `app/admission.py` bounds requests in flight per class (read / write /
-upload) and answers 429 + Retry-After past it. A new read-only POST route goes
+upload) and answers 429 + Retry-After past it, fairly between tenants
+(namespaces): with n holding slots of a class a tenant may hold limit / n,
+and one alone leaves a reserve (1/8) free, so a bulk import cannot take
+every write slot (`fair_share` 429). Measured: a small tenant's writes
+during a 64-way import, limit 16: 0/20 served without it, 20/20 at 20 ms
+with it (`tests/test_api_fair_admission.py`). A new read-only POST route goes
 in its `_READ_POSTS` pattern, or it is counted (and refused) as a write.
 
 **Nothing blocking runs on the event loop.** An `async def` route awaits
@@ -1112,14 +1461,19 @@ If the feature is agent-facing, it probably belongs in `feather_db/pocket.py`,
 | int8 quantization (two modes) | `set_quantized()` shrinks the file; `set_int8_ram()` shrinks RAM (~1.7×, opt-in) via `Int8L2Space`. Its scale is trained from the data, and `refine` (default 2) re-ranks by float originals kept in the file, so recall matches float. Each re-ranked candidate costs a `pread`: on a cold page cache that is a disk read. A trained scale is fixed once set; data that later drifts beyond the clip is clamped. |
 | Versions and idempotency keys need v10 | `FEATHER_FORMAT=9` files carry neither: on reopen versions restart above a `time << 20` floor (no reuse) and keys are gone, so a retry is applied again. The Rust CLI exposes neither. |
 | `tags_json` is a raw string | Tag filtering uses substring search, not JSON parsing |
-| Superseded bytes stay until a vacuum (v10) | append-only: an updated or forgotten record's earlier versions remain in the file until `vacuum()`, `purge()`/`compact()` + save, or the automatic vacuum (`FEATHER_VACUUM_RATIO`). Vectors of forgotten records stay as deleted graph nodes until `compact()`. |
+| Superseded bytes stay until a vacuum (v10) | append-only: an updated or forgotten record's earlier versions remain in the file until `vacuum()`, `purge()`/`compact()` + save, or the automatic vacuum (`FEATHER_VACUUM_RATIO`). Vectors of forgotten records stay as deleted graph nodes until `compact()`. For personal data use `erase()`, which does all of it at once. |
+| `erase()` ends history | every erase deletes all kept history files and tags, whatever it matched (a purged record may survive only there): `as_of` cannot reach back past the latest erasure. Fixing it means rewriting each kept file without the erased records |
+| `as_of` sees commits, not writes | writes still only in the WAL at time T are not in any commit. `FeatherStore` and the MCP server save per write; the Cloud API saves on an interval |
+| Kept history costs a whole file each | a kept file is the DB as it was, superseded bytes included (hard link, so no copy at the time). Retention is off by default; `storage_stats()["history_bytes"]` reports it |
+| `erase()` rewrites the whole file | the graph surgery is local (`scrubDeleted`), but no byte may survive, so the file is rewritten: O(file size), 0.08 s at 94 MB. Saves wait for it (`erase_mutex_`). Read-only handles opened before it refuse calls once they see it, but keep the replaced file's blocks until they close |
+| Erasure cannot reach below the file system | freed blocks, SSD remapping, copy-on-write snapshots (APFS, btrfs, ZFS) and backups keep what a file system has freed. Encrypt the volume and bound backup retention; per-subject keys (crypto-shredding) would be a format change |
 | Crash replay can leave a dangling edge | pre-existing (v9 too): `purge()` in memory counts records forgotten before the last save (their shells keep the namespace); the file has none, so after a crash the WAL's PURGE does not prune edges pointing at them. Fix needs the purged id list in the WAL record. |
 | ~~Max 1M vectors per modality~~ | **Fixed in v0.15.3**: index capacity is adaptive (starts 4096, grows via `resizeIndex`); no hard cap |
 | `meta.attributes['k'] = v` no-op | pybind11 map copy; use `set_attribute()` |
 | Load time for large attribute DBs | v4/v5 attribute map deserialization is O(n * attrs); namespace/attribute *lookups* are O(matches) via secondary indexes (Phase 7) |
 | Rust CLI missing v0.5.0 features | namespace/entity/context_chain are Python-only for now |
 | Rust CLI now participates in locking | if a long-running Python process holds a DB, `feather add --db that.feather` is refused rather than silently discarding one side |
-| `mcp_server.py` is broken on SDK 2.0 | `Server.list_tools` was removed; `create_server()` raises on import. Use `mcp_agent.py` (`feather-agent`) |
+| `mcp_server.py` is broken on SDK 2.0 | `Server.list_tools` was removed; `create_server()` raises on import. Use `mcp_agent.py` (`feather-agent`). The `feather-serve` script runs `mcp_agent` too (0.22), local `--db` or remote `--api-url --namespace`; `tests/test_mcp_protocol.py` launches every console script over stdio |
 | BM25 is Porter-stemmed, not semantic | plurals and verb forms now match (`creative`/`creatives`, `running`/`run`, `policy`/`policies`), but Porter does not unify every derivational pair — `allergy` still does not find `allergic` (it stems to `allergi` vs `allerg`). A paraphrase with no shared root still returns nothing, indistinguishable from "never stored" — set `FEATHER_EMBED_PROVIDER` for anything relying on paraphrase. `FEATHER_STEM=0` restores exact matching. Tokens over 64 chars are left unstemmed — a blob or id is not a word, and folding it kept a superlinear term on the ingest and load paths |
 | Namespace graphs are rebuilt after every open | not persisted: the first filtered search on a large namespace after a reopen queues a background build (~6 s at 50k × 384) and scans until it finishes |
 | ~~BM25 cannot match a record by its KEY~~ | **Fixed in 0.22**: native keys (`Metadata.key`) are BM25-indexed with the content (`bm25_text()`) |
@@ -1129,6 +1483,18 @@ If the feature is agent-facing, it probably belongs in `feather_db/pocket.py`,
 ---
 
 ## 12. Testing
+
+### Benchmarks: the protocol (`bench/protocol.py`)
+Rerun noise (~3% of questions flip on a same-context rerun) exceeds most
+effects, so: tune on the frozen dev split only (LongMemEval 100 ids, LoCoMo
+3 conversations, contradiction `--split dev`); a run touching test questions
+refuses an uncommitted tree; compare 3-5 runs per side with
+`python -m bench.compare` and call a difference real only when its CI
+excludes 0 and McNemar agrees (and, for LoCoMo, the interval that resamples
+whole conversations); quote LoCoMo on the audited key (`--key sound|audited`,
+the published key has 99 wrong answers), under Mem0's judge and the strict
+one (`--judge strict`, after `rejudge`). Never quote a single-run delta under
+~2 points as a gain.
 
 ```bash
 # One command, the pre-release gate — build, suite, format scripts, the four

@@ -28,6 +28,14 @@ LME_VARIANTS = {"oracle", "s", "m"}
 
 
 def cmd_run(args):
+    from .runner import release_unused_claims
+    try:
+        return _cmd_run(args)
+    finally:
+        release_unused_claims()     # a run that never wrote leaves no empty file
+
+
+def _cmd_run(args):
     lme = args.scenario.startswith("longmemeval")
     if args.k is None:
         args.k = 20 if lme else 10      # longmemeval: sessions, not turns
@@ -36,7 +44,11 @@ def cmd_run(args):
     if lme and (args.decay_time_weight or args.decay_half_life):
         # Temporal and multi-session questions need old evidence, and decay
         # ranks it lower. Recency reaches the answerer as session dates and
-        # the "latest wins" rule in the prompt instead.
+        # the "latest wins" rule in the prompt instead. Measured with the 0.22
+        # scorer at w=0.3 (python -m bench.lme_retrieval rank, hybrid): every
+        # gold session in the top 5 for 113/133 temporal (113 off) and 77/78
+        # knowledge-update (78 off); it no longer costs evidence there.
+        # Multi-session unmeasured; lift this only with an end-to-end dev win.
         print("longmemeval runs without decay; drop --decay-half-life / "
               "--decay-time-weight", file=sys.stderr)
         return 2
@@ -45,9 +57,10 @@ def cmd_run(args):
 
     official_judge = questions_path = None
     if lme:
-        questions_path = RESULTS_DIR / (
-            f"{args.scenario}__{args.dataset}__"
-            f"{time.strftime('%Y%m%d_%H%M%S')}__questions.jsonl")
+        from .runner import reserve
+        questions_path = reserve(
+            f"{args.scenario}__{args.dataset}__{time.strftime('%Y%m%d_%H%M%S')}",
+            "__questions.jsonl")
         if args.judge == "llm" and args.official_judge_provider != "none":
             from .judges_llm import OfficialJudge
             official_judge = OfficialJudge(args.official_judge_provider,
@@ -88,6 +101,7 @@ def cmd_run(args):
                   file=sys.stderr)
             return 2
         questions = load_longmemeval(variant=args.dataset, limit=args.limit)
+        _held_out_guard(args, questions)
         # Embedder
         if args.embedder == "openai":
             from .embedders_openai import OpenAIEmbedder
@@ -150,6 +164,10 @@ def cmd_run(args):
         if args.split != "all":
             from .datasets.lme_split import select
             questions = select(questions, args.split)
+        if args.question_types:
+            want = {t.strip() for t in args.question_types.split(",")}
+            questions = [q for q in questions if q.get("question_type") in want]
+        _held_out_guard(args, questions)
         count_tokens = None
         if args.context_tokens:
             from .tokens import gemini_counter
@@ -260,6 +278,21 @@ def cmd_run(args):
     return 0
 
 
+def _held_out_guard(args, questions) -> None:
+    """A judged LongMemEval run that reaches a TEST question needs a committed
+    tree (bench/protocol.py). The 500 question ids are the same in s, m and
+    oracle, so the frozen dev ids hold for all three; `--limit N` takes the
+    first N, which are mostly test."""
+    if getattr(args, "judge", None) != "llm":
+        return                       # no model judged anything: nothing to tune on
+    from .datasets.lme_split import dev_ids
+    dev = dev_ids()
+    test = sum(q["question_id"] not in dev for q in questions)
+    if test:
+        from .protocol import require_committed
+        require_committed(f"longmemeval ({test} of {len(questions)} questions)")
+
+
 def lme_reportability(args, metrics: dict, dirty: bool) -> list[str]:
     """Why a LongMemEval result is not a number to put next to another
     system's: anything that changes WHAT was measured, or measured it
@@ -272,6 +305,8 @@ def lme_reportability(args, metrics: dict, dirty: bool) -> list[str]:
         why.append(f"--limit {args.limit}: the first {args.limit} questions")
     if args.split != "all":
         why.append(f"--split {args.split}: not all 500 questions")
+    if getattr(args, "question_types", None):
+        why.append(f"--question-types {args.question_types}: not all 500 questions")
     if args.dataset == "oracle":
         why.append("--dataset oracle: the evidence sessions are given")
     if args.judge != "llm":
@@ -394,6 +429,9 @@ def main(argv=None):
     p_run.add_argument("--map-model", default=None,
                        help="longmemeval --count-map: model for the map "
                             "calls, e.g. a flash model under a pro answerer.")
+    p_run.add_argument("--question-types", default=None,
+                       help="longmemeval: only these question types, comma-"
+                            "separated (e.g. knowledge-update). Not reportable.")
     p_run.add_argument("--split", default="all",
                        choices=["all", "dev", "test"],
                        help="longmemeval -d s: the frozen split "

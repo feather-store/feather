@@ -34,13 +34,17 @@ limited by memory, which only open namespaces hold, so idle ones cost a
 file on disk and a line in the stats sidecar.
 """
 
+import contextvars
 import json
 import os
+import shutil
 import sys
 import struct
 import threading
 import time
+import urllib.parse
 import zlib
+from collections import OrderedDict
 from typing import Dict, Optional
 import feather_db
 from feather_db import DB
@@ -71,6 +75,38 @@ RECOVER_RETRY_S = float(os.getenv("FEATHER_RECOVER_RETRY_S", "5"))
 
 # Every file that belongs to a namespace besides <ns>.feather itself.
 _SIDECARS = (".wal", ".wal.old", ".tmp", ".lock")
+# ...and the directory of files kept for time travel (DB.set_history_retention).
+_HISTORY_DIR = ".history"
+
+# ── Time travel over HTTP ────────────────────────────────────────────────
+# A request carrying `X-Feather-As-Of` is served by a read-only handle opened
+# at that commit (DB.open(..., as_of=)). main.py's middleware sets this for the
+# request and refuses the header on writes; get() reads it. Handles are cached
+# by (namespace, header value), at most AS_OF_HANDLES of them, each closed
+# after AS_OF_IDLE_S unused. A time is resolved when its handle opens.
+AS_OF: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar("feather_as_of", default=None)
+AS_OF_HANDLES = max(1, int(os.getenv("FEATHER_AS_OF_HANDLES", "8")))
+AS_OF_IDLE_S = float(os.getenv("FEATHER_AS_OF_IDLE_S", "60"))
+
+
+class AsOfError(ValueError):
+    """The header is malformed, or names a commit the history does not hold. HTTP 400."""
+
+
+def parse_as_of(value: str) -> dict:
+    """X-Feather-As-Of (written by feather_db.remote) -> DB.open keyword arguments."""
+    kind, _, v = value.partition(":")
+    try:
+        if kind == "time":
+            return {"as_of": float(v)}
+        if kind == "generation":
+            return {"generation": int(v)}
+        if kind == "tag" and v:
+            return {"as_of": urllib.parse.unquote(v)}
+    except ValueError:
+        pass
+    raise AsOfError("X-Feather-As-Of is time:<unix seconds>, generation:<n> or tag:<name>, "
+                    f"not {value!r}")
 
 
 def shard_owner(namespace: str, shard_count: int = SHARD_COUNT) -> int:
@@ -214,6 +250,9 @@ class DBManager:
         self._transit: Dict[str, threading.Event] = {}
         self._known: set = set()                      # owned namespaces with a file
         self._last_used: Dict[str, float] = {}
+        # (namespace, X-Feather-As-Of) -> [read-only handle at that commit, last used]
+        self._as_of: "OrderedDict[tuple, list]" = OrderedDict()
+        self._as_of_lock = threading.Lock()
         self._stats: Dict[str, dict] = {}             # as of each namespace's last close
         self._stats_path = os.path.join(data_dir, STATS_FILE)
         self._stop = threading.Event()
@@ -346,7 +385,11 @@ class DBManager:
             dim: Optional[int] = None) -> DB:
         """Return the DB for this namespace, opening it on first use and
         creating it if `create`. A handle that stopped accepting writes is
-        replaced by a fresh one first."""
+        replaced by a fresh one first. Within a request carrying
+        X-Feather-As-Of, the read-only handle at that commit instead."""
+        spec = AS_OF.get()
+        if spec is not None:
+            return self._get_as_of(namespace, spec)
         self._last_used[namespace] = time.monotonic()   # before the read: see close_namespace
         db = self._dbs.get(namespace)
         if db is not None and write_error(db) is None:
@@ -392,6 +435,60 @@ class DBManager:
             self._transit.pop(namespace, None)
         done.set()
         return db
+
+    def _get_as_of(self, namespace: str, spec: str) -> DB:
+        validate_namespace(namespace)
+        self._check_owner(namespace)
+        key = (namespace, spec)
+        with self._as_of_lock:
+            hit = self._as_of.get(key)
+            if hit is not None and not hit[0].is_closed():
+                hit[1] = time.monotonic()
+                self._as_of.move_to_end(key)
+                return hit[0]
+        kw = parse_as_of(spec)
+        path = self._namespace_path(namespace)
+        if not os.path.exists(path):
+            raise KeyError(f"Namespace '{namespace}' not found")
+        try:
+            db = DB.open(path, dim=self._default_dim, read_only=True, **kw)
+        except ValueError as e:                  # no such commit, tag, or history
+            raise AsOfError(str(e)) from e
+        evict = []
+        with self._as_of_lock:
+            cur = self._as_of.get(key)
+            if cur is not None and not cur[0].is_closed():
+                # A concurrent request opened it first and may be using it:
+                # keep that one, drop ours (nobody else has seen it).
+                cur[1] = time.monotonic()
+                evict.append(db)
+                db = cur[0]
+            else:
+                self._as_of[key] = [db, time.monotonic()]
+                self._as_of.move_to_end(key)
+                while len(self._as_of) > AS_OF_HANDLES:
+                    evict.append(self._as_of.popitem(last=False)[1][0])
+        for h in evict:                          # a request still using one retries (ClosedError)
+            _close_quietly(h, save=False)
+        return db
+
+    def drop_as_of(self, namespace: str):
+        """Close every as_of handle on `namespace` (after an erase: none may
+        keep serving what it erased)."""
+        self._close_as_of(namespace)
+
+    def _close_as_of(self, namespace: Optional[str] = None, idle_s: Optional[float] = None):
+        now, evict = time.monotonic(), []
+        with self._as_of_lock:
+            for key in list(self._as_of):
+                db, used = self._as_of[key]
+                if namespace is not None and key[0] != namespace:
+                    continue
+                if idle_s is not None and now - used < idle_s:
+                    continue
+                evict.append(self._as_of.pop(key)[0])
+        for h in evict:
+            _close_quietly(h, save=False)
 
     # ── closing idle namespaces ───────────────────────────────────────────
     def close_namespace(self, namespace: str, *, blocking: bool = False,
@@ -439,6 +536,7 @@ class DBManager:
     def sweep(self) -> list:
         """Close namespaces idle past FEATHER_IDLE_CLOSE_S, then the least
         recently used while more than FEATHER_MAX_OPEN are open."""
+        self._close_as_of(idle_s=AS_OF_IDLE_S)
         closed = []
         if self._idle_close_s > 0:
             for ns in list(self._dbs):
@@ -636,6 +734,7 @@ class DBManager:
         self._stop.set()
         if self._sweeper is not None:
             self._sweeper.join(timeout=60)
+        self._close_as_of()
         with self._global_lock:
             for ns, db in list(self._dbs.items()):
                 _close_quietly(db, save=True)
@@ -668,6 +767,7 @@ class DBManager:
             if db is not None:
                 _close_quietly(db, save=False)   # its files are deleted next
                 removed = True
+            self._close_as_of(namespace)
             path = self._namespace_path(namespace)
             for p in (path,) + tuple(path + s for s in _SIDECARS):
                 if os.path.exists(p):
@@ -676,4 +776,7 @@ class DBManager:
                         removed = True
                     except Exception:
                         pass
+            if os.path.isdir(path + _HISTORY_DIR):
+                shutil.rmtree(path + _HISTORY_DIR, ignore_errors=True)
+                removed = True
             return removed

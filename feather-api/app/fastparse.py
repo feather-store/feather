@@ -84,6 +84,7 @@ class SearchBody(_VectorMixin, msgspec.Struct, kw_only=True):
     scoring_half_life: Optional[float] = None
     scoring_weight: Optional[float] = None
     scoring_min: Optional[float] = None
+    scoring_relevance_floor: Optional[float] = None
 
 
 class HybridBody(_VectorMixin, msgspec.Struct, kw_only=True):
@@ -112,11 +113,13 @@ class HybridBody(_VectorMixin, msgspec.Struct, kw_only=True):
     scoring_half_life: Optional[float] = None
     scoring_weight: Optional[float] = None
     scoring_min: Optional[float] = None
+    scoring_relevance_floor: Optional[float] = None
 
 
 class KeywordBody(msgspec.Struct, kw_only=True):
     query: str
     k: K = 10
+    track: bool = True
     include_metadata: bool = True
     namespace_id: Optional[str] = None
     namespace_prefix: Optional[str] = None

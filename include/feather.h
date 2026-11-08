@@ -39,16 +39,19 @@
 #  include <sys/file.h>    // flock
 #  include <sys/stat.h>    // stat: exists / size (std::filesystem needs macOS 10.15+)
 #  include <sys/mman.h>    // mmap: read-only handles share the vector image
+#  include <dirent.h>      // readdir: the history directory
 #endif
 #include "hnswlib.h"
 #include "metadata.h"
 #include "filter.h"
 #include "scoring.h"
 #include "format_v10.h"
+#include "heat.h"
 #include <deque>
 #include <map>
 #include <optional>
 #include <set>
+#include <random>
 
 namespace feather {
 
@@ -218,6 +221,10 @@ namespace fsio {
 // on purpose: a disk that returned an fsync error is not trusted again either.
 inline std::atomic<long>& sync_faults_after() { static std::atomic<long> n{-1}; return n; }
 inline std::atomic<int>&  sync_fault_errno()  { static std::atomic<int>  e{EIO}; return e; }
+// Test hook (feather_db.core._halt_erase_after_log): erase() stops after its
+// records are logged and applied, before the compaction and rewrite. What a
+// crash at that point leaves behind; the next writer open must finish it.
+inline std::atomic<bool>& erase_halts_after_log() { static std::atomic<bool> b{false}; return b; }
 inline bool sync_fault() {
     auto& n = sync_faults_after();
     long v = n.load();
@@ -347,6 +354,69 @@ inline uint64_t size_or_zero(const std::string& p) {
 #else
     struct stat st;
     return ::stat(p.c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) : 0;
+#endif
+}
+// The history directory (<path>.history/): rewritten-away files kept for
+// DB::open(..., as_of=). Plain POSIX for the same reason as exists().
+inline void make_dir(const std::string& p) {
+#if defined(_WIN32)
+    std::error_code ec;
+    std::filesystem::create_directory(p, ec);
+#else
+    ::mkdir(p.c_str(), 0755);                        // EEXIST is fine
+#endif
+}
+inline std::vector<std::string> list_dir(const std::string& p) {
+    std::vector<std::string> out;
+#if defined(_WIN32)
+    std::error_code ec;
+    for (auto it = std::filesystem::directory_iterator(p, ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
+        out.push_back(it->path().filename().string());
+#else
+    if (DIR* d = ::opendir(p.c_str())) {
+        while (const dirent* e = ::readdir(d)) {
+            const std::string n = e->d_name;
+            if (n != "." && n != "..") out.push_back(n);
+        }
+        ::closedir(d);
+    }
+#endif
+    return out;
+}
+inline bool same_inode(const std::string& a, const std::string& b) {
+#if defined(_WIN32)
+    std::error_code ec;
+    return std::filesystem::equivalent(a, b, ec);
+#else
+    struct stat x, y;
+    return ::stat(a.c_str(), &x) == 0 && ::stat(b.c_str(), &y) == 0 &&
+           x.st_dev == y.st_dev && x.st_ino == y.st_ino;
+#endif
+}
+// A second name for the inode `from` names now. Never written again (a full
+// rewrite renames a NEW inode over `from`), so the link is a frozen copy for
+// free. Falls back to copying where hard links are refused.
+inline void link_or_copy(const std::string& from, const std::string& to) {
+#if defined(_WIN32)
+    std::error_code ec;
+    std::filesystem::create_hard_link(from, to, ec);
+    if (!ec) return;
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) throw std::runtime_error("cannot keep history file " + to + ": " + ec.message());
+#else
+    if (::link(from.c_str(), to.c_str()) == 0) return;
+    if (errno == EEXIST) return;                     // already kept (a retried commit)
+    std::ifstream in(from, std::ios::binary);
+    std::ofstream out(to + ".tmp", std::ios::binary | std::ios::trunc);
+    if (!in || !out) throw std::runtime_error("cannot keep history file " + to + ": " + std::strerror(errno));
+    out << in.rdbuf();
+    out.flush();
+    if (!out) { std::remove((to + ".tmp").c_str()); throw std::runtime_error("cannot keep history file " + to); }
+    out.close();
+    fsync_path(to + ".tmp");
+    if (std::rename((to + ".tmp").c_str(), to.c_str()) != 0)
+        throw std::runtime_error("cannot keep history file " + to + ": " + std::strerror(errno));
 #endif
 }
 // 64-bit positioned stdio for the v10 append handle.
@@ -501,6 +571,11 @@ struct WriteFailed : std::runtime_error { using std::runtime_error::runtime_erro
 // caller that closed a handle under a request (a server closing an idle
 // namespace) can safely run the request again on a fresh one.
 struct HandleClosed : std::logic_error { using std::logic_error::logic_error; };
+
+// A read-only handle whose snapshot predates an erasure: it still holds what
+// was erased, so it refuses every call. Close it and open the file again.
+// Python: feather_db.ClosedError, as for a closed handle.
+struct SnapshotErased : HandleClosed { using HandleClosed::HandleClosed; };
 
 // A conditional write whose expected version was not the record's current
 // one. Nothing of its batch was logged or applied. `actual` is 0 when the
@@ -829,6 +904,12 @@ private:
         // retries when a commit finished between its reads (see
         // read_snapshot()). Written in the same write as the header.
         WALGEN = 0x0A,
+        // [count u32][id u64 x count][version base u64]: erase(). Hard-deletes
+        // the ids (as PURGE does a namespace) and leaves them pending: their
+        // graph nodes still hold vectors until a compaction, so the next writer
+        // open compacts and rewrites the file before anything else. Logged
+        // after a FORGET per id, so a build without it keeps them deleted.
+        ERASE  = 0x0B,
     };
     // What replay_wal() saw of a WAL file: whether it held any record, and
     // the generation its WALGEN record named (none: written before them).
@@ -918,6 +999,52 @@ private:
     bool       last_commit_full_  = false;
     uint64_t   commits_           = 0;
     uint64_t   vacuums_           = 0;
+
+    // ── History: commit markers, tags, retention, as_of ──────────────
+    // Every commit ends with a COMMIT section (format_v10.h), so any earlier
+    // commit of the file can be loaded by parsing up to its marker. A full
+    // rewrite starts a new file; the old one is kept under <path>.history/
+    // while the retention window or a tag needs it (keep_history_file()).
+    // Guarded by save_mutex_ (and set by the single-threaded load):
+    std::map<std::string, uint64_t> tags_;        // tag -> generation (committed)
+    std::vector<v10::TagOp> pending_tags_;        // the next commit's tag ops
+    int64_t  history_keep_us_  = -1;              // retention in force; -1: never set
+    bool     keep_dirty_       = false;           // retention changed: next commit marks it
+    int64_t  last_mark_us_     = 0;               // marker times never decrease
+    uint64_t file_first_gen_   = 0;               // oldest commit the current file holds
+    int64_t  file_first_us_    = 0;
+    // erase(): the next full rewrite deletes every history file and keeps no
+    // tags: an erased record must not come back through as_of. Set under
+    // mutex_ (or by replay) and read under save_mutex_ + shared mutex_.
+    bool     history_cut_      = false;
+    // Read-only handles: the erasure count when this one opened (see
+    // check_not_erased), and the throttle of its checks.
+    uint64_t erasures_at_open_ = 0;
+    mutable std::atomic<int64_t> erasure_checked_ns_{0};
+    mutable std::atomic<bool>    erased_since_open_{false};
+    std::string erasure_notice_error_;           // writer: the last note_erasure() failure
+    uint64_t history_removed_  = 0;               // files the last cut deleted
+public:
+    // What an as_of open asks for: a time (microseconds), a generation, or a tag.
+    struct AsOf {
+        enum Kind { TIME, GENERATION, TAG } kind = TIME;
+        int64_t     time_us = 0;
+        uint64_t    gen     = 0;
+        std::string tag;
+    };
+    struct CommitInfo {
+        uint64_t generation = 0;
+        double   time       = 0;        // unix seconds (microsecond precision)
+        std::vector<std::string> tags;
+        bool     archived   = false;    // held by a file under <path>.history/
+        bool     marked     = true;     // false: known only from its header
+        uint64_t end        = 0;        // the file offset this commit ends at
+    };
+private:
+    std::optional<AsOf> as_of_;                   // set: this handle is a past commit
+    v10::CommitMark     as_of_mark_;              // ...which one
+    std::optional<double> pinned_clock_;          // as_of: scoring's "now" (seconds)
+    std::string         base_path_;               // file the base was read from
     // Guarded by mutex_: written by mutations (exclusive) and consumed by a
     // commit, which holds it shared — no writer runs — under save_mutex_.
     std::unordered_set<uint64_t> dirty_meta_;
@@ -948,12 +1075,27 @@ private:
     std::deque<std::pair<int64_t, std::string>> idem_order_;  // insertion order, for expiry
     std::unordered_set<std::string> dirty_idem_;               // keys the next commit writes
     bool     vacuum_requested_ = false;      // purge/compact/set_quantized: rewrite next
+    // erase(): held from logging the erasure until the file is rewritten
+    // without it, and by every checkpoint (save, vacuum, close, ~DB) for its
+    // whole length. A checkpoint between the two would rotate away the WAL's
+    // ERASE record while the file still held the erased vectors as deleted
+    // graph nodes; a crash after it would leave them there for good. Lock
+    // order: erase_mutex_ -> compact_run_mx_ -> save_mutex_ -> mutex_.
+    std::mutex erase_mutex_;
+    // Erased ids that may still hold a graph node (deleted, vector intact).
+    // Written under erase_mutex_ and mutex_ (or by the single-threaded load);
+    // read under either.
+    std::unordered_set<uint64_t> erase_pending_;
     uint64_t meta_rec_bytes_   = 0;          // META record sizes seen, for the live
     uint64_t meta_rec_count_   = 0;          //   estimate that triggers a vacuum
     // Queries record salience under the SHARED lock, so they cannot touch
     // dirty_meta_; they queue here instead (once per record per commit, via
     // Metadata::recall_unsaved).
     mutable std::mutex            salience_mx_;
+    // background_cosine(): per modality, (estimate, live count it was made at).
+    // A leaf lock, taken under mutex_ (shared) and nothing inside it.
+    mutable std::mutex            background_mx_;
+    mutable std::unordered_map<std::string, std::pair<float, size_t>> background_;
     mutable std::vector<uint64_t> salience_dirty_;
 
     // ── Helpers ─────────────────────────────────────────────────────
@@ -1389,6 +1531,12 @@ private:
         return it != m.attributes.end() && it->second == "true";
     }
 
+    // A live record's metadata, or an empty one (new or forgotten id).
+    Metadata live_meta_or_empty_nolock(uint64_t id) const {
+        auto it = metadata_store_.find(id);
+        return it != metadata_store_.end() && !is_dead_meta(it->second) ? it->second : Metadata();
+    }
+
     // Length-prefixed, so no (namespace, key) split can produce another's string.
     static std::string key_ref(const std::string& ns, const std::string& key) {
         return std::to_string(ns.size()) + ':' + ns + key;
@@ -1481,8 +1629,60 @@ private:
         for (auto it = ns_names_.lower_bound(lo); it != ns_names_.end() && *it < hi; ++it) f(*it);
     }
 
+    // A time window is a range of the (valid_time, id) or (timestamp, id)
+    // index of each namespace the filter allows: O(log n + window), where
+    // checking the window record by record read every record of the
+    // namespace. Inclusive, as SearchFilter::matches. The valid window when
+    // there is one (the other is still checked by matches()). Collects at
+    // most `cap` ids; false when the window holds more.
+    bool window_ids(const SearchFilter& f, const std::vector<std::string>* spaces,
+                    size_t cap, std::vector<uint64_t>& out) const {
+        const bool valid = f.valid_after || f.valid_before;
+        const auto& index = valid ? valid_index_ : time_index_;
+        const auto& lo_b = valid ? f.valid_after : f.timestamp_after;
+        const auto& hi_b = valid ? f.valid_before : f.timestamp_before;
+        const TimeKey lo{lo_b ? *lo_b : std::numeric_limits<int64_t>::min(), 0};
+        const int64_t hi = hi_b ? *hi_b : std::numeric_limits<int64_t>::max();
+        // How many fall in the window, assuming times spread evenly over each
+        // namespace's span (O(1) from its ends): a window that is plainly too
+        // wide is refused before a tree walk. A skewed one is stopped by `cap`.
+        auto guess = [&](const std::set<TimeKey>& s) -> double {
+            if (s.empty()) return 0.0;
+            const double a = static_cast<double>(s.begin()->first);
+            const double b = static_cast<double>(s.rbegin()->first);
+            const double l = std::max(a, static_cast<double>(lo.first));
+            const double h = std::min(b, static_cast<double>(hi));
+            if (h < l) return 0.0;
+            return b > a ? static_cast<double>(s.size()) * (h - l) / (b - a)
+                         : static_cast<double>(s.size());
+        };
+        auto take = [&](const std::set<TimeKey>& s) {
+            for (auto it = s.lower_bound(lo); it != s.end() && it->first <= hi; ++it) {
+                if (out.size() >= cap) return false;
+                out.push_back(it->second);
+            }
+            return true;
+        };
+        std::vector<const std::set<TimeKey>*> sets;
+        if (spaces) {
+            for (const auto& ns : *spaces) {
+                auto it = index.find(ns);
+                if (it != index.end()) sets.push_back(&it->second);
+            }
+        } else {
+            for (const auto& [ns, s] : index) sets.push_back(&s);
+        }
+        double expect = 0.0;
+        for (const auto* s : sets) expect += guess(*s);
+        if (expect > 1.5 * static_cast<double>(cap)) return false;
+        for (const auto* s : sets)
+            if (!take(*s)) return false;
+        return true;
+    }
+
     std::vector<uint64_t>
-    candidates_for_filter(const SearchFilter& f, bool& indexed) const {
+    candidates_for_filter(const SearchFilter& f, bool& indexed,
+                          size_t max_window = std::numeric_limits<size_t>::max()) const {
         indexed = false;
         std::vector<const std::unordered_set<uint64_t>*> sets;
         auto pick = [&](const std::unordered_map<std::string, std::unordered_set<uint64_t>>& idx,
@@ -1517,6 +1717,40 @@ private:
         if (f.attributes_match)
             for (const auto& [k, v] : *f.attributes_match)
                 if (!pick(attr_index_, attr_key(k, v)))              return {};
+
+        // A time window: within the namespaces the filter names, always (they
+        // would be read whole otherwise); across all of them only while it is
+        // selective (`max_window`, from the caller's cost model), since a
+        // wide window is better served by the graph walk.
+        if (f.valid_after || f.valid_before || f.timestamp_after || f.timestamp_before) {
+            const bool scoped = f.namespace_id || (f.namespace_prefix && !f.namespace_prefix->empty());
+            std::vector<std::string> spaces;
+            if (scoped) spaces = filter_namespaces(f);
+            const size_t smallest = sets.empty() ? std::numeric_limits<size_t>::max()
+                : (*std::min_element(sets.begin(), sets.end(),
+                     [](auto* a, auto* b) { return a->size() < b->size(); }))->size();
+            // Worth it only while well below every set it would be intersected
+            // with: walking the time tree and sorting cost more per id than a
+            // namespace scan's check (100k x 128-d: a 10% window 2x faster, a
+            // 50% one 1.4x slower; break-even near a quarter).
+            const size_t cap = (scoped ? smallest : std::min(max_window, smallest)) / 4;
+            std::vector<uint64_t> window;
+            if (window_ids(f, scoped ? &spaces : nullptr, cap, window)) {
+                indexed = true;
+                // Time order is random in memory: in id order (about the
+                // order records were written, so the order of their slots)
+                // the scan reads vectors and metadata nearly sequentially.
+                std::sort(window.begin(), window.end());
+                std::vector<uint64_t> result;
+                result.reserve(window.size());
+                for (uint64_t id : window) {
+                    bool all = true;
+                    for (size_t i = 0; i < sets.size() && all; ++i) all = sets[i]->count(id) > 0;
+                    if (all) result.push_back(id);
+                }
+                return result;
+            }
+        }
 
         if (!indexed) return {};                 // no indexed constraint at all
 
@@ -2186,6 +2420,7 @@ private:
     void mark_meta_dirty(uint64_t id) { dirty_meta_.insert(id); }
 
     void touch_nolock(uint64_t id) const {
+        if (as_of_) return;              // a replay of the past must not change it
         auto it = metadata_store_.find(id);
         if (it != metadata_store_.end() &&
             it->second.note_recall(static_cast<uint64_t>(std::time(nullptr)))) {
@@ -3076,6 +3311,21 @@ private:
             if (ss.peek() != std::char_traits<char>::eof()) rd(&base, 8);
             purge_core(ns, /*maintain_derived=*/false, base);
             return;                           // stamps its survivors itself
+        } else if (op == WalOp::ERASE) {
+            uint32_t n = 0;
+            rd(&n, 4);
+            // Bounded by the bytes that back it before anything is read.
+            if (static_cast<uint64_t>(n) * 8 > plen - 4)
+                throw std::runtime_error("corrupt WAL '" + path + "': ERASE record at offset " +
+                                         std::to_string(rec_start) + " names more ids than it holds");
+            std::unordered_set<uint64_t> gone;
+            for (uint32_t i = 0; i < n; ++i) { uint64_t x = 0; rd(&x, 8); gone.insert(x); }
+            uint64_t base = 0;
+            if (ss.peek() != std::char_traits<char>::eof()) rd(&base, 8);
+            hard_delete_nolock(gone, /*maintain_derived=*/false, base);
+            erase_pending_.insert(gone.begin(), gone.end());
+            history_cut_ = true;              // the open's vacuum deletes the history too
+            return;                           // stamps its survivors itself
         } else {
             return;                           // a newer build's op: skipped, as before
         }
@@ -3298,7 +3548,171 @@ private:
         struct FullRec { uint32_t slot; uint64_t off; uint64_t seq; };
         struct FullSet { std::string name; uint64_t epoch; std::vector<FullRec> recs; };
         std::vector<FullSet> full_vecs;
+        v10::CommitMark mark;     // the COMMIT section this commit ends with
+        bool     cut       = false;   // full: delete every history file (erase)
+        bool     keep_old  = false;   // full: keep the replaced file under <path>.history/
     };
+
+    // ── History helpers ──────────────────────────────────────────────
+    double clock_now() const {
+        return pinned_clock_ ? *pinned_clock_ : static_cast<double>(std::time(nullptr));
+    }
+    static void check_tag_name(const std::string& name) {
+        if (name.empty() || name.size() > v10::MAX_TAG_LEN)
+            throw std::invalid_argument("a tag is 1-255 bytes");
+        for (unsigned char ch : name)
+            if (ch < 0x20 || ch == 0x7f) throw std::invalid_argument("a tag holds no control characters");
+    }
+    static int64_t wall_us() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    // FEATHER_HISTORY_KEEP_S: the retention of a file that never had one set.
+    static int64_t env_keep_us() {
+        const char* e = std::getenv("FEATHER_HISTORY_KEEP_S");
+        if (!e || !*e) return -1;
+        const double s = env_double("FEATHER_HISTORY_KEEP_S", 0.0);
+        if (!(s > 0)) return 0;
+        return s >= 9.2e12 ? std::numeric_limits<int64_t>::max() : static_cast<int64_t>(s * 1e6);
+    }
+    int64_t effective_keep_us() const {
+        if (history_keep_us_ >= 0) return history_keep_us_;
+        const int64_t e = env_keep_us();
+        return e >= 0 ? e : 0;
+    }
+    std::string history_dir() const { return path_ + ".history"; }
+
+    // The marker a commit about to be written ends with. Tag ops pending
+    // from tag()/untag() name the commit that carries them.
+    v10::CommitMark make_mark(bool full, bool cut) const {
+        v10::CommitMark m;
+        m.gen     = generation_ + 1;
+        m.time_us = std::max(wall_us(), last_mark_us_);
+        m.keep_us = history_keep_us_ >= 0 ? history_keep_us_ : env_keep_us();
+        std::vector<v10::TagOp> ops = pending_tags_;
+        for (auto& op : ops) op.gen = op.op == v10::TAG_SET ? m.gen : 0;
+        if (full) {
+            // The commits that set the tags are not in the new file: write the map.
+            std::map<std::string, uint64_t> t;
+            if (!cut) t = tags_;
+            v10::CommitMark delta;
+            delta.tags = ops;
+            v10::apply_tags(t, delta);
+            m.flags = v10::MARK_TAGS_FULL;
+            for (const auto& [name, gen] : t) m.tags.push_back({v10::TAG_SET, gen, name});
+        } else {
+            m.tags = std::move(ops);
+        }
+        return m;
+    }
+
+    // A committed marker's effect on this handle's view of the history.
+    void note_mark(const v10::CommitMark& m, bool starts_file) {
+        v10::apply_tags(tags_, m);
+        history_keep_us_ = m.keep_us;
+        last_mark_us_    = std::max(last_mark_us_, m.time_us);
+        if (starts_file || !file_first_gen_) { file_first_gen_ = m.gen; file_first_us_ = m.time_us; }
+    }
+
+    // <path>.history/g<first gen>-<last gen>-t<first time us>.feather
+    struct HistName { std::string path; uint64_t first = 0, last = 0; int64_t first_us = 0; };
+    static std::string history_name(uint64_t first, uint64_t last, int64_t first_us) {
+        char b[96];
+        std::snprintf(b, sizeof(b), "g%020llu-%020llu-t%lld.feather",
+                      static_cast<unsigned long long>(first), static_cast<unsigned long long>(last),
+                      static_cast<long long>(first_us));
+        return b;
+    }
+    // The kept files, oldest first. A file whose commits a newer one also
+    // holds (a crash between keeping a file and replacing it leaves the live
+    // file under a second name) is left out.
+    static std::vector<HistName> history_files(const std::string& path, bool with_stale = false) {
+        std::vector<HistName> out;
+        const std::string dir = path + ".history";
+        for (const auto& n : fsio::list_dir(dir)) {
+            unsigned long long a = 0, b = 0;
+            long long t = 0;
+            char tail[16] = {};
+            if (std::sscanf(n.c_str(), "g%llu-%llu-t%lld%15s", &a, &b, &t, tail) != 4 ||
+                std::strcmp(tail, ".feather") != 0 || a > b)
+                continue;
+            out.push_back({dir + "/" + n, a, b, t});
+        }
+        std::sort(out.begin(), out.end(), [](const HistName& x, const HistName& y) {
+            return x.first != y.first ? x.first < y.first : x.last < y.last;
+        });
+        if (with_stale) return out;
+        std::vector<HistName> kept;
+        for (size_t i = 0; i < out.size(); ++i)
+            if (i + 1 == out.size() || out[i].last < out[i + 1].first) kept.push_back(out[i]);
+        return kept;
+    }
+
+    // Keep the file a full rewrite is about to replace: a hard link to its
+    // inode, which is never written again once the rename lands.
+    void keep_history_file() {
+        const std::string dir = history_dir();
+        fsio::make_dir(dir);
+        const uint64_t first    = file_first_gen_ ? file_first_gen_ : generation_;
+        const int64_t  first_us = file_first_gen_ ? file_first_us_ : last_mark_us_;
+        const std::string name  = dir + "/" + history_name(first, generation_, first_us);
+        fsio::link_or_copy(path_, name);
+        // Best effort: a lost link costs history, never acknowledged data, so
+        // it does not poison the handle the way a data fsync does.
+        if (checkpoint_sync_enabled()) {
+            try { fsio::fsync_parent_dir(name); } catch (const std::exception&) {}
+        }
+    }
+
+    // erase(): every kept file goes BEFORE the rewrite is published. Until
+    // then the WAL still logs the erasure, so a crash in between redoes it.
+    uint64_t drop_history_files() {
+        const std::string dir = history_dir();
+        uint64_t n = 0;
+        for (const auto& name : fsio::list_dir(dir))
+            if (std::remove((dir + "/" + name).c_str()) == 0) ++n;
+        std::remove(dir.c_str());
+        if (checkpoint_sync_enabled()) {
+            try { fsio::fsync_parent_dir(dir); } catch (const std::exception&) {}
+        }
+        return n;
+    }
+
+    // Delete kept files nothing can reach: outside the retention window and
+    // holding no tagged commit. A file is inside the window when the commit
+    // after its last one is newer than now - keep (as_of at the edge of the
+    // window resolves into it). Best effort: never throws.
+    void prune_history() noexcept {
+        try {
+            auto all = history_files(path_, /*with_stale=*/true);
+            if (all.empty()) return;
+            const std::string dir = history_dir();
+            for (const auto& n : fsio::list_dir(dir))
+                if (n.size() > 4 && n.compare(n.size() - 4, 4, ".tmp") == 0)
+                    std::remove((dir + "/" + n).c_str());
+            const auto live = history_files(path_);
+            std::vector<HistName> drop;
+            for (const auto& h : all) {
+                bool listed = false;
+                for (const auto& l : live) listed |= l.path == h.path;
+                if (!listed || fsio::same_inode(h.path, path_)) drop.push_back(h);
+            }
+            const int64_t keep   = effective_keep_us();
+            const int64_t now    = wall_us();
+            const int64_t cutoff = keep == std::numeric_limits<int64_t>::max() ? INT64_MIN : now - keep;
+            const int64_t cur_first_us = file_first_gen_ ? file_first_us_ : now;
+            for (size_t i = 0; i < live.size(); ++i) {
+                const auto& h = live[i];
+                bool pinned = false;
+                for (const auto& [tag, gen] : tags_) pinned |= gen >= h.first && gen <= h.last;
+                const int64_t next_first = i + 1 < live.size() ? live[i + 1].first_us : cur_first_us;
+                const bool in_window = keep > 0 && next_first > cutoff;
+                if (!pinned && !in_window) drop.push_back(h);
+            }
+            for (const auto& h : drop) std::remove(h.path.c_str());
+            if (fsio::list_dir(dir).empty()) std::remove(dir.c_str());
+        } catch (...) {}
+    }
 
     // Writes sections at the stream's current position.
     struct SectionOut {
@@ -3630,6 +4044,7 @@ private:
 
     bool has_changes(const std::vector<uint64_t>& salience) const {
         if (!dirty_meta_.empty() || !salience.empty() || !dirty_idem_.empty()) return true;
+        if (!pending_tags_.empty() || keep_dirty_) return true;
         for (const auto& [name, m] : modality_indices_) {
             if (!m.persisted) return true;
             const auto& ix = *m.index;
@@ -3725,6 +4140,7 @@ private:
             if (!buf.empty()) out.write(v10::SEC_META, buf);
             write_versions(out, /*all=*/true);
             write_idempotency(out, /*all=*/true);
+            out.write(v10::SEC_COMMIT, v10::encode_mark(c.mark), v10::SEC_OPTIONAL);
 
             c.gen   = generation_ + 1;
             c.end   = out.pos;
@@ -3790,12 +4206,16 @@ private:
             if (dirty_meta_.count(id)) continue;          // its META put has the counters
             auto it = metadata_store_.find(id);
             if (it == metadata_store_.end() || is_dead_meta(it->second)) continue;
+            const auto [rc, lr] = it->second.recall_state();
             v10::put<uint64_t>(buf, id);
-            v10::put<uint32_t>(buf, it->second.recalls());
-            v10::put<uint64_t>(buf, it->second.recalled_at());
+            v10::put<uint32_t>(buf, rc);
+            v10::put<uint64_t>(buf, lr);
             if (buf.size() >= v10::CHUNK) { out.write(v10::SEC_SALIENCE, buf); buf.clear(); }
         }
         if (!buf.empty()) out.write(v10::SEC_SALIENCE, buf);
+        // Last: the bytes up to the end of this marker are this commit.
+        if (out.written > 0 || !pending_tags_.empty() || keep_dirty_)
+            out.write(v10::SEC_COMMIT, v10::encode_mark(c.mark), v10::SEC_OPTIONAL);
 
         if (std::fflush(data_fh_) != 0 || std::ferror(data_fh_))
             throw std::runtime_error("write failed (disk full?) while committing " + path_);
@@ -3819,7 +4239,14 @@ private:
         std::vector<uint64_t> salience = take_salience();
         Commit c;
         try {
-            c.full = force_full || commit_failed_ || !file_v10_ || vacuum_requested_ || vacuum_due();
+            c.full = force_full || commit_failed_ || !file_v10_ || vacuum_requested_ ||
+                     history_cut_ || vacuum_due();
+            c.cut  = c.full && history_cut_;
+            // The file being replaced holds the history: keep it while the
+            // retention window or a tag can still reach into it.
+            c.keep_old = c.full && !c.cut && file_v10_ &&
+                         (effective_keep_us() > 0 || !tags_.empty()) && fsio::exists(path_);
+            c.mark = make_mark(c.full, c.cut);
             if (c.full)                          write_full_v10(path_ + ".tmp", c);
             else if (!has_changes(salience))     c.skip = true;
             else                                 append_delta(c, salience);
@@ -3842,6 +4269,8 @@ private:
         try {
             if (c.full) {
                 close_data_fh();             // the inode it points at is being replaced
+                if (c.cut)           history_removed_ = drop_history_files();
+                else if (c.keep_old) keep_history_file();
                 publish_snapshot(path_ + ".tmp");
                 ++vacuums_;
             } else {
@@ -3874,6 +4303,14 @@ private:
         last_commit_bytes_ = c.bytes;
         last_commit_full_  = c.full;
         ++commits_;
+        // Every commit that wrote anything ended with its marker. Its tag ops
+        // were taken under save_mutex_, held since commit_begin(): all of the
+        // pending ones are in it.
+        note_mark(c.mark, c.full);
+        pending_tags_.clear();
+        keep_dirty_ = false;
+        if (c.cut) { history_cut_ = false; note_erasure(); }
+        if (c.full && !c.cut) prune_history();
     }
 
     // ── v10 load ─────────────────────────────────────────────────────
@@ -3908,6 +4345,11 @@ private:
         clock_loaded_  = false;
         idem_.clear();
         idem_order_.clear();
+        tags_.clear();
+        history_keep_us_ = -1;
+        last_mark_us_    = 0;
+        file_first_gen_  = 0;
+        file_first_us_   = 0;
     }
 
     // Returns false when the file is not v10, for the v2-v9 reader.
@@ -4058,6 +4500,12 @@ private:
                 case v10::SEC_SALIENCE: load_salience_section(r);                break;
                 case v10::SEC_VERSIONS: load_versions_section(r);                break;
                 case v10::SEC_IDEMPOTENCY: load_idempotency_section(r);          break;
+                case v10::SEC_COMMIT: {
+                    v10::CommitMark m = v10::decode_mark(r);
+                    // The first marker of a file is the oldest commit it holds.
+                    note_mark(m, /*starts_file=*/false);
+                    break;
+                }
                 default:
                     if (!(flags & v10::SEC_OPTIONAL))
                         throw std::runtime_error("'" + path_ + "' holds section type " +
@@ -4142,7 +4590,7 @@ private:
             // Room to grow in place: WAL replay and later commits add slots.
             const size_t reserve = static_cast<size_t>(
                 std::max<uint64_t>(uint64_t{count} * 4, uint64_t{count} + 65536) * stride);
-            auto mp = fsio::map_private(path_, data_off, static_cast<size_t>(data_len), reserve);
+            auto mp = fsio::map_private(base_path_.empty() ? path_ : base_path_, data_off, static_cast<size_t>(data_len), reserve);
             if (mp.base) {
                 ix.attachVectorMapping(mp.base, mp.bytes);
                 h.update(mp.base, static_cast<size_t>(data_len));   // shared page cache, not a copy
@@ -4530,6 +4978,13 @@ private:
     // reader checks the WALGEN generations chain onto the base it read, and
     // starts over when they do not.
     std::streamoff read_snapshot() {
+        if (as_of_) {
+            // A past commit: the WAL holds writes after the newest one.
+            read_base_file();
+            seed_version_clock();
+            wal_gen_ = generation_;
+            return -1;
+        }
         std::optional<std::tuple<uint64_t, std::optional<uint64_t>, std::optional<uint64_t>>> last;
         for (int attempt = 0;; ++attempt) {
             read_base_file();
@@ -4606,6 +5061,154 @@ private:
                                // this false and the destructor won't checkpoint
     }
 
+    // ── as_of: load a past commit ─────────────────────────────────────
+    // Every commit of the kept files and the live file, oldest first. A
+    // commit both a kept file and a newer one hold is taken from the newer.
+    struct Timeline {
+        struct Entry { size_t file; v10::CommitMark mark; };
+        std::vector<std::string> files;          // oldest first; the last is the live file
+        std::vector<Entry> commits;
+        std::map<std::string, uint64_t> tags;    // as the live file's newest commit has them
+        bool live_v10 = false;
+    };
+    static Timeline read_timeline(const std::string& path, std::istream* live, uint64_t live_size) {
+        Timeline tl;
+        auto add = [&](const std::string& file, v10::FileCommits& fc) {
+            tl.files.push_back(file);
+            for (auto& m : fc.marks)
+                if (tl.commits.empty() || m.gen > tl.commits.back().mark.gen)
+                    tl.commits.push_back({tl.files.size() - 1, m});
+        };
+        for (const auto& h : history_files(path)) {
+            std::ifstream a(h.path, std::ios::binary);
+            v10::FileCommits fc;
+            if (a && v10::read_file_commits(a, fsio::size_or_zero(h.path), fc)) add(h.path, fc);
+        }
+        v10::FileCommits fc;
+        std::ifstream own;
+        if (!live) {
+            own.open(path, std::ios::binary);
+            live      = own ? &own : nullptr;
+            live_size = fsio::size_or_zero(path);
+        }
+        if (live && v10::read_file_commits(*live, live_size, fc)) {
+            tl.live_v10 = true;
+            // Commits newer than the live file's first are only ever in it.
+            while (!tl.commits.empty() && !fc.marks.empty() && tl.commits.back().mark.gen >= fc.marks.front().gen)
+                tl.commits.pop_back();
+            for (const auto& m : fc.marks) v10::apply_tags(tl.tags, m);
+            add(path, fc);
+        }
+        return tl;
+    }
+
+    static std::string fmt_time_us(int64_t us) {
+        const std::time_t s = static_cast<std::time_t>(us / 1000000);
+        std::tm tm{};
+#if defined(_WIN32)
+        gmtime_s(&tm, &s);
+#else
+        gmtime_r(&s, &tm);
+#endif
+        char b[64];
+        std::strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tm);
+        char f[80];
+        std::snprintf(f, sizeof(f), "%s.%06lld UTC", b, static_cast<long long>(((us % 1000000) + 1000000) % 1000000));
+        return f;
+    }
+    static std::string describe_commit(const v10::CommitMark& m) {
+        return "generation " + std::to_string(m.gen) + " (" + fmt_time_us(m.time_us) + ")";
+    }
+
+    // The commit an as_of open loads, or invalid_argument saying exactly why
+    // there is none.
+    size_t resolve_as_of(const Timeline& tl, const AsOf& q) const {
+        static const char* kHint =
+            " History is kept by set_history_retention() (or FEATHER_HISTORY_KEEP_S) and by "
+            "tag(); without either, vacuum(), compact(), purge() and set_quantized() start a "
+            "new file, and erase() always deletes all history.";
+        const auto& cs = tl.commits;
+        if (cs.empty()) throw std::invalid_argument("as_of: '" + path_ + "' has no commits");
+        const std::string start = describe_commit(cs.front().mark);
+        uint64_t want = q.gen;
+        if (q.kind == AsOf::TAG) {
+            auto it = tl.tags.find(q.tag);
+            if (it == tl.tags.end()) {
+                std::string names;
+                for (const auto& [n, g] : tl.tags) names += (names.empty() ? "" : ", ") + n;
+                throw std::invalid_argument("as_of: no tag '" + q.tag + "' in '" + path_ + "'" +
+                                            (names.empty() ? std::string(" (it has none)") : "; tags: " + names));
+            }
+            want = it->second;
+        }
+        if (q.kind != AsOf::TIME) {
+            for (size_t i = 0; i < cs.size(); ++i)
+                if (cs[i].mark.gen == want) return i;
+            if (want > cs.back().mark.gen)
+                throw std::invalid_argument("as_of: generation " + std::to_string(want) +
+                    " does not exist; the newest is " + describe_commit(cs.back().mark));
+            if (want < cs.front().mark.gen)
+                throw std::invalid_argument("as_of: generation " + std::to_string(want) +
+                    " is older than the history of '" + path_ + "', which begins at " + start + "." + kHint);
+            throw std::invalid_argument("as_of: generation " + std::to_string(want) +
+                " was written by a build without history markers, so it cannot be located");
+        }
+        size_t i = cs.size();
+        while (i > 0 && cs[i - 1].mark.time_us > q.time_us) --i;
+        if (i == 0)
+            throw std::invalid_argument("as_of: " + fmt_time_us(q.time_us) + " is before the history of '" +
+                                        path_ + "', which begins at " + start + "." + kHint);
+        --i;
+        if (i + 1 < cs.size() && cs[i + 1].mark.gen > cs[i].mark.gen + 1)
+            throw std::invalid_argument("as_of: generations " + std::to_string(cs[i].mark.gen + 1) + "-" +
+                std::to_string(cs[i + 1].mark.gen - 1) + " were written by a build without history "
+                "markers, so the state at " + fmt_time_us(q.time_us) + " is unknown. The nearest known "
+                "commits are " + describe_commit(cs[i].mark) + " and " + describe_commit(cs[i + 1].mark));
+        return i;
+    }
+
+    void read_v10_prefix(std::ifstream& f, uint64_t size, const v10::CommitMark& m) {
+        reset_loaded_state();
+        try {
+            parse_v10(f, m.end, size);
+        } catch (const TornSection& e) {
+            throw std::runtime_error("corrupt .feather: commit " + std::to_string(m.gen) + " of '" +
+                                     base_path_ + "' is damaged (" + e.what() + ")");
+        }
+        generation_    = m.gen;
+        committed_end_ = m.end;
+        file_v10_      = true;
+        base_version_  = v10::VERSION;
+    }
+
+    void load_as_of(std::ifstream& f) {
+        f.clear();
+        f.seekg(0, std::ios::end);
+        const std::streamoff sz = f.tellg();
+        const uint64_t size = sz > 0 ? static_cast<uint64_t>(sz) : 0;
+        Timeline tl = read_timeline(path_, &f, size);
+        if (!tl.live_v10)
+            throw std::invalid_argument(
+                "as_of: '" + path_ + "' has no commit history: it is not a v10 file (written with "
+                "FEATHER_FORMAT=9, or by a build before 0.20). The first save by this build rewrites "
+                "it as v10, and its history starts there.");
+        const auto& e = tl.commits[resolve_as_of(tl, *as_of_)];
+        as_of_mark_   = e.mark;
+        pinned_clock_ = static_cast<double>(as_of_->kind == AsOf::TIME ? as_of_->time_us : e.mark.time_us) / 1e6;
+        if (e.file + 1 == tl.files.size()) {
+            read_v10_prefix(f, size, e.mark);
+            return;
+        }
+        const std::string& kept = tl.files[e.file];
+        fv_file_.reopen(kept);
+        std::ifstream a(kept, std::ios::binary);
+        if (!a)
+            throw std::invalid_argument("as_of: history file '" + kept + "' was removed while it was "
+                                        "being opened (the retention window moved past it)");
+        base_path_ = kept;
+        read_v10_prefix(a, fsio::size_or_zero(kept), e.mark);
+    }
+
     void read_base_file() {
         // FULLVEC offsets must point into the inode that is parsed, and a
         // writer's full rewrite may rename a new file over path_ at any time.
@@ -4620,8 +5223,14 @@ private:
             if (!f) break;
             same = fv_file_.same_file(path_);
         }
-        if (!f) { fv_file_.close(); return; }
+        base_path_ = path_;
+        if (!f) {
+            fv_file_.close();
+            if (as_of_) throw std::invalid_argument("as_of: no such file '" + path_ + "'");
+            return;
+        }
         if (!same) fv_file_.close();                        // re-rank falls back to int8
+        if (as_of_) { load_as_of(f); return; }
         if (read_v10(f, fsio::size_or_zero(path_))) return;
         fv_file_.close();                                   // v3-v9 hold no originals
         f.clear();
@@ -4774,6 +5383,63 @@ public:
 private:
     void ensure_open() const {
         if (closed_) throw HandleClosed("DB is closed: " + path_);
+        if (read_only_) check_not_erased();
+    }
+
+    // ── Erasures, as read-only handles see them ──────────────────────
+    // A read-only handle keeps its snapshot after the writer rewrites the
+    // file: the contract for an ordinary save, and wrong after an erasure,
+    // when the snapshot (and the replaced file it maps) holds what was
+    // erased. The writer counts its erasures in <path>.erasures; a read-only
+    // handle reads the count before it loads, and refuses every call once it
+    // has moved, checked at most every 50 ms (one small read).
+    std::string erasures_path() const { return path_ + ".erasures"; }
+
+    static uint64_t read_erasure_count(const std::string& p) {
+        std::ifstream f(p, std::ios::binary);
+        uint64_t n = 0;
+        return f && f.read(reinterpret_cast<char*>(&n), 8) ? n : 0;
+    }
+
+    void check_not_erased() const {
+        if (erased_since_open_.load(std::memory_order_relaxed)) throw_erased();
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t last = erasure_checked_ns_.load(std::memory_order_relaxed);
+        if (now - last < 50'000'000) return;
+        if (!erasure_checked_ns_.compare_exchange_strong(last, now)) return;   // another call checks
+        if (read_erasure_count(erasures_path()) != erasures_at_open_) {
+            erased_since_open_.store(true);
+            throw_erased();
+        }
+    }
+
+    [[noreturn]] void throw_erased() const {
+        throw SnapshotErased("records were erased from " + path_ + " after this read-only "
+                             "handle opened, and its snapshot still holds them: close it and "
+                             "open the file again");
+    }
+
+    // Writer: an erasure's rewrite is durable; tell the read-only handles.
+    // Best effort from a commit (close and ~DB must not throw); erase()
+    // reports a failure in its receipt.
+    void note_erasure() {
+        try {
+            const std::string p = erasures_path(), tmp = p + ".tmp";
+            const uint64_t n = read_erasure_count(p) + 1;
+            {
+                std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                f.write(reinterpret_cast<const char*>(&n), 8);
+                f.flush();
+                if (!f) throw std::runtime_error("cannot write " + tmp);
+            }
+            if (checkpoint_sync_enabled()) fsio::fsync_path(tmp);
+            fsio::atomic_replace(tmp, p);
+            erasure_notice_error_.clear();
+        } catch (const std::exception& e) {
+            erasure_notice_error_ = std::string("read-only handles were not told of the "
+                                                "erasure: ") + e.what();
+        }
     }
 
 public:
@@ -4781,8 +5447,13 @@ public:
     /// readers may hold the file at once; the default takes an EXCLUSIVE one and
     /// refuses if another process already has it. See the lock_path_ comment for
     /// why this is enforcement of single-writer rather than concurrent writing.
+    ///
+    /// `as_of` opens a past commit instead (read-only, no WAL, salience not
+    /// recorded, scoring's clock pinned to that time): see resolve_as_of().
     static std::unique_ptr<DB> open(const std::string& path, size_t default_dim = 768,
-                                    bool read_only = false) {
+                                    bool read_only = false,
+                                    std::optional<AsOf> as_of = std::nullopt) {
+        if (as_of) read_only = true;
         // Writer opens of one path take turns within the process. They always
         // did — the Python binding held the GIL across open() — and the load
         // depends on it: a writer's load cuts a torn WAL tail, repairs a header
@@ -4796,12 +5467,22 @@ public:
         db->wal_path_    = path + ".wal";
         db->default_dim_ = default_dim;
         db->read_only_   = read_only;
+        db->as_of_       = std::move(as_of);
         // Before load_vectors(), for two reasons: a refused handle should not
         // have parsed a 2 GB file first, and replay_wal() WRITES (it applies the
         // log and then clears it), so it must not run on a file another process
         // is mid-save on.
         db->acquire_lock(!read_only);
+        // Before the load: an erasure finishing during it moves the count,
+        // and the handle refuses rather than serve what it loaded.
+        if (read_only) db->erasures_at_open_ = read_erasure_count(db->erasures_path());
         db->load_vectors();
+        // An erasure the WAL logged and a crash kept from finishing: finish it
+        // (compact, rewrite) before the handle is used.
+        if (!read_only && (!db->erase_pending_.empty() || db->history_cut_)) db->vacuum();
+        // Kept history files outside the retention window, and any a crash
+        // left as a second name of the live file.
+        if (!read_only) db->prune_history();
         // Intentionally do NOT pre-create the "text" index. An empty HNSW index
         // preallocates ~70MB (1M-element link locks etc.); pre-creating it forced
         // set_int8_ram()/set_quantized() to build a *second* index, doubling RAM.
@@ -4938,9 +5619,34 @@ public:
         wal_wait_durable(lsn);   // group commit: fsync outside the data lock
     }
 
+    // A vector without metadata, as add(id, vec, modality=...) with no meta:
+    // a live record keeps its metadata, a new or forgotten id gets an empty
+    // one. Adding a second modality's vector used to replace the record's
+    // metadata with an empty one. The metadata applied is the one logged.
+    void add_vector(uint64_t id, const std::vector<float>& vec,
+                    const std::string& modality = "text") {
+        check_writable("add a record");
+        uint64_t lsn = 0;
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            check_dim_nolock(modality, vec.size());
+            const Metadata meta = live_meta_or_empty_nolock(id);
+            const std::string payload = encode_add(modality, vec, meta);
+            const uint64_t v = next_version_nolock();
+            WalPos at;
+            lsn = wal_append(WalOp::ADD, id, payload, &at, v);
+            apply_add_nolock(id, vec.data(), vec.size(), meta, modality, at);
+            stamp_nolock(id, v);
+            if (wal_strict()) wal_wait_durable(lsn);
+        }
+        wal_wait_durable(lsn);
+    }
+
     // Bulk insert. Same per-item semantics as add(), but the HNSW graph (the
     // expensive part) is built in PARALLEL, much faster for bulk ingestion.
-    // `metas` may be empty (default Metadata for all) or must match ids.size().
+    // `metas` may be empty (each id keeps its live record's metadata, as
+    // add_vector(); a new id gets an empty one) or must match ids.size().
     // The batch is applied in chunks (FEATHER_BATCH_CHUNK, default
     // max(64, 2 x cores)); readers may observe a partially-applied batch. The
     // call returns once the whole batch is durable (one fsync, not one per record).
@@ -4964,20 +5670,33 @@ public:
             ensure_open();
             check_dim_nolock(modality, dim);
         }
-        static const Metadata kDefault;
         const size_t chunk = batch_chunk();
         uint64_t last_lsn = 0;
 
         for (size_t s = 0; s < n; s += chunk) {
             const size_t e = std::min(n, s + chunk);
+            static const Metadata kEmpty;
             std::vector<std::string> payloads;
             payloads.reserve(e - s);
-            for (size_t i = s; i < e; ++i)
-                payloads.push_back(encode_add(modality, vecs[i], metas.empty() ? kDefault : metas[i]));
+            for (size_t i = s; i < e; ++i)                 // outside the lock
+                payloads.push_back(encode_add(modality, vecs[i], metas.empty() ? kEmpty : metas[i]));
 
             std::unique_lock<RWMutex> lock(mutex_);
             ensure_open();
             check_dim_nolock(modality, dim);
+            // No metadata given: an id that holds a live record keeps its
+            // metadata, re-encoded here; a new one (the bulk-load case) costs
+            // a lookup and stays as encoded above.
+            std::vector<Metadata> kept;
+            if (metas.empty()) {
+                kept.resize(e - s);
+                for (size_t i = s; i < e; ++i) {
+                    auto it = metadata_store_.find(ids[i]);
+                    if (it == metadata_store_.end() || is_dead_meta(it->second)) continue;
+                    kept[i - s] = it->second;
+                    payloads[i - s] = encode_add(modality, vecs[i], kept[i - s]);
+                }
+            }
             if (!metas.empty()) {
                 // Keys must stay unique, within the chunk as well as against
                 // the DB. (Chunks commit separately, as add_batch always has.)
@@ -5000,7 +5719,7 @@ public:
                 at[i - s].off = wal_vector_offset(at[i - s].off, modality);
             }
             for (size_t i = s; i < e; ++i) {
-                apply_meta_upsert_nolock(ids[i], metas.empty() ? kDefault : metas[i]);
+                apply_meta_upsert_nolock(ids[i], metas.empty() ? kept[i - s] : metas[i]);
                 log_compaction_add(modality, ids[i], vecs[i].data(), dim);
             }
             auto& m_idx = get_or_create_index(modality, dim);
@@ -5302,8 +6021,11 @@ public:
             auto sit = sim_scores.find(id);
             if (sit != sim_scores.end()) sim = sit->second;
 
-            // Score: similarity decays by hop, modulated by importance + stickiness
-            float stickiness = 1.0f + std::log(1.0f + static_cast<float>(meta.recalls()));
+            // Score: similarity decays by hop, modulated by importance + stickiness.
+            // Recalls counted as of now, as in scored search: use long past is
+            // not a reason to lead a chain today.
+            float stickiness = 1.0f + static_cast<float>(std::log(1.0 + Scorer::effective_recalls(
+                meta, clock_now())));
             float hop_decay  = 1.0f / (1.0f + static_cast<float>(hop));
             float base       = (hop == 0) ? sim : hop_decay;
             float score      = base * meta.importance * stickiness;
@@ -5434,6 +6156,38 @@ public:
         auto it = metadata_store_.find(id);
         if (it == metadata_store_.end() || (!include_dead && is_dead_meta(it->second))) return std::nullopt;
         return it->second;
+    }
+
+    // get_metadata for many ids, under one shared lock and, over the Cloud
+    // API, in one request. An agent loading its working set reads every record
+    // in scope: one call per record was one round trip per record remotely
+    // (282 ms for 500 on localhost; seconds over a real network).
+    // The modality's background cosine (see background_cosine_nolock): what
+    // scored search measures relevance from by default. 0 for an unknown
+    // modality or one with too few vectors to tell.
+    float background_cosine(const std::string& modality = "text") const {
+        std::shared_lock<RWMutex> lock(mutex_);
+
+        ensure_open();
+        auto it = modality_indices_.find(modality);
+        return it == modality_indices_.end() ? 0.0f : background_cosine_nolock(modality, it->second);
+    }
+
+    std::vector<std::optional<Metadata>> get_metadata_many(const std::vector<uint64_t>& ids,
+                                                           bool include_dead = false) const {
+        std::shared_lock<RWMutex> lock(mutex_);
+
+        ensure_open();
+        std::vector<std::optional<Metadata>> out;
+        out.reserve(ids.size());
+        for (uint64_t id : ids) {
+            auto it = metadata_store_.find(id);
+            if (it == metadata_store_.end() || (!include_dead && is_dead_meta(it->second)))
+                out.emplace_back(std::nullopt);
+            else
+                out.emplace_back(it->second);
+        }
+        return out;
     }
 
 private:
@@ -5758,6 +6512,23 @@ public:
         return it->second;
     }
 
+    // Many keys under one lock: (namespace, key) pairs -> ids (nullopt: no
+    // live record). One request over the Cloud API, where id_for per key is
+    // one round trip each.
+    std::vector<std::optional<uint64_t>> ids_for_many(
+            const std::vector<std::pair<std::string, std::string>>& refs) const {
+        std::shared_lock<RWMutex> lock(mutex_);
+        ensure_open();
+        std::vector<std::optional<uint64_t>> out;
+        out.reserve(refs.size());
+        for (const auto& [ns, key] : refs) {
+            auto it = key_index_.find(key_ref(ns, key));
+            if (it == key_index_.end()) out.push_back(std::nullopt);
+            else out.push_back(it->second);
+        }
+        return out;
+    }
+
     std::optional<Metadata> get_by_key(const std::string& key, const std::string& ns = "") const {
         std::shared_lock<RWMutex> lock(mutex_);
         ensure_open();
@@ -6011,6 +6782,81 @@ public:
         return {it->second.begin(), it->second.end()};
     }
 
+    // Pocket.hot() (feather_db/pocket.py, which is the specification; see
+    // heat.h): the records of q.namespaces (deepest first) an agent should
+    // carry, by heat, within q.budget tokens. Per key the nearest record
+    // wins, unless a further one is trusted and it is not. Ranked by heat
+    // (stable: ties keep first-sighting order), then filled greedily: an
+    // item that does not fit is skipped, not the end, and the walk stops at
+    // min_heat. Returns the picks in rank order. O(records in scope), but no
+    // object per record leaves the engine: 43 ms -> ~1 ms at 10k in Python.
+    std::vector<HeatPick> heat_select(const HeatQuery& q) const {
+        std::shared_lock<RWMutex> lock(mutex_);
+
+        ensure_open();
+        struct Cand { uint64_t id; uint32_t depth; double heat; bool trusted;
+                      const Metadata* m; };
+        std::vector<Cand> scored;
+        // Keys as views into the records (stable under the lock); an id
+        // standing in for a missing key is kept in `spelled`.
+        std::unordered_map<std::string_view, size_t> at;
+        std::deque<std::string> spelled;
+        for (uint32_t d = 0; d < q.namespaces.size(); ++d) {
+            auto nit = ns_index_.find(q.namespaces[d]);
+            if (nit == ns_index_.end()) continue;
+            scored.reserve(scored.size() + nit->second.size());
+            at.reserve(at.size() + nit->second.size());
+            const double inherit_weight = std::pow(q.inherit_decay, static_cast<double>(d));
+            for (uint64_t id : nit->second) {           // ids_in_namespace's order
+                auto it = metadata_store_.find(id);
+                if (it == metadata_store_.end() || is_dead_meta(it->second)) continue;
+                const Metadata& m = it->second;
+                if (q.exclude_sources.count(m.source)) continue;
+                std::string_view key;
+                if (!m.key.empty()) key = m.key;
+                else if (!m.entity_id.empty()) key = m.entity_id;
+                else key = spelled.emplace_back(std::to_string(id));
+                const std::string* o = heat::attr(m, q.origin_attr);
+                const std::string& origin =
+                    (!o || o->empty()) ? q.default_origin
+                    : std::find(q.origins.begin(), q.origins.end(), *o) != q.origins.end()
+                        ? *o : q.unknown_origin;
+                const bool trusted = q.trusted.count(origin) > 0;
+                auto ait = at.find(key);
+                if (ait != at.end() && !(trusted && !scored[ait->second].trusted)) continue;
+                Cand c{id, d, heat::heat_of(m, q, trusted, inherit_weight), trusted, &m};
+                if (ait != at.end()) scored[ait->second] = c;
+                else { at.emplace(key, scored.size()); scored.push_back(c); }
+            }
+        }
+        // Rank order is heat descending, ties in first-sighting order (a
+        // stable sort). What is below min_heat ends the walk, so it is never
+        // ranked; the rest come off a heap only as far as the walk goes.
+        std::vector<uint32_t> rank;
+        rank.reserve(scored.size());
+        for (uint32_t i = 0; i < scored.size(); ++i)
+            if (!(scored[i].heat < q.min_heat)) rank.push_back(i);
+        const auto after = [&scored](uint32_t a, uint32_t b) {   // a ranks after b
+            return scored[a].heat < scored[b].heat ||
+                   (!(scored[b].heat < scored[a].heat) && a > b);
+        };
+        std::make_heap(rank.begin(), rank.end(), after);
+        std::vector<HeatPick> out;
+        double spent = 0.0;
+        const int64_t cpt = q.chars_per_token > 0 ? q.chars_per_token : 1;
+        for (auto end = rank.end(); end != rank.begin(); --end) {
+            std::pop_heap(rank.begin(), end, after);
+            const Cand& c = scored[*(end - 1)];
+            if (spent + 1.0 > q.budget) break;      // nothing more can fit
+            const int64_t chars = heat::display_chars(*c.m, q.text_attr);
+            const int64_t tokens = std::max<int64_t>(1, chars / cpt);
+            if (spent + static_cast<double>(tokens) > q.budget) continue;
+            out.push_back({c.id, c.depth, c.heat, tokens});
+            spent += static_cast<double>(tokens);
+        }
+        return out;
+    }
+
     std::vector<uint64_t> ids_for_entity(const std::string& eid) const {
         std::shared_lock<RWMutex> lock(mutex_);
 
@@ -6073,8 +6919,9 @@ public:
         float    score;
         Metadata metadata;
         // Exact cosine(query, stored vector) when search(..., with_cosine=true);
-        // NaN otherwise. `score` is a ranking value (1/(1+L2^2), optionally
-        // decay-weighted), not a similarity you can threshold.
+        // NaN otherwise. `score` is a ranking value: 1/(1+L2^2), or with
+        // scoring= cosine x freshness x importance (scoring.h). Neither is a
+        // similarity you can threshold.
         float    cosine = std::numeric_limits<float>::quiet_NaN();
     };
 
@@ -6184,6 +7031,158 @@ private:
         }
     }
 
+    // What scoring= ranks by: the cosine of a candidate whose squared L2
+    // distance to the query is `dist2`. |x|^2 comes from the stored vector
+    // through the same kernel as the distance (an int8 row dequantized), so
+    // one extra pass per candidate, and only for scored queries. A refined
+    // int8 distance is against the float original while |x|^2 is the int8
+    // row's: off by the quantization error, ~1e-3 in cosine.
+    struct CosineOf {
+        // Unit length within this, for the pool bound below (int8 rows
+        // dequantize to within ~1e-3 of their original length).
+        static constexpr double UNIT_TOL = 0.05;
+        const ModalityIndex& m;
+        double qq = 0.0;
+        float floor = 0.0f;                // resolved relevance floor (scoring.h)
+        mutable double max_dev = 0.0;      // largest | |x|^2 - 1 | seen
+        std::vector<float> zeros;
+        CosineOf(const ModalityIndex& mi, const std::vector<float>& q, float relevance_floor)
+            : m(mi), floor(relevance_floor), zeros(mi.dim, 0.0f) {
+            for (float x : q) qq += static_cast<double>(x) * x;
+        }
+        float score(float dist2, uint64_t id, const Metadata& meta,
+                    const ScoringConfig& cfg, double now_ts) const {
+            return Scorer::calculate_score((*this)(dist2, id), meta, cfg, now_ts, floor);
+        }
+        float operator()(float dist2, uint64_t id) const {
+            const auto& idx = *m.index;
+            auto lit = idx.label_lookup_.find(id);
+            if (lit == idx.label_lookup_.end()) return 0.0f;
+            const char* data = idx.getDataByInternalId(lit->second);
+            const float xx = m.int8
+                ? feather_simd::f32_i8_l2_fn()(zeros.data(),
+                      reinterpret_cast<const int8_t*>(data), m.scale, m.dim)
+                : feather_simd::l2_fn()(zeros.data(),
+                      reinterpret_cast<const float*>(data), m.dim);
+            max_dev = std::max(max_dev, std::fabs(static_cast<double>(xx) - 1.0));
+            return Scorer::cosine_from_l2(dist2, qq, xx);
+        }
+        // Query and every vector seen are unit length: L2 order is cosine order.
+        bool near_unit() const {
+            return std::fabs(qq - 1.0) <= UNIT_TOL && max_dev <= UNIT_TOL;
+        }
+        // The largest cosine a vector of near-unit length can have at squared
+        // distance >= d2 from the query: cos = (|q|^2 + |x|^2 - d2) / (2|q||x|),
+        // numerator at its largest |x|^2 and denominator at its smallest (or the
+        // reverse, when the numerator is negative).
+        float bound_beyond(float d2) const {
+            const double e = max_dev + 1e-3;
+            const double num = qq + 1.0 + e - static_cast<double>(d2);
+            const double c = num > 0.0 ? num / (2.0 * std::sqrt(qq * std::max(1e-9, 1.0 - e)))
+                                       : num / (2.0 * std::sqrt(qq * (1.0 + e)));
+            return static_cast<float>(std::min(1.0, c));
+        }
+    };
+
+    // Scored search over a graph re-scores the records nearest the query. A
+    // fixed pool of 3k missed what the score promotes: on LongMemEval
+    // knowledge-update (3072-d, k=10) the scored top-k held 0.92 of the exact
+    // one on average and 0.40 at worst. So `fetch(n)` (the n nearest as
+    // (dist2, id)) is called with a pool that doubles until no record outside
+    // it can beat the k-th score: each is at least as far as the farthest
+    // fetched, so its cosine is at most bound_beyond(that distance), its
+    // freshness at most 1, its importance at most the larger of 1 (the
+    // documented range) and the largest seen. Measured, that took a pool of
+    // p50 120 / max 240 for k=10 over 38k records. Exact relative to the
+    // index for unit-length vectors; for others L2 order is not cosine order,
+    // and the first pool is kept, as before.
+    template <class Fetch>
+    std::vector<std::pair<float, uint64_t>> scored_pool_nolock(
+            size_t k, size_t pool, size_t limit, const CosineOf& cosine,
+            const ScoringConfig& cfg, double now_ts, Fetch&& fetch) const {
+        static const Metadata kNone;
+        std::vector<float> scores;
+        for (;;) {
+            auto dists = fetch(pool);
+            if (k == 0 || dists.size() < pool || pool >= limit) return dists;
+            float far = 0.0f, imp = 1.0f;
+            scores.clear();
+            for (const auto& [d, id] : dists) {
+                far = std::max(far, d);
+                auto it = metadata_store_.find(id);
+                const Metadata& m = it != metadata_store_.end() ? it->second : kNone;
+                imp = std::max(imp, m.importance);
+                scores.push_back(cosine.score(d, id, m, cfg, now_ts));
+            }
+            if (!cosine.near_unit()) return dists;
+            const size_t kk = std::min(k, scores.size());
+            std::nth_element(scores.begin(), scores.begin() + (kk - 1), scores.end(),
+                             std::greater<float>());
+            const float rel = Scorer::relevance(cosine.bound_beyond(far), cosine.floor);
+            if (scores[kk - 1] >= (rel > 0.0f ? rel * imp : rel)) return dists;
+            pool = std::min(limit, pool * 2);
+        }
+    }
+
+    static constexpr size_t BACKGROUND_PAIRS = 1024;   // sampled per estimate
+    static constexpr size_t BACKGROUND_MIN   = 64;     // live vectors to estimate from
+
+    // The cosine two unrelated vectors of this modality typically have: the
+    // median over random pairs of live vectors. It is the embedding model's
+    // floor (gemini-embedding-001: 0.51), and scoring measures relevance from
+    // it. Cached; re-estimated once the live count has doubled or halved.
+    // Deterministic for a given count. 0 below BACKGROUND_MIN live vectors.
+    // Caller holds mutex_ (shared or exclusive).
+    float background_cosine_nolock(const std::string& modality, const ModalityIndex& m) const {
+        auto& idx = *m.index;
+        const size_t n = idx.getCurrentElementCount();
+        const size_t live = n - std::min(n, idx.getDeletedCount());
+        {
+            std::lock_guard<std::mutex> g(background_mx_);
+            auto it = background_.find(modality);
+            if (it != background_.end() && live <= 2 * it->second.second &&
+                2 * live >= it->second.second)
+                return it->second.first;
+        }
+        float est = 0.0f;
+        if (live >= BACKGROUND_MIN) {
+            std::mt19937_64 rng(0x9E3779B97F4A7C15ull ^ n);
+            const std::vector<float> zeros(m.dim, 0.0f);
+            const auto dist = m.space->get_dist_func();
+            void* param = m.space->get_dist_func_param();
+            auto norm2 = [&](const char* x) -> double {
+                return m.int8 ? feather_simd::f32_i8_l2_fn()(zeros.data(),
+                                    reinterpret_cast<const int8_t*>(x), m.scale, m.dim)
+                              : feather_simd::l2_fn()(zeros.data(),
+                                    reinterpret_cast<const float*>(x), m.dim);
+            };
+            std::vector<float> cs;
+            cs.reserve(BACKGROUND_PAIRS);
+            for (size_t t = 0; t < 4 * BACKGROUND_PAIRS && cs.size() < BACKGROUND_PAIRS; ++t) {
+                const size_t i = rng() % n, j = rng() % n;
+                if (i == j || idx.isMarkedDeleted(i) || idx.isMarkedDeleted(j)) continue;
+                const char* a = idx.getDataByInternalId(i);
+                const char* b = idx.getDataByInternalId(j);
+                cs.push_back(Scorer::cosine_from_l2(dist(a, b, param), norm2(a), norm2(b)));
+            }
+            if (cs.size() >= BACKGROUND_MIN) {
+                std::nth_element(cs.begin(), cs.begin() + cs.size() / 2, cs.end());
+                est = std::clamp(cs[cs.size() / 2], 0.0f, 0.95f);
+            }
+        }
+        std::lock_guard<std::mutex> g(background_mx_);
+        background_[modality] = {est, live};
+        return est;
+    }
+
+    // ScoringConfig::relevance_floor, resolved: < 0 is this modality's
+    // background cosine, anything else is used as given (clamped to [0, 0.95]).
+    float relevance_floor_nolock(const ScoringConfig& cfg, const std::string& modality,
+                                 const ModalityIndex& m) const {
+        if (cfg.relevance_floor < 0.0f) return background_cosine_nolock(modality, m);
+        return std::clamp(cfg.relevance_floor, 0.0f, 0.95f);
+    }
+
 public:
 
     // `record_salience` controls whether this query counts as a recall for the
@@ -6208,10 +7207,12 @@ public:
         auto& m_idx = m_it->second;
         check_query_dim(m_idx, q.size(), modality);
 
-        const double now_ts = static_cast<double>(std::time(nullptr));
+        const double now_ts = clock_now();
         static const Metadata kNoMeta;
-        auto score_of = [&](float dist, const Metadata& meta) {
-            return scoring ? Scorer::calculate_score(dist, meta, *scoring, now_ts)
+        std::optional<CosineOf> cosine_of;
+        if (scoring) cosine_of.emplace(m_idx, q, relevance_floor_nolock(*scoring, modality, m_idx));
+        auto score_of = [&](float dist, uint64_t id, const Metadata& meta) {
+            return scoring ? cosine_of->score(dist, id, meta, *scoring, now_ts)
                            : 1.0f / (1.0f + dist);
         };
         // Rank on (score, id) only; copy metadata for the k winners alone. The
@@ -6262,14 +7263,21 @@ public:
         const size_t refine = (m_idx.int8 && m_idx.refine) ? m_idx.refine : 0;
 
         // Graph traversal, optionally with a per-call ef. Returns (score, id).
+        // The pool a scored walk may widen to (scored_pool_nolock).
+        const size_t pool_limit = std::max(want, PREFILTER_MAX_EF);
         auto hnsw = [&](const SearchFilter* f, size_t ef_override) {
             FilterWrapper fw(f, metadata_store_);
-            const auto dists = knn_nolock(m_idx, q.data(), qbytes, want, ef_override, f ? &fw : nullptr);
+            auto fetch = [&](size_t n) {
+                return knn_nolock(m_idx, q.data(), qbytes, n, ef_override, f ? &fw : nullptr);
+            };
+            const auto dists = scoring
+                ? scored_pool_nolock(k, want, pool_limit, *cosine_of, *scoring, now_ts, fetch)
+                : fetch(want);
             std::vector<std::pair<float, uint64_t>> scored;
             scored.reserve(dists.size());
             for (const auto& [dist, id] : dists) {
                 auto it = metadata_store_.find(id);
-                scored.push_back({score_of(dist, it != metadata_store_.end() ? it->second : kNoMeta), id});
+                scored.push_back({score_of(dist, id, it != metadata_store_.end() ? it->second : kNoMeta), id});
             }
             return scored;
         };
@@ -6302,7 +7310,15 @@ public:
             const bool sized_only = graphs_fit && namespace_only(*filter);
             bool indexed = sized_only;
             std::vector<uint64_t> cand;
-            if (!sized_only) cand = candidates_for_filter(*filter, indexed);
+            if (!sized_only) {
+                // A window over every namespace is a candidate set only while
+                // the cost model would scan it: c * (c / live)^2 <= C * want.
+                const double live = static_cast<double>(m_idx.index->getCurrentElementCount() -
+                                                        m_idx.index->getDeletedCount());
+                const size_t max_window = std::max<size_t>(2000, static_cast<size_t>(
+                    std::cbrt(prefilter_c() * static_cast<double>(want) * live * live)));
+                cand = candidates_for_filter(*filter, indexed, max_window);
+            }
             const bool use_graphs = sized_only || (graphs_fit && cand.size() >= ns_ann_min());
             if (indexed) {
                 const size_t live = m_idx.index->getCurrentElementCount() -
@@ -6366,12 +7382,28 @@ public:
                             // Membership is exact (marks), so a filter that only
                             // names namespaces needs no per-node callback.
                             NsFilter nf(filter, ns, metadata_store_);
-                            auto res = g->index->searchKnnEf(&qref, kk, ef,
-                                                             namespace_only(*filter) ? nullptr : &nf);
+                            auto walk = [&](size_t n) {
+                                auto res = g->index->searchKnnEf(&qref, n, std::max(ef, n),
+                                                                 namespace_only(*filter) ? nullptr : &nf);
+                                std::vector<std::pair<float, uint64_t>> out;
+                                out.reserve(res.size());
+                                for (; !res.empty(); res.pop())
+                                    out.emplace_back(res.top().first, res.top().second);
+                                return out;
+                            };
+                            // Scored: widened like the global walk. Checking each
+                            // namespace against k is enough, since the overall k-th
+                            // score is at least this namespace's.
+                            auto res = scoring
+                                ? scored_pool_nolock(refine ? k * refine : k, kk,
+                                                     std::min(pool_limit * (refine ? refine : 1),
+                                                              members.size()),
+                                                     *cosine_of, *scoring, now_ts, walk)
+                                : walk(kk);
                             // Short: the other predicates leave too few in this
                             // namespace for a walk to find. Scan it instead.
                             if (res.size() >= std::min(kk, members.size())) {
-                                for (; !res.empty(); res.pop()) scored.push_back(res.top());
+                                scored.insert(scored.end(), res.begin(), res.end());
                                 continue;
                             }
                         } else if (members.size() >= ns_ann_min()) {
@@ -6385,7 +7417,7 @@ public:
                 }
                 // The nearest want x refine on their exact distance, then scores.
                 if (refine) refine_nolock(m_idx, q.data(), scored, want * refine);
-                for (auto& [dist, id] : scored) dist = score_of(dist, metadata_store_.find(id)->second);
+                for (auto& [dist, id] : scored) dist = score_of(dist, id, metadata_store_.find(id)->second);
                 return finish(scored);
             }
         }
@@ -6534,13 +7566,17 @@ private:
     }
 
 public:
+    // `record_salience`: as for search(). A caller that fetches more than it
+    // will use (Pocket.recall over-fetches, then touches what it returns)
+    // passes false so the extras are not counted as recalls.
     std::vector<SearchResult> keyword_search(const std::string& query, size_t k = 10,
-                                             const SearchFilter* filter = nullptr) {
+                                             const SearchFilter* filter = nullptr,
+                                             bool record_salience = true) {
         ensure_bm25();
         std::shared_lock<RWMutex> lock(mutex_);
 
         ensure_open();
-        return to_results_nolock(bm25_top_nolock(query, k, filter), /*record_hit=*/true);
+        return to_results_nolock(bm25_top_nolock(query, k, filter), record_salience);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -6586,16 +7622,27 @@ public:
                 } fw(filter, metadata_store_);
                 size_t cands = scoring ? candidates * 3 : candidates;
                 auto qbytes = encode_query(m_idx, vec.data());
-                const auto res = knn_nolock(m_idx, vec.data(), qbytes, cands, 0, filter ? &fw : nullptr);
-                const double now_ts = static_cast<double>(std::time(nullptr));
+                const double now_ts = clock_now();
                 static const Metadata kNoMeta;
+                std::optional<CosineOf> cosine_of;
+                if (scoring) cosine_of.emplace(m_idx, vec,
+                                               relevance_floor_nolock(*scoring, modality, m_idx));
+                auto fetch = [&](size_t n) {
+                    return knn_nolock(m_idx, vec.data(), qbytes, n, 0, filter ? &fw : nullptr);
+                };
+                // Scored: the vector half's top `candidates` by score, widened
+                // until nothing beyond the pool could enter it (scored_pool_nolock).
+                const auto res = scoring
+                    ? scored_pool_nolock(candidates, cands, std::max(cands, PREFILTER_MAX_EF),
+                                         *cosine_of, *scoring, now_ts, fetch)
+                    : fetch(cands);
                 vec_ranked.reserve(res.size());
                 for (const auto& [dist, id] : res) {
                     float score;
                     if (scoring) {
                         auto it = metadata_store_.find(id);
-                        score = Scorer::calculate_score(
-                            dist, it != metadata_store_.end() ? it->second : kNoMeta,
+                        score = cosine_of->score(
+                            dist, id, it != metadata_store_.end() ? it->second : kNoMeta,
                             *scoring, now_ts);
                     } else {
                         score = 1.0f / (1.0f + dist);
@@ -6708,7 +7755,16 @@ private:
         for (const auto& [id, meta] : metadata_store_)
             if (meta.namespace_id == ns_id) to_purge.insert(id);
         if (to_purge.empty()) return 0;
+        hard_delete_nolock(to_purge, maintain_derived, version_base);
+        return to_purge.size();
+    }
 
+    // Hard-delete `to_purge`: metadata, index entries, and every edge into
+    // them; their graph nodes are marked deleted (a compaction drops them).
+    // Shared by purge(), erase() and the replay of both.
+    void hard_delete_nolock(const std::unordered_set<uint64_t>& to_purge, bool maintain_derived,
+                            uint64_t version_base) {
+        if (to_purge.empty()) return;
         for (auto& [name, m_idx] : modality_indices_)
             for (uint64_t id : to_purge) {
                 try { m_idx.index->markDelete(id); } catch (...) {}
@@ -6744,7 +7800,6 @@ private:
         std::sort(changed.begin(), changed.end());
         for (size_t k = 0; k < changed.size(); ++k)
             stamp_nolock(changed[k], version_base ? version_base + 1 + k : 0);
-        return to_purge.size();
     }
 
 public:
@@ -6798,6 +7853,404 @@ public:
         return n;
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // erase(): an erasure that leaves nothing behind (GDPR art. 17)
+    // ─────────────────────────────────────────────────────────────────
+    // forget() is not one. It clears a record's content, but the bytes it had
+    // stay in the file until a vacuum, its vector stays in the graph as a
+    // deleted node until a compaction (a vacuum writes deleted nodes too), the
+    // WAL holds everything written since the last save, and a summary or
+    // observation made from the record is untouched.
+    //
+    // erase() removes the records a request names, and every record derived
+    // from or citing them (by the edge kinds in `cites` and `feeds`,
+    // transitively); prunes survivors' edges into them; takes every deleted
+    // node out of the graph with its vector (scrubDeleted: a local repair,
+    // not a rebuild); rewrites the file, so no superseded byte survives; and
+    // rotates the WAL away. It returns a receipt of what was
+    // erased and what the storage now holds. The whole of it holds off every
+    // checkpoint (erase_mutex_), and a crash part-way is finished by the next
+    // writer open (WalOp::ERASE). Matching scans every record, the forgotten
+    // ones included: their graph nodes hold vectors too.
+    // Selects the records `ids` names, plus every record whose namespace AND
+    // entity match those given (either may be left empty, not both).
+    struct EraseRequest {
+        std::vector<uint64_t> ids;
+        std::string namespace_id;             // "" = any namespace
+        bool        namespace_prefix = false; // ...and every dotted child of it
+        std::string entity_id;                // "" = any entity
+        // A record with an edge of one of these kinds INTO an erased record
+        // was derived from it or cites it, and is erased too.
+        std::vector<std::string> cites = default_erase_cites();
+        // An erased record's edge of one of these kinds points at a record
+        // made from it (a summary), which is erased too.
+        std::vector<std::string> feeds = default_erase_feeds();
+        bool dry_run = false;                 // plan only: change nothing
+    };
+    static std::vector<std::string> default_erase_cites() {
+        return {"derived_from", "extracted_from", "cites", "references", "refers_to",
+                "part_of", "multimodal_of", "summarizes", "quotes"};
+    }
+    static std::vector<std::string> default_erase_feeds() {
+        // registered_in: an index record -> its key's registry entry
+        // (feather_db.pocket): a key can name the person the data is about.
+        return {"consolidated_into", "summarized_in", "registered_in"};
+    }
+    // What erase() does not reach, stated on every receipt.
+    static std::vector<std::string> erase_residuals() {
+        return {
+            "read-only handles opened before the erasure refuse every call once they "
+            "see it (checked every 50 ms), but keep the replaced file's disk blocks "
+            "allocated until they close",
+            "storage below the file system (freed blocks, SSD remapping, copy-on-write "
+            "snapshots, backups) is outside any database: encrypt the volume and bound "
+            "backup retention",
+            "embedding caches in other processes hold vectors keyed by a SHA-256 of the "
+            "text, never the text, until evicted (the erasing process clears its own)",
+        };
+    }
+    struct ErasedVia  { uint64_t id; uint64_t via; std::string rel; };
+    struct PrunedEdge { uint64_t from; uint64_t to; std::string rel; };
+    struct EraseReceipt {
+        std::string  receipt_id;
+        int64_t      completed_at = 0;           // unix seconds
+        bool         dry_run = false;
+        EraseRequest request;
+        std::vector<uint64_t>   matched;         // named by the request
+        std::vector<uint64_t>   not_found;       // ids named that hold no record
+        std::vector<ErasedVia>  derived;         // derived from / citing an erased record
+        std::vector<PrunedEdge> pruned_edges;    // survivors' edges into erased records
+        uint64_t graph_nodes_removed = 0;        // deleted nodes taken out of the graph, vectors
+                                                 //   zeroed (any record's, earlier forgets too)
+        uint64_t generation = 0;                 // the rewritten file's commit generation
+        bool     full_rewrite = false;
+        uint64_t file_bytes_before = 0, file_bytes_after = 0;
+        uint64_t wal_bytes_after = 0;
+        uint64_t history_files_removed = 0;      // kept files deleted (as_of cannot reach back past an erase)
+        bool     verified = false;               // every check below passed
+        std::vector<std::string> problems;
+        size_t erased() const { return matched.size() + derived.size(); }
+    };
+
+    EraseReceipt erase(const EraseRequest& rq) {
+        if (rq.ids.empty() && rq.namespace_id.empty() && rq.entity_id.empty())
+            throw std::invalid_argument(
+                "erase() needs ids, a namespace or an entity; it will not match every record");
+        EraseReceipt r;
+        r.receipt_id = random_receipt_id();
+        r.dry_run    = rq.dry_run;
+        r.request    = rq;
+        if (rq.dry_run) {
+            std::shared_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            erase_plan_nolock(rq, r);
+            r.completed_at = static_cast<int64_t>(std::time(nullptr));
+            return r;
+        }
+        check_writable("erase records");
+        std::lock_guard<std::mutex> gate(erase_mutex_);
+        // No compaction may run from here to the scrub: one built from a
+        // snapshot taken before the erasure would swap the erased vectors
+        // back in. Waits out one already running.
+        std::unique_lock<std::mutex> no_compaction(compact_run_mx_);
+        std::unordered_set<uint64_t> gone;
+        uint64_t lsn = 0;
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            r.file_bytes_before = file_v10_ ? committed_end_ : fsio::size_or_zero(path_);
+            erase_plan_nolock(rq, r);
+            for (uint64_t id : r.matched) gone.insert(id);
+            for (const auto& d : r.derived) gone.insert(d.id);
+            // History goes whatever matched now: a record purged last week can
+            // still be in a kept file, or in this file's earlier commits. The
+            // ERASE record is logged even when empty, so a crash before the
+            // rewrite still deletes the history on the next open.
+            if (gone.empty()) {
+                std::string payload;
+                v10::put<uint32_t>(payload, 0);
+                v10::put<uint64_t>(payload, version_clock_);
+                std::vector<WalRec> recs{{WalOp::ERASE, 0, &payload}};
+                lsn = wal_append_group(recs);
+                if (wal_strict()) wal_wait_durable(lsn);
+            } else {
+                std::vector<uint64_t> ids(gone.begin(), gone.end());
+                std::sort(ids.begin(), ids.end());
+                const uint64_t base = version_clock_;
+                std::string payload;
+                v10::put<uint32_t>(payload, static_cast<uint32_t>(ids.size()));
+                for (uint64_t id : ids) v10::put<uint64_t>(payload, id);
+                v10::put<uint64_t>(payload, base);
+                static const std::string none;
+                std::vector<WalRec> recs;
+                recs.reserve(ids.size() + 1);
+                // A FORGET per record first, as purge() does: a build without
+                // WalOp::ERASE skips it, and still replays these.
+                for (uint64_t id : ids) recs.push_back({WalOp::FORGET, id, &none});
+                recs.push_back({WalOp::ERASE, 0, &payload});
+                lsn = wal_append_group(recs);
+                hard_delete_nolock(gone, /*maintain_derived=*/true, base);
+                erase_pending_.insert(gone.begin(), gone.end());
+                if (wal_strict()) wal_wait_durable(lsn);
+            }
+            history_cut_ = true;                 // after logging: a failed append changes nothing
+        }
+        wal_wait_durable(lsn);
+        if (fsio::erase_halts_after_log().load())
+            throw std::runtime_error("erase(): halted after logging (test hook)");
+
+        // Every deleted node leaves the graph, this erasure's and the residue
+        // of earlier forgets: a deleted node keeps its vector, and a rewrite
+        // writes the node. Local repair, not a rebuild (scrubDeleted).
+        {
+            std::unique_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            r.graph_nodes_removed = scrub_deleted_nolock();
+            erase_pending_.clear();
+        }
+        no_compaction.unlock();
+        erasure_notice_error_.clear();
+        checkpoint_gated(/*force_full=*/true);   // superseded bytes and the WAL go
+        if (legacy_format_requested()) note_erasure();   // a v9 save has no cut
+        if (!erasure_notice_error_.empty()) r.problems.push_back(erasure_notice_error_);
+
+        {
+            std::shared_lock<RWMutex> lock(mutex_);
+            ensure_open();
+            std::vector<uint64_t> ids(gone.begin(), gone.end());
+            std::sort(ids.begin(), ids.end());
+            for (uint64_t id : ids) {
+                if (metadata_store_.count(id))
+                    r.problems.push_back("record " + std::to_string(id) +
+                                         " was written again after it was erased");
+                else if (holds_deleted_node_nolock(id))
+                    r.problems.push_back("record " + std::to_string(id) +
+                                         " still holds a graph node");
+            }
+            if (const size_t left = unscrubbed_deleted_nolock())
+                r.problems.push_back(std::to_string(left) +
+                                     " deleted graph node(s) still hold a vector");
+            r.generation       = generation_;
+            r.full_rewrite     = last_commit_full_ || legacy_format_requested();
+            r.file_bytes_after = file_v10_ ? committed_end_ : fsio::size_or_zero(path_);
+        }
+        if (!r.full_rewrite) r.problems.push_back("the file was not rewritten in full");
+        {
+            std::lock_guard<std::mutex> g(save_mutex_);
+            r.history_files_removed = history_removed_;
+            history_removed_ = 0;
+        }
+        if (!fsio::list_dir(history_dir()).empty())
+            r.problems.push_back("history files remain under " + history_dir());
+        r.wal_bytes_after = wal_size();
+        r.verified        = r.problems.empty();
+        r.completed_at    = static_cast<int64_t>(std::time(nullptr));
+        return r;
+    }
+
+    // The receipt as JSON: for the C ABI and anything that logs it.
+    static std::string erase_receipt_json(const EraseReceipt& r) {
+        std::string o = "{";
+        auto key = [&](const char* k) { if (o.size() > 1) o += ','; o += '"'; o += k; o += "\":"; };
+        auto ids = [&](const std::vector<uint64_t>& v) {
+            o += '[';
+            for (size_t i = 0; i < v.size(); ++i) { if (i) o += ','; o += std::to_string(v[i]); }
+            o += ']';
+        };
+        auto strs = [&](const std::vector<std::string>& v) {
+            o += '[';
+            for (size_t i = 0; i < v.size(); ++i) { if (i) o += ','; o += json_quote(v[i]); }
+            o += ']';
+        };
+        key("receipt_id");   o += json_quote(r.receipt_id);
+        key("completed_at"); o += std::to_string(r.completed_at);
+        key("dry_run");      o += r.dry_run ? "true" : "false";
+        key("request");
+        {
+            std::string q = "{\"ids\":";
+            std::swap(o, q); ids(r.request.ids); std::swap(o, q);
+            q += ",\"namespace\":" + json_quote(r.request.namespace_id);
+            q += std::string(",\"prefix\":") + (r.request.namespace_prefix ? "true" : "false");
+            q += ",\"entity\":" + json_quote(r.request.entity_id) + ",\"cites\":";
+            std::swap(o, q); strs(r.request.cites); std::swap(o, q);
+            q += ",\"feeds\":";
+            std::swap(o, q); strs(r.request.feeds); std::swap(o, q);
+            o += q + "}";
+        }
+        key("matched");   ids(r.matched);
+        key("not_found"); ids(r.not_found);
+        key("derived");
+        o += '[';
+        for (size_t i = 0; i < r.derived.size(); ++i) {
+            if (i) o += ',';
+            o += "{\"id\":" + std::to_string(r.derived[i].id) + ",\"via\":" +
+                 std::to_string(r.derived[i].via) + ",\"rel\":" + json_quote(r.derived[i].rel) + "}";
+        }
+        o += ']';
+        key("pruned_edges");
+        o += '[';
+        for (size_t i = 0; i < r.pruned_edges.size(); ++i) {
+            if (i) o += ',';
+            o += "{\"from\":" + std::to_string(r.pruned_edges[i].from) + ",\"to\":" +
+                 std::to_string(r.pruned_edges[i].to) + ",\"rel\":" +
+                 json_quote(r.pruned_edges[i].rel) + "}";
+        }
+        o += ']';
+        key("erased");              o += std::to_string(r.erased());
+        key("graph_nodes_removed"); o += std::to_string(r.graph_nodes_removed);
+        key("generation");          o += std::to_string(r.generation);
+        key("full_rewrite");        o += r.full_rewrite ? "true" : "false";
+        key("file_bytes_before");   o += std::to_string(r.file_bytes_before);
+        key("file_bytes_after");    o += std::to_string(r.file_bytes_after);
+        key("wal_bytes_after");     o += std::to_string(r.wal_bytes_after);
+        key("history_files_removed"); o += std::to_string(r.history_files_removed);
+        key("verified");            o += r.verified ? "true" : "false";
+        key("problems");            strs(r.problems);
+        key("residuals");           strs(erase_residuals());
+        return o + "}";
+    }
+
+private:
+    static std::string json_quote(const std::string& s) {
+        std::string o = "\"";
+        for (unsigned char c : s) {
+            if (c == '"' || c == '\\') { o += '\\'; o += static_cast<char>(c); }
+            else if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof buf, "\\u%04x", c);
+                o += buf;
+            } else o += static_cast<char>(c);
+        }
+        return o + "\"";
+    }
+
+    static std::string random_receipt_id() {
+        std::random_device rd;
+        std::mt19937_64 g((static_cast<uint64_t>(rd()) << 32) ^ rd() ^
+            static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "er_%016llx", static_cast<unsigned long long>(g()));
+        return buf;
+    }
+
+    // Which records an erase request reaches: those it names, then, until
+    // nothing changes, every record citing or derived from one already in
+    // (`cites` edges into it) and every record made from one (`feeds` edges
+    // out of it). Also the survivors' edges into the set. Deterministic.
+    void erase_plan_nolock(const EraseRequest& rq, EraseReceipt& r) const {
+        std::unordered_set<uint64_t> in;
+        const std::string& ns = rq.namespace_id;
+        auto ns_match = [&](const std::string& x) {
+            if (ns.empty() || x == ns) return true;
+            return rq.namespace_prefix && x.size() > ns.size() &&
+                   x.compare(0, ns.size(), ns) == 0 && x[ns.size()] == '.';
+        };
+        if (!ns.empty() || !rq.entity_id.empty()) {
+            std::vector<uint64_t> hit;
+            for (const auto& [id, m] : metadata_store_)
+                if (ns_match(m.namespace_id) && (rq.entity_id.empty() || m.entity_id == rq.entity_id))
+                    hit.push_back(id);
+            std::sort(hit.begin(), hit.end());
+            for (uint64_t id : hit) if (in.insert(id).second) r.matched.push_back(id);
+        }
+        for (uint64_t id : rq.ids) {
+            if (!metadata_store_.count(id)) { r.not_found.push_back(id); continue; }
+            if (in.insert(id).second) r.matched.push_back(id);
+        }
+        const std::unordered_set<std::string> cites(rq.cites.begin(), rq.cites.end());
+        const std::unordered_set<std::string> feeds(rq.feeds.begin(), rq.feeds.end());
+        std::vector<uint64_t> todo(r.matched.begin(), r.matched.end());
+        for (size_t i = 0; i < todo.size(); ++i) {
+            const uint64_t x = todo[i];
+            std::vector<ErasedVia> found;
+            if (auto ri = reverse_index_.find(x); ri != reverse_index_.end())
+                for (const auto& ie : ri->second)
+                    if (cites.count(ie.rel_type) && metadata_store_.count(ie.source_id))
+                        found.push_back({ie.source_id, x, ie.rel_type});
+            if (auto mi = metadata_store_.find(x); mi != metadata_store_.end())
+                for (const auto& e : mi->second.edges)
+                    if (feeds.count(e.rel_type) && metadata_store_.count(e.target_id))
+                        found.push_back({e.target_id, x, e.rel_type});
+            std::sort(found.begin(), found.end(),
+                      [](const ErasedVia& a, const ErasedVia& b) { return a.id < b.id; });
+            for (auto& f : found)
+                if (in.insert(f.id).second) { todo.push_back(f.id); r.derived.push_back(std::move(f)); }
+        }
+        for (uint64_t x : todo)
+            if (auto ri = reverse_index_.find(x); ri != reverse_index_.end())
+                for (const auto& ie : ri->second)
+                    if (!in.count(ie.source_id)) r.pruned_edges.push_back({ie.source_id, x, ie.rel_type});
+        std::sort(r.pruned_edges.begin(), r.pruned_edges.end(),
+                  [](const PrunedEdge& a, const PrunedEdge& b) {
+                      return std::tie(a.from, a.to, a.rel) < std::tie(b.from, b.to, b.rel); });
+    }
+
+    // Take every deleted node out of every graph (scrubDeleted): links
+    // repaired around it, its vector, links and label zeroed, its float
+    // original (int8 refine) dropped. Namespace graphs of a modality that
+    // changed are dropped (they route through slot vectors) and rebuild on
+    // demand. Caller holds compact_run_mx_ and mutex_ exclusively.
+    size_t scrub_deleted_nolock() {
+        using HNSW = hnswlib::HierarchicalNSW<float>;
+        size_t total = 0;
+        for (auto& [name, m] : modality_indices_) {
+            auto& ix = *m.index;
+            std::vector<hnswlib::tableint> slots;
+            for (size_t i = 0, n = ix.cur_element_count; i < n; ++i) {
+                const auto iid = static_cast<hnswlib::tableint>(i);
+                if (ix.isMarkedDeleted(iid) && ix.getExternalLabel(iid) != HNSW::kScrubbedLabel)
+                    slots.push_back(iid);
+            }
+            if (slots.empty()) continue;
+            total += ix.scrubDeleted(slots);
+            for (auto slot : slots) {
+                if (slot < m.fv_off.size()) m.fv_off[slot] = 0;
+                m.fv_pending.erase(static_cast<uint32_t>(slot));
+            }
+            drop_ns_graphs_nolock(name, m);
+            vacuum_requested_ = true;
+        }
+        return total;
+    }
+
+    // Deleted nodes that still hold a vector (not scrubbed).
+    size_t unscrubbed_deleted_nolock() const {
+        using HNSW = hnswlib::HierarchicalNSW<float>;
+        size_t left = 0;
+        for (const auto& [name, m] : modality_indices_) {
+            const auto& ix = *m.index;
+            for (size_t i = 0, n = ix.cur_element_count; i < n; ++i) {
+                const auto iid = static_cast<hnswlib::tableint>(i);
+                if (ix.isMarkedDeleted(iid) && ix.getExternalLabel(iid) != HNSW::kScrubbedLabel) ++left;
+            }
+        }
+        return left;
+    }
+
+    // Does `id` still hold a deleted graph node, vector intact, anywhere?
+    bool holds_deleted_node_nolock(uint64_t id) const {
+        for (const auto& [name, m] : modality_indices_) {
+            const auto& ix = *m.index;
+            auto it = ix.label_lookup_.find(id);
+            if (it != ix.label_lookup_.end() && ix.isMarkedDeleted(it->second)) return true;
+        }
+        return false;
+    }
+
+    // Caller holds erase_mutex_. Finish an erasure left pending (replayed
+    // from the WAL, or a halted erase()): scrub every deleted node. True
+    // when no erased id holds a graph node any more.
+    bool finish_erase_gated() {
+        std::lock_guard<std::mutex> no_compaction(compact_run_mx_);
+        std::unique_lock<RWMutex> lock(mutex_);
+        ensure_open();
+        scrub_deleted_nolock();
+        for (auto it = erase_pending_.begin(); it != erase_pending_.end(); )
+            it = holds_deleted_node_nolock(*it) ? std::next(it) : erase_pending_.erase(it);
+        return erase_pending_.empty();
+    }
+
+public:
     // Scan all nodes and soft-delete any with ttl>0 where now > timestamp+ttl.
     // Returns count of nodes forgotten.
     size_t forget_expired() {
@@ -7179,6 +8632,135 @@ public:
     // file keeps until it is vacuumed.
     void vacuum() { checkpoint(/*force_full=*/true); }
 
+    // ── History (time travel) ────────────────────────────────────────
+    // Every commit ends with a marker, so DB::open(path, ..., as_of) can
+    // load any commit the file — or a kept file under <path>.history/ —
+    // still holds. A full rewrite (vacuum, compact, purge, set_quantized, the
+    // automatic vacuum) starts a new file: the old one is kept while the
+    // retention window or a tag needs it. erase() deletes all history.
+
+    /// Every commit an as_of open can reach, oldest first.
+    std::vector<CommitInfo> history() const {
+        ensure_open();
+        Timeline tl = read_timeline(path_, nullptr, 0);
+        std::map<uint64_t, std::vector<std::string>> named;
+        for (const auto& [name, gen] : tl.tags) named[gen].push_back(name);
+        std::vector<CommitInfo> out;
+        out.reserve(tl.commits.size());
+        for (const auto& e : tl.commits) {
+            CommitInfo ci;
+            ci.generation = e.mark.gen;
+            ci.time       = static_cast<double>(e.mark.time_us) / 1e6;
+            auto it = named.find(e.mark.gen);
+            if (it != named.end()) ci.tags = it->second;
+            ci.archived   = e.file + 1 != tl.files.size();
+            ci.marked     = !e.mark.synthetic;
+            ci.end        = e.mark.end;
+            out.push_back(std::move(ci));
+        }
+        return out;
+    }
+
+    /// Commit now and name the commit: open(..., as_of=name) loads it, and it
+    /// is kept past the retention window until untag(name). A name is reused
+    /// by moving it.
+    void tag(const std::string& name) {
+        check_writable("tag a commit");
+        check_tag_name(name);
+        if (legacy_format_requested())
+            throw std::runtime_error("tag(): history needs format v10, and FEATHER_FORMAT=9 is set");
+        {
+            std::lock_guard<std::mutex> g(save_mutex_);
+            pending_tags_.push_back({v10::TAG_SET, 0, name});
+        }
+        save();
+    }
+
+    /// Drop a tag. The commit it named is then kept only while the
+    /// retention window covers it.
+    void untag(const std::string& name) {
+        check_writable("untag a commit");
+        {
+            std::lock_guard<std::mutex> g(save_mutex_);
+            bool known = tags_.count(name) > 0;
+            for (const auto& op : pending_tags_) if (op.name == name) known = op.op == v10::TAG_SET;
+            if (!known) throw std::invalid_argument("untag(): no tag '" + name + "'");
+            pending_tags_.push_back({v10::TAG_DEL, 0, name});
+        }
+        save();
+        std::lock_guard<std::mutex> g(save_mutex_);
+        prune_history();
+    }
+
+    /// tag -> generation, as of the commit this handle loaded or last made.
+    std::map<std::string, uint64_t> tags() const {
+        std::lock_guard<std::mutex> g(save_mutex_);
+        ensure_open();
+        return tags_;
+    }
+
+    /// How long a rewrite keeps the file it replaces, so that as_of can
+    /// reach back at least this far. 0 (the default) keeps nothing; infinity
+    /// keeps everything. Stored in the file. Costs disk: each kept file is the
+    /// whole DB as it was, superseded records included.
+    void set_history_retention(double seconds) {
+        check_writable("set the history retention");
+        if (std::isnan(seconds) || seconds < 0)
+            throw std::invalid_argument("history retention is seconds >= 0 (infinity: keep everything)");
+        if (legacy_format_requested())
+            throw std::runtime_error("set_history_retention(): history needs format v10, and FEATHER_FORMAT=9 is set");
+        {
+            std::lock_guard<std::mutex> g(save_mutex_);
+            history_keep_us_ = seconds >= 9.2e12 ? std::numeric_limits<int64_t>::max()
+                                                 : static_cast<int64_t>(seconds * 1e6);
+            keep_dirty_ = true;
+        }
+        save();
+        std::lock_guard<std::mutex> g(save_mutex_);
+        prune_history();
+    }
+
+    double history_retention() const {
+        std::lock_guard<std::mutex> g(save_mutex_);
+        ensure_open();
+        const int64_t k = effective_keep_us();
+        return k == std::numeric_limits<int64_t>::max() ? std::numeric_limits<double>::infinity()
+                                                        : static_cast<double>(k) / 1e6;
+    }
+
+    /// The clock scoring uses: the as_of time on a past commit, else now
+    /// (to the microsecond, as time.time()).
+    double now() const {
+        return pinned_clock_ ? *pinned_clock_ : static_cast<double>(wall_us()) / 1e6;
+    }
+
+    struct AsOfInfo {
+        uint64_t generation  = 0;
+        double   commit_time = 0;    // when that commit was made
+        double   clock       = 0;    // the time scoring runs at (the asked-for time)
+        std::string file;            // the file it was read from
+    };
+    /// The commit this handle holds, if it was opened with as_of.
+    std::optional<AsOfInfo> as_of() const {
+        ensure_open();
+        if (!as_of_) return std::nullopt;
+        return AsOfInfo{as_of_mark_.gen, static_cast<double>(as_of_mark_.time_us) / 1e6,
+                        pinned_clock_ ? *pinned_clock_ : 0.0, base_path_};
+    }
+
+    /// (id, version) of every live record under `namespace_prefix` (all when
+    /// empty), by id. Two handles' lists diff two states: feather_db.diff().
+    std::vector<std::pair<uint64_t, uint64_t>> record_versions(const std::string& namespace_prefix = "") const {
+        std::shared_lock<RWMutex> lock(mutex_);
+        ensure_open();
+        std::vector<std::pair<uint64_t, uint64_t>> out;
+        for (const auto& [id, m] : metadata_store_)
+            if (!is_dead_meta(m) && SearchFilter::under(m.namespace_id, namespace_prefix))
+                out.emplace_back(id, m.version);
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
     struct StorageStats {
         uint32_t format;              // on-disk format of the file (0: none yet)
         uint64_t generation;          // v10 commit generation
@@ -7189,6 +8771,8 @@ public:
         uint64_t commits;             // saves that wrote something, this handle
         uint64_t vacuums;             // of which whole-file rewrites
         uint64_t mapped_bytes;        // vector bytes this process maps from the file
+        uint64_t history_files;       // kept files under <path>.history/
+        uint64_t history_bytes;       // ...and their size
     };
     StorageStats storage_stats() const {
         std::lock_guard<std::mutex> save_lock(save_mutex_);
@@ -7197,14 +8781,36 @@ public:
         uint64_t mapped = 0;
         for (const auto& [name, m] : modality_indices_)
             if (m.mapped) mapped += static_cast<uint64_t>(m.image_count) * m.index->data_size_;
+        uint64_t hist_n = 0, hist_bytes = 0;
+        for (const auto& h : history_files(path_, /*with_stale=*/true)) {
+            ++hist_n;
+            hist_bytes += fsio::size_or_zero(h.path);
+        }
         return {base_version_, generation_,
                 file_v10_ ? committed_end_ : fsio::size_or_zero(path_),
                 live_bytes_estimate(), last_commit_bytes_, last_commit_full_,
-                commits_, vacuums_, mapped};
+                commits_, vacuums_, mapped, hist_n, hist_bytes};
     }
 
 private:
+    // Every checkpoint passes erase_mutex_, and finishes an erasure left
+    // pending (a halted erase(), or one replayed from the WAL) before it may
+    // rotate the WAL that names it.
     void checkpoint(bool force_full) {
+        check_writable("save");
+        std::lock_guard<std::mutex> gate(erase_mutex_);
+        if (!erase_pending_.empty()) {
+            if (!finish_erase_gated())
+                throw std::runtime_error(
+                    "save: an erasure has not finished (erased records still hold graph "
+                    "nodes after compaction); the WAL is kept, and the next save or open retries");
+            force_full = true;
+        }
+        checkpoint_gated(force_full);
+    }
+
+    // The checkpoint itself; the caller holds erase_mutex_.
+    void checkpoint_gated(bool force_full) {
         check_writable("save");
         std::lock_guard<std::mutex> save_lock(save_mutex_);
         if (legacy_format_requested()) { save_legacy(); return; }
@@ -7263,6 +8869,14 @@ public:
     void close(bool do_save = true) {
         stop_compactor();                            // never join while holding mutex_
         stop_ns_builder();
+        std::lock_guard<std::mutex> gate(erase_mutex_);
+        // An erasure that did not finish is finished now, or the checkpoint
+        // is skipped: the WAL that names it stays for the next open.
+        if (do_save && !erase_pending_.empty()) {
+            bool done = false;
+            try { done = finish_erase_gated(); } catch (...) {}
+            if (!done) do_save = false;
+        }
         std::lock_guard<std::mutex> save_lock(save_mutex_);
         std::unique_lock<RWMutex> lock(mutex_);
         if (closed_) return;
@@ -7334,7 +8948,12 @@ public:
         // a checkpoint from here would rewrite the file while other readers —
         // and possibly a writer waiting on it — are using it.
         if (!closed_ && load_complete_ && !read_only_ && !poisoned_.load()) {
-            try { save_vectors(); } catch (...) {}
+            try {
+                // As close(): an unfinished erasure is finished, or the WAL
+                // that names it is kept.
+                std::lock_guard<std::mutex> gate(erase_mutex_);
+                if (erase_pending_.empty() || finish_erase_gated()) save_vectors();
+            } catch (...) {}
         }
         close_data_fh();
         wal_close();   // save_vectors() clears the WAL on success; on failure

@@ -330,14 +330,7 @@ def read_jsonl(path) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def mcnemar_p(b: int, c: int) -> float:
-    """Two-sided exact McNemar p: b questions only A got right, c only B."""
-    from math import comb
-    n = b + c
-    if n == 0:
-        return 1.0
-    tail = sum(comb(n, i) for i in range(min(b, c) + 1)) / 2 ** n
-    return min(1.0, 2 * tail)
+from .stats import mcnemar_p   # noqa: E402  one implementation, shared
 
 
 def _paired(pairs: list[tuple[bool, bool]]) -> dict:
@@ -439,3 +432,5 @@ if __name__ == "__main__":
     a, b = (only_split(read_jsonl(p), split) for p in sys.argv[1:3])
     print(f"split: {split}")
     print(format_compare(compare(a, b, judge)))
+    print("(one run per side: for 3-5 runs each, with CIs and rerun noise, use "
+          "python -m bench.compare lme --a ... --b ...)")

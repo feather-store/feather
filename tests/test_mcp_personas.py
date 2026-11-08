@@ -80,8 +80,11 @@ def test_a_pinned_safety_fact_survives_budget_pressure(tmp_path):
 
     async def go():
         async with session(path, "me.assistant", budget_tokens=300) as mcp:
-            await mcp.call("remember", key="allergy",
-                           content="severely allergic to shellfish", pinned=True)
+            # The pin holds because the user confirmed it, not by luck: forty
+            # fresh memories tie on heat, so an unpinned one survives by chance.
+            assert "confirmed by the user" in await mcp.call(
+                "remember", key="allergy",
+                content="severely allergic to shellfish", pinned=True)
             for i in range(40):
                 await mcp.call("remember", key=f"chat_{i}",
                                content=f"discussed weekend plans, option {i}, "

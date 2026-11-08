@@ -410,3 +410,71 @@ def test_ingest_facts_routes_each_kind_by_its_lifetime(mem):
     mem.ingest_facts(facts)                       # re-ingest: nothing new
     assert len(mem.episodes) == 2 and len(mem.facts.history(
         "user_mortgage_pre_approval")) == 1
+
+
+# ── intentions: held until due, carried until done ───────────────────────
+
+def test_intentions_surface_when_due_oldest_first(mem):
+    now = time.time()
+    mem.intentions.add("passport", "renew the passport", due_at=now + 86400)
+    mem.intentions.add("q3", "send Dana the Q3 numbers", due_at=now - 60)
+    mem.intentions.add("vet", "book the vet", due_at=now - 3600)
+    assert [v["text"] for v in mem.intentions.due()] == [
+        "book the vet", "send Dana the Q3 numbers"]
+    assert [v["text"] for v in mem.intentions.due(now + 2 * 86400)][-1] == "renew the passport"
+    assert mem.summary()["intentions"] == 3
+
+
+def test_a_pocket_over_intentions_pins_the_due_one(mem):
+    """FeatherStore maps the value's due_at onto the record, so the Pocket rule
+    applies to AgentMemory's intentions too."""
+    from feather_db.pocket import pocket
+    now = time.time()
+    mem.intentions.add("q3", "send Dana the Q3 numbers", due_at=now - 60)
+    mem.intentions.add("passport", "renew the passport", due_at=now + 86400)
+    pk = pocket(mem.store.db, ".".join(mem.intentions.namespace))
+    hot = pk.hot()
+    assert [i.key for i in hot] == ["q3"] and hot[0].heat == 1.0
+
+
+def test_done_removes_the_intention_and_records_the_episode(mem):
+    from feather_db.pocket import pocket
+    now = time.time()
+    mem.intentions.add("q3", "send Dana the Q3 numbers", due_at=now - 60)
+    pk = pocket(mem.store.db, ".".join(mem.intentions.namespace))
+    assert [i.key for i in pk.hot()] == ["q3"]
+    ep = mem.intentions.done("q3", outcome="sent")
+    # Kept as an open-looking record, it would read as still to do.
+    assert mem.intentions.due() == [] and len(mem.intentions) == 0
+    assert pk.hot() == [], "a memoised hot() still carried the done intention"
+    last = mem.episodes.recent(1)[0]
+    assert ep and last["text"] == "done: send Dana the Q3 numbers"
+    assert last["outcome"] == "sent" and last["intention"] == "q3"
+    assert mem.intentions.done("q3") is None
+
+
+def test_rescheduling_replaces_the_reminder(mem):
+    now = time.time()
+    mem.intentions.add("q3", "send the numbers", due_at=now - 60)
+    mem.intentions.add("q3", "send the numbers", due_at=now + 3600)
+    assert mem.intentions.due() == [] and len(mem.intentions) == 1
+
+
+# ── rendering: an item's text, not its JSON ───────────────────────────────
+
+def test_a_keyed_fact_renders_its_text_and_date_not_its_history(mem):
+    """A FeatherStore record's content is its indexed text: every field of
+    the value, history included. A packet showed all of it, ~10x the tokens
+    and every superseded value (bench.contradiction)."""
+    from feather_db.packet import PacketBuilder
+    from feather_db.pocket import Pocket
+    mem.facts.state("city", "dana lives in denver", at=1_700_000_000)
+    mem.facts.state("city", "dana moved to lisbon", at=1_760_000_000)
+    pk = Pocket(mem.store.db, mem.facts.namespace, embed=embedder())
+    [item] = [i for i in pk.recall("where does dana live") if i.key == "city"]
+    assert item.content == "dana moved to lisbon"
+    p = PacketBuilder(pk).build(query="where does dana live")
+    assert "- [2025-10-09] dana moved to lisbon" in p.text.splitlines()
+    assert "denver" not in p.text and "supersedes" not in p.text
+    # Still found by what only the history says: the indexed text is unchanged.
+    assert mem.facts.history("city")[0]["text"] == "dana lives in denver"

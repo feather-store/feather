@@ -35,7 +35,18 @@ except ImportError:                                           # pragma: no cover
 
 import feather_db
 from feather_db import DB, keys
+from feather_db import clock as _clock
+from feather_db import origin as _origin
 from feather_db.filter import FilterBuilder
+from feather_db.pocket import DUE_ATTR as _DUE_ATTR
+from feather_db.pocket import INTENTION_ATTR as _INTENTION_ATTR
+from feather_db.pocket import _bump as _pocket_bump
+from feather_db.pocket import (_INDEX_KIND, _KEY_SEP, DERIVED_KINDS, INDEX_ATTRS,
+                               INDEX_FOR, INDEX_N, SUPKEYS, IndexEntry, IndexWrite,
+                               _stale_index_ids, apply_index, backfill_registry,
+                               group_records, index_supkeys, index_targets, note_stale,
+                               supkeys_of)
+from feather_db.pocket import known_keys as _known_keys
 
 # LangGraph forbids "." inside a namespace element, which makes it the one
 # separator guaranteed not to collide when flattening the tuple.
@@ -72,6 +83,10 @@ def _is_dead(meta, now: Optional[float] = None) -> bool:
     if meta.source == "_forgotten":
         return True
     if meta.get_attribute("_deleted") == "true":
+        return True
+    # An index record (FeatherStore.index) finds an item; it is not one. Nor
+    # is a key-registry entry or an ingest job.
+    if meta.source in DERIVED_KINDS:
         return True
     return _expired(meta, now)
 
@@ -138,17 +153,34 @@ class FeatherStore(BaseStore):
     # both already worked.
     supports_ttl: bool = True
 
+    # Puts per WriteBatch: one request each over the Cloud API, and a bound
+    # on its body (a 768-d vector is ~8 KB of JSON).
+    PUT_CHUNK = 256
+
     def __init__(
         self,
         path: str = "agent_memory.feather",
         *,
-        dim: int = 768,
+        dim: Optional[int] = None,
         embed: Optional[Callable[[str], Any]] = None,
         index_fields: Optional[list[str]] = None,
-        auto_save: bool = True,
+        auto_save: Optional[bool] = None,
+        db: Any = None,
     ):
+        """A store over the file at `path`, or over `db`: an open handle,
+        local or a `feather_db.RemoteDB` (the Cloud API), which the store
+        uses without owning — close() leaves it open. `auto_save` (save
+        after every write) defaults to on for a file the store opened and
+        off for a handle it was given: a remote server checkpoints on its
+        own, and a save per write would be one more request each."""
         _require_langgraph()
-        self.db = DB.open(path, dim=dim)
+        self._owns_db = db is None
+        if db is None:
+            dim = 768 if dim is None else dim
+            db = DB.open(path, dim=dim)
+        elif dim is None:
+            dim = db.dim()
+        self.db = db
         self.dim = dim
         if embed is None:
             # Default to whatever the environment configures
@@ -160,12 +192,13 @@ class FeatherStore(BaseStore):
             embed = default_embedder(dim)
         self._embed = embed
         self._index_fields = index_fields
-        self._auto_save = auto_save
+        self._auto_save = self._owns_db if auto_save is None else auto_save
         # Items are addressed by native key. Before 0.22 an item's id was a
         # 53-bit SHA-1 of (namespace, key), and two keys that collided shared
         # one record. Items written then get their key now, which also makes
         # them findable by keyword search on it.
-        keys.migrate(self.db)
+        keys.migrate(self.db, visit=lambda ns, ids, metas:
+                     backfill_registry(self.db, ns, ids, metas))
 
     def id_of(self, namespace: tuple[str, ...], key: str) -> Optional[int]:
         """The record id of the item at (namespace, key), or None."""
@@ -174,20 +207,30 @@ class FeatherStore(BaseStore):
     # ── the two abstract methods ─────────────────────────────────────────
 
     def batch(self, ops: Iterable[Any]) -> list[Any]:
-        out: list[Any] = []
+        ops = list(ops)
+        out: list[Any] = [None] * len(ops)
         dirty = False
-        for op in ops:
+        i = 0
+        while i < len(ops):
+            op = ops[i]
+            if isinstance(op, PutOp):
+                # A run of puts is written together: one key lookup, one
+                # metadata read and one WriteBatch for all of them, where
+                # each put cost two or three round trips over the Cloud API.
+                # The run ends at the next read, which must see it.
+                j = i
+                while j < len(ops) and isinstance(ops[j], PutOp):
+                    j += 1
+                self._put_many(ops[i:j])
+                dirty, i = True, j
+                continue
             if isinstance(op, GetOp):
-                out.append(self._get(op))
-            elif isinstance(op, PutOp):
-                self._put(op); dirty = True
-                out.append(None)
+                out[i] = self._get(op)
             elif isinstance(op, SearchOp):
-                out.append(self._search(op))
+                out[i] = self._search(op)
             elif isinstance(op, ListNamespacesOp):
-                out.append(self._list_namespaces(op))
-            else:
-                out.append(None)
+                out[i] = self._list_namespaces(op)
+            i += 1
         if dirty and self._auto_save:
             self.db.save()
         return out
@@ -202,29 +245,68 @@ class FeatherStore(BaseStore):
 
     def _get(self, op: Any) -> Optional[Any]:
         _, meta = keys.get(self.db, NS_SEP.join(op.namespace), op.key)
-        if _is_dead(meta):
+        if _is_dead(meta, _clock.now(self.db)):
             return None
         return self._to_item(op.namespace, op.key, meta)
 
     def _put(self, op: Any) -> None:
-        flat = NS_SEP.join(op.namespace)
-        rid, prev = keys.get(self.db, flat, op.key)
+        self._put_many([op])
 
-        if op.value is None:                       # delete
-            if rid is not None:
-                self.db.forget(rid)
-            return
+    def _put_many(self, ops: list) -> None:
+        # The last put of a (namespace, key) is the one that counts.
+        last: dict = {}
+        for op in ops:
+            last[(NS_SEP.join(op.namespace), op.key)] = op
+        refs = list(last)
+        for c in range(0, len(refs), self.PUT_CHUNK):
+            self._write_puts([(r, last[r]) for r in refs[c:c + self.PUT_CHUNK]])
+        # A Pocket over this DB memoises hot() per write generation: bump it
+        # after the write, so a done intention or a new note is seen at once.
+        _pocket_bump(self.db)
 
+    def _write_puts(self, puts: list) -> None:
+        ids = keys.resolve_many(self.db, [r for r, _ in puts])
+        found = [rid for rid in ids if rid is not None]
+        prev_of = dict(zip(found, self.db.get_metadata_many(found))) if found else {}
+        b = feather_db.WriteBatch()
+        for ((flat, key), op), rid in zip(puts, ids):
+            prev = prev_of.get(rid) if rid is not None else None
+            if op.value is None:                   # delete
+                if rid is not None:
+                    n = int(prev.get_attribute(INDEX_N) or 0) if prev is not None else 0
+                    if n:
+                        for iid in _stale_index_ids(self.db, flat, key, 0):
+                            b.forget(iid)
+                    b.forget(rid)
+                continue
+            meta, vec = self._record(op, flat, key, prev)
+            if rid is not None and prev is not None and not prev.key:
+                # Written before native keys, at its hashed id: it keeps the
+                # id and gains its key (keys.write).
+                b.put(rid, vec, meta)
+            else:
+                b.upsert(meta, vec)
+        if len(b):
+            self.db.write(b)
+
+    def _record(self, op: Any, flat: str, key: str, prev):
+        """The metadata and vector a put writes."""
         created = (prev.get_attribute(_CREATED_ATTR) if prev else "") or str(int(time.time()))
 
         meta = feather_db.Metadata()
         meta.timestamp    = int(time.time())       # doubles as updated_at
-        meta.namespace_id = NS_SEP.join(op.namespace)
-        meta.entity_id    = op.key
+        meta.namespace_id = flat
+        meta.key          = key
+        meta.entity_id    = key
         meta.source       = "langgraph"
         meta.content      = _indexed_text(dict(op.value), self._index_fields)
         meta.set_attribute(_VALUE_ATTR, json.dumps(dict(op.value)))
         meta.set_attribute(_CREATED_ATTR, created)
+        # A rewrite keeps the item's index (FeatherStore.index), as Pocket does.
+        if prev is not None and prev.source != "_forgotten":
+            for attr in INDEX_ATTRS:
+                if prev.get_attribute(attr):
+                    meta.set_attribute(attr, prev.get_attribute(attr))
         # A numeric `valid_at` in the value is when the item happened or
         # became true (unix seconds), as opposed to when it was put: the
         # engine indexes it, so newest(by_valid=True) and a valid-time
@@ -232,6 +314,19 @@ class FeatherStore(BaseStore):
         valid = dict(op.value).get("valid_at")
         if isinstance(valid, (int, float)) and not isinstance(valid, bool):
             meta.valid_at = int(valid)
+        # A numeric `due_at` makes the item an intention: a Pocket reading
+        # this namespace holds it back until then and carries it as if pinned
+        # after (feather_db.pocket.DUE_ATTR).
+        due = dict(op.value).get("due_at")
+        if isinstance(due, (int, float)) and not isinstance(due, bool):
+            meta.set_attribute(_DUE_ATTR, repr(float(due)))
+            meta.set_attribute(_INTENTION_ATTR, "true")
+        # An `origin` naming one of feather_db.origin.ORIGINS labels the record,
+        # so a Pocket or PacketBuilder reading it quotes untrusted content. Any
+        # other value is the caller's own field and is left alone.
+        origin = dict(op.value).get("origin")
+        if isinstance(origin, str) and origin in _origin.ORIGINS:
+            meta.set_attribute(_origin.ATTR, origin)
         if op.ttl is not None:
             # LangGraph ttl is in MINUTES; Feather stores whole SECONDS, where 0
             # means "never expires". Truncating would turn any ttl under one
@@ -259,8 +354,7 @@ class FeatherStore(BaseStore):
         if vec is None:
             vec = np.zeros(self.dim, dtype=np.float32)
             vec[0] = 1.0        # a valid unit vector; never a zero-norm query target
-
-        keys.write(self.db, flat, op.key, meta, vec)
+        return meta, vec
 
     def _ids_under(self, prefix: tuple[str, ...]) -> list[int]:
         """Every id whose namespace starts with `prefix`.
@@ -303,18 +397,75 @@ class FeatherStore(BaseStore):
         q = np.asarray(self._embed(op.query), dtype=np.float32)
         flt = (FilterBuilder().namespace_prefix(NS_SEP.join(op.namespace_prefix)).build()
                if op.namespace_prefix else None)
-        k = max(want, 10)
+        k = max(want, 10) * 3            # an item and its index records share hits
         while True:
             hits = self.db.search(q, k=k, filter=flt, record_salience=False)
-            results = self._select([(h.id, h.score, h.metadata) for h in hits], op, semantic)
+            resolved = self._resolve_index(hits)
+            results = self._select(resolved, op, semantic)
             if len(results) >= want or len(hits) < k:
-                return results[op.offset: op.offset + op.limit]
+                note_stale(self.db, (m for _, _, m in resolved[:want]))
+                return self._group(results[op.offset: op.offset + op.limit], op)
             k *= 4
 
+    def _resolve_index(self, hits) -> list:
+        """(id, score, metadata) per hit, an index record's hit standing for
+        the item it indexes at the better of the two scores, in rank order."""
+        target = index_targets(self.db, [h.metadata for h in hits])
+        out, at = [], {}
+        for h in hits:
+            rid, score, m = h.id, h.score, h.metadata
+            if m.source == _INDEX_KIND:
+                rid, m = target.get((m.namespace_id, m.get_attribute(INDEX_FOR)), (None, None))
+                if m is None:
+                    continue
+            if rid in at:
+                i = at[rid]
+                out[i] = (rid, max(out[i][1], score), out[i][2])
+                continue
+            at[rid] = len(out)
+            out.append((rid, score, m))
+        return out
+
+    def _group(self, items: list, op: Any) -> list:
+        """Items in one key's supersession chain come back once: the newest,
+        with the older values (newest first) in its value's `earlier`; an
+        older item that matched brings the newest in, at its score. Items
+        without keyed index entries are returned as they are."""
+        metas = {}
+        for it in items:
+            rid = self.id_of(it.namespace, it.key)
+            metas[(NS_SEP.join(it.namespace), it.key)] = (
+                self.db.get_metadata(rid) if rid is not None else None)
+        if not any(supkeys_of(m) for m in metas.values()):
+            return items
+        now = _clock.now(self.db)
+
+        def make(ns, key, rid, m):
+            tns = tuple(ns.split(NS_SEP))
+            if _is_dead(m, now) or (op.namespace_prefix and
+                                    tns[:len(op.namespace_prefix)] != tuple(op.namespace_prefix)):
+                return None
+            return self._to_item(tns, key, m, score=0.0)
+
+        records = [((NS_SEP.join(it.namespace), it.key),
+                    supkeys_of(metas[(NS_SEP.join(it.namespace), it.key)]),
+                    _origin.of(metas[(NS_SEP.join(it.namespace), it.key)])
+                    if metas[(NS_SEP.join(it.namespace), it.key)] is not None else _origin.USER,
+                    it) for it in items]
+        out = []
+        for obj, hist, src in group_records(self.db, records, trusted=_origin.TRUSTED, make=make):
+            value = dict(obj.value)
+            if hist:
+                value["earlier"] = [dict(h.value) for h in hist]
+            out.append(SearchItem(value=value, key=obj.key, namespace=obj.namespace,
+                                  created_at=obj.created_at, updated_at=obj.updated_at,
+                                  score=src.score))
+        return out
+
     def _select(self, cand, op: Any, semantic: bool) -> list[Any]:
-        results = []
+        results, now = [], _clock.now(self.db)
         for rid, score, meta in cand:
-            if _is_dead(meta):
+            if _is_dead(meta, now):
                 continue
             # Unindexed records are still returned by a filter-only search —
             # they exist, they are just not semantically retrievable.
@@ -397,7 +548,7 @@ class FeatherStore(BaseStore):
         """
         ids = (self._ids_under(namespace) if prefix
                else self.db.ids_in_namespace(NS_SEP.join(namespace)))
-        now = time.time()
+        now = _clock.now(self.db)
         out = []
         for rid in ids:
             meta = self.db.get_metadata(rid)
@@ -405,6 +556,60 @@ class FeatherStore(BaseStore):
                 continue
             out.append((rid, meta))
         return out
+
+    def erase(self, namespace: tuple[str, ...], key: Optional[str] = None, *,
+              dry_run: bool = False) -> dict:
+        """Erase the item at (namespace, key), or with no key everything under
+        the namespace prefix, so that nothing of it remains: not in the file,
+        not in the WAL, and not in a record derived from or citing it.
+        `delete()` only forgets: the bytes stay until a vacuum, so erasing a
+        key already deleted is how to finish the job. Returns the engine's
+        erase receipt."""
+        if key is not None:
+            # An item's entity_id is its key, and a deleted item's shell keeps
+            # both until the next save: this finds the live item or the shell.
+            # Matching nothing still compacts and rewrites the file.
+            return self.db.erase(namespace=NS_SEP.join(namespace), entity=key,
+                                 dry_run=dry_run)
+        if not namespace:
+            raise ValueError("erase() needs a namespace; it will not erase the whole store")
+        return self.db.erase(namespace=NS_SEP.join(namespace), prefix=True, dry_run=dry_run)
+
+    def index(self, namespace: tuple[str, ...], key: str, entries: Iterable) -> None:
+        """Index the item at (namespace, key) by `entries` (IndexEntry, str,
+        or a SessionFactExtractor Fact), replacing any index it had: each is
+        a record a semantic search can hit in place of the item, which is
+        what comes back. An entry with a one-value `key` puts the item in
+        that key's supersession chain: search returns a chain once, the
+        newest item with the older values in its value's `earlier`. See
+        feather_db.pocket (facts as index; LoCoMo J 78.8 -> 82.4). Needs an
+        embedder to be searchable."""
+        flat = NS_SEP.join(namespace)
+        rid, meta = keys.get(self.db, flat, key)
+        if _is_dead(meta, _clock.now(self.db)):
+            raise KeyError(f"no item at {namespace!r}/{key!r}")
+        # The item's attributes, every index record and every key's registry
+        # entry in ONE batch: over the Cloud API, one round trip instead of
+        # two or three per entry.
+        apply_index(self.db, [IndexWrite(flat, key, [IndexEntry.of(x) for x in entries],
+                                         meta, old_n=int(meta.get_attribute(INDEX_N) or 0))],
+                    self.index_vector)
+        if self._auto_save:
+            self.db.save()
+
+    def index_vector(self, text: str):
+        """The vector an index record is searched by: the store's embedder,
+        or a fixed placeholder without one."""
+        if self._embed is None:
+            v = np.zeros(self.dim, dtype=np.float32)
+            v[0] = 1.0
+            return v
+        return np.asarray(self._embed(text), dtype=np.float32)
+
+    def known_keys(self, namespace: tuple[str, ...]) -> list[str]:
+        """The one-value keys indexed under `namespace`, for an extractor's
+        `known_keys`."""
+        return _known_keys(self.db, NS_SEP.join(namespace))
 
     def count(self, namespace: tuple[str, ...], *, prefix: bool = False) -> int:
         """How many live items. Cannot use the engine's namespace_size(), which
@@ -434,7 +639,7 @@ class FeatherStore(BaseStore):
             rows.sort(key=lambda r: key(r[1]), reverse=True)
             return [self._item_of(m) for _, m in rows[:limit]]
         flat, out, before = NS_SEP.join(namespace), [], None
-        now = time.time()
+        now = _clock.now(self.db)
         while len(out) < limit:
             want = limit - len(out)
             ids = self.db.newest(flat, want, prefix=prefix, before=before,
@@ -459,6 +664,12 @@ class FeatherStore(BaseStore):
                              m.key or m.entity_id, m)
 
     def close(self) -> None:
+        """Close the file the store opened. A handle passed as `db=` is the
+        caller's: it is saved if auto_save is on, and left open."""
+        if not self._owns_db:
+            if self._auto_save:
+                self.db.save()
+            return
         self.db.save()
         # Release the single-owner file lock so the path can be reopened in
         # this process; save() alone keeps the handle (and the lock) alive.

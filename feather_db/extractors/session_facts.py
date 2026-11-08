@@ -43,8 +43,24 @@ the text gives no time, use the session date.
 - A change ("I switched from X to Y", "I now have 3", "we moved to Z") is \
 stated with its NEW value; the old value is kept elsewhere.
 - "subject" and "attribute" name what the fact is about, short and \
-lowercase, so two facts about the same thing match across sessions: \
-("user", "job"), ("user's car", "mileage"), ("user", "gym routine").
+lowercase, so two facts about the same thing match across sessions. The \
+subject is who or what the attribute belongs to: "Tom became my coach" is \
+("user", "coach") with value "Tom". Name the attribute by WHAT the value is, \
+a noun, never by the verb that said it: "drives a Civic", "bought a Civic" \
+and "my car is a Civic" are all ("user", "car"); "goes to Lincoln High" and \
+"transferred to Lincoln High" are both ("user", "school"); ("user's car", \
+"mileage"), ("user", "gym routine").
+- When attributes already on file are listed, a fact about one of those \
+things uses that exact subject and attribute, not a new name for it.
+- "one_value": true only when a later, different value would make this fact \
+false: the attribute is a current state with exactly one value at a time, \
+such as where someone lives, their job or employer, school, car, \
+relationship status, a pet's name, a total or count. That holds whether or \
+not this fact is a change ("moved to", "switched to", "joined" are \
+one-value). False for everything else: anything that happened (an event, \
+incident, trip or visit), activities, likes, hobbies, feelings, plans, \
+goals, projects, and anything several values of which can be true at \
+once. When unsure, false.
 - "turn" is the number of the turn that supports the fact.
 - "kind": "event" for something that happened once on a date (attended, bought, baked, visited, paid, was born); "state" for a value that holds until it changes (job, address, count owned, plan); "preference" for a like, dislike, habit, or something the user owns or uses that should shape advice; otherwise "other".
 - "entity": for an event, the specific instance, named the same way every time it comes up, so a second mention of the same event matches the first: "wedding of rachel and mike", "sourdough loaf for book club", "bike chain replacement". Lowercase.
@@ -55,8 +71,8 @@ that are general knowledge rather than about this user.
 
 Output a JSON array:
 [{{"statement": "...", "date": "YYYY/MM/DD", "subject": "...", \
-"attribute": "...", "value": "...", "turn": 0, "kind": "event", \
-"entity": "...", "amount": "", "own": true}}]
+"attribute": "...", "value": "...", "one_value": false, "turn": 0, \
+"kind": "event", "entity": "...", "amount": "", "own": true}}]
 Return [] when there is nothing worth remembering."""
 
 _DATE_RE = re.compile(r"^\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})")
@@ -89,12 +105,49 @@ def fact_key(f: Fact) -> str:
     return f"{_norm(f.subject)}|{_norm(f.predicate)}"
 
 
+def replaces(f: Fact) -> bool:
+    """Does a later value of this fact's key end this one? The extractor
+    says so per fact (0.3.0: `replaces`); a fact without the field (an older
+    extraction, a hand-built Fact) keeps the old rule, which was yes.
+
+    A shared key alone is not enough: on LoCoMo 117 extracted keys held
+    different values, mostly ones that add up ("hobbies", "plan",
+    "preference"), and treating them as replaced told the reader that
+    "Caroline will continue her education" was over once she "plans to
+    adopt" (bench.locomo --supersede)."""
+    if _norm(f.predicate) in _CATEGORY_ATTRS:
+        return False
+    return bool((f.metadata or {}).get("replaces", True))
+
+
+# Attribute names that name a category, not a thing: "user|event" chained
+# a Tony Awards viewing, a Napa trip and a birthday party as one value
+# replacing the next. 0.3.1 flagged 121 LongMemEval facts (27 contradiction,
+# 10 LoCoMo) that way despite the prompt's rule to name what the value is.
+_CATEGORY_ATTRS = frozenset({"event", "events"})
+
+
+def known_keys_text(keys) -> str:
+    """The prompt lines that list attributes already on file, one
+    'subject | attribute' each: what lets separate calls name one thing one
+    way ("address" in one session, "home city" in the next split a chain)."""
+    rows = sorted({k if isinstance(k, str) else "|".join(k) for k in keys or ()})
+    return "\n".join("- " + " | ".join(p.strip() for p in r.split("|", 1)) for r in rows)
+
+
 class SessionFactExtractor(Extractor):
     """One LLM call per session → dated Facts.
 
     Each Fact has subject / predicate (= the attribute) / object (= the
     value), `valid_at` (unix seconds of the event date, local midnight),
-    and metadata: statement, date (YYYY/MM/DD), turn, session_id.
+    and metadata: statement, date (YYYY/MM/DD), turn, session_id, kind,
+    entity, amount, own, and `replaces` (0.3.0): whether a later value of
+    the same key ends this one (`replaces()`; the model's `one_value`).
+
+    `context` may carry `user_name` (who "the user" is: a subject naming
+    them becomes "user") and `known_keys` ('subject|attribute' strings
+    already on file for this user), which the model reuses for a fact about
+    the same thing. Without them each call names attributes on its own.
 
     Args:
         provider:            any feather_db.providers.LLMProvider.
@@ -107,7 +160,7 @@ class SessionFactExtractor(Extractor):
     """
 
     name = "session_fact_extractor"
-    version = "0.2.0"
+    version = "0.3.1"
 
     def __init__(self, provider, *, max_facts: int = 30,
                  max_turn_chars: int = 1200,
@@ -119,6 +172,19 @@ class SessionFactExtractor(Extractor):
         self._max_session_chars = max_session_chars
         self._max_tokens = max_tokens
         self._max_retries = max_retries
+
+    def fingerprint(self) -> str:
+        """What else, besides `version`, changes what this extractor returns:
+        its prompt, its limits and its model. An index records it
+        (feather_db.ingest), so a prompt edited without a version bump still
+        marks the indexes the old one made as stale."""
+        import hashlib
+        p = self._provider
+        model = (getattr(p, "_model", None) or getattr(p, "model", None)
+                 or type(p).__name__)
+        raw = "\x1f".join(map(str, (SESSION_FACT_SYSTEM_PROMPT, self._max_facts,
+                                    self._max_turn_chars, self._max_session_chars, model)))
+        return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
     def session_text(self, turns: list[dict]) -> str:
         lines, used = [], 0
@@ -153,11 +219,18 @@ class SessionFactExtractor(Extractor):
         day = (session_date if isinstance(session_date, _dt.datetime)
                else _parse_day(session_date))
         day_str = day.strftime("%Y/%m/%d (%a)") if day else "unknown"
+        user_name = str(ctx.get("user_name") or "").strip()
+        head = [f"Session date: {day_str}"]
+        if user_name:
+            head.append(f"The user is {user_name}.")
+        known = known_keys_text(ctx.get("known_keys"))
+        if known:
+            head.append("Attributes already on file (subject | attribute):\n" + known)
         messages = [
             {"role": "system", "content": SESSION_FACT_SYSTEM_PROMPT.format(
                 max_facts=self._max_facts)},
             {"role": "user", "content":
-                f"Session date: {day_str}\n\n{self.session_text(turns)}"},
+                "\n".join(head) + f"\n\n{self.session_text(turns)}"},
         ]
         raw, last_err = None, None
         for attempt in range(self._max_retries + 1):
@@ -196,8 +269,11 @@ class SessionFactExtractor(Extractor):
                 turn = None
             if turn is not None and not 0 <= turn < len(turns):
                 turn = None
+            subject = str(item.get("subject") or "user").strip()
+            if user_name and _norm(subject) == _norm(user_name):
+                subject = "user"
             facts.append(Fact(
-                subject=str(item.get("subject") or "user").strip(),
+                subject=subject,
                 predicate=str(item.get("attribute") or statement).strip(),
                 object=str(item.get("value") or "").strip(),
                 provenance=ctx.get("source_id"),
@@ -210,6 +286,8 @@ class SessionFactExtractor(Extractor):
                           "turn": turn,
                           "session_id": ctx.get("session_id"),
                           "kind": _kind(item.get("kind")),
+                          "replaces": (item.get("one_value") is True
+                                       or item.get("replaces") is True),
                           "entity": _norm(str(item.get("entity") or "")),
                           "amount": str(item.get("amount") or "").strip(),
                           "own": item.get("own") is not False},
@@ -219,12 +297,14 @@ class SessionFactExtractor(Extractor):
 
 def link_validity(facts: list[Fact]) -> dict[str, list[Fact]]:
     """Chain facts that share fact_key() in date order, in place: each gets
-    metadata["valid_from"], and every one but the latest also
+    metadata["valid_from"], and every one that a later value replaces also
     metadata["valid_until"] (the next value's date) and
     metadata["superseded_by"] (its statement). Returns {key: chain}.
 
-    Facts on the same day with the same value are one fact said twice and
-    do not supersede each other."""
+    Only facts that `replaces()` are closed: a like or a plan stays open
+    when another of the same key comes along. Facts on the same day with
+    the same value are one fact said twice and do not supersede each
+    other."""
     chains: dict[str, list[Fact]] = {}
     for f in facts:
         chains.setdefault(fact_key(f), []).append(f)
@@ -235,8 +315,11 @@ def link_validity(facts: list[Fact]) -> dict[str, list[Fact]]:
             f.metadata.pop("valid_until", None)
             f.metadata.pop("superseded_by", None)
         for i, f in enumerate(chain):
+            if not replaces(f):
+                continue
             # Closed by the first later fact that is not a repeat of it.
-            nxt = next((g for g in chain[i + 1:] if g.metadata.get("date") and not (
+            nxt = next((g for g in chain[i + 1:] if g.metadata.get("date") and replaces(g)
+                        and not (
                 g.valid_at == f.valid_at and
                 g.object.strip().lower() == f.object.strip().lower())), None)
             if nxt is not None:
@@ -250,7 +333,7 @@ def timeline(chains: dict[str, list[Fact]], keys, max_keys: int = 15) -> str:
     'user / job: junior dev (2023/01/10 – 2023/05/14) → senior dev (2023/05/14 – now)'."""
     lines = []
     for key in dict.fromkeys(keys):
-        chain = [f for f in chains.get(key, []) if f.object]
+        chain = [f for f in chains.get(key, []) if f.object and replaces(f)]
         values = []
         for f in chain:
             if values and values[-1][0].lower() == f.object.lower():

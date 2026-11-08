@@ -8,13 +8,21 @@ was exactly that.
 """
 import asyncio
 import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 
 from feather_db import DB
 from feather_db.pocket import pocket
 from feather_db.integrations.mcp_agent import build
-from tests.mcp_harness import connect, over_mcp
+from tests.mcp_harness import Client, connect, over_mcp
 
 SCOPE = "org.brand_a.creative"
 
@@ -127,7 +135,8 @@ async def test_stats_resource_is_parseable_json(mcp):
     assert set(stats) == {
         "scope", "inherits", "budget",
         "hot_items", "hot_tokens", "hot_own", "hot_inherited",
-        "warm_items", "warm_tokens", "cache_items", "total_items", "per_scope",
+        "warm_items", "warm_tokens", "cache_items", "index_items", "total_items",
+        "per_scope",
     }
     assert stats["scope"] == SCOPE
     assert stats["inherits"] == ["org.brand_a", "org"]
@@ -249,3 +258,121 @@ def test_concurrent_sessions_against_one_server_stay_independent(tmp_path):
             return await b.call("context")
 
     assert "client a" in asyncio.run(go())
+
+
+# ── the console scripts, launched the way Claude Desktop launches them ────
+#
+# Everything above builds the server in-process. A console script adds the
+# argument parser, the backend choice and stdio on top — and `feather-serve`
+# pointed at a module that raised before serving one message while every
+# in-process test passed. These resolve each script from pyproject.toml, so
+# they test what `pip install` actually puts on the PATH.
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _script_argv(name: str) -> list:
+    m = re.search(rf'^{re.escape(name)}\s*=\s*"([\w.]+):(\w+)"',
+                  (REPO / "pyproject.toml").read_text(), re.M)
+    assert m, f"{name} is not in [project.scripts]"
+    mod, fn = m.groups()
+    return [sys.executable, "-c",
+            f"import sys; from {mod} import {fn}; sys.exit({fn}())"]
+
+
+@asynccontextmanager
+async def _script(name: str, *args: str):
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+    cmd, *argv = _script_argv(name)
+    # The SDK passes the child only a minimal environment; cwd puts this
+    # checkout's feather_db first on the path, as `-c` adds cwd to sys.path.
+    params = StdioServerParameters(command=cmd, args=[*argv, *args], cwd=str(REPO))
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            yield Client(session, await session.initialize())
+
+
+def _run(coro):
+    return asyncio.run(asyncio.wait_for(coro, timeout=60))
+
+
+@pytest.mark.parametrize("script", ["feather-serve", "feather-agent"])
+def test_each_console_script_serves_over_stdio(script, tmp_path):
+    db = str(tmp_path / "agent.feather")
+
+    async def go():
+        async with _script(script, "--db", db, "--dim", "64", "--scope", SCOPE) as mcp:
+            assert mcp.init.server_info.name == "feather"
+            await mcp.call("remember", key="tone", content="captions stay lowercase")
+            return await mcp.call("recall", query="captions")
+
+    assert "lowercase" in _run(go())
+
+
+@pytest.fixture
+def cloud_api(tmp_path):
+    """A real Cloud API process on a free port, as a deployed one would run."""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("uvicorn")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    env = dict(os.environ, FEATHER_DATA_DIR=str(tmp_path / "api"), FEATHER_DEV_MODE="1",
+               FEATHER_DB_DIM="64",
+               PYTHONPATH=str(REPO) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    env.pop("FEATHER_API_KEY", None)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(port),
+         "--log-level", "warning"], cwd=str(REPO / "feather-api"), env=env)
+    url = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(150):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            pytest.fail("the Cloud API did not start")
+        yield url
+    finally:
+        proc.terminate()
+        proc.wait(20)
+
+
+def test_feather_serve_against_the_cloud_api(cloud_api):
+    """The README's command: `feather-serve --api-url … --namespace persona`.
+    Memory written in one session must be in that namespace on the server and
+    reach the next session, which is a new process."""
+    args = ("--api-url", cloud_api, "--namespace", "persona", "--dim", "64",
+            "--scope", SCOPE)
+
+    async def first():
+        async with _script("feather-serve", *args) as mcp:
+            await mcp.call("remember", key="tone", content="captions stay lowercase")
+            return await mcp.call("recall", query="captions")
+
+    async def second():
+        async with _script("feather-serve", *args) as mcp:
+            return await mcp.call("context")
+
+    assert "lowercase" in _run(first())
+    assert "lowercase" in _run(second())
+
+    from feather_db.remote import RemoteDB
+    remote = RemoteDB(cloud_api, "persona")
+    try:
+        assert remote.ids_in_namespace(SCOPE), "the memory is not in the namespace"
+    finally:
+        remote.close(save=False)
+
+
+@pytest.mark.parametrize("args, complaint", [
+    (["--db", "x.feather", "--api-url", "http://h:8000"], "not both"),
+    (["--namespace", "persona"], "needs --api-url"),
+])
+def test_ambiguous_backend_flags_are_refused(args, complaint, tmp_path):
+    r = subprocess.run([*_script_argv("feather-serve"), *args], cwd=str(REPO),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and complaint in r.stderr, r.stderr

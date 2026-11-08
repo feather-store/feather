@@ -26,6 +26,7 @@ Startup fails if FEATHER_API_KEY is unset. To run without auth locally, set
 FEATHER_DEV_MODE=1 explicitly — never on a reachable host.
 """
 
+import math
 import os
 import time
 import asyncio
@@ -49,11 +50,11 @@ import feather_db
 from feather_db import Metadata, ContextType, ScoringConfig
 from feather_db.core import SearchFilter
 
-from .db_manager import (DBManager, InvalidNamespaceError, NamespaceAliasError,
+from .db_manager import (AS_OF, AsOfError, DBManager, InvalidNamespaceError, NamespaceAliasError,
                          NamespaceHeldError, NamespaceLoadingError, NotOwnedError, RECOVER_RETRY_S,
                          write_error)
 from . import errors
-from .admission import Admission
+from .admission import Admission, classify as admission_class
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from .metrics import METRICS, classify, namespace_from_path
@@ -76,8 +77,8 @@ except ImportError:                     # pragma: no cover
 from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
     KeywordSearchRequest, HybridSearchRequest,
-    LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest, PurgeRequest,
-    BatchDeleteRequest, BatchWriteRequest, AutoLinkRequest, EngineSettings, PlacementUpdate,
+    LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest, PurgeRequest, EraseRequest, ByKeysRequest, HeatSelectRequest,
+    BatchDeleteRequest, BatchWriteRequest, GetManyRequest, AutoLinkRequest, EngineSettings, PlacementUpdate,
     MetadataOut, NamespaceStats, HealthResponse, AdminOverview,
     SeedRequest, ContextChainRequest, EdgesResponse, EdgeOut, IncomingEdgeOut,
     ContextChainNode, ContextChainEdge, ContextChainResponse,
@@ -86,7 +87,7 @@ from .models import (
     ConnectionInfo, EmbeddingConfig, EmbeddingConfigUpdate,
     ImportRequest, ImportResponse, IngestTextRequest, MetadataIn,
     HierarchyNode, HierarchyResponse,
-    AutoCompactRequest, QuantizeRequest, IndexStatsResponse,
+    AutoCompactRequest, QuantizeRequest, IndexStatsResponse, TagRequest,
 )
 import numpy as np
 import json
@@ -226,8 +227,41 @@ class _IdempotencyGuard:
         return await self.app(scope, receive, send)
 
 
+class _AsOfScope:
+    """`X-Feather-As-Of: time:<unix s> | generation:<n> | tag:<name>` serves a
+    read from the namespace as it was at that commit (DB.open(..., as_of=)):
+    DBManager.get() returns a read-only handle at it for this request. A
+    write carrying it is refused: the past is read-only, and applying the
+    write to the live namespace instead would be worse."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        value = None
+        for k, v in scope.get("headers", []):
+            if k.lower() == b"x-feather-as-of":
+                value = v.decode("latin-1").strip()
+                break
+        if value is None:
+            return await self.app(scope, receive, send)
+        if admission_class(scope.get("method", "GET"), scope.get("path", "")) != "read":
+            resp = JSONResponse(status_code=400, content=errors.body(
+                400, f"{scope.get('method')} {scope.get('path')}: a request with X-Feather-As-Of "
+                "reads the past and cannot write", "read_only"))
+            return await resp(scope, receive, send)
+        token = AS_OF.set(value)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            AS_OF.reset(token)
+
+
 # Last added = outermost: metrics sees every response, 429s included;
 # admission refuses before any body is read or any work is queued.
+app.add_middleware(_AsOfScope)
 app.add_middleware(_IdempotencyGuard)
 app.add_middleware(Admission)
 app.add_middleware(_MetricsMiddleware)
@@ -295,6 +329,12 @@ async def _namespace_loading(request: Request, exc: NamespaceLoadingError):
     # request; it will succeed once the load finishes.
     return JSONResponse(status_code=503, headers={"Retry-After": "1"},
                         content=errors.body(503, str(exc), "namespace_loading", namespace=exc.namespace))
+
+
+@app.exception_handler(AsOfError)
+async def _as_of_unavailable(request: Request, exc: AsOfError):
+    # No such commit, tag or history (ValueError from DB.open(..., as_of=)).
+    return JSONResponse(status_code=400, content=errors.body(400, str(exc), "as_of_unavailable"))
 
 
 @app.exception_handler(NamespaceHeldError)
@@ -626,10 +666,15 @@ def _build_filter(req: SearchRequest) -> Optional[SearchFilter]:
 def _build_scoring(req: SearchRequest) -> Optional[ScoringConfig]:
     if req.scoring_half_life is None and req.scoring_weight is None:
         return None
+    # `is None`, not `or`: weight 0 (no recency) and floor 0 (plain cosine)
+    # are values, and `or` turned them into the defaults.
+    def given(v, default):
+        return default if v is None else v
     return ScoringConfig(
-        half_life = req.scoring_half_life or 30.0,
-        weight    = req.scoring_weight    or 0.3,
-        min       = req.scoring_min       or 0.0,
+        half_life       = given(req.scoring_half_life, 30.0),
+        weight          = given(req.scoring_weight, 0.3),
+        min             = given(req.scoring_min, 0.0),
+        relevance_floor = given(getattr(req, "scoring_relevance_floor", None), -1.0),
     )
 
 
@@ -1102,15 +1147,23 @@ async def add_vector(namespace: str, request: Request, response: Response,
     return await _in_write_pool(_add_vector_impl, namespace, req, idem, response)
 
 
+def _kept_metadata(db, rid: int, namespace: str):
+    """A put that carries no metadata writes the vector only: a live record
+    keeps its metadata (DB.add without meta). Called under the namespace lock."""
+    existing = db.get_metadata(int(rid))
+    if existing is not None:
+        return existing
+    meta = Metadata()
+    meta.namespace_id = namespace
+    return meta
+
+
 def _add_vector_impl(namespace: str, req, idem: Idem = Idem(), response: Optional[Response] = None):
     db = manager.get(namespace)
     # `is not None`, not truthiness: `"metadata": {}` was a MetadataIn() before
     # the msgspec path, which stamps timestamp=now; a bare Metadata() is 1970.
-    if req.metadata is not None:
-        meta = _meta_from_model(_metadata_in(req.metadata), namespace)
-    else:
-        meta = Metadata()
-        meta.namespace_id = namespace
+    meta = (_meta_from_model(_metadata_in(req.metadata), namespace)
+            if req.metadata is not None else None)       # None: the vector only
     vec = req.vector_array()
 
     # Reject a mismatch only against an *established* dim. On an empty namespace
@@ -1126,6 +1179,8 @@ def _add_vector_impl(namespace: str, req, idem: Idem = Idem(), response: Optiona
 
     body = {"id": req.id, "namespace": namespace, "modality": req.modality}
     with manager.lock(namespace):
+        if meta is None:
+            meta = _kept_metadata(db, req.id, namespace)
         r = writes.prior(db, idem) or writes.apply(
             db, [Op("put", req.id, meta, vec, req.modality)], idem, body)
     return _with_version(response, body, r)
@@ -1273,6 +1328,28 @@ def update_importance(namespace: str, record_id: int, req: UpdateImportanceReque
             except HTTPException as e:
                 raise writes.precondition_failed(e)
     return _with_version(response, body, r)
+
+
+@app.post("/v1/{namespace}/records/get_many", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+async def get_many_records(namespace: str, req: GetManyRequest):
+    """Read many records in one request: `records[i]` is `ids[i]`'s
+    {id, metadata}, or null where GET /records/{id} would 404. An agent
+    loading its working set reads every record in scope; one GET each was one
+    round trip each."""
+    return await run_in_threadpool(_retry_closed, _get_many_impl, namespace, req)
+
+
+def _get_many_impl(namespace: str, req):
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    metas = db.get_metadata_many(req.ids, include_dead=req.include_deleted)
+    return {"records": [
+        None if m is None or (_is_dead_meta(m) and not req.include_deleted)
+        else {"id": rid, "metadata": m.to_dict()}
+        for rid, m in zip(req.ids, metas)]}
 
 
 @app.post("/v1/{namespace}/records/{record_id}/link", tags=["records"],
@@ -1442,6 +1519,8 @@ def write_batch(namespace: str, req: BatchWriteRequest, response: Response,
             for i, o in enumerate(req.ops):
                 if o.metadata is not None:
                     meta = _meta_from_model(o.metadata, namespace)
+                elif o.op == "put" and o.id is not None:
+                    meta = _kept_metadata(db, o.id, namespace)   # the vector only
                 else:
                     meta = Metadata()
                     meta.namespace_id = namespace
@@ -1505,6 +1584,25 @@ def get_by_key(namespace: str, key: str, key_namespace: str = ""):
     body = _meta_to_model(meta)
     body = body.model_dump() if hasattr(body, "model_dump") else body.dict()
     return {**body, "id": rid, "metadata": body}
+
+
+@app.post("/v1/{namespace}/by_keys", tags=["records"], dependencies=[Depends(verify_api_key)])
+def ids_for_keys(namespace: str, req: ByKeysRequest):
+    """Ids of the live records holding each (key_namespace, key) in `refs`
+    (null where none): many keys in one request."""
+    if len(req.refs) > 10_000:
+        raise HTTPException(413, "at most 10,000 keys per request")
+    db = _db_or_404(namespace)
+    return {"ids": db.ids_for_many([(ns, k) for ns, k in req.refs])}
+
+
+@app.post("/v1/{namespace}/heat_select", tags=["records"], dependencies=[Depends(verify_api_key)])
+def heat_select(namespace: str, req: HeatSelectRequest):
+    """An agent's working set (Pocket.hot()), chosen in the engine:
+    [[id, depth, heat, tokens], ...] in rank order."""
+    db = _db_or_404(namespace)
+    picks = db.heat_select(**req.model_dump())
+    return {"picks": [[str(i), d, h, t] for i, d, h, t in picks]}
 
 
 @app.get("/v1/{namespace}/newest", tags=["records"], dependencies=[Depends(verify_api_key)])
@@ -1584,6 +1682,54 @@ def vacuum(namespace: str):
     return {"vacuumed": True}
 
 
+def _retention_json(seconds: float):
+    return None if math.isinf(seconds) else seconds   # JSON has no infinity: null = keep everything
+
+
+@app.get("/v1/{namespace}/history", tags=["history"], dependencies=[Depends(verify_api_key)])
+def history(namespace: str):
+    """Every commit X-Feather-As-Of can reach (oldest first), the tags, and the
+    retention (`retention_s` null = everything is kept)."""
+    db = _db_or_404(namespace)
+    return {"commits": db.history(), "tags": db.tags(),
+            "retention_s": _retention_json(db.history_retention())}
+
+
+@app.post("/v1/{namespace}/tags", tags=["history"], dependencies=[Depends(verify_api_key)])
+@_write_route
+def tag_commit(namespace: str, req: TagRequest):
+    """Commit now and name the commit (DB.tag)."""
+    db = _db_or_404(namespace)
+    with manager.lock(namespace):
+        db.tag(req.name)
+        return {"tag": req.name, "generation": db.tags()[req.name]}
+
+
+@app.delete("/v1/{namespace}/tags/{name}", tags=["history"], dependencies=[Depends(verify_api_key)])
+@_write_route
+def untag_commit(namespace: str, name: str):
+    """Drop a tag (DB.untag)."""
+    db = _db_or_404(namespace)
+    with manager.lock(namespace):
+        db.untag(name)
+    return {"untagged": name}
+
+
+@app.get("/v1/{namespace}/as_of", tags=["history"], dependencies=[Depends(verify_api_key)])
+def as_of_state(namespace: str):
+    """The commit this request reads (DB.as_of): null without X-Feather-As-Of."""
+    db = _db_or_404(namespace)
+    return {"as_of": db.as_of(), "now": db.now()}
+
+
+@app.get("/v1/{namespace}/record_versions", tags=["history"], dependencies=[Depends(verify_api_key)])
+def record_versions(namespace: str, namespace_prefix: str = ""):
+    """[[id, version], ...] of the live records under a namespace prefix: two of
+    these (now and X-Feather-As-Of) diff two states (feather_db.diff)."""
+    db = _db_or_404(namespace)
+    return {"versions": [[int(i), int(v)] for i, v in db.record_versions(namespace_prefix).items()]}
+
+
 @app.get("/v1/{namespace}/admin/engine", tags=["admin"], dependencies=[Depends(verify_api_key)])
 def engine_state(namespace: str):
     """Everything embedded Feather reports about itself, for this namespace."""
@@ -1592,7 +1738,8 @@ def engine_state(namespace: str):
     for name in db.modality_names():
         modalities[name] = {"dim": db.dim(name), "ef": db.get_ef(name),
                             "quantized": db.is_quantized(name), "int8_ram": db.is_int8_ram(name),
-                            "int8": db.int8_info(name)}
+                            "int8": db.int8_info(name),
+                            "background_cosine": db.background_cosine(name)}
     return {"size": db.size(), "dim": db.dim(), "modalities": modalities,
             "auto_compact": db.get_auto_compact(), "compacting": db.is_compacting(),
             "namespace_ann": db.namespace_ann_info(), "storage": db.storage_stats(),
@@ -1616,6 +1763,9 @@ def engine_settings(namespace: str, req: EngineSettings):
         for modality, cfg in (req.int8_ram or {}).items():
             refine = cfg.get("refine")
             db.set_int8_ram(modality, cfg.get("max_abs"), refine=2 if refine is None else int(refine))
+        if req.history_retention_s is not None:
+            r = req.history_retention_s
+            db.set_history_retention(math.inf if r == "inf" else float(r))
     return engine_state(namespace)
 
 
@@ -1634,6 +1784,31 @@ def purge_namespace(namespace: str, req: PurgeRequest):
     with manager.lock(namespace):
         removed = db.purge(req.namespace_id)   # WAL-logged since 0.19
     return {"namespace": namespace, "namespace_id": req.namespace_id, "removed": removed}
+
+
+@app.post("/v1/{namespace}/erase", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+@_write_route
+def erase_records(namespace: str, req: EraseRequest):
+    """Erase records so that nothing of them remains: those named, and every
+    record derived from or citing them. Hard-deletes, cuts their graph nodes
+    and vectors out, rewrites the file and rotates the WAL away; returns the
+    receipt. Unlike DELETE (a
+    forget), nothing is left for a vacuum. `dry_run` only plans."""
+    if not (req.ids or req.namespace_id or req.entity_id):
+        raise HTTPException(422, "erase needs ids, a namespace_id or an entity_id")
+    try:
+        db = manager.get(namespace, create=False)
+    except KeyError:
+        raise HTTPException(404, f"Namespace '{namespace}' not found")
+    with manager.lock(namespace):
+        receipt = db.erase(ids=req.ids, namespace=req.namespace_id, entity=req.entity_id,
+                           prefix=req.prefix, cites=req.cites, feeds=req.feeds,
+                           dry_run=req.dry_run)
+    if not req.dry_run:
+        manager.drop_as_of(namespace)   # an erased record must not be served from the past
+        EMBEDDING.clear_cache()         # nor from the server's embeddings of its text
+    return receipt
 
 
 @app.post("/v1/{namespace}/compact", tags=["records"],
@@ -1799,7 +1974,7 @@ def _keyword_search_impl(namespace: str, req):
         raise HTTPException(404, f"Namespace '{namespace}' not found")
 
     sf = _build_filter(req)
-    raw = db.keyword_search(req.query, k=req.k, filter=sf)
+    raw = db.keyword_search(req.query, k=req.k, filter=sf, record_salience=req.track)
     return _results_response(raw, req.include_metadata)
 
 

@@ -21,6 +21,8 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from feather_db import clock as _clock
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Score formula constants (must mirror scoring.h)
@@ -46,49 +48,63 @@ class MemoryManager:
         query_vec: np.ndarray,
         half_life_days: float = _DEFAULT_HALF_LIFE,
         time_weight: float    = _DEFAULT_TIME_WT,
+        relevance_floor: float = -1.0,
     ) -> dict:
         """
         Explain why `node_id` would be returned for `query_vec`.
 
         Returns a dict with keys:
-          similarity, stickiness, effective_age_days, recency,
-          importance, confidence, final_score, recall_count
+          similarity (cosine), relevance_floor, relevance, stickiness,
+          effective_age_days, recency, freshness, importance, confidence,
+          final_score, recall_count
+
+        `relevance_floor` as in ScoringConfig: < 0 is the modality's
+        background cosine (db.background_cosine()), 0 plain cosine.
         """
         meta = db.get_metadata(node_id)
         if meta is None:
             return {"error": f"Node {node_id} not found"}
 
-        # Retrieve stored vector for similarity calculation
+        # The engine's scored search, recomputed (scoring.h): relevance (cosine
+        # measured from the floor) scaled by freshness and importance, with
+        # recalls faded since the last one.
+        from feather_db.pocket import effective_recalls
         stored = db.get_vector(node_id, "text")
-        if len(stored) == 0:
-            similarity = 0.0
-        else:
-            stored_arr = np.array(stored, dtype=np.float32)
-            q = np.array(query_vec, dtype=np.float32)
-            dist = float(np.linalg.norm(q - stored_arr))
-            similarity = 1.0 / (1.0 + dist)
+        similarity = 0.0
+        if len(stored):
+            x = np.asarray(stored, dtype=np.float64)
+            q = np.asarray(query_vec, dtype=np.float64)
+            denom = float(np.linalg.norm(q) * np.linalg.norm(x))
+            similarity = float(q @ x) / denom if denom > 0 else 0.0
 
-        now         = time.time()
-        age_days    = (now - meta.timestamp) / 86400.0 if meta.timestamp > 0 else 0.0
-        stickiness  = 1.0 + math.log(1.0 + meta.recall_count)
+        now         = _clock.now(db)
+        age_days    = max(0.0, (now - meta.valid_time) / 86400.0)
+        stickiness  = 1.0 + math.log(1.0 + effective_recalls(meta, now))
         eff_age     = age_days / stickiness
         recency     = 0.5 ** (eff_age / half_life_days)
-        final_score = ((1.0 - time_weight) * similarity + time_weight * recency) * meta.importance
+        freshness   = (1.0 - time_weight) + time_weight * recency
+        floor       = (db.background_cosine("text") if relevance_floor < 0
+                       else min(max(relevance_floor, 0.0), 0.95))
+        relevance   = (similarity - floor) / (1.0 - floor) if floor > 0 else similarity
+        final_score = (relevance * freshness * meta.importance if relevance > 0
+                       else relevance)
 
         return {
             "node_id":           node_id,
             "similarity":        round(similarity, 4),
+            "relevance_floor":   round(floor, 4),
+            "relevance":         round(relevance, 4),
             "stickiness":        round(stickiness, 3),
             "effective_age_days":round(eff_age, 2),
             "recency":           round(recency, 4),
+            "freshness":         round(freshness, 4),
             "importance":        round(meta.importance, 3),
             "confidence":        round(meta.confidence, 3),
             "final_score":       round(final_score, 4),
             "recall_count":      meta.recall_count,
             "formula":           (
-                f"((1-{time_weight}) × {round(similarity,4)} "
-                f"+ {time_weight} × {round(recency,4)}) "
-                f"× {round(meta.importance,3)} = {round(final_score,4)}"
+                f"{round(relevance,4)} × ((1-{time_weight}) + {time_weight} × "
+                f"{round(recency,4)}) × {round(meta.importance,3)} = {round(final_score,4)}"
             ),
         }
 
@@ -105,7 +121,7 @@ class MemoryManager:
           recall_histogram, avg_importance, avg_confidence
         """
         ids  = db.get_all_ids(modality)
-        now  = int(time.time())
+        now  = int(_clock.now(db))
 
         hot_count = warm_count = cold_count = 0
         orphan_count = expired_count = 0
@@ -261,7 +277,7 @@ class MemoryManager:
             return {}
 
         # Score per node: 40% recall_count rank + 60% recency rank
-        now = time.time()
+        now = _clock.now(db)
         scores: list[tuple[int, float]] = []
         for nid in ids:
             meta = db.get_metadata(nid)

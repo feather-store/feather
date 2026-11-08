@@ -1,5 +1,7 @@
 #pragma once
 #include <atomic>
+#include <cmath>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +28,34 @@ struct Edge {
         : target_id(t), rel_type(r), weight(w) {}
 };
 
+// recall_count is a moving count of recent recalls, not a lifetime total. Each
+// recall first fades the count so far by the time since the previous recall,
+// then adds one:  n <- round(n * 0.5^(gap / RECALL_HALF_LIFE_DAYS)) + 1.
+// Scorer::effective_recalls then fades it from last_recalled_at to now. The
+// earlier rule kept a lifetime count and faded all of it from the LAST recall,
+// as if every recall had happened then: 100 recalls a year ago plus one
+// yesterday counted ~99. Now that is 1, which is right (exact: 1.02).
+//
+// Rounding loses at most half a recall per gap. Over short gaps the count
+// still goes up by exactly one per recall: a gap fades nothing until
+// n * (1 - 0.5^(gap/30d)) reaches 0.5, which is n ~22 for daily gaps and
+// n ~1.9M for one-second gaps. Under regular use it levels off
+// near half the exact moving count. Daily recalls for a year give 22 against
+// an exact 44 (the old rule gave 365).
+//
+// Fixed, not per query: a moving count can only fade at one rate. History
+// before the last recall fades at 30 days whatever half-life a query or a
+// Pocket uses; the time since the last recall fades at the caller's.
+constexpr double RECALL_HALF_LIFE_DAYS = 30.0;
+
+// note_recall() reads and writes both counters, and runs under the DB's SHARED
+// lock, so two queries can recall one record at once. A stripe keeps the pair
+// consistent without a mutex in every record.
+inline std::mutex& recall_stripe(const void* p) {
+    static std::mutex stripes[64];
+    return stripes[(reinterpret_cast<uintptr_t>(p) * 0x9E3779B97F4A7C15ull) >> 58];
+}
+
 struct Metadata {
     int64_t timestamp;
     float importance;
@@ -50,13 +80,37 @@ struct Metadata {
     // Convenience for the (many) places that just want the value.
     uint32_t recalls() const { return recall_count.load(std::memory_order_relaxed); }
     uint64_t recalled_at() const { return last_recalled_at.load(std::memory_order_relaxed); }
+    // Both counters as one value, for anything that persists them: a recall
+    // landing between two plain loads would save a count with the previous
+    // recall's time, and the count would then fade from the wrong moment.
+    std::pair<uint32_t, uint64_t> recall_state() const {
+        std::lock_guard<std::mutex> g(recall_stripe(this));
+        return {recalls(), recalled_at()};
+    }
 
     // Record one retrieval. Safe to call under a shared lock. Returns true for
     // the first retrieval since the counters were last committed, so the DB
     // queues this record for the next commit exactly once.
     bool note_recall(uint64_t now) const {
-        recall_count.fetch_add(1, std::memory_order_relaxed);
-        last_recalled_at.store(now, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> g(recall_stripe(this));
+            const uint32_t n = recalls();
+            uint32_t next = 1;
+            if (n) {
+                // A count with no recall time (copied by hand) fades from the
+                // record's own timestamp, as in effective_recalls().
+                const uint64_t at = recalled_at();
+                const uint64_t from = at ? at : static_cast<uint64_t>(
+                                                    timestamp > 0 ? timestamp : 0);
+                const double gap_days = now > from ? (now - from) / 86400.0 : 0.0;
+                const double kept = std::floor(
+                    n * std::pow(0.5, gap_days / RECALL_HALF_LIFE_DAYS) + 0.5);
+                next = kept >= 4294967295.0 ? UINT32_MAX
+                                            : static_cast<uint32_t>(kept) + 1;
+            }
+            recall_count.store(next, std::memory_order_relaxed);
+            last_recalled_at.store(now, std::memory_order_relaxed);
+        }
         // acq_rel pairs with clear_recall_unsaved(): a commit that clears the
         // flag after this exchange also sees the increment above, and one that
         // cleared it before makes this call return true and queue it again.

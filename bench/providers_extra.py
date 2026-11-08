@@ -96,7 +96,9 @@ class OpenRouterProvider:
     def __init__(self, model: Optional[str] = None, api_key: Optional[str] = None):
         from openai import OpenAI
         self._model = model or "openai/gpt-4o-2024-08-06"
-        self._client = OpenAI(base_url=OPENROUTER_BASE, max_retries=0,
+        # A timeout, or a half-open connection holds a worker for the SDK's
+        # default 600 s (a LoCoMo run stalled on twelve of them at once).
+        self._client = OpenAI(base_url=OPENROUTER_BASE, max_retries=0, timeout=120,
                               api_key=api_key or os.environ.get("OPENROUTER_API_KEY"))
 
     def complete(self, messages: list[dict], max_tokens: int = 512,

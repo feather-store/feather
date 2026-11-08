@@ -23,6 +23,10 @@ Usage — write the test as a coroutine whose first parameter is `mcp`:
 
 The decorator turns it back into an ordinary sync test taking the `server`
 fixture, so no pytest-asyncio dependency and no event loop shared between tests.
+
+`connect(server, user=...)` decides how the simulated user answers when the
+server asks them something (elicitation, e.g. to confirm a pin): "confirms"
+(the default), "declines", or None for a client that cannot ask at all.
 """
 from __future__ import annotations
 
@@ -36,8 +40,22 @@ import pytest
 
 pytest.importorskip("mcp", reason="needs the MCP SDK")
 
-from mcp import ClientSession                            # noqa: E402
+from mcp import ClientSession, types                     # noqa: E402
 from mcp.client._memory import InMemoryTransport         # noqa: E402
+
+
+def _user(answer):
+    """An elicitation callback: a user who confirms or declines every ask."""
+    if answer is None:
+        return None                       # the SDK default: "not supported"
+
+    async def respond(context, params):
+        if answer == "confirms":
+            # Yes to every field the server asked about (each is a boolean).
+            fields = (getattr(params, "requested_schema", None) or {}).get("properties", {})
+            return types.ElicitResult(action="accept", content={k: True for k in fields})
+        return types.ElicitResult(action="decline")
+    return respond
 
 
 def _text(result) -> str:
@@ -96,10 +114,10 @@ class Client:
 
 
 @asynccontextmanager
-async def connect(server, *, raise_exceptions: bool = False):
+async def connect(server, *, raise_exceptions: bool = False, user="confirms"):
     """Open a real client session against `server` and complete the handshake."""
     async with InMemoryTransport(server, raise_exceptions=raise_exceptions) as (read, write):
-        async with ClientSession(read, write) as session:
+        async with ClientSession(read, write, elicitation_callback=_user(user)) as session:
             init = await session.initialize()
             yield Client(session, init)
 

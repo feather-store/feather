@@ -12,6 +12,11 @@ stored, they have different lifetimes, and the difference is not decorative:
     FACTS         world knowledge, rules, positioning   corrected, with history
     PROCEDURES    how to do something                   versioned
     ENTITIES      things that recur                     enriched, merged
+    INTENTIONS    what to do, and when                  held until due, then
+                                                        carried until done
+    NOTES         what was said, in its own words       kept as said; found
+                                                        through what was
+                                                        extracted from it
 
 Write an episode with upsert semantics and you have destroyed the history that
 made it an episode. Write a preference append-only and the agent now holds six
@@ -31,9 +36,17 @@ module owns that ordering so a caller cannot invert it.
     mem.episodes.record("q3 report shipped late", outcome="missed_deadline")
     mem.facts.state("positioning", "premium, never discount-led")
     mem.entities.enrich("nike", {"industry": "apparel"})
+    mem.intentions.add("q3_followup", "send Dana the Q3 numbers", due_at=friday)
 
+    mem.intentions.due()             # what is due now, oldest first
     mem.about()                      # every kind, one prefix read
     mem.recall("how should I contact them", kinds=["preferences"])
+
+Every item carries an `origin` (feather_db.origin): `user` by default, since
+the code calling these vouches for what it stores; `agent` for observations,
+which are inferences by definition, and for `ingest_facts`, which a model
+extracted. Pass `origin="tool"` or `"external"` for what was read rather than
+told. Anything but `user` is quoted as data when it reaches a prompt.
 
 Everything underneath is still a `.feather` file and a plain `BaseStore`, so a
 LangGraph agent can use this and `store.get(...)` interchangeably.
@@ -45,14 +58,21 @@ import threading
 import time
 from typing import Any, Iterable, Optional
 
+from feather_db import clock as _clock
+from feather_db import origin as _origin
+from feather_db.pocket import due_at as _due_at
+
 PREFERENCES = "preferences"
 EPISODES    = "episodes"
 FACTS       = "facts"
 PROCEDURES  = "procedures"
 ENTITIES    = "entities"
 OBSERVATIONS = "observations"
+INTENTIONS  = "intentions"
+NOTES       = "notes"
 
-KINDS = (PREFERENCES, EPISODES, FACTS, PROCEDURES, ENTITIES, OBSERVATIONS)
+KINDS = (PREFERENCES, EPISODES, FACTS, PROCEDURES, ENTITIES, OBSERVATIONS, INTENTIONS,
+         NOTES)
 
 _SLUG = re.compile(r"[^a-z0-9]+")
 _APPEND_LOCK = threading.Lock()   # check-then-write for episode keys
@@ -75,6 +95,8 @@ def _event_time(meta) -> float:
 class _Kind:
     """One kind of memory, bound to its namespace. Not constructed directly."""
 
+    default_origin = _origin.USER
+
     def __init__(self, memory: "AgentMemory", kind: str, namespace: tuple[str, ...]):
         self._mem = memory
         self.kind = kind
@@ -84,9 +106,22 @@ class _Kind:
     def _write(self, key: str, value: dict, *, ttl: Optional[float] = None,
                index: Any = None) -> str:
         payload = {"kind": self.kind, "recorded_at": time.time(), **value}
+        payload["origin"] = _origin.check(payload.get("origin") or self.default_origin)
         self._mem.store.put(self.namespace, key, payload, ttl=ttl,
                             **({"index": index} if index is not None else {}))
         return key
+
+    def _write_many(self, items: list) -> list:
+        """[(key, value)] in one store batch: one save, not one per item."""
+        from langgraph.store.base import PutOp
+        ops = []
+        for key, value in items:
+            payload = {"kind": self.kind, "recorded_at": time.time(), **value}
+            payload["origin"] = _origin.check(payload.get("origin") or self.default_origin)
+            ops.append(PutOp(self.namespace, key, payload))
+        if ops:
+            self._mem.store.batch(ops)
+        return [k for k, _ in items]
 
     def get(self, key: str) -> Optional[dict]:
         item = self._mem.store.get(self.namespace, key)
@@ -209,7 +244,11 @@ class _Facts(_Kind):
                              key=lambda h: h.get("since") or 0)
             for h, nxt in zip(history, [*history[1:], {"since": held}]):
                 h["until"] = nxt.get("since")
-            return self._write(key, {**previous, "supersedes": history[-10:]})
+            # The record now holds this statement too, in its history.
+            origin = _origin.least(_origin.check(extra.get("origin") or self.default_origin),
+                                   previous.get("origin") or _origin.USER)
+            return self._write(key, {**previous, "supersedes": history[-10:],
+                                     "origin": origin})
         if previous and previous.get("text") != text:
             history = [*history, {"text": previous["text"],
                                   "since": held, "until": since,
@@ -251,21 +290,123 @@ class _Entities(_Kind):
         current = self.get(name) or {}
         merged = {**current.get("attributes", {}), **attributes}
         seen = int(current.get("seen_count", 0)) + 1
+        # The merged entity holds what every write added, so it is only as
+        # trusted as the least trusted of them: otherwise a `user` enrichment
+        # would launder the attributes a tool or web page put there.
+        origin = _origin.check(extra.pop("origin", None) or self.default_origin)
+        if current:
+            origin = _origin.least(origin, current.get("origin") or _origin.USER)
         return self._write(name, {"name": name, "attributes": merged,
                                   "text": text or current.get("text") or name,
-                                  "seen_count": seen, **extra})
+                                  "seen_count": seen, "origin": origin, **extra})
 
 
 class _Observations(_Kind):
     """The reflection layer. An observation cites the records that support it,
-    so a conclusion the agent drew can be traced back or retracted."""
+    so a conclusion the agent drew can be traced back or retracted. Its origin
+    is `agent`: it is an inference, whoever's evidence it cites."""
+
+    default_origin = _origin.AGENT
 
     def note(self, key: str, text: str, *, evidence: Optional[Iterable[str]] = None,
-             confidence: float = 0.5, supersedes: Optional[Iterable[str]] = None) -> str:
-        return self._write(key, {"text": text,
-                                 "evidence": list(evidence or []),
-                                 "confidence": confidence,
-                                 "supersedes": list(supersedes or [])})
+             confidence: float = 0.5, supersedes: Optional[Iterable[str]] = None,
+             origin: str = _origin.AGENT) -> str:
+        evidence = list(evidence or [])
+        self._write(key, {"text": text,
+                          "evidence": evidence,
+                          "confidence": confidence,
+                          "supersedes": list(supersedes or []),
+                          "origin": origin})
+        # The citation as an edge as well as a key in the value: the engine
+        # reads edges, so erasing what an observation cites erases it too.
+        store = self._mem.store
+        obs = store.id_of(self.namespace, key)
+        for cited in self._mem._resolve_keys(evidence):
+            store.db.link(obs, cited, "cites", 1.0)
+        return key
+
+
+class _Intentions(_Kind):
+    """Prospective memory: something to do, and when. An intention is held
+    back until `due_at`, then surfaces until it is marked done; a reminder
+    that decays like a note is forgotten exactly when it matters.
+
+    The value's `due_at` is mapped onto the record (FeatherStore), so a Pocket
+    reading this namespace keeps an open intention out of its working set
+    until it is due and carries it as if pinned after. `due()` is the same
+    read for code that assembles its own prompt. `done()` ends it: an
+    intention kept after it is done reads like one still to do."""
+
+    def add(self, key: str, text: str, *, due_at: float, **extra) -> str:
+        """Hold `text` until `due_at` (unix seconds). Same key replaces, so a
+        rescheduled reminder is one reminder."""
+        return self._write(key, {"text": text, "due_at": float(due_at),
+                                 "status": "open", **extra})
+
+    def due(self, now: Optional[float] = None, limit: int = 100) -> list[dict]:
+        """Open intentions due at `now` (default: the handle's clock, so an
+        as_of replay sees what was due then), the longest overdue first.
+        Reads the due time off each record and parses only the due ones."""
+        store = self._mem.store
+        now = _clock.now(store.db) if now is None else now
+        rows = [(d, meta) for _rid, meta in store.scan(self.namespace)
+                if (d := _due_at(meta)) is not None and d <= now]
+        rows.sort(key=lambda r: r[0])
+        return [store._value_of(meta) for _d, meta in rows[:limit]]
+
+    def done(self, key: str, *, outcome: Optional[str] = None) -> Optional[str]:
+        """Remove the intention; with a user, record its completion as an
+        episode, so "did I send it?" still has an answer. Returns the
+        episode's key, or None (unknown key, or no episodes to record in)."""
+        current = self.get(key)
+        if current is None:
+            return None
+        episode = None
+        if not isinstance(self._mem.episodes.namespace, _Missing):
+            episode = self._mem.episodes.record(
+                f"done: {current.get('text', key)}", outcome=outcome,
+                intention=key, was_due_at=current.get("due_at"))
+        self.delete(key)
+        return episode
+
+class _Notes(_Kind):
+    """Raw memory: what was said, kept in its own words, and found through
+    the facts extracted from it (`FeatherStore.index`): facts as index,
+    notes as payload. A fact with a one-value key also chains the notes
+    that state a value of it, so `recall` returns the newest with the older
+    ones in its `earlier`.
+
+    Why not store the facts themselves: on LoCoMo a reader given extracted
+    facts scored J 64, given the raw turns 78.8, and given the raw turns
+    found through their facts too, 82.4 (bench.locomo). Extraction keeps a
+    few facts per session and drops the detail a question asks about."""
+
+    def add(self, text: str, *, key: Optional[str] = None, at: Optional[float] = None,
+            index: Optional[Iterable[Any]] = None, **extra) -> str:
+        """Keep `text` as said, at `at` (when it was said or became true,
+        default now), indexed by `index` (IndexEntry, str or extractor Fact).
+        Without `key` it is appended (`<unix>_<slug>`, `#n` on a clash); a
+        key rewrites the note at it and replaces its index."""
+        at = at if at is not None else time.time()
+        if key is None:
+            base = key = f"{int(at)}_{_slug(text)}"
+            with _APPEND_LOCK:
+                n = 1
+                while self._mem.store.get(self.namespace, key) is not None:
+                    n += 1
+                    key = f"{base}#{n}"
+                self._write(key, {"text": text, "valid_at": at, **extra})
+        else:
+            self._write(key, {"text": text, "valid_at": at, **extra})
+        if index is not None:
+            self._mem.store.index(self.namespace, key, index)
+        return key
+
+    def known_keys(self) -> list[str]:
+        """The one-value keys these notes are indexed by: pass them to the
+        extractor (`known_keys`) so it names an attribute the way it did
+        before."""
+        return self._mem.store.known_keys(self.namespace)
 
 
 class AgentMemory:
@@ -289,6 +430,9 @@ class AgentMemory:
         self.procedures   = _Procedures(self, PROCEDURES, self._ns(agent, PROCEDURES, "agent"))
         self.entities     = _Entities(self, ENTITIES, (org, ENTITIES))
         self.observations = _Observations(self, OBSERVATIONS, self._ns(user, OBSERVATIONS, "user"))
+        self.intentions   = _Intentions(self, INTENTIONS,
+                                        self._ns(user or agent, INTENTIONS, "user or agent"))
+        self.notes        = _Notes(self, NOTES, self._ns(user, NOTES, "user"))
 
     def _ns(self, subject: Optional[str], kind: str, needs: str) -> tuple[str, ...]:
         if subject is None:
@@ -329,6 +473,71 @@ class AgentMemory:
         hits.sort(key=lambda h: -(h.score if h.score is not None else 0.0))
         return [h.value for h in hits[:limit]]
 
+    def ingest_session(self, turns: list[dict], session_date: Any, extractor: Any = None, *,
+                       session_id: Optional[str] = None,
+                       user_name: Optional[str] = None, queue: Any = None) -> dict[str, int]:
+        """Keep a conversation session as notes, one per turn in its own words
+        ("user: ...", "assistant: ..."), indexed by the facts `extractor` (a
+        SessionFactExtractor) draws from it: each fact indexes the turn it
+        cites (the first turn when it cites none). The extractor is told
+        `user_name` and the one-value keys the notes already hold, so an
+        attribute keeps one name across sessions.
+
+        The measured alternative to `ingest_facts`, which stores the facts as
+        the memory: LoCoMo J 82.4 against 64 (bench.locomo --memory index /
+        facts). Idempotent per session: notes are keyed `<session>#<turn>`,
+        so ingesting a session again rewrites it. User turns are stored with
+        origin `user`, the rest `agent`. Returns counts.
+
+        With `queue` (feather_db.ingest.IngestQueue) the notes are written now,
+        in one batch, and the extraction is a job: the call returns before
+        any model is asked, and a failed call is retried instead of leaving
+        the session unindexed. `extractor` is then the queue's."""
+        import datetime as _dt
+        from feather_db.extractors.session_facts import _parse_day
+        day = (session_date if isinstance(session_date, _dt.datetime)
+               else _parse_day(session_date))
+        at = day.timestamp() if day else time.time()
+        sid = session_id or str(int(at))
+        if queue is not None:
+            notes = []
+            for i, t in enumerate(turns):
+                text = str(t.get("content") or "").strip()
+                if not text:
+                    continue
+                role = t.get("role") or "user"
+                notes.append((f"{sid}#{i}", {
+                    "text": f"{role}: {text}", "valid_at": at, "role": role,
+                    "session": sid, "turn": i,
+                    "origin": _origin.USER if role == "user" else _origin.AGENT}))
+            written = self.notes._write_many(notes)
+            job = queue.submit_session(".".join(self.notes.namespace), written,
+                                       session_date, session_id=sid, user_name=user_name)
+            return {"turns": len(written), "queued": job}
+        if extractor is None:
+            raise ValueError("ingest_session needs an extractor, or a queue that has one")
+        facts = extractor.extract_session(
+            turns, session_date,
+            context={"user_name": user_name, "known_keys": self.notes.known_keys(),
+                     "session_id": sid})
+        cited: dict[int, list] = {}
+        for f in facts:
+            t = f.metadata.get("turn")
+            cited.setdefault(t if isinstance(t, int) and 0 <= t < len(turns) else 0,
+                             []).append(f)
+        written = 0
+        for i, t in enumerate(turns):
+            text = str(t.get("content") or "").strip()
+            if not text:
+                continue
+            role = t.get("role") or "user"
+            self.notes.add(f"{role}: {text}", key=f"{sid}#{i}", at=at,
+                           index=cited.get(i, []), role=role, session=sid, turn=i,
+                           origin=_origin.USER if role == "user" else _origin.AGENT)
+            written += 1
+        return {"turns": written, "facts": len(facts),
+                "one_value": sum(1 for f in facts if f.metadata.get("replaces"))}
+
     def ingest_facts(self, facts: Iterable[Any], *,
                      source: Optional[str] = None) -> dict[str, int]:
         """Route extracted facts (feather_db.extractors.Fact, e.g. from
@@ -341,7 +550,9 @@ class AgentMemory:
                            value supersedes with its valid-from date
 
         Every write carries the fact's valid time (`valid_at`), not the
-        time of ingest, so sessions can be ingested in any order.
+        time of ingest, so sessions can be ingested in any order, and
+        origin `agent`: a model extracted it, from a transcript that may
+        hold tool output or pasted text as well as what the user said.
         Returns how many facts went to each kind (and how many were
         repeats of an episode already held).
         """
@@ -363,26 +574,84 @@ class AgentMemory:
                     "text": text, "outcome": None, "happened_at": day,
                     "valid_at": day,
                     "entity": m.get("entity", ""), "amount": m.get("amount", ""),
-                    "own": m.get("own", True), "source": src})
+                    "own": m.get("own", True), "source": src,
+                    "origin": _origin.AGENT})
                 counts["episodes"] += 1
             elif kind == "preference":
                 self.preferences.set(_slug(fact_key(f), 80), text, at=at,
-                                     value=f.object, source=src)
+                                     value=f.object, source=src,
+                                     origin=_origin.AGENT)
                 counts["preferences"] += 1
             else:
                 self.facts.state(_slug(fact_key(f), 80), text, at=at,
-                                 source=src, value=f.object)
+                                 source=src, value=f.object,
+                                 origin=_origin.AGENT)
                 counts["facts"] += 1
         return counts
+
+    # ── erasure ──────────────────────────────────────────────────────────
+
+    def erase_subject(self, subject: Optional[str] = None, *,
+                      dry_run: bool = False) -> dict:
+        """Erase everything held about `subject` (default: this user), so that
+        nothing of it remains: every kind under (org, subject), the org entity
+        named after it, and every record derived from or citing any of those.
+        The right to erasure, for one person. Returns the engine's receipt."""
+        subject = subject or self.user
+        if not subject:
+            raise ValueError("no subject: pass one, or construct with user=...")
+        ids = [i for i in [self.store.id_of((self.org, ENTITIES), subject)] if i is not None]
+        return self.store.db.erase(ids=ids, namespace=f"{self.org}.{subject}",
+                                   prefix=True, dry_run=dry_run)
+
+    def erase(self, kind: str, key: str, *, dry_run: bool = False) -> dict:
+        """Erase one item, and every record derived from or citing it, so that
+        nothing of it remains. Observations cite by edge since 0.22; one
+        written before cites only by key in its value, and is found that way
+        too (over-matching a key shared by two kinds erases an observation more,
+        never one less)."""
+        if kind not in KINDS:
+            raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+        ns = getattr(self, kind).namespace
+        ids = []
+        if not isinstance(self.observations.namespace, _Missing):
+            import json as _json
+            for oid, meta in self.store.scan(self.observations.namespace):
+                try:
+                    value = _json.loads(meta.get_attribute("_lg_value") or "{}")
+                except ValueError:
+                    continue
+                if key in (value.get("evidence") or []):
+                    ids.append(oid)
+        # The item by (namespace, entity = its key), a deleted one's shell
+        # included; the observations citing it by key, by id.
+        return self.store.db.erase(ids=ids, namespace=".".join(ns), entity=key,
+                                   dry_run=dry_run)
+
+    def _resolve_keys(self, keys_: Iterable[str]) -> list[int]:
+        """Record ids for bare keys, looked up in every kind of this subject and
+        in the org's entities. A key held by two kinds resolves to both."""
+        spaces = [getattr(self, k).namespace for k in
+                  ("preferences", "episodes", "facts", "procedures", "observations",
+                   "intentions", "notes", "entities")]
+        out = []
+        for k in keys_:
+            for ns in spaces:
+                if isinstance(ns, _Missing):
+                    continue
+                rid = self.store.id_of(ns, k)
+                if rid is not None:
+                    out.append(rid)
+        return out
 
     def summary(self) -> dict[str, int]:
         """How much of each kind is held — cheap enough to log every turn."""
         out = {}
         for name in ("preferences", "episodes", "facts", "procedures",
-                     "entities", "observations"):
+                     "entities", "observations", "intentions", "notes"):
             kind = getattr(self, name)
             out[name] = 0 if isinstance(kind.namespace, _Missing) else len(kind)
-        return out   # len() is now a count, so this is six cheap scans
+        return out   # len() is now a count, so this is one cheap scan per kind
 
     def __repr__(self) -> str:
         who = ", ".join(f"{k}={v}" for k, v in

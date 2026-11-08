@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import json
 import hashlib
+import weakref
 import urllib.request
 import urllib.error
 from collections import OrderedDict
@@ -222,5 +223,27 @@ def _cached(embed: Callable[[str], List[float]], cap: int) -> Callable[[str], Li
                 cache.popitem(last=False)
         return list(v)
 
+    def clear() -> None:
+        with lock:
+            cache.clear()
+
     cached.stats = stats
+    cached.clear = clear
+    _CACHES.add(cached)
     return cached
+
+
+# Every cache this process holds, so an erasure can drop them all (weak: a
+# cache goes with its embedder).
+_CACHES: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def clear_caches() -> int:
+    """Empty every embedding cache in this process; returns how many.
+
+    A cache holds a vector per text, keyed by the text's SHA-256: an embedding
+    of what an erasure removed. DB.erase() and RemoteDB.erase() call this."""
+    caches = list(_CACHES)
+    for c in caches:
+        c.clear()
+    return len(caches)
