@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixes
+
+- **Startup no longer reads every record.** `FeatherStore` and `Pocket` ran
+  the pre-0.22 key migration over every record on every start: over the
+  Cloud API the whole dataset downloaded per start (1,000 items: 17
+  requests, 705 KB). It now runs once per file and leaves a marker
+  (`keys.upkeep`, a bookkeeping record in namespace ""): 2 requests, 1.3 KB.
+- **`ids_in_namespace(ns, prefix=True)`** (engine, `GET /ids?prefix=true`,
+  `RemoteDB`): a subtree in one call. `FeatherStore` searches under a prefix
+  with it; `AgentMemory.about()` over 8 kinds went from 8 requests to 2.
+- **`erase()` of a large share of the graph was quadratic.** Its local
+  repair followed chains of removed nodes without limit; past ~1/32 of the
+  graph removed they percolate, and every touched node walked the whole
+  cluster: 10% of 20k x 768 took 79 s. It now stops after 2 hops and gives
+  the heuristic the 4 x M closest candidates: 1.2 s, recall@10 0.824 vs
+  0.834 for a full rebuild (0.808 / 0.831 at 1% / 4%, at or above a rebuild).
+- **Budgets count datamarks.** Quoted memory is ~60% more tokens; `hot()`
+  and `DB.heat_select` cost an untrusted item 8/5 of its estimate
+  (`pocket.estimate_quoted_tokens`, the same integer rule in heat.h), and
+  `PacketBuilder`'s estimate (without tiktoken) counts each mark.
+- **Tombstones do not slow search** (correction): the 0.4 -> 13.9 ms p99
+  reported on 2026-11-08 was a cold CPU, not the 10% forgotten records
+  (warm, 100k x 768: 0.51-0.92 ms without deletes, 0.67-1.01 ms with).
+- `bench.locomo`: the run summary named `select` without receiving it.
+
 ### Fewer requests per operation over the Cloud API
 
 Counted against the real API (in-process), 1,000 items:
