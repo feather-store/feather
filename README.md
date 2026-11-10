@@ -1043,9 +1043,8 @@ v3–v9 files load transparently, and the first `save()` rewrites them as v10.
 | Rust CLI missing v0.6.0+ features | namespace/entity/context_chain/integrations/time travel are Python-only |
 | History ends at an erase | `erase()` deletes all history; `as_of` sees commits, not writes still only in the WAL |
 | Kept history costs a full copy | each file kept by `set_history_retention()` is the whole DB as it was (off by default) |
-| BM25 builds on first use | the first keyword or hybrid search after an open builds the index: 1.95 s and +82 MB per process at 100k conversation turns |
-| Forgotten records slow search | 10% forgotten records take search p99 from 0.4 ms to 13.9 ms until `compact()` or `set_auto_compact()` |
-| Quoted memory in `hot_text()` | a model still obeyed 15 of 20 planted instructions quoted there; query packets held at 0 of 25 |
+| BM25 builds on first use | the first keyword or hybrid search after an open builds the index: 0.65 s and 58 MB per process at 100k conversation turns (it was 2.0 s and 80 MB) |
+| Erasing much of a graph | `erase()` repairs the graph locally; past ~10% of it in one call, recall@10 sits ~1 point under a rebuild until `compact()` (20k x 768: 0.824 vs 0.834) |
 
 ---
 
