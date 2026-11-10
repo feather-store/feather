@@ -1105,7 +1105,7 @@ def _answer_and_judge(tasks, qpath, prior, reuse, reader_chat, judge_chat, extra
             "memory": memory,
             "select": select,
             "categories": sorted(categories) if categories else [1, 2, 3, 4],
-            "retrieval": "hybrid_search (BM25 + dense, RRF), no scoring"
+            "retrieval": "hybrid_search (BM25 + dense, score fusion), no scoring"
                          + (" over turns + extracted facts; a fact hit counts for "
                             "the turn it cites; k distinct turns" if memory == "index" else ""),
             **({"extractor": extractor, "extracted": dict(kept),

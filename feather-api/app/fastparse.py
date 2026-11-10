@@ -17,7 +17,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import msgspec
 import numpy as np
@@ -94,6 +94,7 @@ class HybridBody(_VectorMixin, msgspec.Struct, kw_only=True):
     vector_b64: Optional[str] = None
     k: K = 10
     rrf_k: RRF_K = 60
+    fusion: Literal["score", "rrf"] = "score"
     modality: str = "text"
     include_metadata: bool = True
     namespace_id: Optional[str] = None

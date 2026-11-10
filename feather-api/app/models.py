@@ -244,6 +244,9 @@ class HybridSearchRequest(VectorInput):
                     "first or list records and re-rank client-side.",
     )
     rrf_k: int = Field(60, ge=1, le=10000)
+    fusion: Literal["score", "rrf"] = Field(
+        "score", description="score: vector relevance + 0.2 * sigmoid(BM25 z-score "
+                             "within the query). rrf: Reciprocal Rank Fusion with rrf_k.")
     modality: str = "text"
     include_metadata: bool = True
     # Filters

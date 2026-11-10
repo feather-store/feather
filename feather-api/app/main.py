@@ -2005,7 +2005,7 @@ def _hybrid_search_impl(namespace: str, req, q=None):
     _check_query_dim(db, q, req.modality)
     raw = db.hybrid_search(q, req.query, k=req.k,
                             rrf_k=req.rrf_k, filter=sf, scoring=sc,
-                            modality=req.modality)
+                            modality=req.modality, fusion=req.fusion)
     return _results_response(raw, req.include_metadata)
 
 

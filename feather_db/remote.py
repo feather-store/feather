@@ -627,8 +627,10 @@ class RemoteDB:
                                            "track": bool(record_salience),
                                            **_filter_json(filter)}))
 
-    def hybrid_search(self, vec, query, k=10, rrf_k=60, filter=None, scoring=None, modality="text"):
+    def hybrid_search(self, vec, query, k=10, rrf_k=60, filter=None, scoring=None, modality="text",
+                      fusion="score"):
         body = {"vector_b64": _vec(vec), "query": query, "k": int(k), "rrf_k": int(rrf_k),
+                "fusion": fusion,
                 "modality": modality, **_filter_json(filter), **_scoring_json(scoring)}
         return self._hits(self._call("POST", "/hybrid_search", body=body))
 
