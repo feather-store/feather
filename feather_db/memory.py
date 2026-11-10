@@ -252,8 +252,7 @@ class MemoryManager:
             if chosen.id in vecs:
                 selected_vecs.append(vecs[chosen.id])
 
-        for r in selected:
-            db.touch(r.id)
+        db.touch_many([r.id for r in selected])
         return selected
 
     # ── Tier assignment ──────────────────────────────────────────────────────

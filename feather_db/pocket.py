@@ -1298,12 +1298,10 @@ class Pocket:
     def promote(self, items: Iterable[PocketItem]) -> None:
         """Count `items` as used: each one's `recall_count` goes up by one.
         Untrusted items are skipped: heat() does not count their use."""
-        touched = False
-        for item in items:
-            if item.origin not in self.trusted:
-                continue
-            self.db.touch(item.id)
-            touched = True
+        ids = [item.id for item in items if item.origin in self.trusted]
+        touched = bool(ids)
+        if ids:
+            self.db.touch_many(ids)       # one call: one request over the Cloud API
         # A promotion is a write: it changes heat and therefore the working
         # set. Without this the memoised hot() would keep serving a view that
         # predates it — the exact thing promotion exists to change.

@@ -424,8 +424,7 @@ class FeatherTools:
             if len(output) >= k:
                 break
 
-        for item in output:
-            self.db.touch(item["id"])
+        self.db.touch_many([item["id"] for item in output])
         return json.dumps({"results": output, "count": len(output)}, indent=2)
 
     def feather_context_chain(
@@ -805,8 +804,8 @@ class FeatherTools:
                 if len(output) >= k:
                     break
 
-            for item in output:          # a recall = returned to the agent
-                self.db.touch(item["id"])
+            # a recall = returned to the agent
+            self.db.touch_many([item["id"] for item in output])
             return json.dumps({"results": output, "count": len(output),
                                "decay": {"half_life": half_life_days,
                                          "time_weight": time_weight}}, indent=2)
