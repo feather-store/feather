@@ -32,6 +32,44 @@ with its route and `RemoteDB` method: `DB.touch_many(ids)` (`POST
 already returned both); `keys.get` uses it and `keys.write(found=...)` skips
 a second lookup.
 
+### Retrieval and memory safety, measured
+
+- **`hybrid_search` fuses scores, not ranks** (`fusion="score"`, the
+  default; `fusion="rrf"` keeps Reciprocal Rank Fusion, `rrf_k` still 60).
+  Each candidate of either half scores `relevance + 0.2 * sigmoid(z)`:
+  relevance is the calibrated cosine (or the decay score with `scoring`),
+  computed from the stored vector for a record only BM25 found; z is its BM25
+  score standardised over the query's BM25 candidates. LoCoMo, cached
+  gemini-embedding-001 vectors, form and weight chosen on the 3 dev
+  conversations, reported on the 7 held out (1,079 questions): evidence
+  recall@30 77.9 -> 82.6 (+4.7 [+2.8, +6.4] resampling conversations),
+  @10 66.9 -> 71.4. RRF k=60 was the worst k tried and below vector search
+  alone (79.9); RRF k=20 reached 81.3, and score fusion beats it by +1.4
+  [+0.6, +2.2]. A conditional logit fit on the same labels gave the same
+  BM25 weight. LongMemEval (38 cached haystacks): gold within 5 sessions
+  84.2 -> 89.5. +0.13 ms a search at 3072-d. Cloud API (`fusion` field) and
+  `RemoteDB.hybrid_search` take it too. With an embedder whose cosines carry
+  no meaning (random or very low-dimensional test vectors) BM25 counts for
+  less than under RRF: use `fusion="rrf"` there.
+- **Recency was fit and found absent** from these labels: a recency term's
+  weight in the logit was +0.32 [-0.05, +0.59] and moved held-out recall by
+  -0.06 at every half-life from 7 to 365 days. The decay constants, the
+  recall fade, importance and use cannot be fit from LongMemEval or LoCoMo
+  (no usage, constant importance); they were left as they are.
+- **Untrusted memory is datamarked and fenced** in every prompt renderer
+  (`origin.quote`, `origin.quoted_section`: `hot_text()`, `PacketBuilder`,
+  MCP `context` and `recall`). Every space in quoted text is written as
+  `ˆ` (spotlighting, Hines et al. 2024), and the section sits between two
+  lines naming a hash of its own content, which stored text cannot close.
+  bench.poisoning, gpt-4o-mini, defended, 5 runs on fresh seeds: planted
+  instructions obeyed in `hot_text()` 80/100 -> 6/100, in a hot packet
+  29/100 -> 0/100, in query packets 4/125 -> 0/125. A fact stated only in
+  an agent memory was still answered 100/100. Chosen on other seeds: the
+  fence alone did 49/100, datamarking alone 31/100, PacketBuilder's layout
+  for `hot_text()` 75/100 (no gain). Cost: quoted text is ~60% more tokens
+  (every mark tried costs the same: removing spaces breaks word tokens), and
+  the token budgets, which count characters, do not see it.
+
 ### Algorithms: what each costs, measured
 
 - **`Pocket.hot()` is chosen in the engine** (`DB.heat_select`, Cloud API
