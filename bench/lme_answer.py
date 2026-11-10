@@ -96,11 +96,20 @@ number, where they live now, a plan that was revised):
 PREFERENCES (recommendations, suggestions, tips, "what should I…",
 "any ideas…"):
   Never answer "unknown": a request for suggestions always gets them.
-  Find what the user said they like, use, own, avoid or plan, including in
-  related contexts (a hotel they loved in another city, a hobby, a past
-  purchase), and carry those preferences over. Name them, and give
-  specific suggestions that fit them; no generic advice. Here the final
-  answer is the full personalised recommendation, several sentences.
+  1. PREFERENCES FIRST: before anything else, list what the user said
+     they like, use, own, avoid, are working on or want to move beyond
+     that bears on the request, including in related contexts (a hotel
+     they loved in another city, a hobby, a past purchase). One line
+     each, in the user's words, with the session date. A suggestion the
+     user did not take up is not a preference.
+  2. Do not violate these lines, explicit or implied: never recommend
+     what the user said they avoid, dislike or want to move beyond.
+  3. Build on them: start from the specific things the user named (the
+     gear they own, the recipe that worked, the source they already
+     use), name them, and connect each suggestion to one; no generic
+     advice that would fit anyone.
+  Here the final answer is the full personalised recommendation, several
+  sentences, naming those specifics.
 
 ABSTENTION (factual questions about the user's past, not requests for
 suggestions):
