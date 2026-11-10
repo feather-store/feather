@@ -1160,6 +1160,17 @@ listed `.cpp` sources, so before `depends=glob("include/*.h")` was added to
 and produced a build that looked fresh but contained none of the changes. If you
 ever see a change "not take effect", `rm -rf build` and rebuild.
 
+### Hybrid search fuses scores (0.22)
+`hybrid_search(fusion="score")`, the default: `relevance + HYBRID_BM25_WEIGHT
+(0.2) * sigmoid(z)`, z = BM25 standardised over the query's BM25 candidates;
+a record only BM25 found is scored from its stored vector. Chosen on LoCoMo
+dev, held out +4.7 recall@30 over RRF(60). Rules if you touch it: a new
+weight or form is tuned on the LoCoMo dev conversations and reported on the
+held-out ones (cached vectors, free; the harness is in CHANGELOG 0.22);
+`fusion="rrf"` with `rrf_k=60` must keep reproducing the old ranking; and a
+test that relies on BM25 with random vectors needs high-dimensional ones
+(chance cosines in 8-32 d outweigh the BM25 term).
+
 ### Filtered search: complete always, exact below FEATHER_NS_ANN_MIN
 An indexed filter (namespace / namespace_prefix / entity / attribute) returns
 a complete top-k (never short when k match), which `Pocket.recall` depends on.

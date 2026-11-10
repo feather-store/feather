@@ -7580,16 +7580,42 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Hybrid search: BM25 + vector via Reciprocal Rank Fusion (RRF)
+    // Hybrid search: BM25 + vector
     // ─────────────────────────────────────────────────────────────────
+    // fusion "score" (default): every candidate of either half is scored
+    //     relevance + HYBRID_BM25_WEIGHT * sigmoid(z)
+    // where relevance is the vector half's own score (calibrated cosine,
+    // (cos - floor) / (1 - floor) with the modality's background cosine; the
+    // decay score when `scoring` is given), computed from the stored vector for
+    // a record only BM25 found, and z is its BM25 score standardised over this
+    // query's BM25 candidates (0 if BM25 did not find it).
+    // fusion "rrf": Reciprocal Rank Fusion, sum of 1 / (rrf_k + rank).
+    //
+    // RRF keeps ranks only, so a near-tie and a landslide count the same, and a
+    // record one half missed gets nothing from it. Measured on LoCoMo (cached
+    // gemini-embedding-001 vectors, hybrid k=30, pools of 3k per half; weight
+    // and form chosen on the 3 dev conversations, reported on the 7 held out,
+    // 1,079 questions): evidence recall@30 77.9 (RRF, k=60) -> 82.6, +4.7
+    // [+2.8, +6.4] resampling whole conversations; @10 66.9 -> 71.5. RRF k=60
+    // was the worst k tried (k=20: 81.3) and below vector search alone (79.9).
+    // A conditional logit fit on the same labels gave the same BM25 weight
+    // (0.068 vs 0.053 of raw cosine); held-out recall is flat for weights
+    // 0.08-0.2. LongMemEval (38 cached haystacks): gold within 5 sessions
+    // 84.2 -> 89.5, within 10 92.1 -> 97.4.
+    static constexpr double HYBRID_BM25_WEIGHT = 0.2;
+
     std::vector<SearchResult> hybrid_search(const std::vector<float>& vec,
                                             const std::string& query,
                                             size_t k = 10,
                                             size_t rrf_k = 60,
                                             const SearchFilter* filter = nullptr,
                                             const ScoringConfig* scoring = nullptr,
-                                            const std::string& modality = "text") {
-        // Read-only end to end (RRF fusion never touches salience), so this
+                                            const std::string& modality = "text",
+                                            const std::string& fusion = "score") {
+        if (fusion != "score" && fusion != "rrf")
+            throw std::invalid_argument("fusion must be \"score\" or \"rrf\", not \"" + fusion + "\"");
+        const bool by_score = fusion == "score";
+        // Read-only end to end (fusion never touches salience), so this
         // runs fully concurrently with other queries. Both rankings and the
         // fusion work on (score, id); metadata is copied for the final k only.
         ensure_bm25();
@@ -7597,8 +7623,13 @@ public:
         ensure_open();
         const size_t candidates = k * 3;
 
+        // ── Inline BM25 search (no re-lock) ──────────────────────────
+        const auto kw_ranked = bm25_top_nolock(query, candidates, filter);
+
         // ── Inline vector search (no re-lock) ─────────────────────────
         std::vector<ScoredId> vec_ranked;
+        // Score fusion: the vector score of each record only BM25 found.
+        std::unordered_map<uint64_t, float> kw_only_score;
         {
             auto m_it = modality_indices_.find(modality);
             if (m_it != modality_indices_.end()) {
@@ -7627,6 +7658,8 @@ public:
                 std::optional<CosineOf> cosine_of;
                 if (scoring) cosine_of.emplace(m_idx, vec,
                                                relevance_floor_nolock(*scoring, modality, m_idx));
+                else if (by_score) cosine_of.emplace(m_idx, vec,
+                                                     background_cosine_nolock(modality, m_idx));
                 auto fetch = [&](size_t n) {
                     return knn_nolock(m_idx, vec.data(), qbytes, n, 0, filter ? &fw : nullptr);
                 };
@@ -7637,26 +7670,79 @@ public:
                                          *cosine_of, *scoring, now_ts, fetch)
                     : fetch(cands);
                 vec_ranked.reserve(res.size());
-                for (const auto& [dist, id] : res) {
-                    float score;
+                auto score_of = [&](float dist, uint64_t id) -> float {
                     if (scoring) {
                         auto it = metadata_store_.find(id);
-                        score = cosine_of->score(
+                        return cosine_of->score(
                             dist, id, it != metadata_store_.end() ? it->second : kNoMeta,
                             *scoring, now_ts);
-                    } else {
-                        score = 1.0f / (1.0f + dist);
                     }
-                    vec_ranked.emplace_back(score, id);
-                }
+                    if (by_score)
+                        return Scorer::relevance((*cosine_of)(dist, id), cosine_of->floor);
+                    return 1.0f / (1.0f + dist);
+                };
+                for (const auto& [dist, id] : res)
+                    vec_ranked.emplace_back(score_of(dist, id), id);
                 const auto head_end = vec_ranked.begin() + std::min(candidates, vec_ranked.size());
                 std::partial_sort(vec_ranked.begin(), head_end, vec_ranked.end(), better_scored);
                 vec_ranked.erase(head_end, vec_ranked.end());
+                if (by_score) {
+                    // The exact squared distance to the stored vector: float, or
+                    // a float query against int8 storage. A record with no vector
+                    // in this modality scores as cosine 0 (CosineOf finds no label).
+                    std::unordered_set<uint64_t> in_vec;
+                    for (const auto& [sc, id] : vec_ranked) in_vec.insert(id);
+                    const auto& idx = *m_idx.index;
+                    for (const auto& [sc, id] : kw_ranked) {
+                        if (in_vec.count(id)) continue;
+                        auto lit = idx.label_lookup_.find(id);
+                        float d2 = 0.0f;
+                        if (lit != idx.label_lookup_.end()) {
+                            const char* data = idx.getDataByInternalId(lit->second);
+                            d2 = m_idx.int8
+                                ? feather_simd::f32_i8_l2_fn()(vec.data(),
+                                      reinterpret_cast<const int8_t*>(data), m_idx.scale, m_idx.dim)
+                                : feather_simd::l2_fn()(vec.data(),
+                                      reinterpret_cast<const float*>(data), m_idx.dim);
+                        }
+                        kw_only_score[id] = score_of(d2, id);
+                    }
+                }
             }
         }
 
-        // ── Inline BM25 search (no re-lock) ──────────────────────────
-        const auto kw_ranked = bm25_top_nolock(query, candidates, filter);
+        if (by_score) {
+            // BM25 standardised over this query's candidates, then a logistic:
+            // a record's lexical evidence relative to the others BM25 found,
+            // in (0, 1). One candidate (or all equal) carries no spread: 0.5.
+            double mean = 0.0, var = 0.0;
+            for (const auto& [sc, id] : kw_ranked) mean += sc;
+            if (!kw_ranked.empty()) mean /= static_cast<double>(kw_ranked.size());
+            for (const auto& [sc, id] : kw_ranked) var += (sc - mean) * (sc - mean);
+            const double sd = kw_ranked.size() > 1
+                ? std::sqrt(var / static_cast<double>(kw_ranked.size())) : 0.0;
+            std::unordered_map<uint64_t, double> fused_scores;
+            fused_scores.reserve(vec_ranked.size() + kw_ranked.size());
+            for (const auto& [sc, id] : vec_ranked) fused_scores[id] = sc;
+            for (const auto& [id, sc] : kw_only_score) fused_scores[id] = sc;
+            for (const auto& [sc, id] : kw_ranked) {
+                const double z = kw_ranked.size() > 1 ? (sc - mean) / (sd + 1e-9) : 0.0;
+                fused_scores[id] += HYBRID_BM25_WEIGHT / (1.0 + std::exp(-z));
+            }
+            std::vector<std::pair<double, uint64_t>> fused;
+            fused.reserve(fused_scores.size());
+            for (const auto& [id, sc] : fused_scores) fused.emplace_back(sc, id);
+            const auto top_end = fused.begin() + std::min(k, fused.size());
+            std::partial_sort(fused.begin(), top_end, fused.end(),
+                [](const std::pair<double, uint64_t>& a, const std::pair<double, uint64_t>& b) {
+                    return a.first > b.first || (a.first == b.first && a.second > b.second);
+                });
+            std::vector<ScoredId> ranked;
+            ranked.reserve(top_end - fused.begin());
+            for (auto it = fused.begin(); it != top_end; ++it)
+                ranked.emplace_back(static_cast<float>(it->first), it->second);
+            return to_results_nolock(ranked, /*record_hit=*/false);
+        }
 
         // ── RRF merge ────────────────────────────────────────────────
         std::unordered_map<uint64_t, double> rrf_scores;

@@ -825,16 +825,21 @@ PYBIND11_MODULE(core, m) {
                                    size_t rrf_k,
                                    feather::SearchFilter* filter,
                                    feather::ScoringConfig* scoring,
-                                   const std::string& modality) {
+                                   const std::string& modality,
+                                   const std::string& fusion) {
             py::buffer_info buf = q.request();
             std::vector<float> query_vec(static_cast<float*>(buf.ptr),
                                          static_cast<float*>(buf.ptr) + buf.size);
             py::gil_scoped_release rel;
-            return db.hybrid_search(query_vec, query, k, rrf_k, filter, scoring, modality);
+            return db.hybrid_search(query_vec, query, k, rrf_k, filter, scoring, modality,
+                                    fusion);
         }, py::arg("vec"), py::arg("query"), py::arg("k") = 10,
            py::arg("rrf_k") = 60, py::arg("filter") = nullptr,
            py::arg("scoring") = nullptr, py::arg("modality") = "text",
-           "Hybrid search: BM25 + dense vector merged via Reciprocal Rank Fusion (RRF).")
+           py::arg("fusion") = "score",
+           "Hybrid search: BM25 + dense vector. fusion=\"score\" (default): vector "
+           "relevance + 0.2 * sigmoid(BM25 z-score within the query); fusion=\"rrf\": "
+           "Reciprocal Rank Fusion with rrf_k.")
 
         // -- Compact (rebuild HNSW without dead records) --
         .def("compact", &feather::DB::compact,
