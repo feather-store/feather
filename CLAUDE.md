@@ -1173,6 +1173,15 @@ held-out ones (cached vectors, free; the harness is in CHANGELOG 0.22);
 test that relies on BM25 with random vectors needs high-dimensional ones
 (chance cosines in 8-32 d outweigh the BM25 term).
 
+### Untrusted memory is datamarked and fenced (0.22)
+`origin.quote` writes whitespace as `DATAMARK` (ˆ); `origin.quoted_section`
+fences the quoted section between lines naming a hash of its content. Every
+renderer goes through both (`render`, PacketBuilder, MCP). bench.poisoning
+defended: hot_text 80 -> 6 obeyed of 100, hot packet 29 -> 0. A check for
+quoted content reads `DATAMARK` back as a space; bench.poisoning's
+`_has_mark` does. Token budgets count characters, so quoted text costs ~60%
+more real tokens than budgeted.
+
 ### Filtered search: complete always, exact below FEATHER_NS_ANN_MIN
 An indexed filter (namespace / namespace_prefix / entity / attribute) returns
 a complete top-k (never short when k match), which `Pocket.recall` depends on.

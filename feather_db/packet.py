@@ -579,9 +579,7 @@ class PacketBuilder:
         if earlier_lines:
             volatile.append(self.history_header + "\n" + "\n".join(earlier_lines))
         if quoted:
-            volatile.append(self.quoted_header + "\n" + "\n".join(
-                _origin.group_label(o) + "\n" + "\n".join(quoted[o])
-                for o in _origin.ORIGINS if o in quoted))
+            volatile.append(_origin.quoted_section(quoted, self.quoted_header))
         packet.stable_text = "\n\n".join(stable)
         packet.volatile_text = "\n\n".join(volatile)
         packet.text = "\n\n".join(stable + volatile)
