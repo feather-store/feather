@@ -366,13 +366,12 @@ class FeatherStore(BaseStore):
         is still the O(matches) index hit.
         """
         flat = NS_SEP.join(prefix)
+        if flat:          # one call for the subtree, where each namespace was one
+            return list(self.db.ids_in_namespace(flat, prefix=True))
         ids: list[int] = []
         for known in self.db.list_namespaces():
-            if not known:
-                continue
-            if flat and not (known == flat or known.startswith(flat + NS_SEP)):
-                continue
-            ids.extend(self.db.ids_in_namespace(known))
+            if known:
+                ids.extend(self.db.ids_in_namespace(known))
         return ids
 
     def _search(self, op: Any) -> list[Any]:
