@@ -48,10 +48,17 @@ DIM = 768
 
 
 def pct(xs):
+    """Percentiles, and the p99's 95% interval from order statistics
+    (bench.stats.quantile_ci): a p99 of n samples rests on ~n/100 of them,
+    and an upper end of None says there were too few to bound it."""
+    from bench.stats import quantile_ci
     a = np.asarray(xs, dtype=float)
+    lo, hi = quantile_ci(a.tolist(), q=0.99)
+    r = lambda v: None if v is None else round(float(v), 3)          # noqa: E731
     return {"n": int(a.size), "p50_ms": round(float(np.percentile(a, 50)), 3),
             "p95_ms": round(float(np.percentile(a, 95)), 3),
             "p99_ms": round(float(np.percentile(a, 99)), 3),
+            "p99_ci95_ms": [r(lo), r(hi)],
             "mean_ms": round(float(a.mean()), 3), "max_ms": round(float(a.max()), 3)}
 
 

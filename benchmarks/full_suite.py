@@ -26,9 +26,12 @@ def rss_mb():
 
 
 def pct(xs):
+    from bench.stats import quantile_ci        # the p99's 95% interval (order statistics)
     a = np.asarray(xs)
+    lo, hi = quantile_ci(a.tolist(), q=0.99)
     return {"p50_ms": float(np.percentile(a, 50)), "p95_ms": float(np.percentile(a, 95)),
-            "p99_ms": float(np.percentile(a, 99)), "mean_ms": float(a.mean())}
+            "p99_ms": float(np.percentile(a, 99)), "p99_ci95_ms": [lo, hi],
+            "mean_ms": float(a.mean())}
 
 
 def time_each(fn, items):
