@@ -1,6 +1,7 @@
 """CLI: python -m bench run <scenario> --dataset <name> ..."""
 from __future__ import annotations
 import argparse
+import os
 import sys
 import time
 
@@ -188,6 +189,9 @@ def _cmd_run(args):
             embedder = GeminiEmbedder(dim=(args.dim or None))
         else:
             embedder = get_embedder(args.embedder, dim=args.dim)
+        if args.embedder != "deterministic" and args.embed_cache != "off":
+            from .embedders import CachedEmbedder
+            embedder = CachedEmbedder(embedder, args.embed_cache)
 
         # Build judge
         if args.judge == "llm":
@@ -453,6 +457,12 @@ def main(argv=None):
                        help="longmemeval: no retrieval, no budget: every "
                             "session verbatim to the same reader (the "
                             "full-context baseline, ~110k tokens on s).")
+    p_run.add_argument("--embed-cache",
+                       default=os.path.expanduser(
+                           "~/.cache/feather/longmemeval/emb-batch"),
+                       help="longmemeval: directory caching paid embeddings "
+                            "per haystack (keyed by model and exact texts); "
+                            "'off' re-embeds every run.")
     p_run.add_argument("--tokenizer-model", default="gemini-2.5-flash",
                        help="Tokenizer for --context-tokens (Gemini local "
                             "tokenizer; needs sentencepiece + protobuf).")
