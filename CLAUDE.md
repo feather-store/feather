@@ -1263,6 +1263,11 @@ included. `dry_run=True` plans. Rules if you touch it:
   It scrubs every deleted node, so earlier forgets' vectors go too; an int8
   slot's float original (`fv_off` / `fv_pending`) and the modality's namespace
   graphs are dropped with it.
+  The walk through removed nodes stops after 2 hops and the heuristic sees
+  the 4 x M closest candidates: unbounded, removed nodes percolate past
+  ~1/maxM0 of the graph and every touched node walked the whole cluster
+  (10% of 20k x 768: 79 s -> 1.2 s; recall@10 0.824 vs 0.834 for a
+  rebuild).
 - **Read-only handles refuse after an erasure.** A commit that cuts history
   (`c.cut`, i.e. an erasure's rewrite) bumps the count in `<path>.erasures`;
   a read-only handle (`as_of` included) reads it before loading and

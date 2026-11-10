@@ -360,30 +360,48 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 for (size_t j = 0; j < cnt && !touched; ++j) touched = gone[nb[j]];
                 if (!touched) continue;
                 // Candidates: the surviving neighbours, and through each
-                // removed one (and any removed chain behind it) its neighbours.
+                // removed one its neighbours, following removed chains at most
+                // kChainHops deep. Unbounded, the walk went through every
+                // removed node connected to this one: past ~1/maxM0 removed
+                // they percolate into one component, every touched node
+                // walked all of it, and 10% removed at 20k x 768 took 79 s
+                // (4% took 0.9 s).
+                constexpr int kChainHops = 2;
                 cand.clear(); seen.clear(); stack.clear();
                 for (size_t j = 0; j < cnt; ++j) {
                     if (!gone[nb[j]]) cand.insert(nb[j]);
                     else if (seen.insert(nb[j]).second) stack.push_back(nb[j]);
                 }
-                while (!stack.empty()) {
-                    const tableint g = stack.back(); stack.pop_back();
-                    if (element_levels_[g] < l) continue;
-                    linklistsizeint *gl = get_linklist_at_level(g, l);
-                    tableint *gnb = (tableint *) (gl + 1);
-                    for (size_t k = 0, gc = getListCount(gl); k < gc; ++k) {
-                        const tableint z = gnb[k];
-                        if (z == x || element_levels_[z] < l) continue;
-                        if (!gone[z]) cand.insert(z);
-                        else if (seen.insert(z).second) stack.push_back(z);
+                for (int hop = 0; hop < kChainHops && !stack.empty(); ++hop) {
+                    std::vector<tableint> next;
+                    for (tableint g : stack) {
+                        if (element_levels_[g] < l) continue;
+                        linklistsizeint *gl = get_linklist_at_level(g, l);
+                        tableint *gnb = (tableint *) (gl + 1);
+                        for (size_t k = 0, gc = getListCount(gl); k < gc; ++k) {
+                            const tableint z = gnb[k];
+                            if (z == x || element_levels_[z] < l) continue;
+                            if (!gone[z]) cand.insert(z);
+                            else if (seen.insert(z).second) next.push_back(z);
+                        }
                     }
+                    stack.swap(next);
+                }
+                // The heuristic sees the closest kKeep x mmax of them: its cost
+                // grows with candidates x kept, and the far ones are pruned anyway.
+                const size_t mmax = l ? maxM_ : maxM0_;
+                constexpr size_t kKeep = 4;
+                std::vector<std::pair<dist_t, tableint>> scored;
+                scored.reserve(cand.size());
+                for (tableint c : cand)
+                    scored.emplace_back(fstdistfunc_(getDataByInternalId(x), getDataByInternalId(c),
+                                                     dist_func_param_), c);
+                if (scored.size() > kKeep * mmax) {
+                    std::nth_element(scored.begin(), scored.begin() + kKeep * mmax, scored.end());
+                    scored.resize(kKeep * mmax);
                 }
                 std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>,
-                                    CompareByFirst> top;
-                for (tableint c : cand)
-                    top.emplace(fstdistfunc_(getDataByInternalId(x), getDataByInternalId(c),
-                                             dist_func_param_), c);
-                const size_t mmax = l ? maxM_ : maxM0_;
+                                    CompareByFirst> top(CompareByFirst(), std::move(scored));
                 if (top.size() > mmax) getNeighborsByHeuristic2(top, mmax);
                 size_t k = 0;
                 while (!top.empty()) { nb[k++] = top.top().second; top.pop(); }
