@@ -16,6 +16,7 @@ key the first time it is written (same id, so edges into it stay valid); and
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Iterable, Optional
 
 import feather_db
@@ -138,6 +139,44 @@ def migrate(db, namespaces: Optional[Iterable[str]] = None, batch: int = 512,
                 adopted += _adopt(db, pending)
                 pending = []
     return adopted + _adopt(db, pending)
+
+
+# A file whose records all have their native keys (and whose index records
+# their registry entries, backfill_registry) carries this record, so a start
+# skips that pass. It read every record of the file on every start: over the
+# Cloud API the whole dataset downloaded per start, long after there was
+# nothing left to migrate. In the namespace "" (FeatherStore and Pocket never
+# list or carry it), keyed, naming no subject. Bump UPKEEP_VERSION to run
+# the pass once more on every file.
+UPKEEP_KIND = "_feather_upkeep"
+UPKEEP_KEY = "\x1fupkeep"
+UPKEEP_ATTR = "_feather_upkeep_v"
+UPKEEP_VERSION = "1"
+
+
+def upkeep_done(db) -> bool:
+    """Has this file had the one-off upkeep pass (one key lookup)?"""
+    m = db.get_by_key(UPKEEP_KEY, "")
+    return m is not None and m.get_attribute(UPKEEP_ATTR) == UPKEEP_VERSION
+
+
+def upkeep(db, visit=None) -> int:
+    """migrate() every namespace of the file, once: after the pass the file
+    is marked and later calls cost one lookup. A read-only handle does
+    nothing (it could write neither the keys nor the mark; resolve() still
+    finds a legacy record by its id). Returns how many records were adopted.
+
+    A record written at a hashed id after the mark (by a pre-0.22 client of
+    the same file) is not adopted at start, but resolve() still finds it."""
+    if db.is_read_only() or upkeep_done(db):
+        return 0
+    n = migrate(db, visit=visit)
+    m = feather_db.Metadata()
+    m.namespace_id, m.key, m.source = "", UPKEEP_KEY, UPKEEP_KIND
+    m.timestamp = int(time.time())
+    m.set_attribute(UPKEEP_ATTR, UPKEEP_VERSION)
+    db.upsert(m)
+    return n
 
 
 def _adopt(db, pending) -> int:
