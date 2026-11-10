@@ -171,12 +171,25 @@ def upkeep(db, visit=None) -> int:
     if db.is_read_only() or upkeep_done(db):
         return 0
     n = migrate(db, visit=visit)
+    # Text vectors at unit length, as the agent layer now writes them
+    # (pocket.unit): a Matryoshka-cut vector stored before is ~0.59 long, and
+    # search ranks by L2 distance. Saved before the mark: a mark that outlived
+    # a crash the rescale did not would stop the pass from ever running again.
+    if not _int8(db, "text") and db.normalize_vectors("text"):
+        db.save()
     m = feather_db.Metadata()
     m.namespace_id, m.key, m.source = "", UPKEEP_KEY, UPKEEP_KIND
     m.timestamp = int(time.time())
     m.set_attribute(UPKEEP_ATTR, UPKEEP_VERSION)
     db.upsert(m)
     return n
+
+
+def _int8(db, modality: str) -> bool:
+    try:
+        return bool(db.is_int8_ram(modality))
+    except Exception:          # no such modality yet
+        return False
 
 
 def _adopt(db, pending) -> int:
