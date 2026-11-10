@@ -431,11 +431,14 @@ class FeatherStore(BaseStore):
         with the older values (newest first) in its value's `earlier`; an
         older item that matched brings the newest in, at its score. Items
         without keyed index entries are returned as they are."""
-        metas = {}
-        for it in items:
-            rid = self.id_of(it.namespace, it.key)
-            metas[(NS_SEP.join(it.namespace), it.key)] = (
-                self.db.get_metadata(rid) if rid is not None else None)
+        # Every item's key and record in two reads (keys.resolve_many,
+        # get_metadata_many), not two or three round trips per result.
+        refs = [(NS_SEP.join(it.namespace), it.key) for it in items]
+        rids = keys.resolve_many(self.db, refs)
+        found = [r for r in rids if r is not None]
+        by_rid = dict(zip(found, self.db.get_metadata_many(found)))
+        metas = {ref: (by_rid.get(rid) if rid is not None else None)
+                 for ref, rid in zip(refs, rids)}
         if not any(supkeys_of(m) for m in metas.values()):
             return items
         now = _clock.now(self.db)
