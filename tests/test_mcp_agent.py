@@ -46,7 +46,9 @@ def _text(result):
 
 
 def call(server, name, **kw):
-    return _text(asyncio.run(server.call_tool(name, kw)))
+    """A tool's text, datamarks (quoted, untrusted memory) read back as spaces:
+    these tests check what is remembered; test_origin checks how it is quoted."""
+    return _text(asyncio.run(server.call_tool(name, kw))).replace("\u02c6", " ")
 
 
 # ── the surface ───────────────────────────────────────────────────────────
@@ -127,7 +129,7 @@ def test_context_resource_matches_the_tool(server):
     res = asyncio.run(server.read_resource("feather://context"))
     body = getattr(res[0], "content", None) if isinstance(res, list) else None
     text = body if isinstance(body, str) else _text(res)
-    assert "a durable fact" in text
+    assert "a durable fact" in text.replace("\u02c6", " ")
 
 
 def test_stats_resource_is_json(server):

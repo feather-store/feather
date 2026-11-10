@@ -27,6 +27,11 @@ from tests.mcp_harness import Client, connect, over_mcp
 SCOPE = "org.brand_a.creative"
 
 
+def _plain(text: str) -> str:
+    """Quoted (untrusted) memory has its spaces datamarked; read them back."""
+    return text.replace("\u02c6", " ")
+
+
 @pytest.fixture
 def server(tmp_path):
     path = str(tmp_path / "agent.feather")
@@ -204,7 +209,7 @@ async def test_the_session_survives_a_failed_call(mcp):
     the same session, and a dead session looks to the user like memory loss."""
     await mcp.fails("remember", content="no key")
     await mcp.call("remember", key="retry", content="second attempt worked")
-    assert "second attempt" in await mcp.call("context")
+    assert "second attempt" in _plain(await mcp.call("context"))
 
 
 @over_mcp
@@ -219,15 +224,20 @@ def test_memory_written_in_one_session_survives_the_next(tmp_path):
     path = str(tmp_path / "a.feather")
 
     async def first():
-        async with connect(build(path, SCOPE, dim=64)) as mcp:
+        server = build(path, SCOPE, dim=64)
+        async with connect(server) as mcp:
             await mcp.call("remember", key="brand", content="voice is dry and factual")
+        server.close_db()                         # the process exits
 
     async def second():
-        async with connect(build(path, SCOPE, dim=64)) as mcp:
-            return await mcp.call("context")
+        server = build(path, SCOPE, dim=64)
+        async with connect(server) as mcp:
+            out = await mcp.call("context")
+        server.close_db()
+        return out
 
     asyncio.run(first())
-    assert "dry and factual" in asyncio.run(second())
+    assert "dry and factual" in _plain(asyncio.run(second()))
 
 
 def test_two_agents_on_one_file_do_not_read_each_other(tmp_path):
@@ -257,7 +267,7 @@ def test_concurrent_sessions_against_one_server_stay_independent(tmp_path):
             assert b.init.server_info.name == "feather"
             return await b.call("context")
 
-    assert "client a" in asyncio.run(go())
+    assert "client a" in _plain(asyncio.run(go()))
 
 
 # ── the console scripts, launched the way Claude Desktop launches them ────
