@@ -172,14 +172,22 @@ def _build(cfg: _Cfg, texts: List[str]) -> Tuple[str, dict, dict, Callable[[dict
         base = (cfg.base_url or "https://generativelanguage.googleapis.com").rstrip("/")
         url = f"{base}/v1beta/models/{model}:batchEmbedContents"
         reqs = []
+        cut = False
         for t in texts:
             r = {"model": f"models/{model}", "content": {"parts": [{"text": t}]}}
-            if _strict_dims() and model.startswith("gemini-embedding"):
+            # Gemini's d-dim output is exactly the first d values of the
+            # 3072-d vector (checked live: cosine 1.000000, same norm), so
+            # asking for it changes no stored vector, strict or not, and a
+            # batch of 100 at 768 downloads 4x less JSON.
+            if model.startswith("gemini-embedding") and (
+                    _strict_dims() or 128 <= cfg.dim < 3072):
                 r["outputDimensionality"] = cfg.dim
+                cut = cfg.dim < 3072
             reqs.append(r)
 
         def parse(j):
-            return [_vec(_extract(e, ["values"], p), p, j) for e in _extract(j, ["embeddings"], p)]
+            vs = [_vec(_extract(e, ["values"], p), p, j) for e in _extract(j, ["embeddings"], p)]
+            return [_unit(v) for v in vs] if cut else vs     # a Matryoshka prefix is ~0.59 long
         return url, {"x-goog-api-key": cfg.key}, {"requests": reqs}, parse
 
     if p == "voyage":
@@ -231,11 +239,18 @@ def _mock_vectors(cfg: _Cfg, texts: List[str]) -> List[List[float]]:
     return out
 
 
+def _unit(v: List[float]) -> List[float]:
+    n = sum(x * x for x in v) ** 0.5
+    return [x / n for x in v] if n > 0 else v
+
+
 def _check_dims(cfg: _Cfg, vecs: List[List[float]]) -> List[List[float]]:
     if not _strict_dims():
-        # Legacy (default): fit to the configured dim — see the module docstring.
+        # Legacy (default): fit to the configured dim — see the module
+        # docstring. A cut vector is renormalised: search ranks by L2
+        # distance, which is cosine order only for vectors of one length.
         return [v if len(v) == cfg.dim
-                else (v + [0.0] * (cfg.dim - len(v)) if len(v) < cfg.dim else v[:cfg.dim])
+                else (v + [0.0] * (cfg.dim - len(v)) if len(v) < cfg.dim else _unit(v[:cfg.dim]))
                 for v in vecs]
     for v in vecs:
         if len(v) != cfg.dim:
