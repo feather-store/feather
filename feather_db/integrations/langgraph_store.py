@@ -39,6 +39,7 @@ from feather_db import clock as _clock
 from feather_db import origin as _origin
 from feather_db.filter import FilterBuilder
 from feather_db.pocket import DUE_ATTR as _DUE_ATTR
+from feather_db.pocket import unit as _unit
 from feather_db.pocket import INTENTION_ATTR as _INTENTION_ATTR
 from feather_db.pocket import _bump as _pocket_bump
 from feather_db.pocket import (_INDEX_KIND, _KEY_SEP, DERIVED_KINDS, INDEX_ATTRS,
@@ -177,7 +178,8 @@ class FeatherStore(BaseStore):
         self._owns_db = db is None
         if db is None:
             dim = 768 if dim is None else dim
-            db = DB.open(path, dim=dim)
+            from feather_db.pocket import open_agent_db
+            db = open_agent_db(path, dim)
         elif dim is None:
             dim = db.dim()
         self.db = db
@@ -197,8 +199,10 @@ class FeatherStore(BaseStore):
         # 53-bit SHA-1 of (namespace, key), and two keys that collided shared
         # one record. Items written then get their key now, which also makes
         # them findable by keyword search on it.
-        keys.migrate(self.db, visit=lambda ns, ids, metas:
-                     backfill_registry(self.db, ns, ids, metas))
+        # Once per file (keys.upkeep): later starts cost one key lookup, not
+        # a read of every record of every namespace.
+        keys.upkeep(self.db, visit=lambda ns, ids, metas:
+                    backfill_registry(self.db, ns, ids, metas))
 
     def id_of(self, namespace: tuple[str, ...], key: str) -> Optional[int]:
         """The record id of the item at (namespace, key), or None."""
@@ -350,7 +354,7 @@ class FeatherStore(BaseStore):
             text = _indexed_text(dict(op.value),
                                  op.index if isinstance(op.index, list) else self._index_fields)
             if text.strip():
-                vec = np.asarray(self._embed(text), dtype=np.float32)
+                vec = _unit(self._embed(text))
         if vec is None:
             vec = np.zeros(self.dim, dtype=np.float32)
             vec[0] = 1.0        # a valid unit vector; never a zero-norm query target
@@ -366,13 +370,12 @@ class FeatherStore(BaseStore):
         is still the O(matches) index hit.
         """
         flat = NS_SEP.join(prefix)
+        if flat:          # one call for the subtree, where each namespace was one
+            return list(self.db.ids_in_namespace(flat, prefix=True))
         ids: list[int] = []
         for known in self.db.list_namespaces():
-            if not known:
-                continue
-            if flat and not (known == flat or known.startswith(flat + NS_SEP)):
-                continue
-            ids.extend(self.db.ids_in_namespace(known))
+            if known:
+                ids.extend(self.db.ids_in_namespace(known))
         return ids
 
     def _search(self, op: Any) -> list[Any]:
@@ -381,11 +384,11 @@ class FeatherStore(BaseStore):
         if not semantic:
             ids = (self._ids_under(op.namespace_prefix) if op.namespace_prefix
                    else self.db.get_all_ids("text"))
-            cand = []
-            for i in ids:
-                m = self.db.get_metadata(i)
-                if m is not None:
-                    cand.append((i, None, m))
+            # One read for every record (get_metadata_many): per id it was one
+            # request each over the Cloud API, N + 2 for about().
+            ids = list(ids)
+            cand = [(i, None, m) for i, m in zip(ids, self.db.get_metadata_many(ids))
+                    if m is not None]
             return self._select(cand, op, semantic)[op.offset: op.offset + op.limit]
 
         # Ranked WITHIN the prefix by the engine (an indexed namespace_prefix
@@ -394,7 +397,7 @@ class FeatherStore(BaseStore):
         # them and a user's own search came back empty. Only what the engine
         # cannot filter — expired and unindexed items, value filters — is
         # dropped here, and k grows until enough survive or the prefix runs out.
-        q = np.asarray(self._embed(op.query), dtype=np.float32)
+        q = _unit(self._embed(op.query))
         flt = (FilterBuilder().namespace_prefix(NS_SEP.join(op.namespace_prefix)).build()
                if op.namespace_prefix else None)
         k = max(want, 10) * 3            # an item and its index records share hits
@@ -431,11 +434,14 @@ class FeatherStore(BaseStore):
         with the older values (newest first) in its value's `earlier`; an
         older item that matched brings the newest in, at its score. Items
         without keyed index entries are returned as they are."""
-        metas = {}
-        for it in items:
-            rid = self.id_of(it.namespace, it.key)
-            metas[(NS_SEP.join(it.namespace), it.key)] = (
-                self.db.get_metadata(rid) if rid is not None else None)
+        # Every item's key and record in two reads (keys.resolve_many,
+        # get_metadata_many), not two or three round trips per result.
+        refs = [(NS_SEP.join(it.namespace), it.key) for it in items]
+        rids = keys.resolve_many(self.db, refs)
+        found = [r for r in rids if r is not None]
+        by_rid = dict(zip(found, self.db.get_metadata_many(found)))
+        metas = {ref: (by_rid.get(rid) if rid is not None else None)
+                 for ref, rid in zip(refs, rids)}
         if not any(supkeys_of(m) for m in metas.values()):
             return items
         now = _clock.now(self.db)
@@ -549,13 +555,9 @@ class FeatherStore(BaseStore):
         ids = (self._ids_under(namespace) if prefix
                else self.db.ids_in_namespace(NS_SEP.join(namespace)))
         now = _clock.now(self.db)
-        out = []
-        for rid in ids:
-            meta = self.db.get_metadata(rid)
-            if meta is None or _is_dead(meta, now):
-                continue
-            out.append((rid, meta))
-        return out
+        ids = list(ids)
+        return [(rid, meta) for rid, meta in zip(ids, self.db.get_metadata_many(ids))
+                if meta is not None and not _is_dead(meta, now)]
 
     def erase(self, namespace: tuple[str, ...], key: Optional[str] = None, *,
               dry_run: bool = False) -> dict:
@@ -604,7 +606,7 @@ class FeatherStore(BaseStore):
             v = np.zeros(self.dim, dtype=np.float32)
             v[0] = 1.0
             return v
-        return np.asarray(self._embed(text), dtype=np.float32)
+        return _unit(self._embed(text))
 
     def known_keys(self, namespace: tuple[str, ...]) -> list[str]:
         """The one-value keys indexed under `namespace`, for an extractor's
@@ -645,8 +647,7 @@ class FeatherStore(BaseStore):
             ids = self.db.newest(flat, want, prefix=prefix, before=before,
                                  by_valid=by_valid)
             cursor = before
-            for rid in ids:
-                meta = self.db.get_metadata(rid)
+            for rid, meta in zip(ids, self.db.get_metadata_many(list(ids))):
                 if meta is None:              # removed since: nothing to show
                     continue
                 cursor = (meta.valid_time if by_valid else meta.timestamp, rid)

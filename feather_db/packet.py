@@ -263,7 +263,9 @@ def _default_counter() -> tuple[Callable[[str], int], bool]:
         enc = tiktoken.get_encoding("cl100k_base")
         return (lambda text: len(enc.encode(text))), True
     except Exception:
-        return estimate_tokens, False
+        # Each datamark (quoted, untrusted memory) is a token of its own,
+        # which a character count does not see.
+        return (lambda text: estimate_tokens(text) + text.count(_origin.DATAMARK)), False
 
 
 class PacketBuilder:
@@ -579,9 +581,7 @@ class PacketBuilder:
         if earlier_lines:
             volatile.append(self.history_header + "\n" + "\n".join(earlier_lines))
         if quoted:
-            volatile.append(self.quoted_header + "\n" + "\n".join(
-                _origin.group_label(o) + "\n" + "\n".join(quoted[o])
-                for o in _origin.ORIGINS if o in quoted))
+            volatile.append(_origin.quoted_section(quoted, self.quoted_header))
         packet.stable_text = "\n\n".join(stable)
         packet.volatile_text = "\n\n".join(volatile)
         packet.text = "\n\n".join(stable + volatile)

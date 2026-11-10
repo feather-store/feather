@@ -183,13 +183,29 @@ def test_provider_dim_mismatch_fits_by_default_and_errors_when_strict(monkeypatc
     cfg = _Cfg(provider="openai", model="text-embedding-3-small", key="k", base_url="",
                deployment="", api_version="", dim=4)
     monkeypatch.delenv("FEATHER_EMBED_STRICT_DIM", raising=False)
-    assert _check_dims(cfg, [[1.0, 2.0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]) == \
-        [[1.0, 2.0, 0.0, 0.0], [1.0, 2.0, 3.0, 4.0]]
+    padded, cut = _check_dims(cfg, [[1.0, 2.0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
+    assert padded == [1.0, 2.0, 0.0, 0.0]
+    # A cut vector is renormalised: search ranks by L2 distance.
+    assert cut == pytest.approx([x / 30 ** 0.5 for x in (1.0, 2.0, 3.0, 4.0)])
     assert "dimensions" not in _build(cfg, ["x"])[2]
     monkeypatch.setenv("FEATHER_EMBED_STRICT_DIM", "1")
     with pytest.raises(RuntimeError, match="never padded"):
         _check_dims(cfg, [[1.0, 2.0]])
     assert _build(cfg, ["x"])[2]["dimensions"] == 4
+
+
+def test_gemini_is_asked_for_its_prefix_without_strict_mode(monkeypatch):
+    """Gemini's d-dim output is the 3072-d vector's first d values, which is
+    what the default fit made of it: asking for it changes no stored vector."""
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+    from app.embedding import _Cfg, _build  # noqa: WPS433
+    monkeypatch.delenv("FEATHER_EMBED_STRICT_DIM", raising=False)
+    cfg = lambda dim: _Cfg(provider="gemini", model="gemini-embedding-001",  # noqa: E731
+                           key="k", base_url="", deployment="", api_version="", dim=dim)
+    reqs = _build(cfg(768), ["a", "b"])[2]["requests"]
+    assert [r["outputDimensionality"] for r in reqs] == [768, 768]
+    assert "outputDimensionality" not in _build(cfg(3072), ["a"])[2]["requests"][0]
 
 
 def test_mock_provider_requires_dev_mode(monkeypatch):

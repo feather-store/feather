@@ -9,6 +9,177 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Scored search for vectors of any length; honest percentiles
+
+- **The scored-search pool bound works at any common vector length.** It
+  used the cosine law only for near-unit vectors and kept the first pool
+  otherwise. It now applies the law at both ends of the lengths seen
+  (`near_uniform`): 20k x 64, recency-weighted scoring, lengths 0.58-0.60
+  (an unnormalised 768-d Gemini prefix): 0.533 -> 0.895 of the exact scored
+  top 10, on par with unit vectors (0.867, HNSW's own limit). Widely varying
+  lengths now take the widest allowed pool instead of the first (0.74 ->
+  0.89); only `normalize_vectors()` makes those exact.
+- `bench.stats.quantile_ci` (order-statistic interval for a percentile) and
+  `benjamini_hochberg`; the latency benchmarks report `p99_ci95_ms`. A p99 of
+  120 samples has no upper bound; of 3,000, a bracket. `bench/protocol.py`
+  states what a bench can detect (LongMemEval-500 ~4 points, LoCoMo ~2.3),
+  FDR across variants, and fixed-arrival-rate load tests.
+
+### Vectors at unit length; int8 by default for new agent files
+
+- **Cut embeddings are renormalised** (correctness). Gemini's 768-d prefix
+  is ~0.59 long and varies by record; search ranks by L2 distance (cosine
+  order only for one length) and scored search is exact only for unit
+  vectors, so it fell back to a fixed pool. `make_embedder` and the Cloud
+  API's embedder renormalise any vector they cut (`_fit`, Gemini
+  `outputDimensionality`), and the agent layer (`Pocket`, `FeatherStore`)
+  stores and searches with `pocket.unit()` whatever the embedder returns.
+  `DB.normalize_vectors(modality)` (`POST /normalize_vectors`) rescales a
+  file's vectors once, in place; `keys.upkeep` runs it on the text vectors
+  of a file the agent layer opens. The Cloud API does not touch raw
+  namespaces: run the route on one filled by `/ingest_text` at a cut dim.
+- **New agent files keep text vectors as int8, re-ranked** (`open_agent_db`:
+  `FeatherStore(path)`, `feather-agent`; `FEATHER_INT8=0` keeps float).
+  27k real gemini-embedding-001 turns at 768-d: recall@10 0.9997 vs 0.9967
+  for float32, p50 0.40 vs 0.22 ms, 768 B per vector in RAM vs 3 KB; the
+  file is 23% larger (it keeps the float originals).
+- **BM25 postings are 6 bytes** (u32 doc + u16 count, two arrays; counts
+  saturate at 65535): 100k turns 58.3 -> 50.6 MB (79.6 before 0.22), results
+  bit-identical.
+- `mcp_agent.build()` returns a server with `close_db()`, and `feather-agent`
+  closes its file on exit. The MCP tests opened a second writer handle per
+  "restart" without closing the first; with int8 originals in play the older
+  handle's checkpoint cut what the newer one appended (the documented
+  same-process double-open). Tests now close, or share one handle.
+
+### Measured, not changed
+
+- **Facts as index, per vector** (LoCoMo test, cached facts): +33% vectors
+  buys +3.8 recall@30 [+2.4, +5.3] and +5.9 @10. Only one-value-key facts:
+  +6% vectors, -0.7 (no gain). One fact per turn: +28%, +3.5.
+
+### Fixes
+
+- **Startup no longer reads every record.** `FeatherStore` and `Pocket` ran
+  the pre-0.22 key migration over every record on every start: over the
+  Cloud API the whole dataset downloaded per start (1,000 items: 17
+  requests, 705 KB). It now runs once per file and leaves a marker
+  (`keys.upkeep`, a bookkeeping record in namespace ""): 2 requests, 1.3 KB.
+- **`ids_in_namespace(ns, prefix=True)`** (engine, `GET /ids?prefix=true`,
+  `RemoteDB`): a subtree in one call. `FeatherStore` searches under a prefix
+  with it; `AgentMemory.about()` over 8 kinds went from 8 requests to 2.
+- **`erase()` of a large share of the graph was quadratic.** Its local
+  repair followed chains of removed nodes without limit; past ~1/32 of the
+  graph removed they percolate, and every touched node walked the whole
+  cluster: 10% of 20k x 768 took 79 s. It now stops after 2 hops and gives
+  the heuristic the 4 x M closest candidates: 1.2 s, recall@10 0.824 vs
+  0.834 for a full rebuild (0.808 / 0.831 at 1% / 4%, at or above a rebuild).
+- **Budgets count datamarks.** Quoted memory is ~60% more tokens; `hot()`
+  and `DB.heat_select` cost an untrusted item 8/5 of its estimate
+  (`pocket.estimate_quoted_tokens`, the same integer rule in heat.h), and
+  `PacketBuilder`'s estimate (without tiktoken) counts each mark.
+- **Tombstones do not slow search** (correction): the 0.4 -> 13.9 ms p99
+  reported on 2026-11-08 was a cold CPU, not the 10% forgotten records
+  (warm, 100k x 768: 0.51-0.92 ms without deletes, 0.67-1.01 ms with).
+- `bench.locomo`: the run summary named `select` without receiving it.
+
+### Fewer requests per operation over the Cloud API
+
+Counted against the real API (in-process), 1,000 items:
+
+| operation | before | after |
+|---|---:|---:|
+| `AgentMemory.about()`, `FeatherStore.search` without a query | 1,002 | 3 |
+| `FeatherStore.count` | 1,001 | 2 |
+| `FeatherStore.newest(10)` | 11 | 2 |
+| `FeatherStore.search` with a query (limit 10) | 21 | 3 |
+| `AgentMemory.recall` | 11 | 3 |
+| `Pocket.recall(k=5)` | 8 | 4 |
+| `PacketBuilder.build(query)` | 15 | 6 |
+| `Pocket.remember`, existing key / new key | 3 / 4 | 2 / 3 |
+
+`FeatherStore` reads records with `get_metadata_many` (scan, count,
+newest, query-less search, supersession grouping). New engine calls, each
+with its route and `RemoteDB` method: `DB.touch_many(ids)` (`POST
+/records/touch_many`; `Pocket.promote` and the older connectors use it) and
+`DB.lookup_key(key, namespace)` -> `(id, metadata)` (`GET /by_key`, which
+already returned both); `keys.get` uses it and `keys.write(found=...)` skips
+a second lookup.
+
+### BM25 builds 3x faster in 27% less memory
+
+Terms are numbered once and a build's postings are one array (CSR), with a
+small delta for later writes; the build tokenizes through an arena word
+table, one lookup per token. 100k LongMemEval turns: first keyword search
+2.0 s -> 0.65 s, index 79.6 -> 58.3 MB; results bit-identical (500 queries).
+The build's transient peak is ~30 MB higher than before for its ~0.6 s.
+
+### Retrieval and memory safety, measured
+
+- **`hybrid_search` fuses scores, not ranks** (`fusion="score"`, the
+  default; `fusion="rrf"` keeps Reciprocal Rank Fusion, `rrf_k` still 60).
+  Each candidate of either half scores `relevance + 0.2 * sigmoid(z)`:
+  relevance is the calibrated cosine (or the decay score with `scoring`),
+  computed from the stored vector for a record only BM25 found; z is its BM25
+  score standardised over the query's BM25 candidates. LoCoMo, cached
+  gemini-embedding-001 vectors, form and weight chosen on the 3 dev
+  conversations, reported on the 7 held out (1,079 questions): evidence
+  recall@30 77.9 -> 82.6 (+4.7 [+2.8, +6.4] resampling conversations),
+  @10 66.9 -> 71.4. RRF k=60 was the worst k tried and below vector search
+  alone (79.9); RRF k=20 reached 81.3, and score fusion beats it by +1.4
+  [+0.6, +2.2]. A conditional logit fit on the same labels gave the same
+  BM25 weight. LongMemEval (38 cached haystacks): gold within 5 sessions
+  84.2 -> 89.5. +0.13 ms a search at 3072-d. Cloud API (`fusion` field) and
+  `RemoteDB.hybrid_search` take it too. With an embedder whose cosines carry
+  no meaning (random or very low-dimensional test vectors) BM25 counts for
+  less than under RRF: use `fusion="rrf"` there.
+- **Recency was fit and found absent** from these labels: a recency term's
+  weight in the logit was +0.32 [-0.05, +0.59] and moved held-out recall by
+  -0.06 at every half-life from 7 to 365 days. The decay constants, the
+  recall fade, importance and use cannot be fit from LongMemEval or LoCoMo
+  (no usage, constant importance); they were left as they are.
+- **Untrusted memory is datamarked and fenced** in every prompt renderer
+  (`origin.quote`, `origin.quoted_section`: `hot_text()`, `PacketBuilder`,
+  MCP `context` and `recall`). Every space in quoted text is written as
+  `ˆ` (spotlighting, Hines et al. 2024), and the section sits between two
+  lines naming a hash of its own content, which stored text cannot close.
+  bench.poisoning, gpt-4o-mini, defended, 5 runs on fresh seeds: planted
+  instructions obeyed in `hot_text()` 80/100 -> 6/100, in a hot packet
+  29/100 -> 0/100, in query packets 4/125 -> 0/125. A fact stated only in
+  an agent memory was still answered 100/100. Chosen on other seeds: the
+  fence alone did 49/100, datamarking alone 31/100, PacketBuilder's layout
+  for `hot_text()` 75/100 (no gain). Cost: quoted text is ~60% more tokens
+  (every mark tried costs the same: removing spaces breaks word tokens), and
+  the token budgets, which count characters, do not see it.
+
+### Embedding latency, measured
+
+- **The default Gemini model works again.** `make_embedder("gemini")` /
+  `FEATHER_EMBED_PROVIDER=gemini` defaulted to `text-embedding-004`, which
+  Google shut down: every embed answered HTTP 404. The default is now
+  `gemini-embedding-001`. A database embedded with `text-embedding-004`
+  must be re-embedded (vectors from different models are not comparable).
+- **Provider requests reuse their connection** (one per thread and host;
+  a proxy still goes through urllib). gemini-embedding-001 at 768-d, 150
+  interleaved calls each: p50 597 -> 474 ms, p95 792 -> 562 ms, identical
+  vectors. Every agent turn that embeds saves ~120 ms.
+- **Gemini is asked for `dim` natively** (`outputDimensionality`), in the
+  library and, outside strict mode too, in the Cloud API. Checked live: the
+  768-d output is exactly the first 768 values of the 3072-d vector (cosine
+  1.000000, same norm), which is what the slice made of it, so no stored
+  vector changes; the response is 4x smaller.
+- **768-d costs nothing in retrieval.** LoCoMo, all 1,536 questions with
+  evidence, hybrid k=30 on cached gemini-embedding-001 vectors: evidence
+  recall 0.7894 at the 768 prefix vs 0.7891 at 3072 (+0.0004 [-0.003,
+  +0.004]); LongMemEval temporal all-gold@20 103 vs 104 earlier. Engine RAM
+  per record (300-char text, BM25 built): 2.7 KB at 768 vs 11.6 KB at 3072.
+  Agent memory already defaults to 768 (`FeatherStore`, `feather-agent
+  --dim`, Cloud API `FEATHER_EMBED_DIM`); the benchmarks still run 3072.
+- **Hedged requests were measured and not kept.** A duplicate sent at the
+  recent p95 (adaptive): 450 calls, 13 hedges, none won; the 18.7 s stall
+  hit the duplicate on its own connection too (correlated, not per
+  request). It cost 3-6% more requests for no measured gain.
+
 ### Algorithms: what each costs, measured
 
 - **`Pocket.hot()` is chosen in the engine** (`DB.heat_select`, Cloud API

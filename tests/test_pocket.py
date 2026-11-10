@@ -442,7 +442,7 @@ def test_a_later_run_inherits_findings_not_thinking(fleet):
         s1.keep("finding", "the durable conclusion")
     with agent.session() as s2:
         ctx = s2.context()
-    assert "durable conclusion" in ctx
+    assert "durable conclusion" in ctx.replace("\u02c6", " ")
     assert "step one" not in ctx and "step two" not in ctx
 
 
@@ -452,7 +452,7 @@ def test_session_inherits_the_agents_ancestors(fleet):
     with agent.session() as s:
         s.note("local thought")
         ctx = s.context()
-    assert "org rule" in ctx and "local thought" in ctx
+    assert "org rule" in ctx and "local thought" in ctx.replace("\u02c6", " ")
 
 
 def test_scratch_cannot_evict_the_durable_rules(fleet):

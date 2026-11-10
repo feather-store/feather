@@ -34,28 +34,47 @@ disagree, the session is right.
 To fit, some sessions are shortened: assistant replies are cut ("[…]"
 marks a cut), user turns are kept whole.
 
+Whose words are facts:
+  What the user says about their own life, plans, decisions and dates is
+  fact, unless their own later turns say otherwise. What the assistant
+  says (suggestions, recommendations, example plans or dates, lists of
+  options) is not a fact about the user unless the user adopted or
+  confirmed it. A question about what the assistant said or recommended
+  is answered from the assistant's turns.
+  A plan for a date that has passed ("I'll start the diet on Monday",
+  said two weeks before the current date) happened, unless a later turn
+  says it did not. A plan with no date, or one the user only considered,
+  is still a plan.
+
 Use the procedure that fits the question (more than one may apply):
 
 COUNTING ("how many", "how much in total", "list all"):
   Write this ledger in your reply; the answer is read off it, not recalled.
   1. WINDOW: if the question limits time ("in the past two weeks", "this
      year", "last month", "before X"), write its exact first and last date.
-  2. CANDIDATES: go through the sessions ONE BY ONE, oldest first. For
-     every possible instance write one line:
-       <date> | <item> | IN or OUT: <reason>
-     An instance mentioned in passing, or in a session mostly about
-     something else, is still a candidate. Mark it OUT when it is
+  2. SCAN: go through the sessions ONE BY ONE, oldest first, and write
+     at least one line for EVERY session; do not skip, merge or
+     summarise sessions. A session with nothing that could count gets
+       <session date> | no match
+     Every possible instance gets a line of its own, even one mentioned
+     in passing or in a session mostly about something else:
+       <date> | <item> | MATCH
+       <date> | <item> | no match: <reason>
+     It is no match when it is
        - outside the window (date it by the session, or by a date stated
          in the text);
        - not the user's own: something the assistant suggested or listed,
-         or the user only asked about, considered or planned (unless the
-         question asks about plans);
-       - the same item as an earlier line (the same concert, book or
+         or the user only asked about, considered, or planned for a date
+         that has not passed or with no date (unless the question asks
+         about plans);
+       - the same item as an earlier MATCH line (the same concert, book or
          repair mentioned again), or a different kind than asked.
   3. If the user states a running total ("that's my third visit this year"), the
      latest such statement is the count; do not add instances to it.
-  4. For sums of money or quantities, write each IN amount, then add.
-  5. The answer is the number of IN lines (or the sum).
+  4. For sums of money or quantities, write the amount on each MATCH
+     line ("rode it 3 times" is 3), then add.
+  5. COUNT: recount the MATCH lines (or add their amounts) once more.
+     Unless step 3 applies, the answer must equal that number.
 
 TIME SPANS ("how long ago", "how many days/weeks/months between", "when",
 "which came first", "in what order"):
@@ -77,11 +96,20 @@ number, where they live now, a plan that was revised):
 PREFERENCES (recommendations, suggestions, tips, "what should I…",
 "any ideas…"):
   Never answer "unknown": a request for suggestions always gets them.
-  Find what the user said they like, use, own, avoid or plan, including in
-  related contexts (a hotel they loved in another city, a hobby, a past
-  purchase), and carry those preferences over. Name them, and give
-  specific suggestions that fit them; no generic advice. Here the final
-  answer is the full personalised recommendation, several sentences.
+  1. PREFERENCES FIRST: before anything else, list what the user said
+     they like, use, own, avoid, are working on or want to move beyond
+     that bears on the request, including in related contexts (a hotel
+     they loved in another city, a hobby, a past purchase). One line
+     each, in the user's words, with the session date. A suggestion the
+     user did not take up is not a preference.
+  2. Do not violate these lines, explicit or implied: never recommend
+     what the user said they avoid, dislike or want to move beyond.
+  3. Build on them: start from the specific things the user named (the
+     gear they own, the recipe that worked, the source they already
+     use), name them, and connect each suggestion to one; no generic
+     advice that would fit anyone.
+  Here the final answer is the full personalised recommendation, several
+  sentences, naming those specifics.
 
 ABSTENTION (factual questions about the user's past, not requests for
 suggestions):

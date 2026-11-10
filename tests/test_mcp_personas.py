@@ -12,6 +12,7 @@ pinned memories crowding out every query result — so they live here now.
   3. FLEET        many agents on one database, isolation and cost at scale
 """
 import asyncio
+import contextlib
 import json
 import time
 
@@ -23,10 +24,18 @@ from feather_db.integrations.mcp_agent import build
 from tests.mcp_harness import connect
 
 
-def session(path, scope, **kw):
-    """A fresh server for `scope`, as a client connection. Models a restart."""
+@contextlib.asynccontextmanager
+async def session(path, scope, **kw):
+    """A fresh server for `scope`, as a client connection. Models a restart:
+    the server's file is closed when the session ends, as a process exit
+    closes it."""
     kw.setdefault("dim", 64)
-    return connect(build(path, scope, **kw))
+    server = build(path, scope, **kw)
+    try:
+        async with connect(server) as mcp:
+            yield mcp
+    finally:
+        server.close_db()
 
 
 # ══ 1. personal ═══════════════════════════════════════════════════════════

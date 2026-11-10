@@ -46,7 +46,9 @@ def _text(result):
 
 
 def call(server, name, **kw):
-    return _text(asyncio.run(server.call_tool(name, kw)))
+    """A tool's text, datamarks (quoted, untrusted memory) read back as spaces:
+    these tests check what is remembered; test_origin checks how it is quoted."""
+    return _text(asyncio.run(server.call_tool(name, kw))).replace("\u02c6", " ")
 
 
 # ── the surface ───────────────────────────────────────────────────────────
@@ -127,7 +129,7 @@ def test_context_resource_matches_the_tool(server):
     res = asyncio.run(server.read_resource("feather://context"))
     body = getattr(res[0], "content", None) if isinstance(res, list) else None
     text = body if isinstance(body, str) else _text(res)
-    assert "a durable fact" in text
+    assert "a durable fact" in text.replace("\u02c6", " ")
 
 
 def test_stats_resource_is_json(server):
@@ -166,15 +168,18 @@ def test_memory_survives_a_server_restart(tmp_path):
     path = str(tmp_path / "persist.feather")
     s1 = build(path, SCOPE, dim=64)
     call(s1, "remember", key="durable", content="this must survive")
+    s1.close_db()                                 # the process exits
 
     s2 = build(path, SCOPE, dim=64)
     assert "this must survive" in call(s2, "context")
+    s2.close_db()
 
 
 def test_sibling_agents_do_not_see_each_other(tmp_path):
     path = str(tmp_path / "fleet.feather")
-    a = build(path, "org.brand_a.creative", dim=64)
-    b = build(path, "org.brand_a.media", dim=64)
+    db = DB.open(path, dim=64)                    # one handle, two agents (CLAUDE.md §9)
+    a = build(path, "org.brand_a.creative", dim=64, db=db)
+    b = build(path, "org.brand_a.media", dim=64, db=db)
     call(a, "remember", key="note", content="creative private note")
     call(b, "remember", key="note", content="media private note")
 

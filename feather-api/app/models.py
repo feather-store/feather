@@ -244,6 +244,9 @@ class HybridSearchRequest(VectorInput):
                     "first or list records and re-rank client-side.",
     )
     rrf_k: int = Field(60, ge=1, le=10000)
+    fusion: Literal["score", "rrf"] = Field(
+        "score", description="score: vector relevance + 0.2 * sigmoid(BM25 z-score "
+                             "within the query). rrf: Reciprocal Rank Fusion with rrf_k.")
     modality: str = "text"
     include_metadata: bool = True
     # Filters
@@ -402,6 +405,11 @@ class TagRequest(BaseModel):
 
 class BatchWriteRequest(BaseModel):
     ops: List[BatchOpIn] = Field(..., min_length=1, max_length=10_000)
+
+
+class TouchManyRequest(BaseModel):
+    ids: List[int] = Field(..., max_length=10_000,
+                           description="Record ids to count a recall for, up to 10k per call.")
 
 
 class GetManyRequest(BaseModel):

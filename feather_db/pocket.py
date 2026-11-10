@@ -30,6 +30,7 @@ import math
 import re
 import time
 import uuid
+import weakref
 import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
@@ -236,9 +237,25 @@ def scoped_id(namespace: str, key: str) -> int:
     return keys.legacy_id(namespace, key)
 
 
-# (id(db), namespace) pairs already migrated in this process: migrate() is
-# idempotent, but it reads every record of the scope.
-_MIGRATED: set = set()
+# The DB handles that ran keys.upkeep in this process. Weak: keyed by id(db),
+# a handle opened after another was collected could get its id and skip the
+# pass (no marker was written, flakily). A handle that cannot be weakly
+# referenced is not remembered, and pays upkeep's one lookup each time.
+_MIGRATED: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _upkept(db) -> bool:
+    try:
+        return db in _MIGRATED
+    except TypeError:
+        return False
+
+
+def _mark_upkept(db) -> None:
+    try:
+        _MIGRATED.add(db)
+    except TypeError:
+        pass
 
 
 def _scope(scope) -> tuple[str, ...]:
@@ -274,8 +291,47 @@ def _overrides(origin: str, held: str, trusted) -> bool:
     return origin in trusted and held not in trusted
 
 
+def unit(vec) -> np.ndarray:
+    """`vec` as float32 at unit length. Every vector the agent layer stores or
+    searches with goes through this, whatever the embedder returns: search
+    ranks by L2 distance, which is cosine order only for vectors of one
+    length, and scored search is exact only for unit vectors."""
+    v = np.asarray(vec, dtype=np.float32)
+    n = float(np.linalg.norm(v))
+    return v / n if n > 0 else v
+
+
+def open_agent_db(path: str, dim: int):
+    """Open (or create) a file for the agent layer. A NEW file keeps its text
+    vectors as int8 in RAM, re-ranked by the float originals (refine 2): on
+    gemini-embedding-001 at 768-d (27k real turns), recall@10 0.9997 against
+    0.9967 for float32, 0.2 ms more a search, 768 B per vector in RAM where
+    float was 3 KB. The scale is fixed at 1: every vector the agent layer
+    stores is unit length (`unit`), so nothing is ever clipped.
+    FEATHER_INT8=0 keeps float. An existing file keeps what it has."""
+    import os
+    from feather_db import DB
+    new = not os.path.exists(path)
+    db = DB.open(path, dim=dim)
+    if new and os.getenv("FEATHER_INT8", "1") != "0":
+        db.set_int8_ram("text", 1.0, 2)
+    return db
+
+
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+# An untrusted item is rendered quoted and datamarked (origin.quote): every
+# space becomes a mark, and a mark is a token of its own. Quoted text came out
+# 57-63% more tokens for every mark tried (Gemini tokenizer), so in a budget
+# it costs 8/5 of the estimate: in _hot_scan and, by the same integer
+# arithmetic, in DB.heat_select (heat.h), which must agree to the item.
+QUOTED_COST = (8, 5)
+
+
+def estimate_quoted_tokens(text: str) -> int:
+    return max(1, (len(text) * QUOTED_COST[0] // QUOTED_COST[1]) // CHARS_PER_TOKEN)
 
 
 # FeatherStore keeps an item's JSON value here (langgraph_store._VALUE_ATTR).
@@ -325,9 +381,10 @@ def date_tag(item) -> str:
 
 # Records that live in a scope but are not memory: never carried, never
 # returned, never resolved as a required key.
-_NOT_MEMORY = ("_forgotten", _CACHE_KIND, _INDEX_KIND, _KEYREG_KIND, _JOB_KIND)
+_NOT_MEMORY = ("_forgotten", _CACHE_KIND, _INDEX_KIND, _KEYREG_KIND, _JOB_KIND,
+               keys.UPKEEP_KIND)
 # Derived or bookkeeping records: never an item, never carried.
-DERIVED_KINDS = (_INDEX_KIND, _KEYREG_KIND, _JOB_KIND)
+DERIVED_KINDS = (_INDEX_KIND, _KEYREG_KIND, _JOB_KIND, keys.UPKEEP_KIND)
 
 
 @dataclass(frozen=True)
@@ -763,13 +820,14 @@ class Pocket:
         self._hot_cache: dict = {}
         # Records written before native keys get theirs, so they are found by
         # key — keyword search included — like everything written since.
-        if (id(db), self.namespace) not in _MIGRATED and not db.is_read_only():
-            # The same read backfills the key registry of an index written
-            # before it existed.
-            if keys.migrate(db, [self.namespace], visit=lambda ns, ids, metas:
-                            backfill_registry(db, ns, ids, metas)):
+        # Once per file (keys.upkeep): later opens cost one key lookup, not a
+        # read of every record. The same read backfills the key registry of
+        # an index written before it existed.
+        if not _upkept(db) and not db.is_read_only():
+            if keys.upkeep(db, visit=lambda ns, ids, metas:
+                           backfill_registry(db, ns, ids, metas)):
                 _bump(db)
-            _MIGRATED.add((id(db), self.namespace))
+            _mark_upkept(db)
 
     # ── scope resolution ─────────────────────────────────────────────────
 
@@ -975,7 +1033,8 @@ class Pocket:
             key=key,
             content=content,
             heat=self.heat(meta, now, depth),
-            tokens=estimate_tokens(content),
+            tokens=(estimate_tokens(content) if origin in self.trusted
+                    else estimate_quoted_tokens(content)),
             recalls=meta.recall_count,
             age_days=(now - meta.valid_time) / 86400.0,
             pinned=meta.get_attribute(_PINNED) == "true",
@@ -1082,7 +1141,14 @@ class Pocket:
         _origin.check(origin)
         # One request remotely (keys.get is two). The scope's legacy records
         # were given native keys when this pocket opened.
-        prev = self.db.get_by_key(key, self.namespace)
+        if index is None:
+            # (id, metadata) in one read, handed to keys.write so the key is
+            # not looked up again: 2 requests to rewrite a memory, 3 for a new
+            # key (the legacy-id check), where it was 3 and 4.
+            found = keys.get(self.db, self.namespace, key)
+            prev = found[1]
+        else:
+            prev = self.db.get_by_key(key, self.namespace)   # apply_index writes by native key
 
         meta = feather_db.Metadata()
         meta.timestamp    = int(time.time())
@@ -1116,7 +1182,8 @@ class Pocket:
             meta.last_recalled_at = prev.last_recalled_at
 
         if entries is None:
-            rid = keys.write(self.db, self.namespace, key, meta, self._vec(content))
+            rid = keys.write(self.db, self.namespace, key, meta, self._vec(content),
+                             found=found)
         else:
             # The memory and its whole index in one batch (one round trip).
             r = apply_index(self.db, [IndexWrite(
@@ -1199,7 +1266,7 @@ class Pocket:
             f = FilterBuilder().namespace(flat).build()
             if self._embed is not None:
                 hits += [(h, depth) for h in self.db.search(
-                    np.asarray(self._embed(query), dtype=np.float32), k=k * 3, filter=f,
+                    unit(self._embed(query)), k=k * 3, filter=f,
                     record_salience=False)]
             else:
                 hits += [(h, depth) for h in self.db.keyword_search(
@@ -1298,12 +1365,10 @@ class Pocket:
     def promote(self, items: Iterable[PocketItem]) -> None:
         """Count `items` as used: each one's `recall_count` goes up by one.
         Untrusted items are skipped: heat() does not count their use."""
-        touched = False
-        for item in items:
-            if item.origin not in self.trusted:
-                continue
-            self.db.touch(item.id)
-            touched = True
+        ids = [item.id for item in items if item.origin in self.trusted]
+        touched = bool(ids)
+        if ids:
+            self.db.touch_many(ids)       # one call: one request over the Cloud API
         # A promotion is a write: it changes heat and therefore the working
         # set. Without this the memoised hot() would keep serving a view that
         # predates it — the exact thing promotion exists to change.
@@ -1428,7 +1493,7 @@ class Pocket:
 
     def _vec(self, text: str) -> np.ndarray:
         if self._embed is not None:
-            return np.asarray(self._embed(text), dtype=np.float32)
+            return unit(self._embed(text))
         # The dimension once per pocket: over the Cloud API each dim() is a
         # request, and an index of 20 entries asked 20 times.
         dim = getattr(self, "_dim", None)

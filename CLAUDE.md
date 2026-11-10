@@ -479,8 +479,10 @@ Rules if you touch scoring:
   the pool until no record outside it can beat the k-th score (cosine
   bounded by the farthest fetched distance, freshness ≤ 1, importance ≤
   max(1, seen)). A fixed 3k pool held 0.92 of the exact scored top 10 on
-  LongMemEval, 0.40 at worst. Exact for unit-length vectors only; for others
-  the first pool is kept. A new graph path with scoring= must use it.
+  LongMemEval, 0.40 at worst. The bound needs the vectors seen to share one
+  length (any length, `near_uniform`: unnormalised 768-d Gemini prefixes
+  0.53 -> 0.90 of the exact top 10 with recency); widely varying lengths
+  take the widest pool instead. A new graph path with scoring= must use it.
 - **Every ranking that reads `recall_count` fades it** (`effective_recalls`):
   scorer, `context_chain`, `Pocket.heat`, `why_retrieved`.
 
@@ -1160,6 +1162,26 @@ listed `.cpp` sources, so before `depends=glob("include/*.h")` was added to
 and produced a build that looked fresh but contained none of the changes. If you
 ever see a change "not take effect", `rm -rf build` and rebuild.
 
+### Hybrid search fuses scores (0.22)
+`hybrid_search(fusion="score")`, the default: `relevance + HYBRID_BM25_WEIGHT
+(0.2) * sigmoid(z)`, z = BM25 standardised over the query's BM25 candidates;
+a record only BM25 found is scored from its stored vector. Chosen on LoCoMo
+dev, held out +4.7 recall@30 over RRF(60). Rules if you touch it: a new
+weight or form is tuned on the LoCoMo dev conversations and reported on the
+held-out ones (cached vectors, free; the harness is in CHANGELOG 0.22);
+`fusion="rrf"` with `rrf_k=60` must keep reproducing the old ranking; and a
+test that relies on BM25 with random vectors needs high-dimensional ones
+(chance cosines in 8-32 d outweigh the BM25 term).
+
+### Untrusted memory is datamarked and fenced (0.22)
+`origin.quote` writes whitespace as `DATAMARK` (ˆ); `origin.quoted_section`
+fences the quoted section between lines naming a hash of its content. Every
+renderer goes through both (`render`, PacketBuilder, MCP). bench.poisoning
+defended: hot_text 80 -> 6 obeyed of 100, hot packet 29 -> 0. A check for
+quoted content reads `DATAMARK` back as a space; bench.poisoning's
+`_has_mark` does. Token budgets count characters, so quoted text costs ~60%
+more real tokens than budgeted.
+
 ### Filtered search: complete always, exact below FEATHER_NS_ANN_MIN
 An indexed filter (namespace / namespace_prefix / entity / attribute) returns
 a complete top-k (never short when k match), which `Pocket.recall` depends on.
@@ -1252,6 +1274,11 @@ included. `dry_run=True` plans. Rules if you touch it:
   It scrubs every deleted node, so earlier forgets' vectors go too; an int8
   slot's float original (`fv_off` / `fv_pending`) and the modality's namespace
   graphs are dropped with it.
+  The walk through removed nodes stops after 2 hops and the heuristic sees
+  the 4 x M closest candidates: unbounded, removed nodes percolate past
+  ~1/maxM0 of the graph and every touched node walked the whole cluster
+  (10% of 20k x 768: 79 s -> 1.2 s; recall@10 0.824 vs 0.834 for a
+  rebuild).
 - **Read-only handles refuse after an erasure.** A commit that cuts history
   (`c.cut`, i.e. an erasure's rewrite) bumps the count in `<path>.erasures`;
   a read-only handle (`as_of` included) reads it before loading and

@@ -8,6 +8,8 @@ same interface.
 from __future__ import annotations
 from abc import ABC, abstractmethod
 import hashlib
+import os
+import threading
 import numpy as np
 
 
@@ -45,6 +47,46 @@ class DeterministicEmbedder(Embedder):
         v = rng.standard_normal(self.dim).astype(np.float32)
         n = float(np.linalg.norm(v))
         return v / n if n > 0 else v
+
+
+class CachedEmbedder(Embedder):
+    """A paid embedder behind a disk cache of whole batches.
+
+    A LongMemEval run embeds every haystack again (~$1.9 per 100
+    questions with gemini-embedding-001), though the texts never change
+    between runs that differ only in k, budget or reader. A batch is keyed
+    by the embedder's name and the exact texts, so a changed text, query
+    rewrite or model is a miss, never a stale vector. Single embeds
+    (follow-up queries an LLM wrote) pass through: they differ per run.
+    """
+
+    def __init__(self, inner: Embedder, cache_dir: str):
+        self.inner, self.dim, self.name = inner, inner.dim, inner.name
+        self._dir = os.path.join(cache_dir, inner.name)
+        os.makedirs(self._dir, exist_ok=True)
+        self.hits = self.misses = 0
+
+    def embed(self, text: str) -> np.ndarray:
+        return self.inner.embed(text)
+
+    def embed_batch(self, texts: list[str]) -> np.ndarray:
+        h = hashlib.sha256(self.name.encode())
+        for t in texts:
+            h.update(hashlib.sha256(t.encode("utf-8")).digest())
+        path = os.path.join(self._dir, h.hexdigest()[:32] + ".npy")
+        try:
+            vecs = np.load(path)
+            if vecs.shape == (len(texts), self.dim):
+                self.hits += 1
+                return vecs
+        except (OSError, ValueError):
+            pass
+        vecs = np.asarray(self.inner.embed_batch(texts), dtype=np.float32)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp.npy"
+        np.save(tmp, vecs)
+        os.replace(tmp, path)            # a reader never sees half a file
+        self.misses += 1
+        return vecs
 
 
 def get_embedder(name: str, **kwargs) -> Embedder:

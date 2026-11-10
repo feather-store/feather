@@ -78,7 +78,7 @@ from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
     KeywordSearchRequest, HybridSearchRequest,
     LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest, PurgeRequest, EraseRequest, ByKeysRequest, HeatSelectRequest,
-    BatchDeleteRequest, BatchWriteRequest, GetManyRequest, AutoLinkRequest, EngineSettings, PlacementUpdate,
+    BatchDeleteRequest, BatchWriteRequest, GetManyRequest, TouchManyRequest, AutoLinkRequest, EngineSettings, PlacementUpdate,
     MetadataOut, NamespaceStats, HealthResponse, AdminOverview,
     SeedRequest, ContextChainRequest, EdgesResponse, EdgeOut, IncomingEdgeOut,
     ContextChainNode, ContextChainEdge, ContextChainResponse,
@@ -1621,12 +1621,13 @@ def newest(namespace: str, metadata_namespace: str = "", limit: int = 10, prefix
 @app.get("/v1/{namespace}/ids", tags=["records"], dependencies=[Depends(verify_api_key)])
 def list_ids(namespace: str, metadata_namespace: Optional[str] = None, entity_id: Optional[str] = None,
              attr_key: Optional[str] = None, attr_value: Optional[str] = None,
-             modality: Optional[str] = None):
-    """Live record ids: in a metadata namespace, for an entity, with an
-    attribute, or (only `modality`) with a vector there; none: every record."""
+             modality: Optional[str] = None, prefix: bool = False):
+    """Live record ids: in a metadata namespace (`prefix`: and every one
+    under it), for an entity, with an attribute, or (only `modality`) with a
+    vector there; none: every record."""
     db = _db_or_404(namespace)
     if metadata_namespace is not None:
-        ids = db.ids_in_namespace(metadata_namespace)
+        ids = db.ids_in_namespace(metadata_namespace, prefix=prefix)
     elif entity_id is not None:
         ids = db.ids_for_entity(entity_id)
     elif attr_key is not None:
@@ -1652,6 +1653,33 @@ def touch_record(namespace: str, record_id: int):
     db = _db_or_404(namespace)
     db.touch(record_id)
     return {"id": record_id, "touched": True}
+
+
+@app.post("/v1/{namespace}/normalize_vectors", tags=["admin"],
+          dependencies=[Depends(verify_api_key)])
+@_write_route
+def normalize_vectors(namespace: str, modality: str = "text"):
+    """Rescale the namespace's vectors to unit length, once, and save: a
+    Matryoshka-cut vector (Gemini at 768-d) is ~0.59 long, and search ranks
+    by L2 distance."""
+    db = _db_or_404(namespace)
+    try:
+        n = db.normalize_vectors(modality)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if n:
+        manager.save(namespace)
+    return {"normalized": n}
+
+
+@app.post("/v1/{namespace}/records/touch_many", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+def touch_many_records(namespace: str, req: TouchManyRequest):
+    """touch for many records in one request: Pocket.promote after a recall
+    was one request per returned memory."""
+    db = _db_or_404(namespace)
+    db.touch_many(req.ids)
+    return {"touched": len(req.ids)}
 
 
 @app.post("/v1/{namespace}/forget_expired", tags=["records"], dependencies=[Depends(verify_api_key)])
@@ -2005,7 +2033,7 @@ def _hybrid_search_impl(namespace: str, req, q=None):
     _check_query_dim(db, q, req.modality)
     raw = db.hybrid_search(q, req.query, k=req.k,
                             rrf_k=req.rrf_k, filter=sf, scoring=sc,
-                            modality=req.modality)
+                            modality=req.modality, fusion=req.fusion)
     return _results_response(raw, req.include_metadata)
 
 

@@ -16,6 +16,7 @@ key the first time it is written (same id, so edges into it stay valid); and
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Iterable, Optional
 
 import feather_db
@@ -31,15 +32,21 @@ def legacy_id(namespace: str, key: str) -> int:
     return int(h[:14], 16) & ((1 << 53) - 1)
 
 
-def _legacy(db, namespace: str, key: str) -> Optional[int]:
+def _legacy_record(db, namespace: str, key: str):
+    """(legacy id, its metadata) if a pre-0.22 record holds (namespace, key),
+    else (None, None)."""
     lid = legacy_id(namespace, key)
     m = db.get_metadata(lid)
     # The id alone proves nothing — under a collision it holds ANOTHER key's
     # record. It is this key's only if the record says so.
     if (m is not None and not m.key and m.source != "_forgotten"
             and m.namespace_id == namespace and m.entity_id == key):
-        return lid
-    return None
+        return lid, m
+    return None, None
+
+
+def _legacy(db, namespace: str, key: str) -> Optional[int]:
+    return _legacy_record(db, namespace, key)[0]
 
 
 def resolve(db, namespace: str, key: str) -> Optional[int]:
@@ -71,25 +78,38 @@ def resolve_many(db, refs) -> list:
 
 
 def get(db, namespace: str, key: str):
-    """(id, metadata) of the record keyed (namespace, key), or (None, None)."""
-    rid = resolve(db, namespace, key)
-    return (rid, db.get_metadata(rid)) if rid is not None else (None, None)
+    """(id, metadata) of the record keyed (namespace, key), or (None, None).
+    One lookup returns both (DB.lookup_key: one request over the Cloud API,
+    where resolving then reading was two); a legacy record costs one more."""
+    if hasattr(db, "lookup_key"):
+        hit = db.lookup_key(key, namespace)
+        if hit is not None:
+            return hit[0], hit[1]
+    else:                                        # a DB built before lookup_key
+        rid = db.id_for(key, namespace)
+        if rid is not None:
+            return rid, db.get_metadata(rid)
+    return _legacy_record(db, namespace, key)
 
 
-def write(db, namespace: str, key: str, meta, vec=None, modality: str = "text") -> int:
+_UNKNOWN = object()
+
+
+def write(db, namespace: str, key: str, meta, vec=None, modality: str = "text",
+          found=_UNKNOWN) -> int:
     """Write the record keyed (namespace, key) and return its id: the existing
     record (a legacy one keeps its id and gains a native key), else a new one
-    with an engine-allocated id."""
+    with an engine-allocated id. `found`: what get() returned for this key,
+    when the caller has just read it, so the key is not looked up again."""
     meta.namespace_id = namespace
     meta.key = key
-    if db.id_for(key, namespace) is None:
-        lid = _legacy(db, namespace, key)
-        if lid is not None:
-            if vec is not None:
-                db.add(lid, vec, meta, modality=modality)
-            else:
-                db.update_metadata(lid, meta)
-            return lid
+    rid, prev = get(db, namespace, key) if found is _UNKNOWN else found
+    if rid is not None and prev is not None and not prev.key:      # legacy: adopt it
+        if vec is not None:
+            db.add(rid, vec, meta, modality=modality)
+        else:
+            db.update_metadata(rid, meta)
+        return rid
     return db.upsert(meta, vec, modality=modality)[0]
 
 
@@ -119,6 +139,57 @@ def migrate(db, namespaces: Optional[Iterable[str]] = None, batch: int = 512,
                 adopted += _adopt(db, pending)
                 pending = []
     return adopted + _adopt(db, pending)
+
+
+# A file whose records all have their native keys (and whose index records
+# their registry entries, backfill_registry) carries this record, so a start
+# skips that pass. It read every record of the file on every start: over the
+# Cloud API the whole dataset downloaded per start, long after there was
+# nothing left to migrate. In the namespace "" (FeatherStore and Pocket never
+# list or carry it), keyed, naming no subject. Bump UPKEEP_VERSION to run
+# the pass once more on every file.
+UPKEEP_KIND = "_feather_upkeep"
+UPKEEP_KEY = "\x1fupkeep"
+UPKEEP_ATTR = "_feather_upkeep_v"
+UPKEEP_VERSION = "1"
+
+
+def upkeep_done(db) -> bool:
+    """Has this file had the one-off upkeep pass (one key lookup)?"""
+    m = db.get_by_key(UPKEEP_KEY, "")
+    return m is not None and m.get_attribute(UPKEEP_ATTR) == UPKEEP_VERSION
+
+
+def upkeep(db, visit=None) -> int:
+    """migrate() every namespace of the file, once: after the pass the file
+    is marked and later calls cost one lookup. A read-only handle does
+    nothing (it could write neither the keys nor the mark; resolve() still
+    finds a legacy record by its id). Returns how many records were adopted.
+
+    A record written at a hashed id after the mark (by a pre-0.22 client of
+    the same file) is not adopted at start, but resolve() still finds it."""
+    if db.is_read_only() or upkeep_done(db):
+        return 0
+    n = migrate(db, visit=visit)
+    # Text vectors at unit length, as the agent layer now writes them
+    # (pocket.unit): a Matryoshka-cut vector stored before is ~0.59 long, and
+    # search ranks by L2 distance. Saved before the mark: a mark that outlived
+    # a crash the rescale did not would stop the pass from ever running again.
+    if not _int8(db, "text") and db.normalize_vectors("text"):
+        db.save()
+    m = feather_db.Metadata()
+    m.namespace_id, m.key, m.source = "", UPKEEP_KEY, UPKEEP_KIND
+    m.timestamp = int(time.time())
+    m.set_attribute(UPKEEP_ATTR, UPKEEP_VERSION)
+    db.upsert(m)
+    return n
+
+
+def _int8(db, modality: str) -> bool:
+    try:
+        return bool(db.is_int8_ram(modality))
+    except Exception:          # no such modality yet
+        return False
 
 
 def _adopt(db, pending) -> int:

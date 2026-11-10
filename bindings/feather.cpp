@@ -629,6 +629,12 @@ PYBIND11_MODULE(core, m) {
 
         // -- Metadata --
         .def("touch",             &feather::DB::touch,             py::arg("id"), py::call_guard<py::gil_scoped_release>())
+        .def("normalize_vectors", &feather::DB::normalize_vectors, py::arg("modality") = "text",
+             py::call_guard<py::gil_scoped_release>(),
+             "Rescale every live vector of `modality` to unit length, in place; returns how "
+             "many changed. Save afterwards.")
+        .def("touch_many",        &feather::DB::touch_many,        py::arg("ids"), py::call_guard<py::gil_scoped_release>(),
+             "touch() for each id, under one lock (one request over the Cloud API).")
         .def("get_metadata",      &feather::DB::get_metadata,      py::arg("id"), py::arg("include_dead") = false,
              py::call_guard<py::gil_scoped_release>(),
              "The record's metadata, or None if it does not exist or was forgotten "
@@ -695,6 +701,10 @@ PYBIND11_MODULE(core, m) {
         .def("get_by_key", &feather::DB::get_by_key, py::arg("key"), py::arg("namespace") = "",
              py::call_guard<py::gil_scoped_release>(),
              "The metadata of the live record holding `key` in `namespace`, or None.")
+        .def("lookup_key", &feather::DB::lookup_key, py::arg("key"), py::arg("namespace") = "",
+             py::call_guard<py::gil_scoped_release>(),
+             "(id, metadata) of the live record holding `key` in `namespace`, or None: "
+             "one call (one request over the Cloud API) where id_for + get_metadata were two.")
         .def("upsert", [](feather::DB& db, const feather::Metadata& meta,
                           std::optional<py::array_t<float, py::array::c_style | py::array::forcecast>> vec,
                           const std::string& modality, std::optional<uint64_t> expected_version) {
@@ -793,7 +803,9 @@ PYBIND11_MODULE(core, m) {
 
         // -- Secondary metadata indexes (O(matches) lookups) --
         .def("ids_in_namespace", &feather::DB::ids_in_namespace, py::arg("namespace_id"),
-             "Live record ids in a namespace (O(matches) via secondary index).",
+             py::arg("prefix") = false,
+             "Live record ids in a namespace (O(matches) via secondary index); prefix=True: "
+             "in every namespace under it too ('.' boundary), one call.",
              py::call_guard<py::gil_scoped_release>())
         .def("ids_for_entity", &feather::DB::ids_for_entity, py::arg("entity_id"),
              "Live record ids for an entity (O(matches) via secondary index).",
@@ -825,16 +837,21 @@ PYBIND11_MODULE(core, m) {
                                    size_t rrf_k,
                                    feather::SearchFilter* filter,
                                    feather::ScoringConfig* scoring,
-                                   const std::string& modality) {
+                                   const std::string& modality,
+                                   const std::string& fusion) {
             py::buffer_info buf = q.request();
             std::vector<float> query_vec(static_cast<float*>(buf.ptr),
                                          static_cast<float*>(buf.ptr) + buf.size);
             py::gil_scoped_release rel;
-            return db.hybrid_search(query_vec, query, k, rrf_k, filter, scoring, modality);
+            return db.hybrid_search(query_vec, query, k, rrf_k, filter, scoring, modality,
+                                    fusion);
         }, py::arg("vec"), py::arg("query"), py::arg("k") = 10,
            py::arg("rrf_k") = 60, py::arg("filter") = nullptr,
            py::arg("scoring") = nullptr, py::arg("modality") = "text",
-           "Hybrid search: BM25 + dense vector merged via Reciprocal Rank Fusion (RRF).")
+           py::arg("fusion") = "score",
+           "Hybrid search: BM25 + dense vector. fusion=\"score\" (default): vector "
+           "relevance + 0.2 * sigmoid(BM25 z-score within the query); fusion=\"rrf\": "
+           "Reciprocal Rank Fusion with rrf_k.")
 
         // -- Compact (rebuild HNSW without dead records) --
         .def("compact", &feather::DB::compact,

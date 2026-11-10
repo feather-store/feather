@@ -19,16 +19,21 @@ default 2048, 0 disables), as the Cloud API does: an agent re-embeds the same
 query and the same memory text turn after turn, and each miss is a 100-300 ms
 round trip — more than the search it feeds, by two orders of magnitude.
 The returned vector is padded/truncated to `dim` so it always matches the
-namespace dimension. For an exact native match use Gemini `text-embedding-004`
-(768) or OpenAI `text-embedding-3-small` with `dim=768` (it supports a
-`dimensions` request).
+namespace dimension. Gemini `gemini-embedding-001` (the default; Google shut
+`text-embedding-004` down) and OpenAI `text-embedding-3-*` are asked for `dim`
+natively. Requests reuse their connection (one per thread and host).
+Hedging (a duplicate request at the p95) was measured and not kept: 450
+calls, 13 hedges, none won; the multi-second stalls hit the duplicate too.
 """
 from __future__ import annotations
 
 import os
 import json
 import hashlib
+import http.client
+import threading
 import weakref
+import urllib.parse
 import urllib.request
 import urllib.error
 from collections import OrderedDict
@@ -37,7 +42,7 @@ from typing import Callable, List, Optional
 
 _DEFAULT_MODELS = {
     "openai":  "text-embedding-3-small",
-    "gemini":  "text-embedding-004",
+    "gemini":  "gemini-embedding-001",   # text-embedding-004 answers 404
     "voyage":  "voyage-3-lite",
     "cohere":  "embed-english-v3.0",
     "ollama":  "nomic-embed-text",
@@ -46,9 +51,68 @@ _DEFAULT_MODELS = {
 
 
 def _http_post_json(url: str, headers: dict, body: dict, timeout: float = 30.0) -> dict:
+    """POST JSON, over a kept-alive connection (one per thread and host).
+
+    A new HTTPS connection per call cost every embed its TCP + TLS
+    handshake: gemini-embedding-001 from one client, 60 calls each, p50
+    602 -> 488 ms and p95 776 -> 535 ms with the connection reused, and the
+    only multi-second calls (3.0 s, 6.1 s) were on fresh connections. A
+    configured proxy keeps the urllib path, which honours it."""
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={**headers, "Content-Type": "application/json"})
+    headers = {**headers, "Content-Type": "application/json"}
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or \
+            urllib.request.getproxies().get(parts.scheme):
+        return _urllib_post(url, headers, data, timeout)
+    path = parts.path + (f"?{parts.query}" if parts.query else "")
+    for attempt in (0, 1):
+        conn, reused = _connection(parts.scheme, parts.netloc, timeout)
+        try:
+            conn.request("POST", path, data, headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+        except (http.client.HTTPException, OSError) as e:
+            _drop_connection(parts.scheme, parts.netloc)
+            # A kept-alive connection the server closed while idle fails
+            # on first use: retry once on a fresh one. A fresh one failing
+            # is a real error.
+            if reused and attempt == 0 and not isinstance(e, TimeoutError):
+                continue
+            raise RuntimeError(f"{url} -> {e}")
+        if resp.will_close:
+            _drop_connection(parts.scheme, parts.netloc)
+        if resp.status >= 400:
+            raise RuntimeError(
+                f"{url} -> HTTP {resp.status}: {raw.decode('utf-8', 'replace')[:300]}")
+        return json.loads(raw.decode("utf-8"))
+    raise AssertionError("unreachable")
+
+
+_conns = threading.local()
+
+
+def _connection(scheme: str, netloc: str, timeout: float):
+    """(this thread's connection to scheme://netloc, whether it was reused)."""
+    pool = getattr(_conns, "pool", None)
+    if pool is None:
+        pool = _conns.pool = {}
+    conn = pool.get((scheme, netloc))
+    if conn is not None:
+        return conn, True
+    cls = (http.client.HTTPSConnection if scheme == "https"
+           else http.client.HTTPConnection)
+    conn = pool[(scheme, netloc)] = cls(netloc, timeout=timeout)
+    return conn, False
+
+
+def _drop_connection(scheme: str, netloc: str) -> None:
+    conn = getattr(_conns, "pool", {}).pop((scheme, netloc), None)
+    if conn is not None:
+        conn.close()
+
+
+def _urllib_post(url: str, headers: dict, data: bytes, timeout: float) -> dict:
+    req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -70,11 +134,19 @@ def _dig(j: dict, path, provider: str) -> List[float]:
     return cur
 
 
+def _unit(vec: List[float]) -> List[float]:
+    n = sum(x * x for x in vec) ** 0.5
+    return [x / n for x in vec] if n > 0 else vec
+
+
 def _fit(vec: List[float], dim: int) -> List[float]:
+    """`vec` at `dim`: padded with zeros, or cut and renormalised. A cut
+    vector is not unit length (Gemini's 768-d prefix is ~0.59), and search
+    ranks by L2 distance, which is cosine order only for one length."""
     if len(vec) == dim:
         return [float(x) for x in vec]
     if len(vec) > dim:
-        return [float(x) for x in vec[:dim]]
+        return _unit([float(x) for x in vec[:dim]])
     return [float(x) for x in vec] + [0.0] * (dim - len(vec))
 
 
@@ -90,8 +162,16 @@ def _gemini(text, model, key, dim, base_url):
     base = (base_url or "https://generativelanguage.googleapis.com").rstrip("/")
     url = f"{base}/v1beta/models/{model}:embedContent"
     body = {"content": {"parts": [{"text": text}]}}
+    # Matryoshka: the API's d-dim output is exactly the first d values of
+    # the 3072-d vector (checked live: cosine 1.000000, same norm ~0.59, not
+    # renormalised), so it is renormalised here, as _fit renormalises a cut.
+    # Asking for d sends 4x less JSON at 768.
+    cut = model.startswith("gemini-embedding") and 128 <= dim < 3072
+    if cut:
+        body["outputDimensionality"] = dim
     j = _http_post_json(url, {"x-goog-api-key": key}, body)
-    return _dig(j, ["embedding", "values"], "gemini")
+    v = _dig(j, ["embedding", "values"], "gemini")
+    return _unit([float(x) for x in v]) if cut else v      # the prefix is ~0.59 long
 
 
 def _voyage(text, model, key, dim, base_url):

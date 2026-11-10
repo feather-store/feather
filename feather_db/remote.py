@@ -58,10 +58,13 @@ PARITY = {
     # reads
     "get_metadata":      "GET /records/{record_id}",
     "get_metadata_many": "POST /records/get_many",
+    "touch_many":        "POST /records/touch_many",
+    "normalize_vectors": "POST /normalize_vectors",
     "get_vector":        "GET /records/{record_id}",
     "version":           "GET /records/{record_id}",
     "get_by_key":        "GET /by_key",
     "id_for":            "GET /by_key",
+    "lookup_key":        "GET /by_key",
     "ids_for_many":      "POST /by_keys",
     "heat_select":       "POST /heat_select",
     "get_edges":         "GET /records/{record_id}/edges",
@@ -541,6 +544,14 @@ class RemoteDB:
     def touch(self, id):
         self._call("POST", f"/records/{int(id)}/touch")
 
+    def normalize_vectors(self, modality="text"):
+        return self._call("POST", "/normalize_vectors", params={"modality": modality})["normalized"]
+
+    def touch_many(self, ids):
+        ids = [int(i) for i in ids]
+        for i in range(0, len(ids), self.BATCH_MAX):
+            self._call("POST", "/records/touch_many", body={"ids": ids[i:i + self.BATCH_MAX]})
+
     # ── reads ─────────────────────────────────────────────────────────
     def get_metadata(self, id, include_dead=False):
         r = self._call("GET", f"/records/{int(id)}",
@@ -574,6 +585,10 @@ class RemoteDB:
     def id_for(self, key, namespace=""):
         r = self._call("GET", "/by_key", params={"key": key, "key_namespace": namespace}, ok_404=True)
         return int(r["id"]) if r else None
+
+    def lookup_key(self, key, namespace=""):
+        r = self._call("GET", "/by_key", params={"key": key, "key_namespace": namespace}, ok_404=True)
+        return (int(r["id"]), _meta_from(r["metadata"])) if r else None
 
     def heat_select(self, namespaces, now, budget, half_life_days, min_heat, trusted,
                     exclude_sources, usage_half_life=3.0, unused_floor=0.4, inherit_decay=0.7,
@@ -627,8 +642,10 @@ class RemoteDB:
                                            "track": bool(record_salience),
                                            **_filter_json(filter)}))
 
-    def hybrid_search(self, vec, query, k=10, rrf_k=60, filter=None, scoring=None, modality="text"):
+    def hybrid_search(self, vec, query, k=10, rrf_k=60, filter=None, scoring=None, modality="text",
+                      fusion="score"):
         body = {"vector_b64": _vec(vec), "query": query, "k": int(k), "rrf_k": int(rrf_k),
+                "fusion": fusion,
                 "modality": modality, **_filter_json(filter), **_scoring_json(scoring)}
         return self._hits(self._call("POST", "/hybrid_search", body=body))
 
@@ -652,8 +669,11 @@ class RemoteDB:
             params["before_ts"] = int(before)
         return self._call("GET", "/newest", params=params)["ids"]
 
-    def ids_in_namespace(self, namespace_id):
-        return self._call("GET", "/ids", params={"metadata_namespace": namespace_id})["ids"]
+    def ids_in_namespace(self, namespace_id, prefix=False):
+        params = {"metadata_namespace": namespace_id}
+        if prefix:
+            params["prefix"] = "true"
+        return self._call("GET", "/ids", params=params)["ids"]
 
     def ids_for_entity(self, entity_id):
         return self._call("GET", "/ids", params={"entity_id": entity_id})["ids"]
