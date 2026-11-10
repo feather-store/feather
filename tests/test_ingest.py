@@ -222,6 +222,7 @@ def test_the_registry_is_backfilled_for_an_index_written_before_it(tmp_path):
     pkt.remember("m1", "Alice moved", index=[P.IndexEntry("x", key="alice|home city",
                                                           value="Denver")])
     reg = list(d.ids_with_attribute(P.KEYREG_NS, pkt.namespace))
+    reg.append(d.id_for(keys.UPKEEP_KEY, ""))                # nor had the upkeep pass run
     b = feather_db.WriteBatch()
     for rid in reg:
         b.forget(rid)
