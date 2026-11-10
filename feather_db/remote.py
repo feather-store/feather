@@ -59,6 +59,7 @@ PARITY = {
     "get_metadata":      "GET /records/{record_id}",
     "get_metadata_many": "POST /records/get_many",
     "touch_many":        "POST /records/touch_many",
+    "normalize_vectors": "POST /normalize_vectors",
     "get_vector":        "GET /records/{record_id}",
     "version":           "GET /records/{record_id}",
     "get_by_key":        "GET /by_key",
@@ -542,6 +543,9 @@ class RemoteDB:
 
     def touch(self, id):
         self._call("POST", f"/records/{int(id)}/touch")
+
+    def normalize_vectors(self, modality="text"):
+        return self._call("POST", "/normalize_vectors", params={"modality": modality})["normalized"]
 
     def touch_many(self, ids):
         ids = [int(i) for i in ids]

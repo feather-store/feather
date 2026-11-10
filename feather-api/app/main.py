@@ -1655,6 +1655,23 @@ def touch_record(namespace: str, record_id: int):
     return {"id": record_id, "touched": True}
 
 
+@app.post("/v1/{namespace}/normalize_vectors", tags=["admin"],
+          dependencies=[Depends(verify_api_key)])
+@_write_route
+def normalize_vectors(namespace: str, modality: str = "text"):
+    """Rescale the namespace's vectors to unit length, once, and save: a
+    Matryoshka-cut vector (Gemini at 768-d) is ~0.59 long, and search ranks
+    by L2 distance."""
+    db = _db_or_404(namespace)
+    try:
+        n = db.normalize_vectors(modality)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if n:
+        manager.save(namespace)
+    return {"normalized": n}
+
+
 @app.post("/v1/{namespace}/records/touch_many", tags=["records"],
           dependencies=[Depends(verify_api_key)])
 def touch_many_records(namespace: str, req: TouchManyRequest):
