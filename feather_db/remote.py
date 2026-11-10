@@ -58,6 +58,7 @@ PARITY = {
     # reads
     "get_metadata":      "GET /records/{record_id}",
     "get_metadata_many": "POST /records/get_many",
+    "touch_many":        "POST /records/touch_many",
     "get_vector":        "GET /records/{record_id}",
     "version":           "GET /records/{record_id}",
     "get_by_key":        "GET /by_key",
@@ -540,6 +541,11 @@ class RemoteDB:
 
     def touch(self, id):
         self._call("POST", f"/records/{int(id)}/touch")
+
+    def touch_many(self, ids):
+        ids = [int(i) for i in ids]
+        for i in range(0, len(ids), self.BATCH_MAX):
+            self._call("POST", "/records/touch_many", body={"ids": ids[i:i + self.BATCH_MAX]})
 
     # ── reads ─────────────────────────────────────────────────────────
     def get_metadata(self, id, include_dead=False):

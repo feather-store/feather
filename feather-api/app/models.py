@@ -407,6 +407,11 @@ class BatchWriteRequest(BaseModel):
     ops: List[BatchOpIn] = Field(..., min_length=1, max_length=10_000)
 
 
+class TouchManyRequest(BaseModel):
+    ids: List[int] = Field(..., max_length=10_000,
+                           description="Record ids to count a recall for, up to 10k per call.")
+
+
 class GetManyRequest(BaseModel):
     ids: List[int] = Field(..., max_length=10_000,
                            description="Record ids to read, up to 10k per call.")

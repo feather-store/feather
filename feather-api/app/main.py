@@ -78,7 +78,7 @@ from .models import (
     AddVectorRequest, SearchRequest, SearchResponse, SearchResultItem,
     KeywordSearchRequest, HybridSearchRequest,
     LinkRequest, UpdateImportanceRequest, UpdateMetadataRequest, PurgeRequest, EraseRequest, ByKeysRequest, HeatSelectRequest,
-    BatchDeleteRequest, BatchWriteRequest, GetManyRequest, AutoLinkRequest, EngineSettings, PlacementUpdate,
+    BatchDeleteRequest, BatchWriteRequest, GetManyRequest, TouchManyRequest, AutoLinkRequest, EngineSettings, PlacementUpdate,
     MetadataOut, NamespaceStats, HealthResponse, AdminOverview,
     SeedRequest, ContextChainRequest, EdgesResponse, EdgeOut, IncomingEdgeOut,
     ContextChainNode, ContextChainEdge, ContextChainResponse,
@@ -1652,6 +1652,16 @@ def touch_record(namespace: str, record_id: int):
     db = _db_or_404(namespace)
     db.touch(record_id)
     return {"id": record_id, "touched": True}
+
+
+@app.post("/v1/{namespace}/records/touch_many", tags=["records"],
+          dependencies=[Depends(verify_api_key)])
+def touch_many_records(namespace: str, req: TouchManyRequest):
+    """touch for many records in one request: Pocket.promote after a recall
+    was one request per returned memory."""
+    db = _db_or_404(namespace)
+    db.touch_many(req.ids)
+    return {"touched": len(req.ids)}
 
 
 @app.post("/v1/{namespace}/forget_expired", tags=["records"], dependencies=[Depends(verify_api_key)])
