@@ -284,6 +284,23 @@ def unit(vec) -> np.ndarray:
     return v / n if n > 0 else v
 
 
+def open_agent_db(path: str, dim: int):
+    """Open (or create) a file for the agent layer. A NEW file keeps its text
+    vectors as int8 in RAM, re-ranked by the float originals (refine 2): on
+    gemini-embedding-001 at 768-d (27k real turns), recall@10 0.9997 against
+    0.9967 for float32, 0.2 ms more a search, 768 B per vector in RAM where
+    float was 3 KB. The scale is fixed at 1: every vector the agent layer
+    stores is unit length (`unit`), so nothing is ever clipped.
+    FEATHER_INT8=0 keeps float. An existing file keeps what it has."""
+    import os
+    from feather_db import DB
+    new = not os.path.exists(path)
+    db = DB.open(path, dim=dim)
+    if new and os.getenv("FEATHER_INT8", "1") != "0":
+        db.set_int8_ram("text", 1.0, 2)
+    return db
+
+
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
 

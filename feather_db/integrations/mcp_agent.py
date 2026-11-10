@@ -114,7 +114,8 @@ def build(
     _require_mcp()
 
     if db is None:
-        db = DB.open(db_path, dim=dim)
+        from feather_db.pocket import open_agent_db
+        db = open_agent_db(db_path, dim)
     if embed is None:
         # Same env default as FeatherStore, so `feather-agent` with
         # FEATHER_EMBED_PROVIDER set gets semantic recall without --embed-provider.

@@ -178,7 +178,8 @@ class FeatherStore(BaseStore):
         self._owns_db = db is None
         if db is None:
             dim = 768 if dim is None else dim
-            db = DB.open(path, dim=dim)
+            from feather_db.pocket import open_agent_db
+            db = open_agent_db(path, dim)
         elif dim is None:
             dim = db.dim()
         self.db = db
