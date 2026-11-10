@@ -37,7 +37,7 @@ the question-level one assumes independence.
 from __future__ import annotations
 
 from itertools import combinations
-from math import comb
+from math import comb, exp, lgamma, log
 from typing import Dict, Iterable, List, Optional
 
 import numpy as np
@@ -228,3 +228,45 @@ def format_compare(c: dict, label_a: str = "A", label_b: str = "B", pct: bool = 
         lines.append(c["note"])
     lines += [f"WARNING: {w}" for w in c.get("warnings", [])]
     return "\n".join(lines)
+
+
+# ── percentiles and many comparisons ─────────────────────────────────────
+
+def quantile_ci(values, q: float = 0.99, level: float = 0.95) -> tuple:
+    """Distribution-free CI of the q-quantile: order statistics whose ranks
+    a Binomial(n, q) count covers with probability >= `level`. A p99 of n
+    samples rests on ~0.01 n of them: from 120 the upper end is None (no
+    order statistic reaches it), which is the honest answer."""
+    xs = sorted(values)
+    n = len(xs)
+    if n == 0:
+        return (None, None)
+    a = (1.0 - level) / 2.0
+
+    def logpmf(k):
+        if q <= 0.0 or q >= 1.0:
+            return 0.0 if (k == 0 and q <= 0.0) or (k == n and q >= 1.0) else float("-inf")
+        return (lgamma(n + 1) - lgamma(k + 1) - lgamma(n - k + 1)
+                + k * log(q) + (n - k) * log(1.0 - q))
+    cdf, acc = [], 0.0
+    for k in range(n + 1):
+        acc += exp(logpmf(k))
+        cdf.append(min(1.0, acc))
+    # x_(j) (1-based) is below the quantile with probability P(B >= j) = 1 - cdf[j-1].
+    lo = max((j for j in range(1, n + 1) if cdf[j - 1] <= a), default=None)
+    hi = min((j for j in range(1, n + 1) if cdf[j - 1] >= 1.0 - a), default=None)
+    return (xs[lo - 1] if lo else None, xs[hi - 1] if hi else None)
+
+
+def benjamini_hochberg(pvalues, fdr: float = 0.05) -> List[bool]:
+    """Which of `pvalues` to call discoveries with the false discovery rate
+    held at `fdr` across all of them: every variant tried in a round, not
+    only the one that looked best."""
+    m = len(pvalues)
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    cut = 0
+    for rank, i in enumerate(order, start=1):
+        if pvalues[i] <= fdr * rank / m:
+            cut = rank
+    keep = set(order[:cut])
+    return [i in keep for i in range(m)]
