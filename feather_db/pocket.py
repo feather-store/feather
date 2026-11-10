@@ -1082,7 +1082,14 @@ class Pocket:
         _origin.check(origin)
         # One request remotely (keys.get is two). The scope's legacy records
         # were given native keys when this pocket opened.
-        prev = self.db.get_by_key(key, self.namespace)
+        if index is None:
+            # (id, metadata) in one read, handed to keys.write so the key is
+            # not looked up again: 2 requests to rewrite a memory, 3 for a new
+            # key (the legacy-id check), where it was 3 and 4.
+            found = keys.get(self.db, self.namespace, key)
+            prev = found[1]
+        else:
+            prev = self.db.get_by_key(key, self.namespace)   # apply_index writes by native key
 
         meta = feather_db.Metadata()
         meta.timestamp    = int(time.time())
@@ -1116,7 +1123,8 @@ class Pocket:
             meta.last_recalled_at = prev.last_recalled_at
 
         if entries is None:
-            rid = keys.write(self.db, self.namespace, key, meta, self._vec(content))
+            rid = keys.write(self.db, self.namespace, key, meta, self._vec(content),
+                             found=found)
         else:
             # The memory and its whole index in one batch (one round trip).
             r = apply_index(self.db, [IndexWrite(
