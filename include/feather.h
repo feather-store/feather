@@ -6805,6 +6805,18 @@ public:
         return metadata_store_.at(it->second);
     }
 
+    // (id, metadata) of the live record holding `key` in `ns`, in one call: a
+    // keyed write reads both, and id_for then get_metadata was two requests
+    // over the Cloud API.
+    std::optional<std::pair<uint64_t, Metadata>> lookup_key(const std::string& key,
+                                                            const std::string& ns = "") const {
+        std::shared_lock<RWMutex> lock(mutex_);
+        ensure_open();
+        auto it = key_index_.find(key_ref(ns, key));
+        if (it == key_index_.end()) return std::nullopt;
+        return std::make_pair(it->second, metadata_store_.at(it->second));
+    }
+
     // Write the record keyed (meta.namespace_id, meta.key): the existing one,
     // or a new one with a fresh id. With `vec` as add(); without, the
     // metadata replaces the record's, keeping its edges when `meta` has none.

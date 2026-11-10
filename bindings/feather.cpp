@@ -697,6 +697,10 @@ PYBIND11_MODULE(core, m) {
         .def("get_by_key", &feather::DB::get_by_key, py::arg("key"), py::arg("namespace") = "",
              py::call_guard<py::gil_scoped_release>(),
              "The metadata of the live record holding `key` in `namespace`, or None.")
+        .def("lookup_key", &feather::DB::lookup_key, py::arg("key"), py::arg("namespace") = "",
+             py::call_guard<py::gil_scoped_release>(),
+             "(id, metadata) of the live record holding `key` in `namespace`, or None: "
+             "one call (one request over the Cloud API) where id_for + get_metadata were two.")
         .def("upsert", [](feather::DB& db, const feather::Metadata& meta,
                           std::optional<py::array_t<float, py::array::c_style | py::array::forcecast>> vec,
                           const std::string& modality, std::optional<uint64_t> expected_version) {
