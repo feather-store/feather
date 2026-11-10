@@ -8984,6 +8984,48 @@ public:
                          it->second.index->ef_construction_);
         maybe_train_int8_nolock(modality);
     }
+    // Rescale every live vector of `modality` to unit length, in place, and
+    // return how many changed. Search ranks by L2 distance, which is cosine
+    // order only for vectors of one length, and scored search is exact only
+    // for unit vectors (scored_pool_nolock): a Matryoshka-cut vector
+    // (gemini-embedding-001 at 768-d: norm ~0.59, varying by record) was
+    // neither. Cosines are unchanged; the graph keeps its links (the lengths
+    // were within a few percent of each other). Takes effect in memory; the
+    // caller saves (keys.upkeep and the Cloud API route do). An int8
+    // modality is refused: its stored values carry the quantization scale.
+    size_t normalize_vectors(const std::string& modality = "text") {
+        check_writable("normalize vectors");
+        // A compaction built from a snapshot taken before would swap the old
+        // lengths back in.
+        std::lock_guard<std::mutex> no_compaction(compact_run_mx_);
+        std::unique_lock<RWMutex> lock(mutex_);
+        ensure_open();
+        auto it = modality_indices_.find(modality);
+        if (it == modality_indices_.end()) return 0;
+        ModalityIndex& m = it->second;
+        if (m.int8)
+            throw std::invalid_argument("normalize_vectors: '" + modality +
+                                        "' stores int8; normalise before set_int8_ram()");
+        auto& ix = *m.index;
+        size_t changed = 0;
+        for (size_t i = 0, n = ix.cur_element_count; i < n; ++i) {
+            const auto iid = static_cast<hnswlib::tableint>(i);
+            if (ix.isMarkedDeleted(iid)) continue;
+            float* v = reinterpret_cast<float*>(ix.getDataByInternalId(iid));
+            double ss = 0.0;
+            for (size_t d = 0; d < m.dim; ++d) ss += static_cast<double>(v[d]) * v[d];
+            if (!(ss > 0.0)) continue;
+            const double norm = std::sqrt(ss);
+            if (std::fabs(norm - 1.0) <= 1e-6) continue;
+            const float inv = static_cast<float>(1.0 / norm);
+            for (size_t d = 0; d < m.dim; ++d) v[d] *= inv;
+            ix.markDirty(iid, hnswlib::HierarchicalNSW<float>::DIRTY_DATA);
+            ++changed;
+        }
+        if (changed) drop_ns_graphs_nolock(modality, m);   // they route through these vectors
+        return changed;
+    }
+
     bool is_int8_ram(const std::string& modality) const {
         std::shared_lock<RWMutex> lock(mutex_);
 
