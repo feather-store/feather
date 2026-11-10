@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BM25 builds 3x faster in 27% less memory
+
+Terms are numbered once and a build's postings are one array (CSR), with a
+small delta for later writes; the build tokenizes through an arena word
+table, one lookup per token. 100k LongMemEval turns: first keyword search
+2.0 s -> 0.65 s, index 79.6 -> 58.3 MB; results bit-identical (500 queries).
+The build's transient peak is ~30 MB higher than before for its ~0.6 s.
+
 ### Algorithms: what each costs, measured
 
 - **`Pocket.hot()` is chosen in the engine** (`DB.heat_select`, Cloud API
