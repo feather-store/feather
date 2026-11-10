@@ -168,8 +168,13 @@ def _cmd_run(args):
             want = {t.strip() for t in args.question_types.split(",")}
             questions = [q for q in questions if q.get("question_type") in want]
         _held_out_guard(args, questions)
+        if args.full_context and args.context_tokens:
+            print("--full-context has no budget: drop --context-tokens",
+                  file=sys.stderr)
+            return 2
         count_tokens = None
-        if args.context_tokens:
+        # Full context is counted too: its size is half of what it measures.
+        if args.context_tokens or args.full_context:
             from .tokens import gemini_counter
             count_tokens = gemini_counter(args.tokenizer_model)
 
@@ -193,8 +198,9 @@ def _cmd_run(args):
                              answerer_model=args.answerer_model,
                              # A token budget is the budget; a char
                              # backstop would cut what it admitted.
-                             max_context_chars=(None if args.context_tokens
-                                                else args.context_chars),
+                             max_context_chars=(
+                                 None if args.context_tokens or args.full_context
+                                 else args.context_chars),
                              answer_max_tokens=args.answer_max_tokens,
                              count_votes=args.count_votes,
                              map_provider=args.map_provider,
@@ -227,7 +233,7 @@ def _cmd_run(args):
                 multi_round=args.multi_round, fact_cache=fact_cache,
                 count_map=args.count_map, workers=args.workers,
                 context_tokens=args.context_tokens, count_tokens=count_tokens,
-                reader=args.reader,
+                reader=args.reader, full_context=args.full_context,
             ),
             n=len(questions), dim=embedder.dim, k=args.k,
             ef=args.ef, embedder=embedder.name, judge=judge.name,
@@ -235,8 +241,8 @@ def _cmd_run(args):
             multi_round=args.multi_round, facts=args.facts,
             count_map=args.count_map, split=args.split, reader=args.reader,
             context_tokens=args.context_tokens,
-            tokenizer_model=(args.tokenizer_model if args.context_tokens
-                             else None),
+            full_context=args.full_context,
+            tokenizer_model=(args.tokenizer_model if count_tokens else None),
             count_votes=args.count_votes, context_chars_budget=args.context_chars,
             system_provider=(args.system_provider if fact_cache else None),
             system_model=(args.system_model if fact_cache else None),
@@ -309,6 +315,9 @@ def lme_reportability(args, metrics: dict, dirty: bool) -> list[str]:
         why.append(f"--question-types {args.question_types}: not all 500 questions")
     if args.dataset == "oracle":
         why.append("--dataset oracle: the evidence sessions are given")
+    if getattr(args, "full_context", False):
+        why.append("--full-context: the whole haystack, no retrieval (a "
+                   "baseline, not Feather's score)")
     if args.judge != "llm":
         why.append(f"--judge {args.judge}: no LLM reader or judge")
     if args.embedder == "deterministic":
@@ -440,6 +449,10 @@ def main(argv=None):
     p_run.add_argument("--context-tokens", type=int, default=None,
                        help="longmemeval: budget the context in tokens of "
                             "--tokenizer-model (overrides --context-chars).")
+    p_run.add_argument("--full-context", action="store_true",
+                       help="longmemeval: no retrieval, no budget: every "
+                            "session verbatim to the same reader (the "
+                            "full-context baseline, ~110k tokens on s).")
     p_run.add_argument("--tokenizer-model", default="gemini-2.5-flash",
                        help="Tokenizer for --context-tokens (Gemini local "
                             "tokenizer; needs sentencepiece + protobuf).")

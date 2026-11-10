@@ -140,7 +140,8 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
         context_tokens: Optional[int] = None,
         count_tokens=None,
         workers: int = 1,
-        reader: str = "single") -> dict:
+        reader: str = "single",
+        full_context: bool = False) -> dict:
     """Execute the scenario and return aggregate metrics.
 
     Adaptive decay is engaged when scoring_time_weight is provided.
@@ -164,6 +165,12 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
 
     count_map also takes the aggregations that are not counts: "which
     is the most", "in what order" (lme_reader.is_aggregation_question).
+
+    full_context: no retrieval and no budget: every session of the
+    haystack, verbatim and oldest first, goes to the same reader (~110k
+    tokens on LongMemEval_S). The baseline retrieval is measured against.
+    Nothing is embedded; needs facts, count_map and multi-round off and
+    reader "single".
 
     reader: "single" answers with lme_answer's one prompt; "verified"
     with the same prompt, and an abstaining draft is re-searched and must
@@ -203,6 +210,11 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
     if reader != "single" and not routed:
         raise ValueError(f"reader={reader!r} needs an answerer exposing "
                          "answer_chat() and planner_chat()")
+
+    if full_context and (fact_cache is not None or count_map != "off"
+                         or reader != "single"):
+        raise ValueError("full_context reads the whole haystack once: it "
+                         "needs facts and count_map off and reader single")
 
     records: list[dict] = []
     failures: list[dict] = []
@@ -266,7 +278,9 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
             bump("history_turns_total", len(turns))
 
             # ---------- Embed all turns + question (batch if possible) ----------
-            if has_batch:
+            if full_context:
+                turn_vecs, qvec = [], None           # nothing is retrieved
+            elif has_batch:
                 texts = [t.content for t in turns] + [
                     lme_retrieve.dense_query(question_text, question_date)]
                 vecs = embedder.embed_batch(texts)
@@ -275,7 +289,7 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
                 turn_vecs = [embedder.embed(t.content) for t in turns]
                 qvec = embedder.embed(
                     lme_retrieve.dense_query(question_text, question_date))
-            bump("embeddings_emitted", len(turns) + 1)
+            bump("embeddings_emitted", len(turn_vecs) + (qvec is not None))
 
             # ---------- Ingest ----------
             # id = position + 1, so a hit maps straight back to its Turn.
@@ -386,11 +400,12 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
                         t.session_date, after, before)]
                 return found[:pool_k]
 
-            hits = search(question_text, qvec)
+            hits = list(turns) if full_context else search(question_text, qvec)
             followups, missing = [], ""
             round1_sids = list(dict.fromkeys(t.session_id for t in hits))
             planner = getattr(judge, "planner_chat", None)
-            if callable(planner) and (multi_round == "always" or (
+            if not full_context and callable(planner) and (
+                    multi_round == "always" or (
                     multi_round == "auto"
                     and lme_retrieve.needs_multi_round(question_text))):
                 followups, missing = lme_retrieve.plan_followups(
@@ -415,7 +430,7 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
                 hits = [t for sid in order for t in by_sid[sid]]
                 max_sessions = len(order)
             else:
-                max_sessions = top_k
+                max_sessions = None if full_context else top_k
             changes = timeline(chains, [fact_key(f) for f in fact_hits])
             events, prefs = "", ""
             if all_facts:
@@ -439,7 +454,8 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
                     (lme_answer.PROFILE_HEADER, prefs),
                     (lme_answer.LEDGER_HEADER, events),
                     (lme_answer.CHANGES_HEADER, changes)) if body)
-            budget = ({"max_tokens": context_tokens - count_tokens(preamble),
+            budget = ({"max_chars": 10 ** 12} if full_context else
+                      {"max_tokens": context_tokens - count_tokens(preamble),
                        "count_tokens": count_tokens}
                       if context_tokens else
                       {"max_chars": context_chars - len(preamble)})
@@ -622,7 +638,8 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
         "unit": unit,
         "context_chars": context_chars,
         "context_tokens": context_tokens,
-        "multi_round": multi_round,
+        "full_context": full_context,
+        "multi_round": "off" if full_context else multi_round,
         "count_map": count_map,
         "reader": reader,
         "workers": workers,
