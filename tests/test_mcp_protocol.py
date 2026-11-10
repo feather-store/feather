@@ -244,13 +244,16 @@ def test_two_agents_on_one_file_do_not_read_each_other(tmp_path):
     """Sibling scopes are the isolation boundary; a shared file is not a leak."""
     path = str(tmp_path / "shared.feather")
 
+    db = DB.open(path, dim=64)                    # one handle, two agents (CLAUDE.md §9)
+
     async def go():
-        async with connect(build(path, "org.team.alice", dim=64)) as alice:
+        async with connect(build(path, "org.team.alice", dim=64, db=db)) as alice:
             await alice.call("remember", key="secret", content="alice's private note")
-            async with connect(build(path, "org.team.bob", dim=64)) as bob:
+            async with connect(build(path, "org.team.bob", dim=64, db=db)) as bob:
                 return await bob.call("context"), await bob.call("recall", query="private note")
 
     context, recalled = asyncio.run(go())
+    db.close()
     assert "alice" not in context.lower()
     assert "alice" not in recalled.lower()
 

@@ -113,6 +113,7 @@ def build(
     """
     _require_mcp()
 
+    owns_db = db is None
     if db is None:
         from feather_db.pocket import open_agent_db
         db = open_agent_db(db_path, dim)
@@ -385,6 +386,11 @@ def build(
         )
 
     server.ingest_queue = queue
+    # The file build() opened, closed when the server stops (a restart). A
+    # second handle on a file this process still holds is the documented
+    # footgun: two writers, and the older one's checkpoint cuts what the newer
+    # appended. A `db` the caller passed stays the caller's to close.
+    server.close_db = db.close if owns_db else (lambda: None)
     return server
 
 
@@ -518,6 +524,7 @@ def main() -> None:
         # database and the next start resumes it.
         if server.ingest_queue is not None:
             server.ingest_queue.close()
+        server.close_db()          # checkpoint and release the file now, not at GC
 
 
 if __name__ == "__main__":
