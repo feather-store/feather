@@ -7142,7 +7142,10 @@ public:
             const Cand& c = scored[*(end - 1)];
             if (spent + 1.0 > q.budget) break;      // nothing more can fit
             const int64_t chars = heat::display_chars(*c.m, q.text_attr);
-            const int64_t tokens = std::max<int64_t>(1, chars / cpt);
+            // An untrusted item is rendered datamarked: 8/5 of the estimate
+            // (pocket.QUOTED_COST, estimate_quoted_tokens).
+            const int64_t tokens = c.trusted ? std::max<int64_t>(1, chars / cpt)
+                                             : std::max<int64_t>(1, (chars * 8 / 5) / cpt);
             if (spent + static_cast<double>(tokens) > q.budget) continue;
             out.push_back({c.id, c.depth, c.heat, tokens});
             spent += static_cast<double>(tokens);

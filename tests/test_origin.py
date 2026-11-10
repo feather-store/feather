@@ -450,3 +450,16 @@ def test_a_reminder_the_user_does_not_confirm_is_not_set(tmp_path, user, says):
     with DB.open(path, dim=16, read_only=True) as d:
         m = keys.get(d, "org.creative", "k")[1]
         assert O.of(m) == O.AGENT and not m.get_attribute("_pocket_due_at")
+
+
+def test_untrusted_memory_is_budgeted_at_its_datamarked_size(pkt):
+    """Quoted memory has every space datamarked, a token each: it is costed
+    8/5 of the plain estimate, in hot() and in the engine's heat_select."""
+    import importlib
+    P = importlib.import_module("feather_db.pocket")
+    text = " ".join(f"word{i}" for i in range(40))
+    pkt.remember("mine", text)
+    pkt.remember("theirs", text, origin=O.TOOL)
+    items = {i.key: i for i in pkt.hot()}
+    assert items["mine"].tokens == P.estimate_tokens(text)
+    assert items["theirs"].tokens == P.estimate_quoted_tokens(text) > items["mine"].tokens

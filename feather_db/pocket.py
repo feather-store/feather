@@ -278,6 +278,18 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
 
 
+# An untrusted item is rendered quoted and datamarked (origin.quote): every
+# space becomes a mark, and a mark is a token of its own. Quoted text came out
+# 57-63% more tokens for every mark tried (Gemini tokenizer), so in a budget
+# it costs 8/5 of the estimate: in _hot_scan and, by the same integer
+# arithmetic, in DB.heat_select (heat.h), which must agree to the item.
+QUOTED_COST = (8, 5)
+
+
+def estimate_quoted_tokens(text: str) -> int:
+    return max(1, (len(text) * QUOTED_COST[0] // QUOTED_COST[1]) // CHARS_PER_TOKEN)
+
+
 # FeatherStore keeps an item's JSON value here (langgraph_store._VALUE_ATTR).
 _LG_VALUE = "_lg_value"
 
@@ -977,7 +989,8 @@ class Pocket:
             key=key,
             content=content,
             heat=self.heat(meta, now, depth),
-            tokens=estimate_tokens(content),
+            tokens=(estimate_tokens(content) if origin in self.trusted
+                    else estimate_quoted_tokens(content)),
             recalls=meta.recall_count,
             age_days=(now - meta.valid_time) / 86400.0,
             pinned=meta.get_attribute(_PINNED) == "true",

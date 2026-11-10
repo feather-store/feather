@@ -263,7 +263,9 @@ def _default_counter() -> tuple[Callable[[str], int], bool]:
         enc = tiktoken.get_encoding("cl100k_base")
         return (lambda text: len(enc.encode(text))), True
     except Exception:
-        return estimate_tokens, False
+        # Each datamark (quoted, untrusted memory) is a token of its own,
+        # which a character count does not see.
+        return (lambda text: estimate_tokens(text) + text.count(_origin.DATAMARK)), False
 
 
 class PacketBuilder:
