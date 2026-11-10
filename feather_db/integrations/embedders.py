@@ -134,11 +134,19 @@ def _dig(j: dict, path, provider: str) -> List[float]:
     return cur
 
 
+def _unit(vec: List[float]) -> List[float]:
+    n = sum(x * x for x in vec) ** 0.5
+    return [x / n for x in vec] if n > 0 else vec
+
+
 def _fit(vec: List[float], dim: int) -> List[float]:
+    """`vec` at `dim`: padded with zeros, or cut and renormalised. A cut
+    vector is not unit length (Gemini's 768-d prefix is ~0.59), and search
+    ranks by L2 distance, which is cosine order only for one length."""
     if len(vec) == dim:
         return [float(x) for x in vec]
     if len(vec) > dim:
-        return [float(x) for x in vec[:dim]]
+        return _unit([float(x) for x in vec[:dim]])
     return [float(x) for x in vec] + [0.0] * (dim - len(vec))
 
 
@@ -154,8 +162,16 @@ def _gemini(text, model, key, dim, base_url):
     base = (base_url or "https://generativelanguage.googleapis.com").rstrip("/")
     url = f"{base}/v1beta/models/{model}:embedContent"
     body = {"content": {"parts": [{"text": text}]}}
+    # Matryoshka: the API's d-dim output is exactly the first d values of
+    # the 3072-d vector (checked live: cosine 1.000000, same norm ~0.59, not
+    # renormalised), so it is renormalised here, as _fit renormalises a cut.
+    # Asking for d sends 4x less JSON at 768.
+    cut = model.startswith("gemini-embedding") and 128 <= dim < 3072
+    if cut:
+        body["outputDimensionality"] = dim
     j = _http_post_json(url, {"x-goog-api-key": key}, body)
-    return _dig(j, ["embedding", "values"], "gemini")
+    v = _dig(j, ["embedding", "values"], "gemini")
+    return _unit([float(x) for x in v]) if cut else v      # the prefix is ~0.59 long
 
 
 def _voyage(text, model, key, dim, base_url):
