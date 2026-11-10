@@ -381,11 +381,11 @@ class FeatherStore(BaseStore):
         if not semantic:
             ids = (self._ids_under(op.namespace_prefix) if op.namespace_prefix
                    else self.db.get_all_ids("text"))
-            cand = []
-            for i in ids:
-                m = self.db.get_metadata(i)
-                if m is not None:
-                    cand.append((i, None, m))
+            # One read for every record (get_metadata_many): per id it was one
+            # request each over the Cloud API, N + 2 for about().
+            ids = list(ids)
+            cand = [(i, None, m) for i, m in zip(ids, self.db.get_metadata_many(ids))
+                    if m is not None]
             return self._select(cand, op, semantic)[op.offset: op.offset + op.limit]
 
         # Ranked WITHIN the prefix by the engine (an indexed namespace_prefix
@@ -549,13 +549,9 @@ class FeatherStore(BaseStore):
         ids = (self._ids_under(namespace) if prefix
                else self.db.ids_in_namespace(NS_SEP.join(namespace)))
         now = _clock.now(self.db)
-        out = []
-        for rid in ids:
-            meta = self.db.get_metadata(rid)
-            if meta is None or _is_dead(meta, now):
-                continue
-            out.append((rid, meta))
-        return out
+        ids = list(ids)
+        return [(rid, meta) for rid, meta in zip(ids, self.db.get_metadata_many(ids))
+                if meta is not None and not _is_dead(meta, now)]
 
     def erase(self, namespace: tuple[str, ...], key: Optional[str] = None, *,
               dry_run: bool = False) -> dict:
@@ -645,8 +641,7 @@ class FeatherStore(BaseStore):
             ids = self.db.newest(flat, want, prefix=prefix, before=before,
                                  by_valid=by_valid)
             cursor = before
-            for rid in ids:
-                meta = self.db.get_metadata(rid)
+            for rid, meta in zip(ids, self.db.get_metadata_many(list(ids))):
                 if meta is None:              # removed since: nothing to show
                     continue
                 cursor = (meta.valid_time if by_valid else meta.timestamp, rid)
