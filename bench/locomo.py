@@ -989,7 +989,7 @@ def _run(conversations, *, k, reader, judge_spec, workers, out_dir, memory, extr
         summaries.append(_answer_and_judge(
             tasks, qpath, prior, reuse, reader_chat, judge_chat, extract_chat, workers,
             spent, total_q, t0, samples, k, memory, categories, extractor, kept, supersede,
-            reader, judge_spec, split, rep, repeats))
+            reader, judge_spec, split, rep, repeats, select))
     if repeats > 1:
         from .stats import rerun_noise
         runs = []
@@ -1017,7 +1017,7 @@ def qid(rec: dict) -> str:
 def _answer_and_judge(tasks, qpath, prior, reuse, reader_chat, judge_chat, extract_chat,
                       workers, spent, total_q, t0, samples, k, memory, categories,
                       extractor, kept, supersede, reader, judge_spec, split, rep,
-                      repeats) -> dict:
+                      repeats, select="rank") -> dict:
     from .runner import _git_commit, _git_dirty
     import feather_db
     lock = threading.Lock()
