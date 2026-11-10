@@ -799,7 +799,9 @@ PYBIND11_MODULE(core, m) {
 
         // -- Secondary metadata indexes (O(matches) lookups) --
         .def("ids_in_namespace", &feather::DB::ids_in_namespace, py::arg("namespace_id"),
-             "Live record ids in a namespace (O(matches) via secondary index).",
+             py::arg("prefix") = false,
+             "Live record ids in a namespace (O(matches) via secondary index); prefix=True: "
+             "in every namespace under it too ('.' boundary), one call.",
              py::call_guard<py::gil_scoped_release>())
         .def("ids_for_entity", &feather::DB::ids_for_entity, py::arg("entity_id"),
              "Live record ids for an entity (O(matches) via secondary index).",

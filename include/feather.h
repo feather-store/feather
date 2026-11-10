@@ -7053,13 +7053,26 @@ public:
     // Back the API's namespace/entity/attribute scans and feed feature A's
     // pre-filtered search with ready-made candidate sets.
     // ─────────────────────────────────────────────────────────────────
-    std::vector<uint64_t> ids_in_namespace(const std::string& ns) const {
+    // `prefix`: every namespace under `ns` too (at a '.' boundary, as
+    // SearchFilter.namespace_prefix; "" is every namespace), in one call
+    // where a caller listing a subtree made one per namespace.
+    std::vector<uint64_t> ids_in_namespace(const std::string& ns, bool prefix = false) const {
         std::shared_lock<RWMutex> lock(mutex_);
 
         ensure_open();
-        auto it = ns_index_.find(ns);
-        if (it == ns_index_.end()) return {};
-        return {it->second.begin(), it->second.end()};
+        if (!prefix) {
+            auto it = ns_index_.find(ns);
+            if (it == ns_index_.end()) return {};
+            return {it->second.begin(), it->second.end()};
+        }
+        std::vector<uint64_t> out;
+        auto add = [&](const std::string& name) {
+            auto it = ns_index_.find(name);
+            if (it != ns_index_.end()) out.insert(out.end(), it->second.begin(), it->second.end());
+        };
+        if (!ns.empty()) for_each_ns_under(ns, add);
+        else for (const auto& [name, set] : ns_index_) out.insert(out.end(), set.begin(), set.end());
+        return out;
     }
 
     // Pocket.hot() (feather_db/pocket.py, which is the specification; see
