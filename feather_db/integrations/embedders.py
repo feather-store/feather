@@ -19,16 +19,21 @@ default 2048, 0 disables), as the Cloud API does: an agent re-embeds the same
 query and the same memory text turn after turn, and each miss is a 100-300 ms
 round trip — more than the search it feeds, by two orders of magnitude.
 The returned vector is padded/truncated to `dim` so it always matches the
-namespace dimension. For an exact native match use Gemini `text-embedding-004`
-(768) or OpenAI `text-embedding-3-small` with `dim=768` (it supports a
-`dimensions` request).
+namespace dimension. Gemini `gemini-embedding-001` (the default; Google shut
+`text-embedding-004` down) and OpenAI `text-embedding-3-*` are asked for `dim`
+natively. Requests reuse their connection (one per thread and host).
+Hedging (a duplicate request at the p95) was measured and not kept: 450
+calls, 13 hedges, none won; the multi-second stalls hit the duplicate too.
 """
 from __future__ import annotations
 
 import os
 import json
 import hashlib
+import http.client
+import threading
 import weakref
+import urllib.parse
 import urllib.request
 import urllib.error
 from collections import OrderedDict
@@ -46,9 +51,68 @@ _DEFAULT_MODELS = {
 
 
 def _http_post_json(url: str, headers: dict, body: dict, timeout: float = 30.0) -> dict:
+    """POST JSON, over a kept-alive connection (one per thread and host).
+
+    A new HTTPS connection per call cost every embed its TCP + TLS
+    handshake: gemini-embedding-001 from one client, 60 calls each, p50
+    602 -> 488 ms and p95 776 -> 535 ms with the connection reused, and the
+    only multi-second calls (3.0 s, 6.1 s) were on fresh connections. A
+    configured proxy keeps the urllib path, which honours it."""
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={**headers, "Content-Type": "application/json"})
+    headers = {**headers, "Content-Type": "application/json"}
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or \
+            urllib.request.getproxies().get(parts.scheme):
+        return _urllib_post(url, headers, data, timeout)
+    path = parts.path + (f"?{parts.query}" if parts.query else "")
+    for attempt in (0, 1):
+        conn, reused = _connection(parts.scheme, parts.netloc, timeout)
+        try:
+            conn.request("POST", path, data, headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+        except (http.client.HTTPException, OSError) as e:
+            _drop_connection(parts.scheme, parts.netloc)
+            # A kept-alive connection the server closed while idle fails
+            # on first use: retry once on a fresh one. A fresh one failing
+            # is a real error.
+            if reused and attempt == 0 and not isinstance(e, TimeoutError):
+                continue
+            raise RuntimeError(f"{url} -> {e}")
+        if resp.will_close:
+            _drop_connection(parts.scheme, parts.netloc)
+        if resp.status >= 400:
+            raise RuntimeError(
+                f"{url} -> HTTP {resp.status}: {raw.decode('utf-8', 'replace')[:300]}")
+        return json.loads(raw.decode("utf-8"))
+    raise AssertionError("unreachable")
+
+
+_conns = threading.local()
+
+
+def _connection(scheme: str, netloc: str, timeout: float):
+    """(this thread's connection to scheme://netloc, whether it was reused)."""
+    pool = getattr(_conns, "pool", None)
+    if pool is None:
+        pool = _conns.pool = {}
+    conn = pool.get((scheme, netloc))
+    if conn is not None:
+        return conn, True
+    cls = (http.client.HTTPSConnection if scheme == "https"
+           else http.client.HTTPConnection)
+    conn = pool[(scheme, netloc)] = cls(netloc, timeout=timeout)
+    return conn, False
+
+
+def _drop_connection(scheme: str, netloc: str) -> None:
+    conn = getattr(_conns, "pool", {}).pop((scheme, netloc), None)
+    if conn is not None:
+        conn.close()
+
+
+def _urllib_post(url: str, headers: dict, data: bytes, timeout: float) -> dict:
+    req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
