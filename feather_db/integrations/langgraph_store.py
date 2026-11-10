@@ -197,8 +197,10 @@ class FeatherStore(BaseStore):
         # 53-bit SHA-1 of (namespace, key), and two keys that collided shared
         # one record. Items written then get their key now, which also makes
         # them findable by keyword search on it.
-        keys.migrate(self.db, visit=lambda ns, ids, metas:
-                     backfill_registry(self.db, ns, ids, metas))
+        # Once per file (keys.upkeep): later starts cost one key lookup, not
+        # a read of every record of every namespace.
+        keys.upkeep(self.db, visit=lambda ns, ids, metas:
+                    backfill_registry(self.db, ns, ids, metas))
 
     def id_of(self, namespace: tuple[str, ...], key: str) -> Optional[int]:
         """The record id of the item at (namespace, key), or None."""

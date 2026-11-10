@@ -325,9 +325,10 @@ def date_tag(item) -> str:
 
 # Records that live in a scope but are not memory: never carried, never
 # returned, never resolved as a required key.
-_NOT_MEMORY = ("_forgotten", _CACHE_KIND, _INDEX_KIND, _KEYREG_KIND, _JOB_KIND)
+_NOT_MEMORY = ("_forgotten", _CACHE_KIND, _INDEX_KIND, _KEYREG_KIND, _JOB_KIND,
+               keys.UPKEEP_KIND)
 # Derived or bookkeeping records: never an item, never carried.
-DERIVED_KINDS = (_INDEX_KIND, _KEYREG_KIND, _JOB_KIND)
+DERIVED_KINDS = (_INDEX_KIND, _KEYREG_KIND, _JOB_KIND, keys.UPKEEP_KIND)
 
 
 @dataclass(frozen=True)
@@ -763,13 +764,14 @@ class Pocket:
         self._hot_cache: dict = {}
         # Records written before native keys get theirs, so they are found by
         # key — keyword search included — like everything written since.
-        if (id(db), self.namespace) not in _MIGRATED and not db.is_read_only():
-            # The same read backfills the key registry of an index written
-            # before it existed.
-            if keys.migrate(db, [self.namespace], visit=lambda ns, ids, metas:
-                            backfill_registry(db, ns, ids, metas)):
+        # Once per file (keys.upkeep): later opens cost one key lookup, not a
+        # read of every record. The same read backfills the key registry of
+        # an index written before it existed.
+        if id(db) not in _MIGRATED and not db.is_read_only():
+            if keys.upkeep(db, visit=lambda ns, ids, metas:
+                           backfill_registry(db, ns, ids, metas)):
                 _bump(db)
-            _MIGRATED.add((id(db), self.namespace))
+            _MIGRATED.add(id(db))
 
     # ── scope resolution ─────────────────────────────────────────────────
 
