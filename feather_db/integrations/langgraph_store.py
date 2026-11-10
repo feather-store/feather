@@ -39,6 +39,7 @@ from feather_db import clock as _clock
 from feather_db import origin as _origin
 from feather_db.filter import FilterBuilder
 from feather_db.pocket import DUE_ATTR as _DUE_ATTR
+from feather_db.pocket import unit as _unit
 from feather_db.pocket import INTENTION_ATTR as _INTENTION_ATTR
 from feather_db.pocket import _bump as _pocket_bump
 from feather_db.pocket import (_INDEX_KIND, _KEY_SEP, DERIVED_KINDS, INDEX_ATTRS,
@@ -352,7 +353,7 @@ class FeatherStore(BaseStore):
             text = _indexed_text(dict(op.value),
                                  op.index if isinstance(op.index, list) else self._index_fields)
             if text.strip():
-                vec = np.asarray(self._embed(text), dtype=np.float32)
+                vec = _unit(self._embed(text))
         if vec is None:
             vec = np.zeros(self.dim, dtype=np.float32)
             vec[0] = 1.0        # a valid unit vector; never a zero-norm query target
@@ -395,7 +396,7 @@ class FeatherStore(BaseStore):
         # them and a user's own search came back empty. Only what the engine
         # cannot filter — expired and unindexed items, value filters — is
         # dropped here, and k grows until enough survive or the prefix runs out.
-        q = np.asarray(self._embed(op.query), dtype=np.float32)
+        q = _unit(self._embed(op.query))
         flt = (FilterBuilder().namespace_prefix(NS_SEP.join(op.namespace_prefix)).build()
                if op.namespace_prefix else None)
         k = max(want, 10) * 3            # an item and its index records share hits
@@ -604,7 +605,7 @@ class FeatherStore(BaseStore):
             v = np.zeros(self.dim, dtype=np.float32)
             v[0] = 1.0
             return v
-        return np.asarray(self._embed(text), dtype=np.float32)
+        return _unit(self._embed(text))
 
     def known_keys(self, namespace: tuple[str, ...]) -> list[str]:
         """The one-value keys indexed under `namespace`, for an extractor's

@@ -274,6 +274,16 @@ def _overrides(origin: str, held: str, trusted) -> bool:
     return origin in trusted and held not in trusted
 
 
+def unit(vec) -> np.ndarray:
+    """`vec` as float32 at unit length. Every vector the agent layer stores or
+    searches with goes through this, whatever the embedder returns: search
+    ranks by L2 distance, which is cosine order only for vectors of one
+    length, and scored search is exact only for unit vectors."""
+    v = np.asarray(vec, dtype=np.float32)
+    n = float(np.linalg.norm(v))
+    return v / n if n > 0 else v
+
+
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
 
@@ -1222,7 +1232,7 @@ class Pocket:
             f = FilterBuilder().namespace(flat).build()
             if self._embed is not None:
                 hits += [(h, depth) for h in self.db.search(
-                    np.asarray(self._embed(query), dtype=np.float32), k=k * 3, filter=f,
+                    unit(self._embed(query)), k=k * 3, filter=f,
                     record_salience=False)]
             else:
                 hits += [(h, depth) for h in self.db.keyword_search(
@@ -1449,7 +1459,7 @@ class Pocket:
 
     def _vec(self, text: str) -> np.ndarray:
         if self._embed is not None:
-            return np.asarray(self._embed(text), dtype=np.float32)
+            return unit(self._embed(text))
         # The dimension once per pocket: over the Cloud API each dim() is a
         # request, and an index of 20 entries asked 20 times.
         dim = getattr(self, "_dim", None)
