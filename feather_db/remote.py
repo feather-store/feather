@@ -63,6 +63,7 @@ PARITY = {
     "version":           "GET /records/{record_id}",
     "get_by_key":        "GET /by_key",
     "id_for":            "GET /by_key",
+    "lookup_key":        "GET /by_key",
     "ids_for_many":      "POST /by_keys",
     "heat_select":       "POST /heat_select",
     "get_edges":         "GET /records/{record_id}/edges",
@@ -580,6 +581,10 @@ class RemoteDB:
     def id_for(self, key, namespace=""):
         r = self._call("GET", "/by_key", params={"key": key, "key_namespace": namespace}, ok_404=True)
         return int(r["id"]) if r else None
+
+    def lookup_key(self, key, namespace=""):
+        r = self._call("GET", "/by_key", params={"key": key, "key_namespace": namespace}, ok_404=True)
+        return (int(r["id"]), _meta_from(r["metadata"])) if r else None
 
     def heat_select(self, namespaces, now, budget, half_life_days, min_heat, trusted,
                     exclude_sources, usage_half_life=3.0, unused_floor=0.4, inherit_decay=0.7,
