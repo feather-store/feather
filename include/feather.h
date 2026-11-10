@@ -6006,6 +6006,16 @@ public:
         touch_nolock(id);
     }
 
+    // touch() for each of `ids`, under one shared lock: what Pocket.promote
+    // does after a recall, in one call (one request over the Cloud API, where
+    // a touch per item was a round trip per item). An unknown id is skipped,
+    // as touch() skips it.
+    void touch_many(const std::vector<uint64_t>& ids) {
+        std::shared_lock<RWMutex> lock(mutex_);
+        ensure_open();
+        for (uint64_t id : ids) touch_nolock(id);
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Graph: link
     // ─────────────────────────────────────────────────────────────────

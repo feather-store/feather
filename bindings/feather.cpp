@@ -629,6 +629,8 @@ PYBIND11_MODULE(core, m) {
 
         // -- Metadata --
         .def("touch",             &feather::DB::touch,             py::arg("id"), py::call_guard<py::gil_scoped_release>())
+        .def("touch_many",        &feather::DB::touch_many,        py::arg("ids"), py::call_guard<py::gil_scoped_release>(),
+             "touch() for each id, under one lock (one request over the Cloud API).")
         .def("get_metadata",      &feather::DB::get_metadata,      py::arg("id"), py::arg("include_dead") = false,
              py::call_guard<py::gil_scoped_release>(),
              "The record's metadata, or None if it does not exist or was forgotten "
