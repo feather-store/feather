@@ -860,8 +860,29 @@ private:
     // increasing order and never reused until the next rebuild, so a stale
     // posting can only point at the doc that wrote it (same as when it held
     // the id), and a list stays in number order for sequential lookups.
+    //
+    // Terms are numbered once (bm25_terms_), and the postings of a build are
+    // one array, a term's contiguous and in doc order (CSR: bm25_off_[t] to
+    // bm25_off_[t+1] in bm25_post_doc_ / _tf_). A string-keyed map of vectors cost four
+    // string-hash lookups and several mallocs per token: the 100k-record build
+    // took 2.1 s, half of it hashing strings, and every term paid a key and a
+    // vector header. Writes after the build go to a small per-term delta;
+    // a removed document is retired in bm25_live_ and skipped (its base
+    // postings stay until the next renumbering), and bm25_df_ keeps every
+    // term's LIVE document count, which IDF reads, exact.
+    // A base posting is 6 bytes: its doc in bm25_post_doc_ and its count in
+    // bm25_post_tf_ (two arrays; a struct of the two pads to 8). Counts
+    // saturate at 65535 everywhere, so a rebuilt index scores exactly as an
+    // incremental one; BM25's count term is flat long before that.
     struct PostingEntry { uint32_t doc; uint32_t term_freq; };
-    std::unordered_map<std::string, std::vector<PostingEntry>> bm25_index_;
+    static constexpr uint32_t BM25_TF_MAX = 65535;
+    std::unordered_map<std::string, uint32_t> bm25_terms_;  // term -> number
+    std::vector<uint32_t> bm25_df_;                         // number -> live docs
+    std::vector<uint64_t> bm25_off_;                        // base CSR offsets
+    std::vector<uint32_t> bm25_post_doc_;                   // base postings: doc
+    std::vector<uint16_t> bm25_post_tf_;                    //   and count
+    std::unordered_map<uint32_t, std::vector<PostingEntry>> bm25_delta_;
+    std::vector<uint8_t> bm25_live_;                        // doc number -> live
     std::unordered_map<uint64_t, uint32_t> doc_lengths_;   // id -> doc number
     std::vector<uint64_t> bm25_doc_id_;                    // doc number -> id
     std::vector<uint32_t> bm25_doc_len_;                   // doc number -> tokens
@@ -2066,7 +2087,7 @@ private:
     // looks — the caller cannot tell "no such memory" from "stored, but you
     // spelled it differently", so it reads as the agent having forgotten.
     //
-    // Safe to change without a format bump: bm25_index_ is never serialised,
+    // Safe to change without a format bump: the BM25 index is never serialised,
     // it is rebuilt from `content` on every load() and after compact(), so an
     // existing .feather re-indexes under the new rules the next time it opens.
     // Both indexing and querying go through tokenize(), so they can never
@@ -2259,29 +2280,151 @@ private:
     // passes no cache.
     using StemCache = std::unordered_map<std::string, std::string>;
 
+    // isalnum / tolower as 256-entry tables, read from the C library once
+    // (the locale in force at the first tokenization). Calling them per
+    // character was 10% of the index build.
+    struct CharClass { bool alnum[256]; char lower[256]; };
+    static const CharClass& char_class() {
+        static const CharClass table = [] {
+            CharClass c{};
+            for (int i = 0; i < 256; ++i) {
+                c.alnum[i] = std::isalnum(i) != 0;
+                c.lower[i] = static_cast<char>(std::tolower(i));
+            }
+            return c;
+        }();
+        return table;
+    }
+
+    // Every maximal alphanumeric run of `text`, lowercased, as a word (before
+    // the length, stopword and stemming rules).
+    template <class Emit>
+    static void for_each_word(const std::string& text, Emit&& emit) {
+        const CharClass& cc = char_class();
+        std::string tok;
+        for (unsigned char c : text) {
+            if (cc.alnum[c]) {
+                tok.push_back(cc.lower[c]);
+            } else if (!tok.empty()) {
+                emit(tok);
+                tok.clear();
+            }
+        }
+        if (!tok.empty()) emit(tok);
+    }
+
     static std::vector<std::string> tokenize(const std::string& text, StemCache* cache = nullptr) {
         std::vector<std::string> tokens;
-        std::string tok;
         const auto& sw = stop_words();
         const bool stemming = stemming_enabled();
-        auto emit = [&] {
+        for_each_word(text, [&](const std::string& tok) {
             if (tok.size() < 2 || sw.find(tok) != sw.end()) return;
             if (!stemming)  { tokens.push_back(tok); return; }
             if (!cache)     { tokens.push_back(stem(tok)); return; }
             auto it = cache->find(tok);
             if (it == cache->end()) it = cache->emplace(tok, stem(tok)).first;
             tokens.push_back(it->second);
-        };
-        for (unsigned char c : text) {
-            if (std::isalnum(c)) {
-                tok += static_cast<char>(std::tolower(c));
-            } else {
-                emit();
-                tok.clear();
+        });
+        return tokens;
+    }
+
+    // The index build's word -> term table: open addressing, linear probing,
+    // every key in one arena, the hash computed while the word is lowercased.
+    // std::unordered_map<std::string, ...> spent ~45% of the build in its
+    // find (node chasing, its string hash, memcmp) with one lookup per token.
+    class WordTable {
+    public:
+        static constexpr uint64_t FNV_OFFSET = 0xcbf29ce484222325ULL;
+        static constexpr uint64_t FNV_PRIME  = 0x100000001b3ULL;
+        static uint64_t finish(uint64_t h) {           // murmur3 fmix64
+            h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+            return h ^ (h >> 33);
+        }
+        // The value of word p[0..n) (h = finish(FNV-1a of it)); make() gives it
+        // on first sight and must not touch this table.
+        template <class Make>
+        uint32_t get(const char* p, uint32_t n, uint64_t h, Make&& make) {
+            if ((used_ + 1) * 4 > slots_.size() * 3) grow();
+            for (size_t i = h & (slots_.size() - 1);; i = (i + 1) & (slots_.size() - 1)) {
+                Slot& sl = slots_[i];
+                if (sl.len == EMPTY) {
+                    const uint32_t v = make();
+                    sl = {h, arena_.size(), n, v};
+                    arena_.insert(arena_.end(), p, p + n);
+                    ++used_;
+                    return v;
+                }
+                if (sl.h == h && sl.len == n && std::memcmp(arena_.data() + sl.off, p, n) == 0)
+                    return sl.val;
             }
         }
-        emit();
-        return tokens;
+    private:
+        static constexpr uint32_t EMPTY = std::numeric_limits<uint32_t>::max();
+        struct Slot { uint64_t h; uint64_t off; uint32_t len; uint32_t val; };
+        std::vector<Slot> slots_ = std::vector<Slot>(1u << 16, Slot{0, 0, EMPTY, 0});
+        std::vector<char> arena_;
+        size_t used_ = 0;
+        void grow() {
+            std::vector<Slot> old(slots_.size() * 2, Slot{0, 0, EMPTY, 0});
+            old.swap(slots_);
+            for (const Slot& sl : old) {
+                if (sl.len == EMPTY) continue;
+                size_t i = sl.h & (slots_.size() - 1);
+                while (slots_[i].len != EMPTY) i = (i + 1) & (slots_.size() - 1);
+                slots_[i] = sl;
+            }
+        }
+    };
+
+    // Append-only storage in fixed blocks: grows without the copy (and the
+    // momentary 2-3x footprint) of a doubling vector. The build's per-doc
+    // runs are as many entries as the index has postings.
+    template <class T, size_t BLOCK = (1u << 16)>
+    class BlockVec {
+    public:
+        void push_back(const T& v) {
+            if (n_ % BLOCK == 0) blocks_.emplace_back().reserve(BLOCK);
+            blocks_.back().push_back(v);
+            ++n_;
+        }
+        T& operator[](size_t i) { return blocks_[i / BLOCK][i % BLOCK]; }
+        const T& operator[](size_t i) const { return blocks_[i / BLOCK][i % BLOCK]; }
+        size_t size() const { return n_; }
+    private:
+        std::vector<std::vector<T>> blocks_;
+        size_t n_ = 0;
+    };
+
+    // The number of `term`, numbering it if new. Caller holds mutex_ exclusively.
+    uint32_t bm25_term_number(const std::string& term) {
+        auto it = bm25_terms_.find(term);
+        if (it != bm25_terms_.end()) return it->second;
+        if (bm25_df_.size() >= std::numeric_limits<uint32_t>::max())
+            throw std::length_error("BM25 index: more than 2^32 terms");
+        const uint32_t t = static_cast<uint32_t>(bm25_df_.size());
+        bm25_terms_.emplace(term, t);
+        bm25_df_.push_back(0);
+        return t;
+    }
+
+    // The base postings of term `t`: positions [first, second) of
+    // bm25_post_doc_ / bm25_post_tf_.
+    std::pair<uint64_t, uint64_t> bm25_base(uint32_t t) const {
+        if (static_cast<size_t>(t) + 1 >= bm25_off_.size()) return {0, 0};
+        return {bm25_off_[t], bm25_off_[t + 1]};
+    }
+
+    // Postings of one document: its term numbers sorted, as (term, tf) runs.
+    template <class Fn>
+    static void for_each_term_run(std::vector<uint32_t>& terms, Fn&& fn) {
+        std::sort(terms.begin(), terms.end());
+        for (size_t i = 0; i < terms.size(); ) {
+            size_t j = i;
+            while (j < terms.size() && terms[j] == terms[i]) ++j;
+            fn(terms[i], static_cast<uint32_t>(j - i));
+            i = j;
+        }
     }
 
     void recompute_avg_dl() {
@@ -2302,29 +2445,39 @@ private:
         const uint32_t doc = len_it->second;
         total_dl_ -= static_cast<double>(bm25_doc_len_[doc]);
         doc_lengths_.erase(len_it);
+        bm25_live_[doc] = 0;
 
-        auto drop_from = [doc](std::vector<PostingEntry>& postings) {
-            postings.erase(
-                std::remove_if(postings.begin(), postings.end(),
-                    [doc](const PostingEntry& p) { return p.doc == doc; }),
-                postings.end());
+        // Retire this doc's posting of term t, if it has one: a delta posting
+        // is erased, a base posting stays (skipped as not live) until the
+        // next renumbering. Either way the term's live count drops by one.
+        auto retire = [&](uint32_t t) {
+            auto dit = bm25_delta_.find(t);
+            if (dit != bm25_delta_.end()) {
+                auto& v = dit->second;
+                auto pit = std::lower_bound(v.begin(), v.end(), doc,
+                    [](const PostingEntry& p, uint32_t d) { return p.doc < d; });
+                if (pit != v.end() && pit->doc == doc) {
+                    v.erase(pit);
+                    if (v.empty()) bm25_delta_.erase(dit);
+                    --bm25_df_[t];
+                    return;
+                }
+            }
+            auto [b, e] = bm25_base(t);
+            const uint32_t* docs = bm25_post_doc_.data();
+            const uint32_t* pit = std::lower_bound(docs + b, docs + e, doc);
+            if (pit != docs + e && *pit == doc) --bm25_df_[t];
         };
 
         if (old_content) {
-            std::unordered_set<std::string> terms;
-            for (auto& t : tokenize(*old_content)) terms.insert(std::move(t));
-            for (const auto& t : terms) {
-                auto pit = bm25_index_.find(t);
-                if (pit == bm25_index_.end()) continue;
-                drop_from(pit->second);
-                if (pit->second.empty()) bm25_index_.erase(pit);
+            std::unordered_set<uint32_t> terms;
+            for (const auto& w : tokenize(*old_content)) {
+                auto it = bm25_terms_.find(w);
+                if (it != bm25_terms_.end()) terms.insert(it->second);
             }
+            for (uint32_t t : terms) retire(t);
         } else {
-            for (auto pit = bm25_index_.begin(); pit != bm25_index_.end(); ) {
-                drop_from(pit->second);
-                if (pit->second.empty()) pit = bm25_index_.erase(pit);
-                else                     ++pit;
-            }
+            for (uint32_t t = 0; t < bm25_df_.size(); ++t) retire(t);
         }
         recompute_avg_dl();
     }
@@ -2343,10 +2496,6 @@ private:
         auto tokens = tokenize(content, cache);
         if (tokens.empty()) return;
 
-        // Count term frequencies
-        std::unordered_map<std::string, uint32_t> tf;
-        for (const auto& t : tokens) tf[t]++;
-
         // Every re-index takes a fresh number, so a long-lived writer's
         // numbering fills with retired ones: compact it once they outnumber
         // the live (amortised O(1) postings per re-index).
@@ -2355,19 +2504,26 @@ private:
             renumber_bm25_docs();
         if (bm25_doc_id_.size() >= std::numeric_limits<uint32_t>::max())
             throw std::length_error("BM25 index: more than 2^32 documents");
+        std::vector<uint32_t> terms;
+        terms.reserve(tokens.size());
+        for (const auto& t : tokens) terms.push_back(bm25_term_number(t));
         const uint32_t doc = static_cast<uint32_t>(bm25_doc_id_.size());
         bm25_doc_id_.push_back(id);
         bm25_doc_len_.push_back(static_cast<uint32_t>(tokens.size()));
+        bm25_live_.push_back(1);
         doc_lengths_[id] = doc;
         total_dl_ += static_cast<double>(tokens.size());
-        for (const auto& [term, freq] : tf)
-            bm25_index_[term].push_back({doc, freq});
+        for_each_term_run(terms, [&](uint32_t t, uint32_t tf) {
+            bm25_delta_[t].push_back({doc, std::min(tf, BM25_TF_MAX)});
+            ++bm25_df_[t];
+        });
 
         recompute_avg_dl();   // O(1) — running total, not a scan
     }
 
-    // Renumber the live documents 0..n-1 in their current order, so every
-    // posting list stays sorted, and drop postings of retired numbers.
+    // Renumber the live documents 0..n-1 in their current order and fold the
+    // delta into a new base: per term the live base postings, then the delta
+    // ones (higher numbers), so every list stays in doc order.
     void renumber_bm25_docs() {
         constexpr uint32_t gone = std::numeric_limits<uint32_t>::max();
         std::vector<uint32_t> remap(bm25_doc_id_.size(), gone);
@@ -2376,39 +2532,141 @@ private:
         ids.reserve(doc_lengths_.size());
         lens.reserve(doc_lengths_.size());
         for (size_t old = 0; old < bm25_doc_id_.size(); ++old) {
+            if (!bm25_live_[old]) continue;                               // retired
             auto it = doc_lengths_.find(bm25_doc_id_[old]);
-            if (it == doc_lengths_.end() || it->second != old) continue;   // retired
             remap[old] = it->second = static_cast<uint32_t>(ids.size());
             ids.push_back(bm25_doc_id_[old]);
             lens.push_back(bm25_doc_len_[old]);
         }
-        for (auto pit = bm25_index_.begin(); pit != bm25_index_.end(); ) {
-            auto& postings = pit->second;
-            size_t w = 0;
-            for (const auto& p : postings)
-                if (remap[p.doc] != gone) postings[w++] = {remap[p.doc], p.term_freq};
-            postings.resize(w);
-            if (postings.empty()) { pit = bm25_index_.erase(pit); continue; }
-            postings.shrink_to_fit();
-            ++pit;
+        const size_t n_terms = bm25_df_.size();
+        std::vector<uint64_t> off(n_terms + 1, 0);
+        for (size_t t = 0; t < n_terms; ++t) off[t + 1] = off[t] + bm25_df_[t];
+        std::vector<uint32_t> docs(off.back());
+        std::vector<uint16_t> tfs(off.back());
+        for (uint32_t t = 0; t < n_terms; ++t) {
+            uint64_t w = off[t];
+            auto [b, e] = bm25_base(t);
+            for (uint64_t i = b; i < e; ++i)
+                if (remap[bm25_post_doc_[i]] != gone) {
+                    docs[w] = remap[bm25_post_doc_[i]]; tfs[w++] = bm25_post_tf_[i];
+                }
+            auto dit = bm25_delta_.find(t);
+            if (dit != bm25_delta_.end())
+                for (const auto& p : dit->second)
+                    if (remap[p.doc] != gone) {
+                        docs[w] = remap[p.doc];
+                        tfs[w++] = static_cast<uint16_t>(p.term_freq);
+                    }
         }
+        bm25_off_.swap(off);
+        bm25_post_doc_.swap(docs);
+        bm25_post_tf_.swap(tfs);
+        bm25_delta_.clear();
+        bm25_live_.assign(ids.size(), 1);
         bm25_doc_id_.swap(ids);
         bm25_doc_len_.swap(lens);
     }
 
     void rebuild_bm25_index() {
         bm25_ready_.store(true, std::memory_order_release);   // caller holds mutex_ exclusively
-        bm25_index_.clear();
+        bm25_terms_.clear();
+        bm25_df_.clear();
+        bm25_off_.clear();
+        bm25_post_doc_.clear();
+        bm25_post_tf_.clear();
+        bm25_delta_.clear();
+        bm25_live_.clear();
         doc_lengths_.clear();
         bm25_doc_id_.clear();
         bm25_doc_len_.clear();
         total_dl_ = 0.0;
         avg_dl_   = 0.0;
-        StemCache cache;
+
+        // One lookup per word: the lowercased word straight to its term
+        // number (length, stopword and stem rules applied once per distinct
+        // word, exactly as tokenize() applies them), where the per-token path
+        // took four string-hash lookups and a malloc each.
+        constexpr uint32_t not_a_term = std::numeric_limits<uint32_t>::max();
+        const auto& sw = stop_words();
+        const bool stemming = stemming_enabled();
+        const CharClass& cc = char_class();
+        // (term, tf) of every document, in doc order; the base is laid out
+        // from these once every term's count is known. A term's run in the
+        // current doc is found through last_doc / run_at, not a sort. The
+        // word table and those two are freed before the base is allocated.
+        BlockVec<PostingEntry> runs;              // {term, tf} here, not {doc, tf}
+        std::vector<uint64_t> doc_runs{0};
+        {
+        WordTable words;
+        std::vector<char> word(64);
+        std::vector<uint32_t> last_doc, run_at;
         for (const auto& [id, meta] : metadata_store_) {
             if (is_dead_meta(meta)) continue;   // forgotten/deleted stay unsearchable
-            add_to_bm25_index(id, bm25_text(meta), nullptr, &cache);
+            const std::string text = bm25_text(meta);
+            if (bm25_doc_id_.size() >= std::numeric_limits<uint32_t>::max())
+                throw std::length_error("BM25 index: more than 2^32 documents");
+            const uint32_t doc = static_cast<uint32_t>(bm25_doc_id_.size());   // if it has terms
+            uint32_t n_tokens = 0;
+            uint32_t n = 0;
+            uint64_t h = WordTable::FNV_OFFSET;
+            auto flush = [&] {
+                if (n >= 2) {
+                    const uint32_t t = words.get(word.data(), n, WordTable::finish(h), [&] {
+                        const std::string w(word.data(), n);
+                        return sw.count(w) ? not_a_term
+                                           : bm25_term_number(stemming ? stem(w) : w);
+                    });
+                    if (t != not_a_term) {
+                        ++n_tokens;
+                        if (t >= last_doc.size()) {
+                            last_doc.resize(bm25_df_.size(), not_a_term);
+                            run_at.resize(bm25_df_.size());
+                        }
+                        if (last_doc[t] != doc) {
+                            last_doc[t] = doc;
+                            run_at[t] = static_cast<uint32_t>(runs.size() - doc_runs.back());
+                            runs.push_back({t, 1});
+                        } else {
+                            ++runs[doc_runs.back() + run_at[t]].term_freq;
+                        }
+                    }
+                }
+                n = 0;
+                h = WordTable::FNV_OFFSET;
+            };
+            for (unsigned char c : text) {
+                if (cc.alnum[c]) {
+                    if (n == word.size()) word.resize(2 * word.size());
+                    word[n++] = cc.lower[c];
+                    h = (h ^ static_cast<unsigned char>(cc.lower[c])) * WordTable::FNV_PRIME;
+                } else if (n) {
+                    flush();
+                }
+            }
+            if (n) flush();
+            if (n_tokens == 0) continue;
+            bm25_doc_id_.push_back(id);
+            bm25_doc_len_.push_back(n_tokens);
+            doc_lengths_[id] = doc;
+            total_dl_ += static_cast<double>(n_tokens);
+            for (uint64_t r = doc_runs.back(); r < runs.size(); ++r) ++bm25_df_[runs[r].doc];
+            doc_runs.push_back(runs.size());
         }
+        }
+        bm25_live_.assign(bm25_doc_id_.size(), 1);
+        bm25_off_.assign(bm25_df_.size() + 1, 0);
+        for (size_t t = 0; t < bm25_df_.size(); ++t)
+            bm25_off_[t + 1] = bm25_off_[t] + bm25_df_[t];
+        bm25_post_doc_.resize(bm25_off_.back());
+        bm25_post_tf_.resize(bm25_off_.back());
+        std::vector<uint64_t> fill(bm25_off_.begin(), bm25_off_.end() - 1);
+        for (uint32_t doc = 0; doc + 1 < doc_runs.size(); ++doc)
+            for (uint64_t r = doc_runs[doc]; r < doc_runs[doc + 1]; ++r) {
+                const uint64_t at = fill[runs[r].doc]++;
+                bm25_post_doc_[at] = doc;
+                bm25_post_tf_[at] = static_cast<uint16_t>(std::min(runs[r].term_freq, BM25_TF_MAX));
+            }
+        recompute_avg_dl();
     }
 
     // ── Touch — call from within already-locked methods ─────────────
@@ -7484,14 +7742,24 @@ private:
         auto terms = tokenize(query);
         if (terms.empty()) return ranked;
 
+        // Terms in the order a string set gives them, as before the terms were
+        // numbered: scores are float sums, and the order is part of the result.
         std::unordered_set<std::string> unique_terms(terms.begin(), terms.end());
-        std::vector<const std::vector<PostingEntry>*> lists;
+        struct List {
+            uint32_t t;
+            uint64_t b, e;                                     // base positions
+            const std::vector<PostingEntry>* delta;
+        };
+        std::vector<List> lists;
         size_t total_postings = 0;
         for (const auto& term : unique_terms) {
-            auto it = bm25_index_.find(term);
-            if (it == bm25_index_.end()) continue;
-            lists.push_back(&it->second);
-            total_postings += it->second.size();
+            auto it = bm25_terms_.find(term);
+            if (it == bm25_terms_.end() || bm25_df_[it->second] == 0) continue;
+            const uint32_t t = it->second;
+            auto [b, e] = bm25_base(t);
+            auto dit = bm25_delta_.find(t);
+            lists.push_back({t, b, e, dit == bm25_delta_.end() ? nullptr : &dit->second});
+            total_postings += bm25_df_[t];
         }
         if (lists.empty()) return ranked;
 
@@ -7513,17 +7781,20 @@ private:
         const double avdl = avg_dl_ > 0.0 ? avg_dl_ : 1.0;
         std::unordered_map<uint32_t, float> scores;
         if (!filter) scores.reserve(total_postings);
-        for (const auto* postings : lists) {
-            const double n_t = static_cast<double>(postings->size());
+        for (const auto& list : lists) {
+            const double n_t = static_cast<double>(bm25_df_[list.t]);
             // IDF (BM25+): log((N - n_t + 0.5) / (n_t + 0.5) + 1)
             const double idf = std::log((N - n_t + 0.5) / (n_t + 0.5) + 1.0);
-            for (const auto& p : *postings) {
-                if (filter && !eligible(bm25_doc_id_[p.doc])) continue;
-                const double tf = static_cast<double>(p.term_freq);
+            auto score = [&](uint32_t doc, uint32_t term_freq) {
+                if (!bm25_live_[doc]) return;                   // retired
+                if (filter && !eligible(bm25_doc_id_[doc])) return;
+                const double tf = static_cast<double>(term_freq);
                 const double tf_norm = (tf * (BM25_K1 + 1.0)) /
-                    (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * static_cast<double>(bm25_doc_len_[p.doc]) / avdl));
-                scores[p.doc] += static_cast<float>(idf * tf_norm);
-            }
+                    (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * static_cast<double>(bm25_doc_len_[doc]) / avdl));
+                scores[doc] += static_cast<float>(idf * tf_norm);
+            };
+            for (uint64_t i = list.b; i < list.e; ++i) score(bm25_post_doc_[i], bm25_post_tf_[i]);
+            if (list.delta) for (const auto& p : *list.delta) score(p.doc, p.term_freq);
         }
 
         ranked.reserve(scores.size());
@@ -8997,7 +9268,13 @@ private:
         decltype(time_index_)().swap(time_index_);
         decltype(valid_index_)().swap(valid_index_);
         decltype(ns_graphs_)().swap(ns_graphs_);
-        decltype(bm25_index_)().swap(bm25_index_);
+        decltype(bm25_terms_)().swap(bm25_terms_);
+        decltype(bm25_df_)().swap(bm25_df_);
+        decltype(bm25_off_)().swap(bm25_off_);
+        decltype(bm25_post_doc_)().swap(bm25_post_doc_);
+        decltype(bm25_post_tf_)().swap(bm25_post_tf_);
+        decltype(bm25_delta_)().swap(bm25_delta_);
+        decltype(bm25_live_)().swap(bm25_live_);
         decltype(doc_lengths_)().swap(doc_lengths_);
         decltype(bm25_doc_id_)().swap(bm25_doc_id_);
         decltype(bm25_doc_len_)().swap(bm25_doc_len_);
