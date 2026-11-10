@@ -40,11 +40,15 @@ COUNTING ("how many", "how much in total", "list all"):
   Write this ledger in your reply; the answer is read off it, not recalled.
   1. WINDOW: if the question limits time ("in the past two weeks", "this
      year", "last month", "before X"), write its exact first and last date.
-  2. CANDIDATES: go through the sessions ONE BY ONE, oldest first. For
-     every possible instance write one line:
-       <date> | <item> | IN or OUT: <reason>
-     An instance mentioned in passing, or in a session mostly about
-     something else, is still a candidate. Mark it OUT when it is
+  2. SCAN: go through the sessions ONE BY ONE, oldest first, and write
+     at least one line for EVERY session; do not skip, merge or
+     summarise sessions. A session with nothing that could count gets
+       <session date> | no match
+     Every possible instance gets a line of its own, even one mentioned
+     in passing or in a session mostly about something else:
+       <date> | <item> | MATCH
+       <date> | <item> | no match: <reason>
+     It is no match when it is
        - outside the window (date it by the session, or by a date stated
          in the text);
        - not the user's own: something the assistant suggested or listed,
@@ -54,8 +58,10 @@ COUNTING ("how many", "how much in total", "list all"):
          repair mentioned again), or a different kind than asked.
   3. If the user states a running total ("that's my third visit this year"), the
      latest such statement is the count; do not add instances to it.
-  4. For sums of money or quantities, write each IN amount, then add.
-  5. The answer is the number of IN lines (or the sum).
+  4. For sums of money or quantities, write the amount on each MATCH
+     line ("rode it 3 times" is 3), then add.
+  5. COUNT: recount the MATCH lines (or add their amounts) once more.
+     Unless step 3 applies, the answer must equal that number.
 
 TIME SPANS ("how long ago", "how many days/weeks/months between", "when",
 "which came first", "in what order"):
