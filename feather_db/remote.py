@@ -665,8 +665,11 @@ class RemoteDB:
             params["before_ts"] = int(before)
         return self._call("GET", "/newest", params=params)["ids"]
 
-    def ids_in_namespace(self, namespace_id):
-        return self._call("GET", "/ids", params={"metadata_namespace": namespace_id})["ids"]
+    def ids_in_namespace(self, namespace_id, prefix=False):
+        params = {"metadata_namespace": namespace_id}
+        if prefix:
+            params["prefix"] = "true"
+        return self._call("GET", "/ids", params=params)["ids"]
 
     def ids_for_entity(self, entity_id):
         return self._call("GET", "/ids", params={"entity_id": entity_id})["ids"]

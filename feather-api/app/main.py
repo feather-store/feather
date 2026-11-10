@@ -1621,12 +1621,13 @@ def newest(namespace: str, metadata_namespace: str = "", limit: int = 10, prefix
 @app.get("/v1/{namespace}/ids", tags=["records"], dependencies=[Depends(verify_api_key)])
 def list_ids(namespace: str, metadata_namespace: Optional[str] = None, entity_id: Optional[str] = None,
              attr_key: Optional[str] = None, attr_value: Optional[str] = None,
-             modality: Optional[str] = None):
-    """Live record ids: in a metadata namespace, for an entity, with an
-    attribute, or (only `modality`) with a vector there; none: every record."""
+             modality: Optional[str] = None, prefix: bool = False):
+    """Live record ids: in a metadata namespace (`prefix`: and every one
+    under it), for an entity, with an attribute, or (only `modality`) with a
+    vector there; none: every record."""
     db = _db_or_404(namespace)
     if metadata_namespace is not None:
-        ids = db.ids_in_namespace(metadata_namespace)
+        ids = db.ids_in_namespace(metadata_namespace, prefix=prefix)
     elif entity_id is not None:
         ids = db.ids_for_entity(entity_id)
     elif attr_key is not None:
