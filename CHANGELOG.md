@@ -36,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle's checkpoint cut what the newer one appended (the documented
   same-process double-open). Tests now close, or share one handle.
 
+### Measured, not changed
+
+- **Facts as index, per vector** (LoCoMo test, cached facts): +33% vectors
+  buys +3.8 recall@30 [+2.4, +5.3] and +5.9 @10. Only one-value-key facts:
+  +6% vectors, -0.7 (no gain). One fact per turn: +28%, +3.5.
+
 ### Embedding latency, measured
 
 - **The default Gemini model works again.** `make_embedder("gemini")` /
