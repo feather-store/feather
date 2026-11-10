@@ -37,7 +37,7 @@ from typing import Callable, List, Optional
 
 _DEFAULT_MODELS = {
     "openai":  "text-embedding-3-small",
-    "gemini":  "text-embedding-004",
+    "gemini":  "gemini-embedding-001",   # text-embedding-004 answers 404
     "voyage":  "voyage-3-lite",
     "cohere":  "embed-english-v3.0",
     "ollama":  "nomic-embed-text",

@@ -110,7 +110,7 @@ see it as an extra attribute named `"\0valid_at"` and write it back intact.
 | **SIMD on x86** | v0.13.0 | SSE/AVX L2 kernels (runtime-dispatched) compiled on x86_64; arm64 uses `-O3` NEON. `FEATHER_SIMD=none\|sse\|avx\|avx512`. |
 | **In-RAM int8 quantization** | v0.15.0 | `set_int8_ram(modality)` stores vectors as int8 **in memory** — **~1.7× less RAM** (227→129 MB at 60k×768). Since 0.22 the scale is trained from the data, and search re-ranks by float originals read from the file (`refine=2`), so recall matches float. |
 | **MCP connector for Claude** | v0.14.0 | `feather-serve` exposes Feather as a persona context engine to **Claude Desktop / Code** — local `.feather` *or* remote Cloud API (`--api-url`). |
-| **Real embedders** | v0.15.1 | `feather-serve --embed-provider gemini\|openai\|voyage\|cohere\|ollama` — semantic recall over a hosted instance (Gemini `text-embedding-004` = native 768). |
+| **Real embedders** | v0.15.1 | `feather-serve --embed-provider gemini\|openai\|voyage\|cohere\|ollama` — semantic recall over a hosted instance (Gemini `gemini-embedding-001`, asked for 768-d natively). |
 
 ```python
 # Bulk-ingest a persona's history fast (parallel HNSW build)
