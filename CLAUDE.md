@@ -479,8 +479,10 @@ Rules if you touch scoring:
   the pool until no record outside it can beat the k-th score (cosine
   bounded by the farthest fetched distance, freshness ≤ 1, importance ≤
   max(1, seen)). A fixed 3k pool held 0.92 of the exact scored top 10 on
-  LongMemEval, 0.40 at worst. Exact for unit-length vectors only; for others
-  the first pool is kept. A new graph path with scoring= must use it.
+  LongMemEval, 0.40 at worst. The bound needs the vectors seen to share one
+  length (any length, `near_uniform`: unnormalised 768-d Gemini prefixes
+  0.53 -> 0.90 of the exact top 10 with recency); widely varying lengths
+  take the widest pool instead. A new graph path with scoring= must use it.
 - **Every ranking that reads `recall_count` fades it** (`effective_recalls`):
   scorer, `context_chain`, `Pocket.heat`, `why_retrieved`.
 

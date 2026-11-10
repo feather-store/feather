@@ -7296,13 +7296,15 @@ private:
     // int8 distance is against the float original while |x|^2 is the int8
     // row's: off by the quantization error, ~1e-3 in cosine.
     struct CosineOf {
-        // Unit length within this, for the pool bound below (int8 rows
-        // dequantize to within ~1e-3 of their original length).
+        // Squared lengths within this (relative) of each other count as one
+        // length, for the pool bound below (int8 rows dequantize to within
+        // ~1e-3 of their original length).
         static constexpr double UNIT_TOL = 0.05;
         const ModalityIndex& m;
         double qq = 0.0;
         float floor = 0.0f;                // resolved relevance floor (scoring.h)
-        mutable double max_dev = 0.0;      // largest | |x|^2 - 1 | seen
+        mutable double xx_min = std::numeric_limits<double>::infinity();
+        mutable double xx_max = 0.0;       // squared lengths seen
         std::vector<float> zeros;
         CosineOf(const ModalityIndex& mi, const std::vector<float>& q, float relevance_floor)
             : m(mi), floor(relevance_floor), zeros(mi.dim, 0.0f) {
@@ -7322,23 +7324,27 @@ private:
                       reinterpret_cast<const int8_t*>(data), m.scale, m.dim)
                 : feather_simd::l2_fn()(zeros.data(),
                       reinterpret_cast<const float*>(data), m.dim);
-            max_dev = std::max(max_dev, std::fabs(static_cast<double>(xx) - 1.0));
+            xx_min = std::min(xx_min, static_cast<double>(xx));
+            xx_max = std::max(xx_max, static_cast<double>(xx));
             return Scorer::cosine_from_l2(dist2, qq, xx);
         }
-        // Query and every vector seen are unit length: L2 order is cosine order.
-        bool near_unit() const {
-            return std::fabs(qq - 1.0) <= UNIT_TOL && max_dev <= UNIT_TOL;
+        // Every vector seen has (nearly) one length, any length: the distance
+        // then bounds the cosine. Unit vectors are the common case; a
+        // Matryoshka-cut embedding left unnormalised (~0.59, varying by a few
+        // percent) is another. The query's length does not matter.
+        bool near_uniform() const {
+            return qq > 0.0 && xx_min > 0.0 && xx_max <= xx_min * (1.0 + 2.0 * UNIT_TOL);
         }
-        // The largest cosine a vector of near-unit length can have at squared
-        // distance >= d2 from the query: cos = (|q|^2 + |x|^2 - d2) / (2|q||x|),
-        // numerator at its largest |x|^2 and denominator at its smallest (or the
-        // reverse, when the numerator is negative).
+        // The largest cosine a vector with a squared length in the seen range
+        // can have at squared distance >= d2 from the query, by the cosine law:
+        // cos(r) = (|q|^2 + r^2 - d2) / (2|q| r) is convex in r (increasing
+        // when d2 >= |q|^2), so over [r_lo, r_hi] it peaks at an end.
         float bound_beyond(float d2) const {
-            const double e = max_dev + 1e-3;
-            const double num = qq + 1.0 + e - static_cast<double>(d2);
-            const double c = num > 0.0 ? num / (2.0 * std::sqrt(qq * std::max(1e-9, 1.0 - e)))
-                                       : num / (2.0 * std::sqrt(qq * (1.0 + e)));
-            return static_cast<float>(std::min(1.0, c));
+            const double pad = 1e-3;
+            const double lo = std::sqrt(xx_min * (1.0 - pad)), hi = std::sqrt(xx_max * (1.0 + pad));
+            const double nq = std::sqrt(qq);
+            auto at = [&](double r) { return (qq + r * r - static_cast<double>(d2)) / (2.0 * nq * r); };
+            return static_cast<float>(std::min(1.0, std::max(at(lo), at(hi))));
         }
     };
 
@@ -7372,7 +7378,15 @@ private:
                 imp = std::max(imp, m.importance);
                 scores.push_back(cosine.score(d, id, m, cfg, now_ts));
             }
-            if (!cosine.near_unit()) return dists;
+            // Lengths that differ widely: the distance bounds no cosine. Take
+            // the widest pool the caller allows instead of the first (best
+            // effort: a long vector pointing the right way can sit anywhere
+            // in L2 order); normalize_vectors() restores the doubling path.
+            if (!cosine.near_uniform()) {
+                if (pool >= limit) return dists;
+                pool = limit;
+                continue;
+            }
             const size_t kk = std::min(k, scores.size());
             std::nth_element(scores.begin(), scores.begin() + (kk - 1), scores.end(),
                              std::greater<float>());
