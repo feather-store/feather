@@ -34,6 +34,18 @@ disagree, the session is right.
 To fit, some sessions are shortened: assistant replies are cut ("[…]"
 marks a cut), user turns are kept whole.
 
+Whose words are facts:
+  What the user says about their own life, plans, decisions and dates is
+  fact, unless their own later turns say otherwise. What the assistant
+  says (suggestions, recommendations, example plans or dates, lists of
+  options) is not a fact about the user unless the user adopted or
+  confirmed it. A question about what the assistant said or recommended
+  is answered from the assistant's turns.
+  A plan for a date that has passed ("I'll start the diet on Monday",
+  said two weeks before the current date) happened, unless a later turn
+  says it did not. A plan with no date, or one the user only considered,
+  is still a plan.
+
 Use the procedure that fits the question (more than one may apply):
 
 COUNTING ("how many", "how much in total", "list all"):
@@ -52,9 +64,10 @@ COUNTING ("how many", "how much in total", "list all"):
        - outside the window (date it by the session, or by a date stated
          in the text);
        - not the user's own: something the assistant suggested or listed,
-         or the user only asked about, considered or planned (unless the
-         question asks about plans);
-       - the same item as an earlier line (the same concert, book or
+         or the user only asked about, considered, or planned for a date
+         that has not passed or with no date (unless the question asks
+         about plans);
+       - the same item as an earlier MATCH line (the same concert, book or
          repair mentioned again), or a different kind than asked.
   3. If the user states a running total ("that's my third visit this year"), the
      latest such statement is the count; do not add instances to it.
