@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Vectors at unit length; int8 by default for new agent files
+
+- **Cut embeddings are renormalised** (correctness). Gemini's 768-d prefix
+  is ~0.59 long and varies by record; search ranks by L2 distance (cosine
+  order only for one length) and scored search is exact only for unit
+  vectors, so it fell back to a fixed pool. `make_embedder` and the Cloud
+  API's embedder renormalise any vector they cut (`_fit`, Gemini
+  `outputDimensionality`), and the agent layer (`Pocket`, `FeatherStore`)
+  stores and searches with `pocket.unit()` whatever the embedder returns.
+  `DB.normalize_vectors(modality)` (`POST /normalize_vectors`) rescales a
+  file's vectors once, in place; `keys.upkeep` runs it on the text vectors
+  of a file the agent layer opens. The Cloud API does not touch raw
+  namespaces: run the route on one filled by `/ingest_text` at a cut dim.
+- **New agent files keep text vectors as int8, re-ranked** (`open_agent_db`:
+  `FeatherStore(path)`, `feather-agent`; `FEATHER_INT8=0` keeps float).
+  27k real gemini-embedding-001 turns at 768-d: recall@10 0.9997 vs 0.9967
+  for float32, p50 0.40 vs 0.22 ms, 768 B per vector in RAM vs 3 KB; the
+  file is 23% larger (it keeps the float originals).
+- **BM25 postings are 6 bytes** (u32 doc + u16 count, two arrays; counts
+  saturate at 65535): 100k turns 58.3 -> 50.6 MB (79.6 before 0.22), results
+  bit-identical.
+- `mcp_agent.build()` returns a server with `close_db()`, and `feather-agent`
+  closes its file on exit. The MCP tests opened a second writer handle per
+  "restart" without closing the first; with int8 originals in play the older
+  handle's checkpoint cut what the newer one appended (the documented
+  same-process double-open). Tests now close, or share one handle.
+
 ### Embedding latency, measured
 
 - **The default Gemini model works again.** `make_embedder("gemini")` /
