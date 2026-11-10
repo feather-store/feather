@@ -14,6 +14,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        # ubuntu-latest is Ubuntu 26.04, which setup-python has no 3.9 for:
+        # run 3.9 on 24.04 instead.
+        exclude:
+          - os: ubuntu-latest
+            python-version: '3.9'
+        include:
+          - os: ubuntu-24.04
+            python-version: '3.9'
 
     steps:
     - uses: actions/checkout@v4
