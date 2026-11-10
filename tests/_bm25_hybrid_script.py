@@ -274,9 +274,18 @@ cleanup(f)
 
 # ── T17: RRF scores in (0, 1) range ──────────────────────────────────────────
 db, f = make_db(BASE_CORPUS)
-r = db.hybrid_search(rng_vec(128), "search retrieval systems", k=10)
+r = db.hybrid_search(rng_vec(128), "search retrieval systems", k=10, fusion="rrf")
 ok = all(0 < x.score < 1 for x in r)
 check("T17 RRF scores in (0, 1)", ok, f"scores={[round(x.score,5) for x in r]}")
+# Score fusion: relevance (<= 1) + 0.2 * a logistic (< 0.2), best first.
+r = db.hybrid_search(rng_vec(128), "search retrieval systems", k=10)
+ok = all(x.score < 1.2 for x in r) and all(a.score >= b.score for a, b in zip(r, r[1:]))
+check("T17b score fusion: scores < 1.2, sorted", ok, f"scores={[round(x.score,5) for x in r]}")
+try:
+    db.hybrid_search(rng_vec(128), "search", k=3, fusion="max")
+    check("T17c unknown fusion refused", False, "no error")
+except ValueError:
+    check("T17c unknown fusion refused", True)
 cleanup(f)
 
 # ── T18: RRF merging — BM25-top gets boosted over vec-only ───────────────────
@@ -308,8 +317,8 @@ cleanup(f3)
 # ── T19: rrf_k effect — higher rrf_k flattens scores ─────────────────────────
 db, f = make_db(BASE_CORPUS)
 q = rng_vec(128, seed=7)
-r_k10  = db.hybrid_search(q, "search retrieval", k=5, rrf_k=10)
-r_k200 = db.hybrid_search(q, "search retrieval", k=5, rrf_k=200)
+r_k10  = db.hybrid_search(q, "search retrieval", k=5, rrf_k=10, fusion="rrf")
+r_k200 = db.hybrid_search(q, "search retrieval", k=5, rrf_k=200, fusion="rrf")
 range_k10  = (r_k10[0].score  - r_k10[-1].score)  if len(r_k10) > 1  else 0
 range_k200 = (r_k200[0].score - r_k200[-1].score) if len(r_k200) > 1 else 0
 check("T19 higher rrf_k → flatter score range",

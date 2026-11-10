@@ -118,8 +118,12 @@ def test_locomo_coverage_gives_a_repeated_turn_one_slot():
              + [{"content": "My dog Rex loves the park by the river.", "speaker": "A",
                  "dia_id": "D3:1", "dt": day}])
     qs = [{"question": "What is the name of the dog adopted?"}]
+    # Random vectors carry no meaning, so BM25 must find the turns. In 8
+    # dimensions their chance cosines (sd ~0.35) outweigh it under score
+    # fusion; at 1024 (sd ~0.03) they are the noise a real embedder's are not.
     rng = np.random.default_rng(0)
-    vecs = rng.standard_normal((len(turns) + 1, 8)).astype(np.float32)
+    vecs = rng.standard_normal((len(turns) + 1, 1024)).astype(np.float32)
+    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
     sample = {"sample_id": "s1"}
     rank = locomo.retrieve(sample, turns, qs, vecs, 3)[0]
     cover = locomo.retrieve(sample, turns, qs, vecs, 3, select="coverage")[0]

@@ -84,7 +84,9 @@ def test_followup_round_recovers_the_missed_session(tmp_path):
          "haystack_dates": ["2023/05/01 (Mon) 10:00"] * len(sessions),
          "haystack_sessions": [[{"role": "user", "content": c}] for _, c in sessions],
          "answer_session_ids": ["s1", "s2"]}
-    emb = get_embedder("deterministic", dim=32)
+    # Hash vectors carry no meaning, so BM25 must find the sessions; at 32
+    # dimensions their chance cosines (sd ~0.18) outweigh it under score fusion.
+    emb = get_embedder("deterministic", dim=1024)
 
     off = lme.run([q], embedder=emb, judge=_Planner(), top_k=1,
                   multi_round="off", questions_path=tmp_path / "off.jsonl")
