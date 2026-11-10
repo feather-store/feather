@@ -31,15 +31,21 @@ def legacy_id(namespace: str, key: str) -> int:
     return int(h[:14], 16) & ((1 << 53) - 1)
 
 
-def _legacy(db, namespace: str, key: str) -> Optional[int]:
+def _legacy_record(db, namespace: str, key: str):
+    """(legacy id, its metadata) if a pre-0.22 record holds (namespace, key),
+    else (None, None)."""
     lid = legacy_id(namespace, key)
     m = db.get_metadata(lid)
     # The id alone proves nothing — under a collision it holds ANOTHER key's
     # record. It is this key's only if the record says so.
     if (m is not None and not m.key and m.source != "_forgotten"
             and m.namespace_id == namespace and m.entity_id == key):
-        return lid
-    return None
+        return lid, m
+    return None, None
+
+
+def _legacy(db, namespace: str, key: str) -> Optional[int]:
+    return _legacy_record(db, namespace, key)[0]
 
 
 def resolve(db, namespace: str, key: str) -> Optional[int]:
@@ -71,25 +77,38 @@ def resolve_many(db, refs) -> list:
 
 
 def get(db, namespace: str, key: str):
-    """(id, metadata) of the record keyed (namespace, key), or (None, None)."""
-    rid = resolve(db, namespace, key)
-    return (rid, db.get_metadata(rid)) if rid is not None else (None, None)
+    """(id, metadata) of the record keyed (namespace, key), or (None, None).
+    One lookup returns both (DB.lookup_key: one request over the Cloud API,
+    where resolving then reading was two); a legacy record costs one more."""
+    if hasattr(db, "lookup_key"):
+        hit = db.lookup_key(key, namespace)
+        if hit is not None:
+            return hit[0], hit[1]
+    else:                                        # a DB built before lookup_key
+        rid = db.id_for(key, namespace)
+        if rid is not None:
+            return rid, db.get_metadata(rid)
+    return _legacy_record(db, namespace, key)
 
 
-def write(db, namespace: str, key: str, meta, vec=None, modality: str = "text") -> int:
+_UNKNOWN = object()
+
+
+def write(db, namespace: str, key: str, meta, vec=None, modality: str = "text",
+          found=_UNKNOWN) -> int:
     """Write the record keyed (namespace, key) and return its id: the existing
     record (a legacy one keeps its id and gains a native key), else a new one
-    with an engine-allocated id."""
+    with an engine-allocated id. `found`: what get() returned for this key,
+    when the caller has just read it, so the key is not looked up again."""
     meta.namespace_id = namespace
     meta.key = key
-    if db.id_for(key, namespace) is None:
-        lid = _legacy(db, namespace, key)
-        if lid is not None:
-            if vec is not None:
-                db.add(lid, vec, meta, modality=modality)
-            else:
-                db.update_metadata(lid, meta)
-            return lid
+    rid, prev = get(db, namespace, key) if found is _UNKNOWN else found
+    if rid is not None and prev is not None and not prev.key:      # legacy: adopt it
+        if vec is not None:
+            db.add(rid, vec, meta, modality=modality)
+        else:
+            db.update_metadata(rid, meta)
+        return rid
     return db.upsert(meta, vec, modality=modality)[0]
 
 
