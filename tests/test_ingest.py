@@ -222,7 +222,9 @@ def test_the_registry_is_backfilled_for_an_index_written_before_it(tmp_path):
     pkt.remember("m1", "Alice moved", index=[P.IndexEntry("x", key="alice|home city",
                                                           value="Denver")])
     reg = list(d.ids_with_attribute(P.KEYREG_NS, pkt.namespace))
-    reg.append(d.id_for(keys.UPKEEP_KEY, ""))                # nor had the upkeep pass run
+    marker = d.id_for(keys.UPKEEP_KEY, "")                   # nor had the upkeep pass run
+    assert marker is not None
+    reg.append(marker)
     b = feather_db.WriteBatch()
     for rid in reg:
         b.forget(rid)
@@ -581,3 +583,19 @@ def test_the_mcp_server_indexes_memories_in_the_background(tmp_path):
     assert ex.calls == 1
     assert P.known_keys(q.db, "org.agent") == ["alice|home city"]
     q.db.close()
+
+
+def test_a_new_handle_runs_upkeep_whatever_id_it_gets(tmp_path):
+    """Handles are remembered weakly: one opened after another was collected
+    can get its id(), and keyed by id() it skipped the pass (CI, flakily)."""
+    import gc
+    gc.collect()
+    before = len(P._MIGRATED)
+    for i in range(20):                       # ids are reused within a few rounds
+        d = DB.open(str(tmp_path / f"h{i}.feather"), dim=8)
+        P.pocket(d, ("org", "u"))
+        assert d.id_for(keys.UPKEEP_KEY, "") is not None
+        d.close()
+        del d
+        gc.collect()
+    assert len(P._MIGRATED) == before          # none of them is still remembered

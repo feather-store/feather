@@ -30,6 +30,7 @@ import math
 import re
 import time
 import uuid
+import weakref
 import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
@@ -236,9 +237,25 @@ def scoped_id(namespace: str, key: str) -> int:
     return keys.legacy_id(namespace, key)
 
 
-# (id(db), namespace) pairs already migrated in this process: migrate() is
-# idempotent, but it reads every record of the scope.
-_MIGRATED: set = set()
+# The DB handles that ran keys.upkeep in this process. Weak: keyed by id(db),
+# a handle opened after another was collected could get its id and skip the
+# pass (no marker was written, flakily). A handle that cannot be weakly
+# referenced is not remembered, and pays upkeep's one lookup each time.
+_MIGRATED: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _upkept(db) -> bool:
+    try:
+        return db in _MIGRATED
+    except TypeError:
+        return False
+
+
+def _mark_upkept(db) -> None:
+    try:
+        _MIGRATED.add(db)
+    except TypeError:
+        pass
 
 
 def _scope(scope) -> tuple[str, ...]:
@@ -806,11 +823,11 @@ class Pocket:
         # Once per file (keys.upkeep): later opens cost one key lookup, not a
         # read of every record. The same read backfills the key registry of
         # an index written before it existed.
-        if id(db) not in _MIGRATED and not db.is_read_only():
+        if not _upkept(db) and not db.is_read_only():
             if keys.upkeep(db, visit=lambda ns, ids, metas:
                            backfill_registry(db, ns, ids, metas)):
                 _bump(db)
-            _MIGRATED.add(id(db))
+            _mark_upkept(db)
 
     # ── scope resolution ─────────────────────────────────────────────────
 
