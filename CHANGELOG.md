@@ -9,13 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### BM25 builds 3x faster in 27% less memory
+### Fewer requests per operation over the Cloud API
 
-Terms are numbered once and a build's postings are one array (CSR), with a
-small delta for later writes; the build tokenizes through an arena word
-table, one lookup per token. 100k LongMemEval turns: first keyword search
-2.0 s -> 0.65 s, index 79.6 -> 58.3 MB; results bit-identical (500 queries).
-The build's transient peak is ~30 MB higher than before for its ~0.6 s.
+Counted against the real API (in-process), 1,000 items:
+
+| operation | before | after |
+|---|---:|---:|
+| `AgentMemory.about()`, `FeatherStore.search` without a query | 1,002 | 3 |
+| `FeatherStore.count` | 1,001 | 2 |
+| `FeatherStore.newest(10)` | 11 | 2 |
+| `FeatherStore.search` with a query (limit 10) | 21 | 3 |
+| `AgentMemory.recall` | 11 | 3 |
+| `Pocket.recall(k=5)` | 8 | 4 |
+| `PacketBuilder.build(query)` | 15 | 6 |
+| `Pocket.remember`, existing key / new key | 3 / 4 | 2 / 3 |
+
+`FeatherStore` reads records with `get_metadata_many` (scan, count,
+newest, query-less search, supersession grouping). New engine calls, each
+with its route and `RemoteDB` method: `DB.touch_many(ids)` (`POST
+/records/touch_many`; `Pocket.promote` and the older connectors use it) and
+`DB.lookup_key(key, namespace)` -> `(id, metadata)` (`GET /by_key`, which
+already returned both); `keys.get` uses it and `keys.write(found=...)` skips
+a second lookup.
 
 ### Algorithms: what each costs, measured
 
