@@ -11,6 +11,17 @@
      cannot be fed back into tuning without leaving a commit behind.
   3. Two configurations are compared on 3-5 runs of each, with paired tests
      (bench.compare): same-context reruns flip ~3% of questions.
+  4. Know what a bench can see. A paired test at 80% power detects about
+     2.8 x sqrt(d / n), d the share of questions two configurations
+     disagree on: LongMemEval-500 ~4 points, LoCoMo ~2.3. Do not tune for
+     effects below that; screen on dev, confirm on all.
+  5. Many variants in one round: control the false discovery rate across
+     every variant tried (bench.stats.benjamini_hochberg), not only the
+     winner's p.
+  6. Latency: a p99 of n samples rests on ~n/100 of them; report its
+     interval (bench.stats.quantile_ci; an upper end of None means too few).
+     A load test that waits for each reply before sending the next hides
+     queueing (coordinated omission): drive a fixed arrival rate instead.
 
 A test result produced before a split existed is not held out. Say so next
 to the number.
