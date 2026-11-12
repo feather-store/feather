@@ -504,8 +504,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    inline labeltype *getExternalLabeLp(tableint internal_id) const {
-        return (labeltype *) (data_level0_memory_ + internal_id * size_data_per_element_ + label_offset_);
+    // A raw address, not a labeltype*: the label sits after the level-0 links
+    // (byte 4 + 4*maxM0, 132 at M=16), so it is not 8-byte aligned, and even
+    // forming a misaligned labeltype* is undefined behaviour (UBSan
+    // -fsanitize=alignment, found by tests/fuzz). Read and write it with memcpy.
+    inline char *getExternalLabeLp(tableint internal_id) const {
+        return data_level0_memory_ + internal_id * size_data_per_element_ + label_offset_;
     }
 
 
@@ -1454,7 +1458,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         int size = getListCount(data);
         std::vector<tableint> result(size);
         tableint *ll = (tableint *) (data + 1);
-        memcpy(result.data(), ll, size * sizeof(tableint));
+        // An empty list is valid, and an empty vector's data() may be null:
+        // memcpy(nullptr, _, 0) is undefined behaviour (UBSan, tests/fuzz).
+        if (size) memcpy(result.data(), ll, size * sizeof(tableint));
         return result;
     }
 

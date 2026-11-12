@@ -167,12 +167,15 @@ inline uint64_t xxh64(const void* data, size_t len, uint64_t seed = 0) {
         h = seed + P5;
     }
     h += static_cast<uint64_t>(len);
-    while (p + 8 <= end) {
+    // Remaining lengths, never `p + 8 <= end`: that forms a pointer past the
+    // buffer, and from a null `data` with len 0 (an empty payload) an offset
+    // from null, both undefined behaviour (UBSan, found by tests/fuzz).
+    while (end - p >= 8) {
         h ^= round(0, rd64(p));
         h  = rotl(h, 27) * P1 + P4;
         p += 8;
     }
-    if (p + 4 <= end) {
+    if (end - p >= 4) {
         h ^= static_cast<uint64_t>(rd32(p)) * P1;
         h  = rotl(h, 23) * P2 + P3;
         p += 4;
@@ -202,6 +205,7 @@ public:
     }
     void update(const void* data, size_t len) {
         using namespace detail;
+        if (len == 0) return;            // data may be null: memcpy(_, null, 0) is UB
         const uint8_t* p = static_cast<const uint8_t*>(data);
         const uint8_t* end = p + len;
         total_ += len;
@@ -213,7 +217,7 @@ public:
             p += fill;
             used_ = 0;
         }
-        while (p + 32 <= end) {
+        while (end - p >= 32) {
             for (int i = 0; i < 4; ++i) v_[i] = round(v_[i], rd64(p + 8 * i));
             p += 32;
         }
@@ -232,8 +236,8 @@ public:
         h += total_;
         const uint8_t* p = buf_;
         const uint8_t* end = buf_ + used_;
-        while (p + 8 <= end) { h ^= round(0, rd64(p)); h = rotl(h, 27) * P1 + P4; p += 8; }
-        if (p + 4 <= end) { h ^= static_cast<uint64_t>(rd32(p)) * P1; h = rotl(h, 23) * P2 + P3; p += 4; }
+        while (end - p >= 8) { h ^= round(0, rd64(p)); h = rotl(h, 27) * P1 + P4; p += 8; }
+        if (end - p >= 4) { h ^= static_cast<uint64_t>(rd32(p)) * P1; h = rotl(h, 23) * P2 + P3; p += 4; }
         while (p < end) { h ^= static_cast<uint64_t>(*p) * P5; h = rotl(h, 11) * P1; ++p; }
         h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P3; h ^= h >> 32;
         return h;

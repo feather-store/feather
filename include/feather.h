@@ -1132,6 +1132,16 @@ private:
     // how many vectors were actually stored). We now start at INITIAL_MAX and
     // double as needed, so RAM tracks the real working set, not the worst case.
     static constexpr size_t INITIAL_MAX_ELEMENTS = 4096;
+    // ...but never more than INITIAL_RESERVE_BYTES of vectors up front: a new
+    // index's first allocation is capacity x dim x 4 bytes, and a dim read off
+    // a corrupt file (bounded only at 2^20) made that 16 GB before a single
+    // vector was read (found by tests/fuzz). At every real dim (<= 4096) this
+    // is still 4096 slots; past it the index starts smaller and doubles.
+    static constexpr size_t INITIAL_RESERVE_BYTES = size_t{64} << 20;
+    static size_t initial_capacity(size_t dim) {
+        const size_t per = std::max<size_t>(dim, 1) * sizeof(float);
+        return std::max<size_t>(16, std::min(INITIAL_MAX_ELEMENTS, INITIAL_RESERVE_BYTES / per));
+    }
     // set_int8_ram's default re-rank factor: candidates fetched per result.
     static constexpr uint32_t DEFAULT_INT8_REFINE = 2;
 
@@ -1168,7 +1178,7 @@ private:
         std::unique_ptr<hnswlib::SpaceInterface<float>> space;
         if (int8) space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
         else      space = std::make_unique<hnswlib::L2Space>(dim);
-        auto index = make_hnsw(space.get(), INITIAL_MAX_ELEMENTS, M, ef_construction);
+        auto index = make_hnsw(space.get(), initial_capacity(dim), M, ef_construction);
         auto& slot = modality_indices_[modality];
         const uint64_t epoch = slot.epoch + 1;
         slot = {std::move(index), std::move(space), dim, int8, scale};
