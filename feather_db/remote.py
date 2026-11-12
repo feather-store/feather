@@ -74,6 +74,7 @@ PARITY = {
     "hybrid_search":     "POST /hybrid_search",
     "context_chain":     "POST /context_chain",
     "newest":            "GET /newest",
+    "count_live":        "GET /count_live",
     "ids_in_namespace":  "GET /ids",
     "ids_for_entity":    "GET /ids",
     "ids_with_attribute": "GET /ids",
@@ -668,6 +669,12 @@ class RemoteDB:
         elif before is not None:
             params["before_ts"] = int(before)
         return self._call("GET", "/newest", params=params)["ids"]
+
+    def count_live(self, namespace, prefix=False, exclude_sources=()):
+        params = {"metadata_namespace": namespace, "prefix": "true" if prefix else "false"}
+        if exclude_sources:
+            params["exclude_source"] = list(exclude_sources)
+        return int(self._call("GET", "/count_live", params=params)["count"])
 
     def ids_in_namespace(self, namespace_id, prefix=False):
         params = {"metadata_namespace": namespace_id}

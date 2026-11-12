@@ -817,6 +817,11 @@ PYBIND11_MODULE(core, m) {
         .def("namespace_size", &feather::DB::namespace_size, py::arg("namespace_id"),
              "Live record count in a namespace (O(1)).",
              py::call_guard<py::gil_scoped_release>())
+        .def("count_live", &feather::DB::count_live, py::arg("namespace"), py::arg("prefix") = false,
+             py::arg("exclude_sources") = std::vector<std::string>{},
+             "Live records in a namespace (prefix: and under it; \"\" = all), not expired, "
+             "whose source is not in exclude_sources. One call, only the count returned.",
+             py::call_guard<py::gil_scoped_release>())
         .def("list_namespaces", &feather::DB::list_namespaces,
              "All namespace ids that currently have at least one live record.",
              py::call_guard<py::gil_scoped_release>())

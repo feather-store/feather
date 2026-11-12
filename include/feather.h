@@ -7190,6 +7190,38 @@ public:
         return it == ns_index_.end() ? 0 : it->second.size();
     }
 
+    // Live records in `ns` (with `prefix`, under it too; "" = every
+    // namespace), leaving out records whose source is in `exclude_sources`
+    // and records whose ttl has run out at this handle's clock. A store's
+    // "how many items" in one call, where it read every record to count them
+    // (FeatherStore.count: index records and bookkeeping are sources to
+    // exclude). Walks the namespace's records in memory; only the count
+    // leaves the engine.
+    size_t count_live(const std::string& ns, bool prefix = false,
+                      const std::vector<std::string>& exclude_sources = {}) const {
+        std::shared_lock<RWMutex> lock(mutex_);
+        ensure_open();
+        const double now = clock_now();
+        size_t n = 0;
+        auto count = [&](const std::string& name) {
+            auto it = ns_index_.find(name);
+            if (it == ns_index_.end()) return;
+            for (uint64_t id : it->second) {
+                auto m = metadata_store_.find(id);
+                if (m == metadata_store_.end() || is_dead_meta(m->second)) continue;
+                const Metadata& md = m->second;
+                if (md.ttl > 0 && now > static_cast<double>(md.timestamp + md.ttl)) continue;
+                if (std::find(exclude_sources.begin(), exclude_sources.end(), md.source)
+                        != exclude_sources.end()) continue;
+                ++n;
+            }
+        };
+        if (!prefix) count(ns);
+        else if (!ns.empty()) for_each_ns_under(ns, count);
+        else for (const auto& entry : ns_index_) count(entry.first);
+        return n;
+    }
+
     std::vector<std::string> list_namespaces() const {
         std::shared_lock<RWMutex> lock(mutex_);
 

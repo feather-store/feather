@@ -39,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional, List, Tuple, Dict
 
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request, UploadFile, File, Form
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import ValidationError
@@ -1616,6 +1616,16 @@ def newest(namespace: str, metadata_namespace: str = "", limit: int = 10, prefix
     before = None if before_ts is None else ((before_ts, before_id) if before_id is not None else before_ts)
     return {"ids": db.newest(metadata_namespace, max(0, min(limit, 10_000)), prefix=prefix,
                              before=before, by_valid=by_valid)}
+
+
+@app.get("/v1/{namespace}/count_live", tags=["records"], dependencies=[Depends(verify_api_key)])
+def count_live(namespace: str, metadata_namespace: str = "", prefix: bool = False,
+               exclude_source: List[str] = Query(default=[])):
+    """How many live, unexpired records `metadata_namespace` holds (with
+    `prefix`, under it too), leaving out the sources named by
+    `exclude_source` (repeatable). Only the count crosses the network."""
+    db = _db_or_404(namespace)
+    return {"count": db.count_live(metadata_namespace, prefix=prefix, exclude_sources=exclude_source)}
 
 
 @app.get("/v1/{namespace}/ids", tags=["records"], dependencies=[Depends(verify_api_key)])
