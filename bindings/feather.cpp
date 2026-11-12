@@ -240,6 +240,17 @@ PYBIND11_MODULE(core, m) {
               feather::fsio::sync_faults_after().store(n);
           }, py::arg("n"), py::arg("errno") = EIO);
 
+    // The WAL's CRC-32, for tests/test_wal_crc.py: zlib.crc32's value, by the
+    // path this build uses (`sliced=False`: the CPU instruction where built
+    // for it) or by slicing-by-8, which every build has, so both are tested
+    // on any machine.
+    m.def("_crc32", [](py::bytes data, bool sliced) {
+              const std::string s = data;
+              return (sliced ? feather::crc32::sliced(s.data(), s.size(), 0xFFFFFFFFu)
+                             : feather::crc32::update(s.data(), s.size(), 0xFFFFFFFFu)) ^ 0xFFFFFFFFu;
+          }, py::arg("data"), py::arg("sliced") = false);
+    m.def("_crc32_hardware", []() { return feather::crc32::hardware(); });
+
     // Crash injection for the erase tests: erase() stops after logging and
     // applying, before its compaction and rewrite.
     m.def("_halt_erase_after_log", [](bool on) {
