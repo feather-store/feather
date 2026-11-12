@@ -1073,7 +1073,10 @@ tests against an **ASan + UBSan** build of the extension; and
 (`tests/cpp/tsan.supp` silences only hnswlib's insert lock-order report).
 Their first runs found: a misaligned `labeltype*` (the label sits at byte 132
 of a slot — use memcpy on a `char*`), pointer arithmetic from null in xxh64,
-`memcpy(nullptr, _, 0)`, and a 16 GB allocation from a corrupt dim (a new
+`memcpy(nullptr, _, 0)`, a 16 GB allocation from a corrupt dim, and the graph
+walks' next-neighbour prefetch reading one entry past a full list (past the
+allocation for upper layers; on ordinary inserts too). A crash input goes
+into `tests/fuzz/crashes/<target>/`, which the fuzz job replays every run (a new
 index's reservation is now capped by bytes, `initial_capacity(dim)`). An
 allocation sized from disk counts toward the "bound it" rule even when it
 happens inside index creation.

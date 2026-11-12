@@ -215,7 +215,7 @@ jobs:
       run: |
         mkdir -p fuzz-artifacts
         opts="-max_total_time=300 -timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=1024 -print_final_stats=1"
-        ./fuzz_file fuzz-corpus/file $opts -artifact_prefix=fuzz-artifacts/file- > fuzz_file.log 2>&1 & a=$!
+        ./fuzz_file fuzz-corpus/file tests/fuzz/crashes/file $opts -artifact_prefix=fuzz-artifacts/file- > fuzz_file.log 2>&1 & a=$!
         FEATHER_FUZZ_BASE=fuzz-corpus/base.feather \
           ./fuzz_wal fuzz-corpus/wal $opts -artifact_prefix=fuzz-artifacts/wal- > fuzz_wal.log 2>&1 & b=$!
         s=0; wait $a || s=1; wait $b || s=1
