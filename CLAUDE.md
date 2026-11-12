@@ -131,6 +131,10 @@ feather/
 │   ├── src/lib.rs           # CLI command implementations
 │   ├── build.rs             # Rust build script (links C++ core)
 │   └── Cargo.toml           # Rust package manifest (v0.20.0)
+├── feather-server/          # Cloud API hot routes in Rust (experimental; README.md)
+│   ├── src/packed.rs        #   reads feather_core.cpp's packed records → the API's JSON
+│   ├── src/bin/loadgen.rs   #   open-loop load generator (fixed arrival rate)
+│   └── tests/parity.py      #   same requests to both servers, answers compared
 ├── feather-api/             # FastAPI Cloud wrapper (v0.10 rewrite)
 │   ├── app/main.py          # FastAPI app + all /v1/* routes
 │   ├── app/db_manager.py    # DB lifecycle management + delete()
@@ -872,8 +876,16 @@ invert it.
 `search` has no ordering, so it returns an arbitrary `n`; sorting those is
 sorting the wrong set. At 300 episodes it returned 299, 298, 296, 295, 293 —
 silently skipping two. Use `store.newest(ns, n, key=…)`, and `store.count(ns)`
-rather than `len(search(...))`. `count` cannot use the engine's
-`namespace_size()`, which counts tombstones until compaction.
+rather than `len(search(...))`. `count` is the engine's `count_live()`
+(one request; `namespace_size()` also counts index records, bookkeeping and
+expired items). A search with no query pages the engine's time index, newest
+first, and stops at `offset + limit`.
+
+**Every read costs O(result), not O(scope).** `tests/test_complexity.py`
+measures agent-facing reads in requests and response bytes over the Cloud
+API at 1k and 10k items: neither may grow with the scope, and each has a
+request budget (`about()` ≤ 3, `count()` 1). A new read joins its `READS`
+list. Erase time is held to linear (4x the records < 8x the time).
 
 ### Domain Profiles
 
@@ -912,6 +924,26 @@ feather save   --db my.feather
 ```
 
 The Rust CLI calls the `extern "C"` C ABI from `src/feather_core.cpp` via the FFI bridge in `build.rs`. **No exception may cross that ABI** (unwinding through an `extern "C"` frame aborts): a new entry point wraps its body in `guarded(...)` and returns `0`/`-1` (`nullptr`, `SIZE_MAX`), with the message in `feather_last_error()`; the Rust wrapper turns that into `Result<_, String>`. The CLI does **not** yet expose v0.4.0/v0.5.0 graph features (namespace, attributes, context_chain) — those are Python-only for now.
+
+`feather-server/` uses the same C ABI, compiled from `../include` and `../src`
+directly (`publish = false`, no vendored copy). Reads come back as packed
+bytes (`Packer` in feather_core.cpp), and **a change to that layout must change
+`feather-server/src/packed.rs` with it**. Failures carry
+`feather_last_error_kind()`, which the server maps to HTTP statuses. After any
+change to a hot route on either server, run `feather-server/tests/parity.py`:
+it fails on any difference in status, error type, headers or body.
+
+feather-server also serves **every route an agent session sends** (the
+agent layer over `RemoteDB`: setup, every turn, close, and outside a turn
+corrections and erasure: `PUT`/`DELETE /records/{id}`, `POST /erase`), because a namespace
+is served by one process and a namespace moved there must answer all of its
+clients' routes: a 501 is an agent that crashes. **A change to
+AgentMemory / Pocket / PacketBuilder / FeatherStore / RemoteDB that sends a
+new route** needs that route on feather-server too:
+`feather-server/tests/agent_session.py` runs a session against both servers
+and fails on any request the Rust server does not serve. An idempotent
+route's stored note must be Python's exact `json.dumps` output (`py_note`
+in api.rs), so the two servers write the same WAL.
 
 ---
 
@@ -952,6 +984,10 @@ CPUs). Build modes: `FEATHER_SIMD=auto` (default) | `native` | `none`;
 `FEATHER_SIMD_RUNTIME=scalar|sse|avx2|avx512` caps the level for A/B tests;
 `feather_db.core.simd_info()` reports it. A new kernel needs a numpy
 equivalence case in `tests/test_simd.py` (it runs every level the CPU has).
+**Keep accumulation chains independent**: the NEON kernels use four
+accumulators because one or two left them waiting on instruction latency
+(int8 96 → 30 ns, float 94 → 62 ns per 768-d distance, M1). Time a kernel
+change against the old one on the same data, in cache and from memory.
 
 ### Rust CLI
 `build.rs` declares `rerun-if-changed=cpp`: the `cc` crate's own
@@ -1029,6 +1065,19 @@ A checksum is not a bounds check: it only proves the bytes are the ones
 written. The fuzz recomputes v10 checksums and WAL CRCs so it reaches the
 parsers.
 
+CI also runs (`.github/workflows/test.yml`): **libFuzzer** on the loader
+(`tests/fuzz/fuzz_file.cpp`) and on WAL replay (`fuzz_wal.cpp`), seeded by
+`tests/fuzz/make_corpus.py` from the builders above; the file, WAL and engine
+tests against an **ASan + UBSan** build of the extension; and
+`tests/cpp/lock_stress.cpp` + `engine_stress.cpp` under **TSan**
+(`tests/cpp/tsan.supp` silences only hnswlib's insert lock-order report).
+Their first runs found: a misaligned `labeltype*` (the label sits at byte 132
+of a slot — use memcpy on a `char*`), pointer arithmetic from null in xxh64,
+`memcpy(nullptr, _, 0)`, and a 16 GB allocation from a corrupt dim (a new
+index's reservation is now capped by bytes, `initial_capacity(dim)`). An
+allocation sized from disk counts toward the "bound it" rule even when it
+happens inside index creation.
+
 ### WAL durability — what the guarantee actually is
 The WAL is format **v2**: an 8-byte header (`FWAL` + version) then records of
 `[op:1][id:8][plen:4][payload][crc32:4]`. Two rules if you touch it:
@@ -1083,6 +1132,12 @@ The WAL is format **v2**: an 8-byte header (`FWAL` + version) then records of
   Bulk mutations append all records and wait once on the last LSN. Never fsync
   (or call `wal_wait_durable`) inside the exclusive lock outside strict mode:
   it blocks every reader for the disk flush (measured −68% reads, 1 writer).
+
+The record CRC is `feather::crc32` (feather.h): zlib's CRC-32 by ARM's
+CRC32 instructions where the build targets them, slicing-by-8 elsewhere.
+Every path must give zlib's value (`tests/test_wal_crc.py` checks both on
+any machine): a WAL is replayed by whatever build opens it. Never switch to
+x86's crc32 instruction: it is CRC-32C, a WAL format change.
 
 v1 WALs (≤0.17.0, no header, no CRC) still replay — the header sniff is exact
 because `'F'` cannot be a v1 opcode. Don't remove that path while any deployed
