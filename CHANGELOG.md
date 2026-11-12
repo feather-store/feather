@@ -9,6 +9,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### arm64: distance kernels 1.4–3.2× faster, WAL checksums 22×
+
+- **The NEON distance kernels keep four independent accumulators.** Each
+  multiply-accumulate fed the next on the same accumulator (two for float,
+  one for int8), so the loops waited on instruction latency. Per 768-d
+  distance on an M1: float 94 → 62 ns, int8 96 → 30 ns (the graph walk of
+  every in-RAM int8 modality, which new agent files use), float query vs
+  int8 row 208 → 86 ns. Engine level, 20k × 768, three alternating runs: an
+  agent file (int8, refine 2) builds in 1.38 s instead of 2.46 s and
+  searches in 0.18 ms instead of 0.25 ms (p50), recall unchanged (0.998);
+  a float file searches 4% faster and builds no faster (its 61 MB of
+  vectors leave the build waiting on memory, not arithmetic). int8 results
+  are identical; float distances move in the last bits (another summation
+  order). x86 kernels unchanged: not measured.
+- **WAL CRC-32 by the CPU's CRC32 instructions where the build targets
+  them** (Apple silicon by default), slicing-by-8 elsewhere; zlib's value
+  by every path, so WALs stay readable across machines and builds. Bytewise
+  it cost 8.1 µs per 768-d record, computed while a write holds the
+  exclusive lock: now 0.36 µs. A ~3 KB metadata update 16.3 → 8.2 µs;
+  replaying 20k such records on open 326 → 155 ms. (x86's crc32
+  instruction is CRC-32C, another polynomial: using it would change the
+  WAL format.) `tests/test_wal_crc.py` checks both paths against zlib on
+  every machine, and every record the engine writes.
+- Found by porting the kernels, xxh64, the WAL CRC and the BM25 tokenizer
+  to Rust and timing them beside the C++: same algorithm, same speed
+  (tokenize and xxh64 within noise). Every gain came from the code's shape,
+  and the C++ written that way got it too, so the engine stays C++.
+
+### LongMemEval: evidence position
+
+- `bench run longmemeval --evidence-position first|middle|last` moves the
+  gold evidence sessions to that place in the context after the budget fill
+  (same sessions, renderings and tokens as the default `date` order), to
+  measure position alone. Never reportable. bench/README.md has one command
+  per cell for it and for the accuracy-vs-tokens curve (4k, 10k, 20k, 40k,
+  full); neither has been run.
+
+### Reads cost O(result): the last two O(scope) operations, and a CI gate
+
+- **`FeatherStore.count()`** downloaded every record of a namespace to count
+  them. It is now `DB.count_live(namespace, prefix, exclude_sources)`: one
+  request, only the count back (`GET /count_live`, `RemoteDB.count_live`).
+- **A FeatherStore search with no query** read every id in the database
+  (`get_all_ids`) with no namespace, or every record under the prefix with
+  one, to return `limit` items (so did `AgentMemory.about()`). It now pages
+  the engine's time index newest first and stops at `offset + limit`. Over
+  the Cloud API at 10k items per user: `about()` 5.3 MB -> 53 KB per call, a
+  10-item listing 5.3 MB -> 8.5 KB, `count()` 15 bytes, all the same at 1k.
+  Results are now newest first (no order was promised).
+- `tests/test_complexity.py`: requests and response bytes of agent reads at
+  1k and 10k items may not grow with the scope (each read has a request
+  budget), and erase time stays linear. Against the old code it fails five
+  ways.
+
+### Sanitizers and libFuzzer in CI; four engine fixes they found
+
+- CI runs libFuzzer on the `.feather` loader and on WAL replay (seeded from
+  the corruption fuzz's builders, 5 min each), the file/WAL/engine tests on
+  an ASan + UBSan build, and the lock and engine stress tests under TSan.
+- **A corrupt v9 dim allocated 16 GB** before a vector was read: a new
+  index reserved 4,096 slots x dim x 4 bytes, with dim bounded only at 2^20.
+  The reservation is now capped at 64 MB (unchanged at every real dim; past
+  4,096 dims the index starts smaller and doubles).
+- Undefined behaviour, harmless on x86/arm64 today but free for a compiler to
+  break: a misaligned `labeltype*` on every insert, pointer arithmetic from
+  null in xxh64 for an empty payload, `memcpy(nullptr, _, 0)` for an empty
+  neighbour list.
+
+### feather-server: the Cloud API's hot routes in Rust (experimental)
+
+- **`feather-server/`**: search, keyword and hybrid search (with a vector),
+  `GET /records/{id}`, `records/get_many` and `POST /vectors` (atomic,
+  versioned, `Idempotency-Key`), on the same files and with the same JSON,
+  status codes and error bodies as feather-api. `tests/parity.py` sends 65
+  requests to both servers: all identical, files included. Every other `/v1`
+  route answers 501. So does `X-Feather-As-Of`, rather than serving the live
+  namespace for a historical read. Fixed-arrival-rate load test
+  (`benchmarks/http_server_load.py`, `feather-loadgen`), 20k x 768: CPU per
+  search 0.89 → 0.59 ms (the HTTP layer ~0.41 → ~0.11 ms; the engine is the
+  other 0.48). feather-api tops out at ~1,500–2,000 searches/s per
+  namespace (the GIL holds its framework work, and one process holds a
+  namespace's write lock); feather-server kept up at 4,000/s, limited by
+  cores. p50 1.10 → 0.68 ms. See bench/reports/http_server_20261110.md.
+- C ABI (`src/feather_core.cpp`): filtered and scored search, keyword and
+  hybrid search, record reads as packed bytes, versioned idempotent puts,
+  `feather_last_error_kind()` (a typed failure, so a caller can pick the
+  status without parsing messages), `feather_close_ex(save)`. The CLI's
+  vendored copy is synced.
+- **feather-server serves every route an agent session sends**, so a
+  namespace agents use can move to it with no client change. One agent turn
+  (AgentMemory.recall, Pocket.hot, Pocket.recall, PacketBuilder.build, an
+  episode write) is 18–20 requests over 9 routes; at that mix feather-api
+  tops out near **50 turns/s per namespace** (850–920 req/s, one core: the
+  GIL), feather-server near **350** (~6,300 req/s), 768-d, same file. New
+  routes: `POST /batch` (every op, by id or key, compare-and-set,
+  `Idempotency-Key`), `by_key`, `by_keys`, `newest`, `count_live`, `ids`,
+  `metadata_namespaces`, `heat_select`, `records/touch_many`,
+  `records/{id}/touch`, `records/{id}/link`, `normalize_vectors`,
+  `admin/engine`, `save`, `POST /v1/namespaces`. `tests/parity.py` now sends
+  148 requests (all identical, WAL bytes and files included: an idempotent
+  write stores Python's exact `json.dumps` note, so either server replays the
+  other's retry); `tests/agent_session.py` runs a whole agent session over
+  HTTP against both servers and fails on any request not served or any
+  difference in what the agent reads. `benchmarks/http_server_load.py
+  --route agent_turn` replays a recorded turn (`feather-loadgen --requests`,
+  `--ok-statuses`). Nothing in feather-api or the SDK changed. See
+  bench/reports/http_agent_turn_20261110.md.
+- **feather-server serves corrections and erasure too**: `PUT
+  /records/{id}` (metadata replace, keeping the edges / key / valid_at a
+  request leaves out; `If-Match` → 412 with the current ETag;
+  `Idempotency-Key`), `DELETE /records/{id}` (forget; `cascade`, default on,
+  prunes edges into the record in the same atomic write) and `POST /erase`
+  (the receipt, `cites` / `feeds` included). Agents send them outside a
+  turn: `Pocket.pin` and `keys.write` (PUT), `Pocket.forget`,
+  `PocketSession.close()` and `maintain()` (DELETE), and every erasure —
+  `Pocket.erase` / `erase_all`, `AgentMemory.erase` / `erase_subject`,
+  `FeatherStore.erase`, the MCP `forget` tools. A namespace moved to the
+  Rust server answered all of them with 501. C ABI: `feather_incoming_bin`,
+  `feather_erase_json`. `tests/parity.py` 148 → 193 requests, all identical;
+  `tests/agent_session.py` now also pins, forgets, closes a session with
+  scratch notes, runs upkeep and erases (one preference and the observation
+  citing it, one note, then the whole subject), reading back after each:
+  341 requests over 20 routes, identical. Its two sessions now share one
+  clock base (each read the wall clock, so they differed when they began in
+  different seconds).
+
 ### Scored search for vectors of any length; honest percentiles
 
 - **The scored-search pool bound works at any common vector length.** It

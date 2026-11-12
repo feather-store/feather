@@ -21,7 +21,13 @@ the gold label, and in the oracle set evidence ids start with "answer_".
 from __future__ import annotations
 import datetime
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
+
+# Where the evidence sessions go (render(place=...)). "date" is the system:
+# every session oldest first. The others are an oracle experiment: the same
+# sessions at the same rendering, with the gold evidence moved to the start,
+# the middle or the end of the context, to measure position alone.
+PLACES = ("date", "first", "middle", "last")
 
 
 def parse_lme_date(s: str) -> Optional[datetime.datetime]:
@@ -167,7 +173,8 @@ def render(ranked_hits: list[Turn], all_turns: list[Turn], *,
            max_sessions: Optional[int] = None,
            question_date: str = "",
            max_tokens: Optional[int] = None,
-           count_tokens: Optional[Callable[[str], int]] = None) -> Rendered:
+           count_tokens: Optional[Callable[[str], int]] = None,
+           evidence: Iterable[str] = (), place: str = "date") -> Rendered:
     """ranked_hits: retrieved turns, best first.
     all_turns:   the whole haystack (for session expansion).
     unit:        "session" expands hits to their sessions; "turn" shows
@@ -183,7 +190,13 @@ def render(ranked_hits: list[Turn], all_turns: list[Turn], *,
                  answer model's tokenizer). Characters are not what the
                  model reads: a token is ~4.5 chars of English prose and
                  fewer of numbers, dates and code.
+    place:       "date" (oldest first), or "first" / "middle" / "last":
+                 the sessions in `evidence` (gold ids) moved there, the rest
+                 still oldest first. Applied after the budget fill, so which
+                 sessions get in, and at what rendering, does not change.
     """
+    if place not in PLACES:
+        raise ValueError(f"place must be one of {PLACES}, not {place!r}")
     if max_tokens is not None:
         if count_tokens is None:
             raise ValueError("max_tokens needs count_tokens")
@@ -250,5 +263,13 @@ def render(ranked_hits: list[Turn], all_turns: list[Turn], *,
         d = parse_lme_date(by_session[sid][0].session_date)
         return (d or datetime.datetime.max, by_session[sid][0].order)
 
-    text = "\n\n".join(chosen[sid] for sid in sorted(chosen, key=when))
+    order = sorted(chosen, key=when)
+    if place != "date":
+        gold = set(evidence)
+        ev = [sid for sid in order if sid in gold]
+        rest = [sid for sid in order if sid not in gold]
+        half = len(rest) // 2
+        order = {"first": ev + rest, "last": rest + ev,
+                 "middle": rest[:half] + ev + rest[half:]}[place]
+    text = "\n\n".join(chosen[sid] for sid in order)
     return Rendered(text, retrieved, list(chosen), level_of)

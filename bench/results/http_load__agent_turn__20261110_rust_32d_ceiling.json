@@ -1,0 +1,128 @@
+{
+ "meta": {
+  "n": 20000,
+  "dim": 768,
+  "duration_s": 8.0,
+  "conns": 64,
+  "route": "agent_turn",
+  "episodes": 2000,
+  "requests_per_turn": 18,
+  "machine": "Darwin arm64, 8 cpus",
+  "python": "3.12.15",
+  "feather_db": "0.21.0",
+  "when": "2026-11-10 13:55:49"
+ },
+ "rows": [
+  {
+   "achieved_rate": 7978.846664239885,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 134693,
+    "mean": 1185.0,
+    "p50": 56,
+    "p90": 562,
+    "p99": 39681,
+    "p999": 55078
+   },
+   "ok": 64000,
+   "scheduled": 64000,
+   "service_us": {
+    "max": 107483,
+    "mean": 382.0,
+    "p50": 48,
+    "p90": 492,
+    "p99": 4823,
+    "p999": 38530
+   },
+   "statuses": {
+    "200": 57190,
+    "404": 6810
+   },
+   "target_rate": 8000.0,
+   "url": "http://127.0.0.1:55317/",
+   "wall_s": 8.021209417,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 5.548,
+   "cpu_ms_per_req": 0.0867,
+   "cpu_cores": 0.666,
+   "round": 0
+  },
+  {
+   "achieved_rate": 11978.708096414155,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 89405,
+    "mean": 1714.0,
+    "p50": 106,
+    "p90": 1953,
+    "p99": 34109,
+    "p999": 57421
+   },
+   "ok": 96000,
+   "scheduled": 96000,
+   "service_us": {
+    "max": 87027,
+    "mean": 633.0,
+    "p50": 95,
+    "p90": 1149,
+    "p99": 8138,
+    "p999": 38026
+   },
+   "statuses": {
+    "200": 90224,
+    "404": 5776
+   },
+   "target_rate": 12000.0,
+   "url": "http://127.0.0.1:55317/",
+   "wall_s": 8.014219833,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 9.959,
+   "cpu_ms_per_req": 0.1037,
+   "cpu_cores": 1.197,
+   "round": 0
+  },
+  {
+   "achieved_rate": 15975.54776069834,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 118367,
+    "mean": 4090.0,
+    "p50": 156,
+    "p90": 14149,
+    "p99": 52301,
+    "p999": 76628
+   },
+   "ok": 128000,
+   "scheduled": 128000,
+   "service_us": {
+    "max": 94033,
+    "mean": 809.0,
+    "p50": 134,
+    "p90": 1836,
+    "p99": 9605,
+    "p999": 43506
+   },
+   "statuses": {
+    "200": 120889,
+    "404": 7111
+   },
+   "target_rate": 16000.0,
+   "url": "http://127.0.0.1:55317/",
+   "wall_s": 8.012244833,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 13.583,
+   "cpu_ms_per_req": 0.1061,
+   "cpu_cores": 1.631,
+   "round": 0
+  }
+ ]
+}

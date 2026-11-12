@@ -377,6 +377,40 @@ one-value (0.3.2: diet 6/32, LoCoMo false chains 52 -> 75) and deciding
 one-value per key in code (majority of a key's flags: contradiction
 coverage +1.5 points, LoCoMo false chains 52 -> 67).
 
+### LongMemEval accuracy vs context tokens, and evidence position (not run yet)
+
+The evidence is in context for 99.4% of questions at the benchmark default
+(k=20, ~35k tokens), yet accuracy is ~91%, and the product's default budget
+is 4k. Each command below is one cell; each run writes a result JSON, and
+`bench.lme_curve` tables them with paired intervals against the 40k row.
+The flags are `scripts/lme_final.sh`'s, on the dev split (100 questions,
+~$1-2 a cell, ~$4 for full context, ~$2 once to embed the haystacks;
+drop `--split dev` for all 500, which needs a commit). Needs `GEMINI_API_KEY` and `OPENROUTER_API_KEY`.
+
+```
+RUN="python -m bench run longmemeval --dataset s --k 20 --embedder gemini \
+  --judge llm --judge-provider gemini-text --judge-model gemini-2.5-flash \
+  --official-judge-provider openrouter --official-judge-model openai/gpt-4o-2024-08-06 \
+  --workers 8 --limit 0 --split dev"
+
+# accuracy vs tokens
+for t in 4000 10000 20000 40000; do $RUN --context-tokens $t; done
+$RUN --full-context                       # every session, ~110k tokens
+
+# where the evidence sits: the same sessions, the gold ones moved
+for p in first middle last; do $RUN --context-tokens 10000 --evidence-position $p; done
+
+python -m bench.lme_curve --ref "k=20 40k tok" bench/results/longmemeval__s__*.json
+```
+
+`--evidence-position` places the gold evidence sessions (`answer_session_ids`)
+at the start, middle or end of the context after the budget fill, the rest
+oldest first, so the sessions, their renderings and the tokens are identical
+to `--evidence-position date` (the default, what the system does). It reads
+the gold labels, so such a run is never reportable (`lme_reportability` says
+so). At 10k tokens the evidence is cut for more questions than at 40k:
+compare position runs with each other and with the 10k row, not the 40k one.
+
 ### LongMemEval knowledge-update with facts as index (2026-11-08)
 
 ```

@@ -96,3 +96,11 @@ def test_curve_rows_pool_reruns_and_compare_with_the_reference(tmp_path, capsys)
     out = capsys.readouterr().out
     assert "k=5 10k tok       2   10  70.0" in out and "-20.0" in out
     assert "full context" in out and "MS 100" in out
+
+
+def test_evidence_position_runs_are_rows_of_their_own():
+    from bench.lme_curve import label
+    assert label({"k": 20, "context_tokens": 10_000}) == "k=20 10k tok"
+    assert label({"k": 20, "context_tokens": 10_000, "evidence_position": "first"}) == \
+        "k=20 10k tok, evidence first"
+    assert label({"full_context": True, "evidence_position": "date"}) == "full context"

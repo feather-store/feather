@@ -108,6 +108,28 @@ def test_keyword_search_and_newest_are_exact(db):
     assert db.newest("", 5, prefix=True) == sorted(range(40), key=lambda i: (1000 + i // 3, i), reverse=True)[:5]
 
 
+def test_count_live_counts_only_live_unexpired_records(db):
+    vec = clustered(12)
+    for i in range(4):
+        db.add(i, vec[i], meta("a", content=f"a{i}"))
+    for i in range(4, 6):
+        db.add(i, vec[i], meta("a.b", content=f"ab{i}"))
+    db.add(6, vec[6], meta("ab", content="a sibling, not under a"))
+    db.forget(3)                                        # forgotten
+    expired = meta("a", content="expired", ts=int(time.time()) - 100)
+    expired.ttl = 10
+    db.add(7, vec[7], expired)
+    derived = meta("a", content="an index record")
+    derived.source = "_pocket_index"
+    db.add(8, vec[8], derived)
+    db.add(9, vec[9], meta("a", content="soft-deleted", _deleted="true"))
+    assert db.count_live("a") == 4                      # 0, 1, 2, and the index record
+    assert db.count_live("a", exclude_sources=["_pocket_index"]) == 3
+    assert db.count_live("a", prefix=True, exclude_sources=["_pocket_index"]) == 5
+    assert db.count_live("", prefix=True) == 7
+    assert db.count_live("missing") == 0
+
+
 def test_namespace_graphs_are_opt_in(db):
     assert db.namespace_ann_info()["min_records"] == 0
 

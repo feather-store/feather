@@ -1,0 +1,11 @@
+# ThreadSanitizer suppressions for tests/cpp/*_stress.cpp (TSAN_OPTIONS=suppressions=...).
+#
+# hnswlib's insert holds the new node's link-list lock and takes each
+# neighbour's in turn (addPoint -> searchBaseLayer / mutuallyConnectNewElement).
+# Over many inserts every pair of nodes is taken in both orders, which TSan's
+# deadlock detector reports as a lock-order inversion, even when every insert
+# runs on one thread. DB::add runs under the exclusive mutex_, so two of those
+# inserts never overlap; parallel_add (add_batch, open) uses upstream hnswlib's
+# concurrent insertion. This suppresses only the lock-order report for these
+# locks: data races are still reported everywhere.
+deadlock:HierarchicalNSW<float>::addPoint

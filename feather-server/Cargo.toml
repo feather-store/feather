@@ -1,0 +1,36 @@
+[package]
+name = "feather-server"
+version = "0.21.0"
+edition = "2021"
+description = "The Feather Cloud API's hot routes in Rust: same JSON, same files, no Python"
+license = "MIT"
+publish = false   # compiles the engine from ../include and ../src, which `cargo package` refuses
+
+[[bin]]
+name = "feather-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "feather-loadgen"
+path = "src/bin/loadgen.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+base64 = "0.22"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+itoa = "1"
+ryu = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+
+[build-dependencies]
+cc = "1.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

@@ -382,14 +382,7 @@ class FeatherStore(BaseStore):
         want = op.limit + op.offset
         semantic = bool(op.query and self._embed is not None)
         if not semantic:
-            ids = (self._ids_under(op.namespace_prefix) if op.namespace_prefix
-                   else self.db.get_all_ids("text"))
-            # One read for every record (get_metadata_many): per id it was one
-            # request each over the Cloud API, N + 2 for about().
-            ids = list(ids)
-            cand = [(i, None, m) for i, m in zip(ids, self.db.get_metadata_many(ids))
-                    if m is not None]
-            return self._select(cand, op, semantic)[op.offset: op.offset + op.limit]
+            return self._listing(op, want)[op.offset: op.offset + op.limit]
 
         # Ranked WITHIN the prefix by the engine (an indexed namespace_prefix
         # filter). It used to rank everything and keep what was under the
@@ -409,6 +402,33 @@ class FeatherStore(BaseStore):
                 note_stale(self.db, (m for _, _, m in resolved[:want]))
                 return self._group(results[op.offset: op.offset + op.limit], op)
             k *= 4
+
+    def _listing(self, op: Any, want: int) -> list[Any]:
+        """A search with no query: the first `want` items under the prefix
+        (every namespace without one) that pass its filter, newest first.
+
+        Pages of the engine's (timestamp, id) index, two requests a page, and
+        stops at `want`: O(result). It read every id in scope (get_all_ids with
+        no prefix: the whole database) and every record's metadata, to return
+        `limit` of them. A value filter or skipped records (index records,
+        bookkeeping, expired items) read further, doubling the page."""
+        flat = NS_SEP.join(op.namespace_prefix)
+        out, before, page = [], None, max(want, 16)
+        while len(out) < want:
+            ids = list(self.db.newest(flat, page, prefix=True, before=before))
+            cand, cursor = [], before
+            for rid, meta in zip(ids, self.db.get_metadata_many(ids)):
+                if meta is None:              # removed since: nothing to show
+                    continue
+                cursor = (meta.timestamp, rid)
+                cand.append((rid, None, meta))
+            out.extend(self._select(cand, op, False))
+            # A short page is the end; a page the cursor cannot move past (all
+            # of it removed meanwhile) would repeat forever.
+            if len(ids) < page or cursor == before:
+                break
+            before, page = cursor, min(page * 2, 10_000)
+        return out
 
     def _resolve_index(self, hits) -> list:
         """(id, score, metadata) per hit, an index record's hit standing for
@@ -614,10 +634,12 @@ class FeatherStore(BaseStore):
         return _known_keys(self.db, NS_SEP.join(namespace))
 
     def count(self, namespace: tuple[str, ...], *, prefix: bool = False) -> int:
-        """How many live items. Cannot use the engine's namespace_size(), which
-        counts tombstones — forgotten records stay in the namespace index until
-        compaction, so it would report deleted memories as present."""
-        return len(self.scan(namespace, prefix=prefix))
+        """How many live items, counted by the engine (DB.count_live): one
+        request, only the number comes back. It read every record of the
+        namespace to count them. Not namespace_size(): that also counts index
+        records, bookkeeping and expired items, which are not items."""
+        return self.db.count_live(NS_SEP.join(namespace), prefix=prefix,
+                                  exclude_sources=list(DERIVED_KINDS))
 
     def newest(self, namespace: tuple[str, ...], limit: int = 10, *,
                key=None, prefix: bool = False, by_valid: bool = False) -> list[Any]:

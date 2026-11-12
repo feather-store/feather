@@ -141,7 +141,8 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
         count_tokens=None,
         workers: int = 1,
         reader: str = "single",
-        full_context: bool = False) -> dict:
+        full_context: bool = False,
+        evidence_position: str = "date") -> dict:
     """Execute the scenario and return aggregate metrics.
 
     Adaptive decay is engaged when scoring_time_weight is provided.
@@ -155,6 +156,11 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
 
     context_tokens: budget the context in tokens (count_tokens = the
     answer model's tokenizer, bench.tokens) instead of context_chars.
+
+    evidence_position: "date" (the system), or "first" / "middle" / "last":
+    the gold evidence sessions moved there in the context, everything else
+    unchanged (lme_context.render). Uses the gold labels: an experiment on
+    position, never a score.
 
     count_map: "retrieved" answers count and total questions by
     map-reduce (lme_answer.count_map_reduce): every retrieved session is
@@ -461,7 +467,9 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
                       {"max_chars": context_chars - len(preamble)})
             rendered = render(
                 hits, turns, unit=unit, max_sessions=max_sessions,
-                question_date=question_date, **budget)
+                question_date=question_date, **budget,
+                evidence=q.get("answer_session_ids") or (),
+                place=evidence_position)
             context = rendered.text
             retrieved_sids, context_sids = (rendered.retrieved,
                                             rendered.in_context)
@@ -639,6 +647,7 @@ def run(questions: list[dict], embedder: Embedder, judge: Judge,
         "context_chars": context_chars,
         "context_tokens": context_tokens,
         "full_context": full_context,
+        "evidence_position": evidence_position,
         "multi_round": "off" if full_context else multi_round,
         "count_map": count_map,
         "reader": reader,

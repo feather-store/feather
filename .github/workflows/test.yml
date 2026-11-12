@@ -116,7 +116,7 @@ jobs:
       # with CI passing, so on every version that supports it, assert the
       # protocol tests actually executed.
       run: |
-        out=$(pytest tests/test_mcp_protocol.py tests/test_mcp_personas.py -q 2>&1 | tail -3)
+        out=$(pytest tests/test_mcp_protocol.py tests/test_mcp_personas.py -q 2>&1 | tail -n 3)
         echo "$out"
         echo "$out" | grep -qE '[0-9]+ passed' || {
           echo "::error::MCP suite did not run on Python ${{ matrix.python-version }}"
@@ -131,3 +131,100 @@ jobs:
           python "$t.py"
           echo "::endgroup::"
         done
+
+  # Memory and thread safety of the C++ engine. The suite above checks that a
+  # corrupt file gives an error; these check that nothing on the way there
+  # reads out of bounds, overflows, races or does undefined arithmetic.
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    # High mmap ASLR entropy on current runner kernels breaks the sanitizer
+    # runtimes ("unexpected memory mapping").
+    - name: Allow sanitizer memory layout
+      run: sudo sysctl vm.mmap_rnd_bits=28
+    - name: Install build dependencies
+      run: pip install setuptools wheel pybind11 numpy pytest
+    - name: Build the extension with ASan + UBSan
+      env:
+        CC: gcc
+        CXX: g++
+        CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g -O1
+        LDFLAGS: -fsanitize=address,undefined
+      run: |
+        python setup.py build_ext --inplace
+        ldd feather_db/core*.so | grep -q libasan || { echo "::error::extension is not built with ASan"; exit 1; }
+    # The tests that load, replay, rewrite and corrupt files (the corruption
+    # probes run in children that inherit the sanitizer through LD_PRELOAD).
+    # abort_on_error: a report kills the process, which the probes count as a
+    # crash; exiting 1 would read as an ordinary refusal.
+    - name: File, WAL and engine tests under ASan + UBSan
+      env:
+        ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:allocator_may_return_null=1
+        UBSAN_OPTIONS: halt_on_error=1:abort_on_error=1:print_stacktrace=1
+        FEATHER_FUZZ_CASES: '200'
+      run: |
+        export LD_PRELOAD="$(gcc -print-file-name=libasan.so):$(gcc -print-file-name=libubsan.so)"
+        pytest -q -p no:cacheprovider tests/test_core.py tests/test_corrupt_files.py \
+          tests/test_format_v10.py tests/test_wal_and_lock_edges.py tests/test_wal_durability.py \
+          tests/test_wal_recovery.py tests/test_time_index_and_replay.py tests/test_time_travel.py \
+          tests/test_erase.py tests/test_versions_batches.py tests/test_open_failure_safety.py \
+          tests/test_mmap_readers.py tests/test_int8_refine.py tests/test_native_keys.py \
+          tests/test_deleted_graph.py
+    - name: Engine under ThreadSanitizer
+      env:
+        TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 suppressions=tests/cpp/tsan.supp
+        STRESS_SECONDS: '20'
+      run: |
+        g++ -std=c++17 -O1 -g -fsanitize=thread -Iinclude tests/cpp/lock_stress.cpp -o lock_stress -lpthread
+        g++ -std=c++17 -O1 -g -fsanitize=thread -Iinclude tests/cpp/engine_stress.cpp \
+          src/metadata.cpp src/filter.cpp src/scoring.cpp -o engine_stress -lpthread
+        ./lock_stress
+        ./engine_stress
+
+  # libFuzzer on the two parsers that read bytes off disk, seeded with every
+  # file kind and WAL op the seeded corruption fuzz builds. Coverage-guided,
+  # so it reaches what single-byte corruptions do not; a new random seed
+  # each run. A crash uploads the input that reproduces it.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install build dependencies
+      run: |
+        pip install setuptools wheel pybind11 numpy pytest
+        sudo apt-get install -y -qq clang libclang-rt-dev
+    - name: Seed corpus
+      run: |
+        python setup.py build_ext --inplace
+        python tests/fuzz/make_corpus.py fuzz-corpus
+    - name: Build fuzz targets
+      run: |
+        for t in file wal; do
+          clang++ -std=c++17 -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -Iinclude \
+            tests/fuzz/fuzz_$t.cpp src/metadata.cpp src/filter.cpp src/scoring.cpp -o fuzz_$t -lpthread
+        done
+    - name: Fuzz the file loader and WAL replay (5 min each, in parallel)
+      run: |
+        mkdir -p fuzz-artifacts
+        opts="-max_total_time=300 -timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=1024 -print_final_stats=1"
+        ./fuzz_file fuzz-corpus/file tests/fuzz/crashes/file $opts -artifact_prefix=fuzz-artifacts/file- > fuzz_file.log 2>&1 & a=$!
+        FEATHER_FUZZ_BASE=fuzz-corpus/base.feather \
+          ./fuzz_wal fuzz-corpus/wal $opts -artifact_prefix=fuzz-artifacts/wal- > fuzz_wal.log 2>&1 & b=$!
+        s=0; wait $a || s=1; wait $b || s=1
+        tail -n 40 fuzz_file.log fuzz_wal.log
+        exit $s
+    - uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: fuzz-crashes
+        path: |
+          fuzz-artifacts/
+          fuzz-corpus/base.feather

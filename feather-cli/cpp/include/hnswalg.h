@@ -504,8 +504,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    inline labeltype *getExternalLabeLp(tableint internal_id) const {
-        return (labeltype *) (data_level0_memory_ + internal_id * size_data_per_element_ + label_offset_);
+    // A raw address, not a labeltype*: the label sits after the level-0 links
+    // (byte 4 + 4*maxM0, 132 at M=16), so it is not 8-byte aligned, and even
+    // forming a misaligned labeltype* is undefined behaviour (UBSan
+    // -fsanitize=alignment, found by tests/fuzz). Read and write it with memcpy.
+    inline char *getExternalLabeLp(tableint internal_id) const {
+        return data_level0_memory_ + internal_id * size_data_per_element_ + label_offset_;
     }
 
 
@@ -573,16 +577,23 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
             size_t size = getListCount((linklistsizeint*)data);
             tableint *datal = (tableint *) (data + 1);
-            FEATHER_PREFETCH((char *) (visited_array + *(data + 1)));
-            FEATHER_PREFETCH((char *) (visited_array + *(data + 1) + 64));
-            FEATHER_PREFETCH(getDataByInternalId(*datal));
-            FEATHER_PREFETCH(getDataByInternalId(*(datal + 1)));
+            // Prefetches read only entries the list holds: one past the last
+            // is past the allocation for an upper layer's list (ASan, found
+            // by tests/fuzz on a loaded file whose list was full).
+            if (size > 0) {
+                FEATHER_PREFETCH((char *) (visited_array + *(data + 1)));
+                FEATHER_PREFETCH((char *) (visited_array + *(data + 1) + 64));
+                FEATHER_PREFETCH(getDataByInternalId(*datal));
+            }
+            if (size > 1) FEATHER_PREFETCH(getDataByInternalId(*(datal + 1)));
 
             for (size_t j = 0; j < size; j++) {
                 tableint candidate_id = *(datal + j);
 //                    if (candidate_id == 0) continue;
-                FEATHER_PREFETCH((char *) (visited_array + *(datal + j + 1)));
-                FEATHER_PREFETCH(getDataByInternalId(*(datal + j + 1)));
+                if (j + 1 < size) {
+                    FEATHER_PREFETCH((char *) (visited_array + *(datal + j + 1)));
+                    FEATHER_PREFETCH(getDataByInternalId(*(datal + j + 1)));
+                }
                 if (visited_array[candidate_id] == visited_array_tag) continue;
                 visited_array[candidate_id] = visited_array_tag;
                 char *currObj1 = (getDataByInternalId(candidate_id));
@@ -671,16 +682,20 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 metric_distance_computations+=size;
             }
 
-            FEATHER_PREFETCH((char *) (visited_array + *(data + 1)));
-            FEATHER_PREFETCH((char *) (visited_array + *(data + 1) + 64));
-            FEATHER_PREFETCH(getDataByInternalId(*(data + 1)));
-            FEATHER_PREFETCH((char *) (data + 2));
+            if (size > 0) {
+                FEATHER_PREFETCH((char *) (visited_array + *(data + 1)));
+                FEATHER_PREFETCH((char *) (visited_array + *(data + 1) + 64));
+                FEATHER_PREFETCH(getDataByInternalId(*(data + 1)));
+                FEATHER_PREFETCH((char *) (data + 2));
+            }
 
             for (size_t j = 1; j <= size; j++) {
                 int candidate_id = *(data + j);
 //                    if (candidate_id == 0) continue;
-                FEATHER_PREFETCH((char *) (visited_array + *(data + j + 1)));
-                FEATHER_PREFETCH(getDataByInternalId(*(data + j + 1)));
+                if (j < size) {
+                    FEATHER_PREFETCH((char *) (visited_array + *(data + j + 1)));
+                    FEATHER_PREFETCH(getDataByInternalId(*(data + j + 1)));
+                }
                 if (!(visited_array[candidate_id] == visited_array_tag)) {
                     visited_array[candidate_id] = visited_array_tag;
 
@@ -1402,9 +1417,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     data = get_linklist_at_level(currObj, level);
                     int size = getListCount(data);
                     tableint *datal = (tableint *) (data + 1);
-                    FEATHER_PREFETCH(getDataByInternalId(*datal));
+                    if (size > 0) FEATHER_PREFETCH(getDataByInternalId(*datal));
                     for (int i = 0; i < size; i++) {
-                        FEATHER_PREFETCH(getDataByInternalId(*(datal + i + 1)));
+                        if (i + 1 < size) FEATHER_PREFETCH(getDataByInternalId(*(datal + i + 1)));
                         tableint cand = datal[i];
                         dist_t d = fstdistfunc_(dataPoint, getDataByInternalId(cand), dist_func_param_);
                         if (d < curdist) {
@@ -1454,7 +1469,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         int size = getListCount(data);
         std::vector<tableint> result(size);
         tableint *ll = (tableint *) (data + 1);
-        memcpy(result.data(), ll, size * sizeof(tableint));
+        // An empty list is valid, and an empty vector's data() may be null:
+        // memcpy(nullptr, _, 0) is undefined behaviour (UBSan, tests/fuzz).
+        if (size) memcpy(result.data(), ll, size * sizeof(tableint));
         return result;
     }
 
