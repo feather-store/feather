@@ -52,8 +52,80 @@
 #include <optional>
 #include <set>
 #include <random>
+#if defined(__ARM_FEATURE_CRC32)
+#  include <arm_acle.h>
+#endif
 
 namespace feather {
+
+// ── CRC-32 of WAL records ──────────────────────────────────────────────
+// IEEE CRC-32 (reflected polynomial 0xEDB88320, zlib's), however computed:
+// every path gives the same value, so a WAL written on one machine replays
+// on any other. One table lookup per byte cost 8.1 us per 768-d put record
+// (3 KB), computed while the write holds the exclusive lock, and again for
+// every record replayed on open. Where the compiler targets ARM's CRC32
+// instructions (Apple silicon by default; FEATHER_SIMD=native on most arm64)
+// they compute this polynomial: 0.36 us per record on an M1. Elsewhere,
+// slicing-by-8. x86's crc32 instruction is CRC-32C, a different polynomial:
+// using it would be a WAL format change.
+namespace crc32 {
+
+// Slicing-by-8: eight lookups per 8 bytes, no instruction needed. The 8-byte
+// step reads two little-endian words (every Feather file is little-endian);
+// on a big-endian host only the bytewise tail loop runs.
+inline uint32_t sliced(const void* data, size_t len, uint32_t crc) {
+    static const auto T = [] {
+        std::array<std::array<uint32_t, 256>, 8> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            t[0][i] = c;
+        }
+        for (uint32_t i = 0; i < 256; ++i)
+            for (int s = 1; s < 8; ++s) t[s][i] = (t[s - 1][i] >> 8) ^ t[0][t[s - 1][i] & 0xFFu];
+        return t;
+    }();
+    const auto* p = static_cast<const uint8_t*>(data);
+#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    for (; len >= 8; p += 8, len -= 8) {
+        uint32_t lo, hi;
+        std::memcpy(&lo, p, 4);
+        std::memcpy(&hi, p + 4, 4);
+        lo ^= crc;
+        crc = T[7][lo & 0xFFu] ^ T[6][(lo >> 8) & 0xFFu] ^ T[5][(lo >> 16) & 0xFFu] ^ T[4][lo >> 24] ^
+              T[3][hi & 0xFFu] ^ T[2][(hi >> 8) & 0xFFu] ^ T[1][(hi >> 16) & 0xFFu] ^ T[0][hi >> 24];
+    }
+#endif
+    for (; len; ++p, --len) crc = T[0][(crc ^ *p) & 0xFFu] ^ (crc >> 8);
+    return crc;
+}
+
+inline bool hardware() {
+#if defined(__ARM_FEATURE_CRC32)
+    return true;
+#else
+    return false;
+#endif
+}
+
+// Continue `crc` over data[0, len): pass 0xFFFFFFFF first and xor the result
+// with 0xFFFFFFFF, as zlib.crc32 does.
+inline uint32_t update(const void* data, size_t len, uint32_t crc) {
+#if defined(__ARM_FEATURE_CRC32)
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (; len >= 8; p += 8, len -= 8) {
+        uint64_t v;
+        std::memcpy(&v, p, 8);
+        crc = __crc32d(crc, v);
+    }
+    for (; len; ++p, --len) crc = __crc32b(crc, *p);
+    return crc;
+#else
+    return sliced(data, len, crc);
+#endif
+}
+
+}  // namespace crc32
 
 // ── Phase-fair readers-writer lock ─────────────────────────────────────
 // libstdc++'s std::shared_mutex is glibc's pthread_rwlock with default
@@ -1132,6 +1204,16 @@ private:
     // how many vectors were actually stored). We now start at INITIAL_MAX and
     // double as needed, so RAM tracks the real working set, not the worst case.
     static constexpr size_t INITIAL_MAX_ELEMENTS = 4096;
+    // ...but never more than INITIAL_RESERVE_BYTES of vectors up front: a new
+    // index's first allocation is capacity x dim x 4 bytes, and a dim read off
+    // a corrupt file (bounded only at 2^20) made that 16 GB before a single
+    // vector was read (found by tests/fuzz). At every real dim (<= 4096) this
+    // is still 4096 slots; past it the index starts smaller and doubles.
+    static constexpr size_t INITIAL_RESERVE_BYTES = size_t{64} << 20;
+    static size_t initial_capacity(size_t dim) {
+        const size_t per = std::max<size_t>(dim, 1) * sizeof(float);
+        return std::max<size_t>(16, std::min(INITIAL_MAX_ELEMENTS, INITIAL_RESERVE_BYTES / per));
+    }
     // set_int8_ram's default re-rank factor: candidates fetched per result.
     static constexpr uint32_t DEFAULT_INT8_REFINE = 2;
 
@@ -1168,7 +1250,7 @@ private:
         std::unique_ptr<hnswlib::SpaceInterface<float>> space;
         if (int8) space = std::make_unique<hnswlib::Int8L2Space>(dim, scale);
         else      space = std::make_unique<hnswlib::L2Space>(dim);
-        auto index = make_hnsw(space.get(), INITIAL_MAX_ELEMENTS, M, ef_construction);
+        auto index = make_hnsw(space.get(), initial_capacity(dim), M, ef_construction);
         auto& slot = modality_indices_[modality];
         const uint64_t epoch = slot.epoch + 1;
         slot = {std::move(index), std::move(space), dim, int8, scale};
@@ -2710,20 +2792,7 @@ private:
     // into the next checkpoint as if it were real. The checksum turns silent
     // corruption into a clean stop at the last known-good record.
     static uint32_t crc32_of(const void* data, size_t len, uint32_t crc = 0xFFFFFFFFu) {
-        static const auto table = [] {
-            std::array<uint32_t, 256> t{};
-            for (uint32_t i = 0; i < 256; ++i) {
-                uint32_t c = i;
-                for (int k = 0; k < 8; ++k)
-                    c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-                t[i] = c;
-            }
-            return t;
-        }();
-        const auto* p = static_cast<const uint8_t*>(data);
-        for (size_t i = 0; i < len; ++i)
-            crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-        return crc;
+        return crc32::update(data, len, crc);      // feather::crc32, above
     }
 
     // The WAL handle is held open for the life of the DB. Reopening the file for
@@ -7178,6 +7247,38 @@ public:
         ensure_open();
         auto it = ns_index_.find(ns);
         return it == ns_index_.end() ? 0 : it->second.size();
+    }
+
+    // Live records in `ns` (with `prefix`, under it too; "" = every
+    // namespace), leaving out records whose source is in `exclude_sources`
+    // and records whose ttl has run out at this handle's clock. A store's
+    // "how many items" in one call, where it read every record to count them
+    // (FeatherStore.count: index records and bookkeeping are sources to
+    // exclude). Walks the namespace's records in memory; only the count
+    // leaves the engine.
+    size_t count_live(const std::string& ns, bool prefix = false,
+                      const std::vector<std::string>& exclude_sources = {}) const {
+        std::shared_lock<RWMutex> lock(mutex_);
+        ensure_open();
+        const double now = clock_now();
+        size_t n = 0;
+        auto count = [&](const std::string& name) {
+            auto it = ns_index_.find(name);
+            if (it == ns_index_.end()) return;
+            for (uint64_t id : it->second) {
+                auto m = metadata_store_.find(id);
+                if (m == metadata_store_.end() || is_dead_meta(m->second)) continue;
+                const Metadata& md = m->second;
+                if (md.ttl > 0 && now > static_cast<double>(md.timestamp + md.ttl)) continue;
+                if (std::find(exclude_sources.begin(), exclude_sources.end(), md.source)
+                        != exclude_sources.end()) continue;
+                ++n;
+            }
+        };
+        if (!prefix) count(ns);
+        else if (!ns.empty()) for_each_ns_under(ns, count);
+        else for (const auto& entry : ns_index_) count(entry.first);
+        return n;
     }
 
     std::vector<std::string> list_namespaces() const {

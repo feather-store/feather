@@ -205,20 +205,29 @@ inline float l2_avx512(const float* a, const float* b, size_t n) {
 #endif
 
 #if defined(FEATHER_SIMD_NEON)
+// Four independent accumulators. Each FMA feeds the next FMA on the same
+// accumulator, so with two the loop waited on FMA latency instead of
+// issuing: 768-d, Apple M1, 94 -> 62 ns per distance in cache, 90 -> 66 ns
+// from memory. Eight measured no better. (A different summation order than
+// before: distances move in the last bits.)
 inline float l2_neon(const float* a, const float* b, size_t n) {
-    float32x4_t s0 = vdupq_n_f32(0.0f), s1 = vdupq_n_f32(0.0f);
+    float32x4_t s0 = vdupq_n_f32(0.0f), s1 = s0, s2 = s0, s3 = s0;
     size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        float32x4_t d0 = vsubq_f32(vld1q_f32(a + i),     vld1q_f32(b + i));
-        float32x4_t d1 = vsubq_f32(vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+    for (; i + 16 <= n; i += 16) {
+        float32x4_t d0 = vsubq_f32(vld1q_f32(a + i),      vld1q_f32(b + i));
+        float32x4_t d1 = vsubq_f32(vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
+        float32x4_t d2 = vsubq_f32(vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
+        float32x4_t d3 = vsubq_f32(vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
         s0 = vfmaq_f32(s0, d0, d0);
         s1 = vfmaq_f32(s1, d1, d1);
+        s2 = vfmaq_f32(s2, d2, d2);
+        s3 = vfmaq_f32(s3, d3, d3);
     }
     for (; i + 4 <= n; i += 4) {
         float32x4_t d = vsubq_f32(vld1q_f32(a + i), vld1q_f32(b + i));
         s0 = vfmaq_f32(s0, d, d);
     }
-    return vaddvq_f32(vaddq_f32(s0, s1)) + l2_scalar(a + i, b + i, n - i);
+    return vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3))) + l2_scalar(a + i, b + i, n - i);
 }
 #endif
 
@@ -293,22 +302,29 @@ inline int64_t i8_l2_avx2(const int8_t* a, const int8_t* b, size_t n) {
 #endif
 
 #if defined(FEATHER_SIMD_NEON)
+// One accumulator per multiply-accumulate. The four vmlal of a step used to
+// chain through one accumulator, each waiting for the last, which made this
+// kernel no faster than float: 768-d, Apple M1, 96 -> 30 ns per distance
+// (it is the graph walk of every in-RAM int8 modality: agent files by
+// default). Exact either way. Overflow: within a block a lane of one
+// accumulator takes 512 squares <= 255^2, the four together 4 x 512, and
+// vaddvq adds 4 lanes: 16 x 512 x 65025 < 2^31, as before.
 inline int64_t i8_l2_neon(const int8_t* a, const int8_t* b, size_t n) {
     int64_t total = 0;
     size_t i = 0;
     while (i + 16 <= n) {
         const size_t block_end = (n - i > 8192) ? i + 8192 : n;
-        int32x4_t acc = vdupq_n_s32(0);
+        int32x4_t a0 = vdupq_n_s32(0), a1 = a0, a2 = a0, a3 = a0;
         for (; i + 16 <= block_end; i += 16) {
             int8x16_t va = vld1q_s8(a + i), vb = vld1q_s8(b + i);
-            int16x8_t dlo = vsubl_s8(vget_low_s8(va),  vget_low_s8(vb));
-            int16x8_t dhi = vsubl_s8(vget_high_s8(va), vget_high_s8(vb));
-            acc = vmlal_s16(acc, vget_low_s16(dlo),  vget_low_s16(dlo));
-            acc = vmlal_s16(acc, vget_high_s16(dlo), vget_high_s16(dlo));
-            acc = vmlal_s16(acc, vget_low_s16(dhi),  vget_low_s16(dhi));
-            acc = vmlal_s16(acc, vget_high_s16(dhi), vget_high_s16(dhi));
+            int16x8_t dlo = vsubl_s8(vget_low_s8(va), vget_low_s8(vb));
+            int16x8_t dhi = vsubl_high_s8(va, vb);
+            a0 = vmlal_s16(a0, vget_low_s16(dlo), vget_low_s16(dlo));
+            a1 = vmlal_high_s16(a1, dlo, dlo);
+            a2 = vmlal_s16(a2, vget_low_s16(dhi), vget_low_s16(dhi));
+            a3 = vmlal_high_s16(a3, dhi, dhi);
         }
-        total += static_cast<int64_t>(vaddvq_s32(acc));
+        total += static_cast<int64_t>(vaddvq_s32(vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(a2, a3))));
         if (block_end == n) break;
     }
     return total + i8_l2_scalar(a + i, b + i, n - i);
@@ -349,19 +365,32 @@ inline float l2_f32_i8_avx2(const float* q, const int8_t* v, float scale, size_t
 #endif
 
 #if defined(FEATHER_SIMD_NEON)
+// Four accumulators, 16 values a step (one accumulator chained every FMA):
+// 768-d, Apple M1, 208 -> 86 ns per distance. Distances move in the last bits.
 inline float l2_f32_i8_neon(const float* q, const int8_t* v, float scale, size_t n) {
-    float32x4_t acc = vdupq_n_f32(0.0f);
+    float32x4_t s0 = vdupq_n_f32(0.0f), s1 = s0, s2 = s0, s3 = s0;
     size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        int8x16_t b = vld1q_s8(v + i);
+        int16x8_t wl = vmovl_s8(vget_low_s8(b)), wh = vmovl_high_s8(b);
+        float32x4_t d0 = vsubq_f32(vld1q_f32(q + i),      vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(wl))), scale));
+        float32x4_t d1 = vsubq_f32(vld1q_f32(q + i + 4),  vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(wl)), scale));
+        float32x4_t d2 = vsubq_f32(vld1q_f32(q + i + 8),  vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(wh))), scale));
+        float32x4_t d3 = vsubq_f32(vld1q_f32(q + i + 12), vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(wh)), scale));
+        s0 = vfmaq_f32(s0, d0, d0);
+        s1 = vfmaq_f32(s1, d1, d1);
+        s2 = vfmaq_f32(s2, d2, d2);
+        s3 = vfmaq_f32(s3, d3, d3);
+    }
     for (; i + 8 <= n; i += 8) {
         int16x8_t w = vmovl_s8(vld1_s8(v + i));
-        float32x4_t f0 = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))), scale);
-        float32x4_t f1 = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(w))), scale);
-        float32x4_t d0 = vsubq_f32(vld1q_f32(q + i), f0);
-        float32x4_t d1 = vsubq_f32(vld1q_f32(q + i + 4), f1);
-        acc = vfmaq_f32(acc, d0, d0);
-        acc = vfmaq_f32(acc, d1, d1);
+        float32x4_t d0 = vsubq_f32(vld1q_f32(q + i),     vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))), scale));
+        float32x4_t d1 = vsubq_f32(vld1q_f32(q + i + 4), vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(w)), scale));
+        s0 = vfmaq_f32(s0, d0, d0);
+        s1 = vfmaq_f32(s1, d1, d1);
     }
-    return vaddvq_f32(acc) + l2_f32_i8_scalar(q + i, v + i, scale, n - i);
+    return vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3))) +
+           l2_f32_i8_scalar(q + i, v + i, scale, n - i);
 }
 #endif
 
