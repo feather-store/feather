@@ -1,0 +1,498 @@
+{
+ "meta": {
+  "n": 20000,
+  "dim": 768,
+  "duration_s": 8.0,
+  "conns": 64,
+  "route": "agent_turn",
+  "episodes": 2000,
+  "requests_per_turn": 18,
+  "machine": "Darwin arm64, 8 cpus",
+  "python": "3.12.15",
+  "feather_db": "0.21.0",
+  "when": "2026-11-10 13:58:47"
+ },
+ "rows": [
+  {
+   "achieved_rate": 247.06803971229604,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 50195,
+    "mean": 3897.0,
+    "p50": 1350,
+    "p90": 11961,
+    "p99": 28311,
+    "p999": 46257
+   },
+   "ok": 2000,
+   "scheduled": 2000,
+   "service_us": {
+    "max": 49170,
+    "mean": 3236.0,
+    "p50": 605,
+    "p90": 11222,
+    "p99": 27588,
+    "p999": 45335
+   },
+   "statuses": {
+    "200": 1889,
+    "404": 111
+   },
+   "target_rate": 250.0,
+   "url": "http://127.0.0.1:55592/",
+   "wall_s": 8.094936125,
+   "server": "python",
+   "route": "agent_turn",
+   "cpu_s": 3.087,
+   "cpu_ms_per_req": 1.5437,
+   "cpu_cores": 0.362,
+   "round": 0
+  },
+  {
+   "achieved_rate": 494.4064247620491,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 175497,
+    "mean": 11646.0,
+    "p50": 3388,
+    "p90": 30186,
+    "p99": 120093,
+    "p999": 157767
+   },
+   "ok": 4000,
+   "scheduled": 4000,
+   "service_us": {
+    "max": 172323,
+    "mean": 11213.0,
+    "p50": 3112,
+    "p90": 29240,
+    "p99": 114495,
+    "p999": 156376
+   },
+   "statuses": {
+    "200": 3710,
+    "404": 290
+   },
+   "target_rate": 500.0,
+   "url": "http://127.0.0.1:55592/",
+   "wall_s": 8.09050975,
+   "server": "python",
+   "route": "agent_turn",
+   "cpu_s": 5.475,
+   "cpu_ms_per_req": 1.3688,
+   "cpu_cores": 0.643,
+   "round": 0
+  },
+  {
+   "achieved_rate": 918.618804119755,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 688379,
+    "mean": 282359.0,
+    "p50": 207234,
+    "p90": 573757,
+    "p99": 649908,
+    "p999": 674986
+   },
+   "ok": 8000,
+   "scheduled": 8000,
+   "service_us": {
+    "max": 195001,
+    "mean": 68432.0,
+    "p50": 65956,
+    "p90": 92259,
+    "p99": 128229,
+    "p999": 163498
+   },
+   "statuses": {
+    "200": 7520,
+    "404": 480
+   },
+   "target_rate": 1000.0,
+   "url": "http://127.0.0.1:55592/",
+   "wall_s": 8.708726584,
+   "server": "python",
+   "route": "agent_turn",
+   "cpu_s": 9.655,
+   "cpu_ms_per_req": 1.2069,
+   "cpu_cores": 1.06,
+   "round": 0
+  },
+  {
+   "achieved_rate": 853.2750249020689,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 6001518,
+    "mean": 3314092.0,
+    "p50": 3648303,
+    "p90": 5489291,
+    "p99": 5958737,
+    "p999": 5993292
+   },
+   "ok": 12000,
+   "scheduled": 12000,
+   "service_us": {
+    "max": 295901,
+    "mean": 74298.0,
+    "p50": 68642,
+    "p90": 102580,
+    "p99": 179251,
+    "p999": 279093
+   },
+   "statuses": {
+    "200": 11312,
+    "404": 688
+   },
+   "target_rate": 1500.0,
+   "url": "http://127.0.0.1:55592/",
+   "wall_s": 14.063460959,
+   "server": "python",
+   "route": "agent_turn",
+   "cpu_s": 15.44,
+   "cpu_ms_per_req": 1.2867,
+   "cpu_cores": 1.068,
+   "round": 0
+  },
+  {
+   "achieved_rate": 246.48053904431205,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 79991,
+    "mean": 2389.0,
+    "p50": 1073,
+    "p90": 4461,
+    "p99": 25907,
+    "p999": 71976
+   },
+   "ok": 2000,
+   "scheduled": 2000,
+   "service_us": {
+    "max": 77761,
+    "mean": 1358.0,
+    "p50": 320,
+    "p90": 3310,
+    "p99": 13100,
+    "p999": 64567
+   },
+   "statuses": {
+    "200": 1889,
+    "404": 111
+   },
+   "target_rate": 250.0,
+   "url": "http://127.0.0.1:55944/",
+   "wall_s": 8.114230875,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 1.164,
+   "cpu_ms_per_req": 0.5818,
+   "cpu_cores": 0.136,
+   "round": 0
+  },
+  {
+   "achieved_rate": 491.4375655349578,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 48367,
+    "mean": 1196.0,
+    "p50": 568,
+    "p90": 2140,
+    "p99": 9329,
+    "p999": 40975
+   },
+   "ok": 4000,
+   "scheduled": 4000,
+   "service_us": {
+    "max": 28827,
+    "mean": 673.0,
+    "p50": 231,
+    "p90": 1520,
+    "p99": 5398,
+    "p999": 19907
+   },
+   "statuses": {
+    "200": 3694,
+    "404": 306
+   },
+   "target_rate": 500.0,
+   "url": "http://127.0.0.1:55944/",
+   "wall_s": 8.139385917,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 1.556,
+   "cpu_ms_per_req": 0.3889,
+   "cpu_cores": 0.176,
+   "round": 0
+  },
+  {
+   "achieved_rate": 990.888158994643,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 67754,
+    "mean": 1141.0,
+    "p50": 310,
+    "p90": 1860,
+    "p99": 18893,
+    "p999": 56794
+   },
+   "ok": 8000,
+   "scheduled": 8000,
+   "service_us": {
+    "max": 63695,
+    "mean": 766.0,
+    "p50": 181,
+    "p90": 1584,
+    "p99": 5502,
+    "p999": 56641
+   },
+   "statuses": {
+    "200": 7334,
+    "404": 666
+   },
+   "target_rate": 1000.0,
+   "url": "http://127.0.0.1:55944/",
+   "wall_s": 8.073565041,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 2.368,
+   "cpu_ms_per_req": 0.2959,
+   "cpu_cores": 0.278,
+   "round": 0
+  },
+  {
+   "achieved_rate": 1483.6985652870287,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 42730,
+    "mean": 1242.0,
+    "p50": 204,
+    "p90": 2830,
+    "p99": 18795,
+    "p999": 37960
+   },
+   "ok": 12000,
+   "scheduled": 12000,
+   "service_us": {
+    "max": 42724,
+    "mean": 983.0,
+    "p50": 147,
+    "p90": 2617,
+    "p99": 12073,
+    "p999": 33593
+   },
+   "statuses": {
+    "200": 11113,
+    "404": 887
+   },
+   "target_rate": 1500.0,
+   "url": "http://127.0.0.1:55944/",
+   "wall_s": 8.087896208,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 3.348,
+   "cpu_ms_per_req": 0.279,
+   "cpu_cores": 0.391,
+   "round": 0
+  },
+  {
+   "achieved_rate": 1972.8743748802815,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 190771,
+    "mean": 4340.0,
+    "p50": 145,
+    "p90": 2718,
+    "p99": 139803,
+    "p999": 179958
+   },
+   "ok": 16000,
+   "scheduled": 16000,
+   "service_us": {
+    "max": 142296,
+    "mean": 1346.0,
+    "p50": 126,
+    "p90": 2589,
+    "p99": 19932,
+    "p999": 80660
+   },
+   "statuses": {
+    "200": 14888,
+    "404": 1112
+   },
+   "target_rate": 2000.0,
+   "url": "http://127.0.0.1:55944/",
+   "wall_s": 8.109994333,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 3.929,
+   "cpu_ms_per_req": 0.2456,
+   "cpu_cores": 0.462,
+   "round": 0
+  },
+  {
+   "achieved_rate": 2957.4915728828464,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 85796,
+    "mean": 1285.0,
+    "p50": 177,
+    "p90": 2416,
+    "p99": 20186,
+    "p999": 53905
+   },
+   "ok": 24000,
+   "scheduled": 24000,
+   "service_us": {
+    "max": 56393,
+    "mean": 1031.0,
+    "p50": 153,
+    "p90": 2353,
+    "p99": 11197,
+    "p999": 39011
+   },
+   "statuses": {
+    "200": 22222,
+    "404": 1778
+   },
+   "target_rate": 3000.0,
+   "url": "http://127.0.0.1:55944/",
+   "wall_s": 8.114985084,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 5.274,
+   "cpu_ms_per_req": 0.2197,
+   "cpu_cores": 0.617,
+   "round": 0
+  },
+  {
+   "achieved_rate": 3950.2864679418944,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 357097,
+    "mean": 12374.0,
+    "p50": 1302,
+    "p90": 25943,
+    "p99": 152367,
+    "p999": 302495
+   },
+   "ok": 32000,
+   "scheduled": 32000,
+   "service_us": {
+    "max": 257649,
+    "mean": 3384.0,
+    "p50": 1216,
+    "p90": 5669,
+    "p99": 40015,
+    "p999": 177830
+   },
+   "statuses": {
+    "200": 29789,
+    "404": 2211
+   },
+   "target_rate": 4000.0,
+   "url": "http://127.0.0.1:55944/",
+   "wall_s": 8.100678333,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 8.369,
+   "cpu_ms_per_req": 0.2615,
+   "cpu_cores": 0.959,
+   "round": 0
+  },
+  {
+   "achieved_rate": 5858.125744673503,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 268208,
+    "mean": 12726.0,
+    "p50": 1265,
+    "p90": 57738,
+    "p99": 141008,
+    "p999": 207899
+   },
+   "ok": 48000,
+   "scheduled": 48000,
+   "service_us": {
+    "max": 202620,
+    "mean": 3606.0,
+    "p50": 1219,
+    "p90": 3534,
+    "p99": 127816,
+    "p999": 166115
+   },
+   "statuses": {
+    "200": 44445,
+    "404": 3555
+   },
+   "target_rate": 6000.0,
+   "url": "http://127.0.0.1:55944/",
+   "wall_s": 8.193746958,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 10.865,
+   "cpu_ms_per_req": 0.2264,
+   "cpu_cores": 1.254,
+   "round": 0
+  },
+  {
+   "achieved_rate": 6279.299950651629,
+   "conns": 64,
+   "duration_s": 8.0,
+   "errors": 0,
+   "latency_us": {
+    "max": 3243532,
+    "mean": 1331495.0,
+    "p50": 1043616,
+    "p90": 2831403,
+    "p99": 3084624,
+    "p999": 3143209
+   },
+   "ok": 64000,
+   "scheduled": 64000,
+   "service_us": {
+    "max": 384042,
+    "mean": 9913.0,
+    "p50": 2523,
+    "p90": 6109,
+    "p99": 202444,
+    "p999": 285173
+   },
+   "statuses": {
+    "200": 59556,
+    "404": 4444
+   },
+   "target_rate": 8000.0,
+   "url": "http://127.0.0.1:55944/",
+   "wall_s": 10.192218958,
+   "server": "rust",
+   "route": "agent_turn",
+   "cpu_s": 16.555,
+   "cpu_ms_per_req": 0.2587,
+   "cpu_cores": 1.554,
+   "round": 0
+  }
+ ]
+}

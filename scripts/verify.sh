@@ -151,5 +151,22 @@ if $PY benchmarks/perf_gate.py >/tmp/_perf.log 2>&1; then
   ok "$(tail -1 /tmp/_perf.log)"
 else bad "performance regressed"; grep FAIL /tmp/_perf.log; fi
 
+hdr "11. feather-server answers like feather-api (routes, and a whole agent session)"
+# A namespace is served by one process: one moved to the Rust server must
+# answer every route its agents send, the same way. A new route in the agent
+# layer that feather-server lacks is an agent that gets 501s there.
+if ! command -v cargo >/dev/null 2>&1; then
+  skp "feather-server (cargo not installed)"
+elif ! (cd feather-server && cargo build --release -q) >/tmp/_fs_build.log 2>&1; then
+  bad "feather-server does not build"; tail -5 /tmp/_fs_build.log
+else
+  if $PY feather-server/tests/parity.py >/tmp/_fs_parity.log 2>&1; then
+    ok "$(tail -1 /tmp/_fs_parity.log)"
+  else bad "parity: $(tail -1 /tmp/_fs_parity.log)"; grep -A3 '^DIFF' /tmp/_fs_parity.log | head -20; fi
+  if $PY feather-server/tests/agent_session.py >/tmp/_fs_agent.log 2>&1; then
+    ok "$(tail -1 /tmp/_fs_agent.log) ($(grep -m1 'requests over' /tmp/_fs_agent.log | sed 's/:$//'))"
+  else bad "agent session on feather-server"; grep -E '^(FAIL|DIFF)' /tmp/_fs_agent.log | head -10; fi
+fi
+
 printf "\n\033[1m%d passed, %d failed, %d skipped\033[0m\n" "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ] || exit 1
