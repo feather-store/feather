@@ -219,7 +219,7 @@ jobs:
         FEATHER_FUZZ_BASE=fuzz-corpus/base.feather \
           ./fuzz_wal fuzz-corpus/wal $opts -artifact_prefix=fuzz-artifacts/wal- > fuzz_wal.log 2>&1 & b=$!
         s=0; wait $a || s=1; wait $b || s=1
-        tail -40 fuzz_file.log fuzz_wal.log
+        tail -n 40 fuzz_file.log fuzz_wal.log
         exit $s
     - uses: actions/upload-artifact@v4
       if: failure()
