@@ -116,7 +116,7 @@ jobs:
       # with CI passing, so on every version that supports it, assert the
       # protocol tests actually executed.
       run: |
-        out=$(pytest tests/test_mcp_protocol.py tests/test_mcp_personas.py -q 2>&1 | tail -3)
+        out=$(pytest tests/test_mcp_protocol.py tests/test_mcp_personas.py -q 2>&1 | tail -n 3)
         echo "$out"
         echo "$out" | grep -qE '[0-9]+ passed' || {
           echo "::error::MCP suite did not run on Python ${{ matrix.python-version }}"
