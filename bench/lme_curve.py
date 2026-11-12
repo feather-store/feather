@@ -39,12 +39,14 @@ TYPES = (("knowledge-update", "KU"), ("multi-session", "MS"),
 
 
 def label(params: dict) -> str:
+    place = params.get("evidence_position") or "date"
+    where = "" if place == "date" else f", evidence {place}"
     if params.get("full_context"):
-        return "full context"
+        return "full context" + where
     budget = (f"{params['context_tokens'] // 1000}k tok"
               if params.get("context_tokens")
               else f"{params.get('context_chars', 160_000) // 1000}k chars")
-    return f"k={params.get('k')} {budget}"
+    return f"k={params.get('k')} {budget}{where}"
 
 
 def load(paths: list[str]) -> dict[str, list[list[dict]]]:

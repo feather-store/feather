@@ -238,6 +238,7 @@ def _cmd_run(args):
                 count_map=args.count_map, workers=args.workers,
                 context_tokens=args.context_tokens, count_tokens=count_tokens,
                 reader=args.reader, full_context=args.full_context,
+                evidence_position=args.evidence_position,
             ),
             n=len(questions), dim=embedder.dim, k=args.k,
             ef=args.ef, embedder=embedder.name, judge=judge.name,
@@ -246,6 +247,7 @@ def _cmd_run(args):
             count_map=args.count_map, split=args.split, reader=args.reader,
             context_tokens=args.context_tokens,
             full_context=args.full_context,
+            evidence_position=args.evidence_position,
             tokenizer_model=(args.tokenizer_model if count_tokens else None),
             count_votes=args.count_votes, context_chars_budget=args.context_chars,
             system_provider=(args.system_provider if fact_cache else None),
@@ -322,6 +324,9 @@ def lme_reportability(args, metrics: dict, dirty: bool) -> list[str]:
     if getattr(args, "full_context", False):
         why.append("--full-context: the whole haystack, no retrieval (a "
                    "baseline, not Feather's score)")
+    if getattr(args, "evidence_position", "date") != "date":
+        why.append(f"--evidence-position {args.evidence_position}: placed by the "
+                   "gold labels (an experiment on position, not a score)")
     if args.judge != "llm":
         why.append(f"--judge {args.judge}: no LLM reader or judge")
     if args.embedder == "deterministic":
@@ -457,6 +462,12 @@ def main(argv=None):
                        help="longmemeval: no retrieval, no budget: every "
                             "session verbatim to the same reader (the "
                             "full-context baseline, ~110k tokens on s).")
+    p_run.add_argument("--evidence-position", default="date",
+                       choices=["date", "first", "middle", "last"],
+                       help="longmemeval: where the gold evidence sessions go "
+                            "in the context (default date: oldest first, as "
+                            "the system does). The same sessions either way; "
+                            "an oracle experiment, never reportable.")
     p_run.add_argument("--embed-cache",
                        default=os.path.expanduser(
                            "~/.cache/feather/longmemeval/emb-batch"),

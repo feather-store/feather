@@ -198,3 +198,25 @@ def test_budget_in_tokens_uses_the_counter():
         assert False, "max_tokens without a counter must raise"
     except ValueError:
         pass
+
+
+def test_evidence_position_moves_only_the_gold_sessions():
+    """The same sessions at the same rendering, only the gold ones moved:
+    position is the one thing that changes."""
+    sessions = [(f"s{i}", f"2023/0{i}/01 (Mon) 10:00") for i in range(1, 6)]
+    turns = [Turn(sid, date, "user", f"text of {sid}", n) for n, (sid, date) in enumerate(sessions)]
+    hits = list(reversed(turns))                   # ranked newest first
+
+    def seq(place):
+        r = render(hits, turns, evidence={"s2", "s4"}, place=place)
+        return sorted(("s1", "s2", "s3", "s4", "s5"), key=lambda s: r.text.index(f"text of {s}")), r
+
+    assert seq("date")[0] == ["s1", "s2", "s3", "s4", "s5"]
+    assert seq("first")[0] == ["s2", "s4", "s1", "s3", "s5"]
+    assert seq("last")[0] == ["s1", "s3", "s5", "s2", "s4"]
+    assert seq("middle")[0] == ["s1", "s2", "s4", "s3", "s5"]
+    base = seq("date")[1]
+    for place in ("first", "middle", "last"):
+        r = seq(place)[1]
+        assert r.in_context == base.in_context and r.levels == base.levels
+        assert sorted(r.text.split("\n\n")) == sorted(base.text.split("\n\n"))
